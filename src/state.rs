@@ -14,6 +14,9 @@ pub struct State {
     /// Reading width set with the slider; None = full width.
     #[serde(default)]
     pub read_width: Option<u16>,
+    /// channel -> (bot last tagged there, unix seconds).
+    #[serde(default)]
+    pub last_bot: std::collections::HashMap<String, (String, u64)>,
 }
 
 fn path(relay: &str, me: &str) -> Option<std::path::PathBuf> {

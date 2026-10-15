@@ -128,6 +128,11 @@ pub struct App {
     /// event id -> (channel, thread root, the draft it came from)
     pub pending_sends: HashMap<String, (String, Option<String>, Draft)>,
     pub relay_host: String,
+    /// channel -> (bot I last tagged there, when). Saved, so it survives
+    /// restarts even when that message is older than the loaded history.
+    pub last_bot: HashMap<String, (String, u64)>,
+    /// Text put in a blank draft on entering insert; Esc drops it untouched.
+    prefill: Option<String>,
 }
 
 impl App {
@@ -177,6 +182,8 @@ impl App {
             actions: vec![],
             pending_sends: HashMap::new(),
             relay_host: String::new(),
+            last_bot: HashMap::new(),
+            prefill: None,
         }
     }
 
@@ -427,7 +434,7 @@ impl App {
         self.thread_selected = None;
         self.focus = Pane::Thread;
         if insert {
-            self.mode = Mode::Insert;
+            self.enter_insert();
         }
     }
 
@@ -455,6 +462,19 @@ impl App {
                 None => return,
             },
         };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        if let Some(bot) = self
+            .draft_ref()
+            .mention_pubkeys()
+            .into_iter()
+            .find(|pk| self.is_agent(pk))
+        {
+            self.last_bot.insert(channel.clone(), (bot, now));
+            self.actions.push(Action::SaveState);
+        }
+        self.prefill = None;
         self.actions.push(Action::Send {
             channel,
             root,
@@ -465,6 +485,59 @@ impl App {
     }
 
     // ---------- mentions ----------
+
+    fn is_agent(&self, pk: &str) -> bool {
+        self.store.profiles.get(pk).is_some_and(|p| p.is_agent)
+    }
+
+    /// The bot my latest message in this channel tagged: from loaded
+    /// history (so sends from Desktop count too) or what we saved, whichever
+    /// is newer.
+    pub fn last_bot_in(&self, channel: &str) -> Option<String> {
+        let seen = self.store.channels.get(channel).and_then(|c| {
+            c.messages
+                .values()
+                .filter(|m| m.author == self.store.me && !m.deleted)
+                .filter_map(|m| {
+                    let bot = m.mentions.iter().find(|pk| self.is_agent(pk))?;
+                    Some((bot.clone(), m.created_at))
+                })
+                .max_by_key(|(_, at)| *at)
+        });
+        let saved = self.last_bot.get(channel).cloned();
+        [seen, saved]
+            .into_iter()
+            .flatten()
+            .max_by_key(|(_, at)| *at)
+            .map(|(pk, _)| pk)
+    }
+
+    /// Insert mode. A blank draft starts with `@bot ` for the bot last
+    /// tagged here, as if it had been typed and Tab-completed.
+    fn enter_insert(&mut self) {
+        self.mode = Mode::Insert;
+        let d = self.draft_ref();
+        if !d.text.is_empty() || !d.attachments.is_empty() {
+            return;
+        }
+        let Some((channel, _)) = self.draft_target() else {
+            return;
+        };
+        let Some(pk) = self.last_bot_in(&channel) else {
+            return;
+        };
+        let Some(name) = self
+            .store
+            .profiles
+            .get(&pk)
+            .map(|p| p.name.clone())
+            .filter(|n| !n.is_empty())
+        else {
+            return;
+        };
+        self.draft_mut().complete_mention(0, &name, &pk);
+        self.prefill = Some(self.draft_ref().text.clone());
+    }
 
     /// Candidates for the `@query` being typed: channel members first.
     pub fn mention_candidates(&self) -> Vec<(String, String)> {
@@ -620,6 +693,9 @@ impl App {
         let cands = self.mention_candidates();
         match k.code {
             KeyCode::Esc => {
+                if self.prefill.take().as_deref() == Some(self.draft_ref().text.as_str()) {
+                    self.draft_mut().clear();
+                }
                 self.mode = Mode::Normal;
             }
             KeyCode::Tab if !cands.is_empty() => {
@@ -710,7 +786,7 @@ impl App {
                     self.close_thread();
                 }
             }
-            KeyCode::Char('i') => self.mode = Mode::Insert,
+            KeyCode::Char('i') => self.enter_insert(),
             KeyCode::Char('a') => self.agents_view = !self.agents_view,
             KeyCode::Char('+') => self.thumbs_up(),
             KeyCode::Char('s') => {
@@ -937,7 +1013,7 @@ impl App {
                 }
                 Some(Hit::Compose) => {
                     if self.mode == Mode::Normal {
-                        self.mode = Mode::Insert;
+                        self.enter_insert();
                     }
                 }
                 Some(Hit::Section(i)) => {
@@ -985,5 +1061,59 @@ mod tests {
             app.on_key(KeyEvent::from(code));
         }
         assert_eq!(app.chosen, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn blank_insert_starts_with_last_bot() {
+        let mut app = App::new("me".into(), None);
+        app.tabs = vec!["ch".into()];
+        for (pk, name, agent) in [
+            ("bot1", "judgebot", true),
+            ("bot2", "taskbot", true),
+            ("al", "Al", false),
+        ] {
+            let p = app.store.profiles.entry(pk.into()).or_default();
+            p.name = name.into();
+            p.is_agent = agent;
+        }
+        let msg = |id: &str, at: u64, mentions: &[&str]| crate::model::Message {
+            id: id.into(),
+            author: "me".into(),
+            created_at: at,
+            content: String::new(),
+            edited: false,
+            deleted: false,
+            root: None,
+            mentions: mentions.iter().map(|s| s.to_string()).collect(),
+            media: vec![],
+            system: false,
+        };
+        let ch = app.store.channel_mut("ch");
+        ch.messages.insert("m1".into(), msg("m1", 10, &["bot1"]));
+        ch.messages
+            .insert("m2".into(), msg("m2", 20, &["al", "bot2"]));
+        ch.messages.insert("m3".into(), msg("m3", 30, &["al"]));
+        let key = |app: &mut App, c| app.on_key(KeyEvent::from(c));
+        key(&mut app, KeyCode::Char('i'));
+        assert_eq!(app.draft.text, "@taskbot ");
+        assert_eq!(app.draft.mention_pubkeys(), vec!["bot2".to_string()]);
+        // Esc with nothing typed leaves no draft behind.
+        key(&mut app, KeyCode::Esc);
+        assert!(app.draft.text.is_empty());
+        // Sending to a bot remembers it, newer than history.
+        key(&mut app, KeyCode::Char('i'));
+        app.draft.clear();
+        app.draft.insert("hi ");
+        app.draft.complete_mention(3, "judgebot", "bot1");
+        app.send();
+        assert_eq!(app.last_bot.get("ch").map(|b| b.0.as_str()), Some("bot1"));
+        app.draft.clear();
+        key(&mut app, KeyCode::Char('i'));
+        assert_eq!(app.draft.text, "@judgebot ");
+        // Something typed after it stays on Esc; a non-blank draft is left alone.
+        key(&mut app, KeyCode::Char('x'));
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Char('i'));
+        assert_eq!(app.draft.text, "@judgebot x");
     }
 }
