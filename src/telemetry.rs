@@ -11,6 +11,9 @@ use crate::model::Store;
 
 #[derive(Default)]
 pub struct Agent {
+    /// One of your managed agents (kind 30177). Only these are listed.
+    pub owned: bool,
+    pub name: String,
     pub busy: bool,
     pub online: bool,
     pub channel: Option<String>,
@@ -46,6 +49,13 @@ fn push_recent(a: &mut Agent, s: String) {
 impl Agents {
     pub fn known(&mut self, pubkey: &str) -> &mut Agent {
         self.by_pubkey.entry(pubkey.to_string()).or_default()
+    }
+
+    /// A managed agent you own, from its kind 30177 record.
+    pub fn own(&mut self, pubkey: &str, name: &str) {
+        let a = self.known(pubkey);
+        a.owned = true;
+        a.name = name.to_string();
     }
 
     /// One decrypted frame from `agent`. Batches are unwrapped.
@@ -153,7 +163,8 @@ impl Agents {
         let mut rows: Vec<Row> = self
             .by_pubkey
             .iter()
-            .map(|(pk, a)| {
+            .filter(|(_, a)| a.owned)
+            .filter_map(|(pk, a)| {
                 // A busy flag with no news for 15 minutes is a lost turn_completed.
                 let stale = a
                     .last_seen
@@ -185,13 +196,22 @@ impl Agents {
                         status = format!("#{} · {status}", ch.name);
                     }
                 }
-                Row {
-                    name: store.name_of(pk),
+                // Offline agents stay off the list; you only see who can answer.
+                if !a.online && !busy {
+                    return None;
+                }
+                let name = match store.profiles.get(pk.as_str()) {
+                    Some(p) if !p.name.is_empty() => p.name.clone(),
+                    _ if !a.name.is_empty() => a.name.clone(),
+                    _ => store.name_of(pk),
+                };
+                Some(Row {
+                    name,
                     busy,
-                    online: a.online || busy,
+                    online: true,
                     status,
                     recent: a.recent.clone(),
-                }
+                })
             })
             .collect();
         rows.sort_by_key(|r| (!r.busy, !r.online, r.name.to_lowercase()));
@@ -207,6 +227,7 @@ mod tests {
     #[test]
     fn turn_lifecycle() {
         let mut ag = Agents::default();
+        ag.own("a1", "bot");
         ag.frame("a1", &json!({"kind": "batch", "payload": {"events": [
             {"kind": "turn_started", "channelId": "c", "payload": {}},
             {"kind": "acp_read", "payload": {"params": {"update": {"sessionUpdate": "tool_call", "title": "Bash: cargo test"}}}},
@@ -222,8 +243,13 @@ mod tests {
             "a1",
             &json!({"model": "opus", "turn": {"totalTokens": 12400, "costUsd": 0.5}}),
         );
+        ag.presence("a1", "online");
         let r = &ag.rows(&s)[0];
         assert!(!r.busy);
         assert_eq!(r.status, "last turn 12k tok $0.50 · opus");
+        // Offline, or not one of yours: not listed.
+        ag.presence("a1", "offline");
+        ag.presence("x9", "online");
+        assert!(ag.rows(&s).is_empty());
     }
 }

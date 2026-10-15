@@ -31,8 +31,20 @@ pub fn flight(tick: u64, width: usize) -> String {
     s
 }
 
-/// Spinner for agents that are mid-turn.
-pub const THINK: &[&str] = &["( ·.·)", "( ·.· )", "(·.· )", "( -.-)", "( ·.·)", "(°.° )"];
+/// Spinner for agents that are mid-turn. Every frame is the same width so
+/// the name next to it doesn't jiggle.
+pub const THINK: &[&str] = &["( ·.·)", "(·.· )", "( -.-)", "( ·.·)", "(°.° )", "(·.· )"];
 
 /// Shown for a moment after a message goes out.
 pub const SENT: &[&str] = &["bzz!", "~bzzz~", "*whoosh*", "delivered ✦", "off it goes"];
+
+#[cfg(test)]
+mod tests {
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn think_frames_share_a_width() {
+        let w = super::THINK[0].width();
+        assert!(super::THINK.iter().all(|f| f.width() == w));
+    }
+}

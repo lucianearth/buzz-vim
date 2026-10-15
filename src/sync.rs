@@ -570,7 +570,11 @@ pub fn fold(app: &mut App, sync: &mut Sync, ev: &Event, live_channel: bool) -> V
         30177 => {
             // Managed agent you own: d = agent pubkey.
             if let Some(pk) = model::tag(ev, "d").filter(|d| d.len() == 64) {
-                app.agents.known(pk);
+                let name = serde_json::from_str::<serde_json::Value>(&ev.content)
+                    .ok()
+                    .and_then(|v| v.get("name")?.as_str().map(str::to_string))
+                    .unwrap_or_default();
+                app.agents.own(pk, &name);
                 return vec![pk.to_string()];
             }
             return vec![];

@@ -43,24 +43,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     };
     let [main, agents] =
         Layout::horizontal([Constraint::Min(20), Constraint::Length(agents_w)]).areas(body);
-    let (timeline, thread) = if app.thread.is_some() {
-        if main.width >= 90 {
-            let [a, b] =
-                Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
-                    .areas(main);
-            (Some(a), b)
-        } else {
-            (None, main)
-        }
-    } else {
-        (Some(main), Rect::default())
-    };
+    // A thread takes over the main pane; h, ← or Esc goes back up.
     let mut images = vec![];
-    if let Some(t) = timeline {
-        draw_timeline(f, app, t, &mut images);
-    }
     if app.thread.is_some() {
-        draw_thread(f, app, thread, &mut images);
+        draw_thread(f, app, main, &mut images);
+    } else {
+        draw_timeline(f, app, main, &mut images);
     }
     if agents_w > 0 {
         draw_agents(f, app, agents);
@@ -198,11 +186,25 @@ fn time_label(at: u64) -> String {
     let Some(t) = Local.timestamp_opt(at as i64, 0).single() else {
         return String::new();
     };
-    let now = Local::now();
-    if t.date_naive() == now.date_naive() {
-        t.format("%H:%M").to_string()
-    } else {
-        t.format("%b %e %H:%M").to_string()
+    relative_time(t, Local::now())
+}
+
+/// "just now", "4m ago", "2h 15m ago" for the last 12 hours, then a date.
+fn relative_time<Tz: chrono::TimeZone>(t: chrono::DateTime<Tz>, now: chrono::DateTime<Tz>) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    use chrono::Datelike;
+    let mins = (now.clone() - t.clone()).num_minutes();
+    match mins {
+        m if m < 1 => "just now".into(),
+        m if m < 60 => format!("{m}m ago"),
+        m if m < 12 * 60 && m % 60 == 0 => format!("{}h ago", m / 60),
+        m if m < 12 * 60 => format!("{}h {}m ago", m / 60, m % 60),
+        _ if t.date_naive().year() == now.date_naive().year() => {
+            t.format("%b %e %H:%M").to_string()
+        }
+        _ => t.format("%b %e %Y %H:%M").to_string(),
     }
 }
 
@@ -504,15 +506,11 @@ fn draw_thread(
     let Some((ch_id, root)) = app.thread.clone() else {
         return;
     };
-    let [rule, area] = Layout::horizontal([Constraint::Length(1), Constraint::Min(0)]).areas(area);
-    f.render_widget(
-        Block::new()
-            .borders(Borders::LEFT)
-            .border_style(theme::rule()),
-        rule,
-    );
     let focused = app.focus == Pane::Thread;
-    let area = pane_title(f, area, "thread".into(), "h closes", focused);
+    let Some(label) = app.store.channels.get(&ch_id).map(channel_label) else {
+        return;
+    };
+    let area = thread_header(f, app, area, &label);
     let Some(ch) = app.store.channels.get(&ch_id) else {
         return;
     };
@@ -538,14 +536,6 @@ fn draw_thread(
         draw_empty(f, app, area, "loading thread…");
         return;
     }
-    let close = Rect {
-        x: area.x + area.width.saturating_sub(3),
-        y: area.y.saturating_sub(1),
-        width: 3,
-        height: 1,
-    };
-    f.render_widget(Paragraph::new(Span::styled(" ✕ ", theme::muted())), close);
-    app.hits.push((close, Hit::CloseThread));
     draw_blocks(
         f,
         app,
@@ -555,6 +545,37 @@ fn draw_thread(
         cursor.as_deref(),
         images,
     );
+}
+
+/// Breadcrumb for a thread that has taken over the main pane:
+/// `‹ #channel › thread`, the back arrow clickable, and a rule under it.
+fn thread_header(f: &mut Frame, app: &mut App, area: Rect, channel: &str) -> Rect {
+    let [t, rule, rest] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+    let line = Line::from(vec![
+        Span::styled(" ‹ ", theme::key()),
+        Span::styled(channel.to_string(), theme::muted()),
+        Span::styled("  ›  ", theme::faint()),
+        Span::styled("thread", theme::bright()),
+        Span::styled("    h ← esc back", theme::faint()),
+    ]);
+    f.render_widget(Paragraph::new(line), t);
+    let back = Rect {
+        width: (3 + channel.chars().count() as u16).min(t.width),
+        ..t
+    };
+    app.hits.push((back, Hit::CloseThread));
+    f.render_widget(
+        Block::new()
+            .borders(Borders::TOP)
+            .border_style(theme::rule()),
+        rule,
+    );
+    rest
 }
 
 fn draw_empty(f: &mut Frame, app: &App, area: Rect, msg: &str) {
@@ -594,7 +615,10 @@ fn draw_agents(f: &mut Frame, app: &mut App, area: Rect) {
     let rows = app.agents.rows(&app.store);
     if rows.is_empty() {
         lines.push(Line::raw(""));
-        lines.push(Line::styled("  no agents reporting yet", theme::faint()));
+        lines.push(Line::styled(
+            "  none of your agents are online",
+            theme::faint(),
+        ));
     }
     let w = area.width.saturating_sub(4) as usize;
     for r in rows {
@@ -650,11 +674,42 @@ fn clip(s: &str, w: usize) -> String {
 
 // ---------- compose + footer ----------
 
-fn compose_height(app: &App, _width: u16) -> u16 {
+fn compose_height(app: &App, width: u16) -> u16 {
     let d = app.draft_ref();
-    let lines = d.text.matches('\n').count() as u16 + 1;
+    let w = compose_cols(width);
+    let lines = d
+        .text
+        .split('\n')
+        .map(|l| wrap_cols(&crate::draft::expand_tabs(l), w).len())
+        .sum::<usize>() as u16;
     let att = if d.attachments.is_empty() { 0 } else { 1 };
     lines.clamp(1, 8) + att + 2
+}
+
+/// Text columns in the compose box: one for the left pad, one so the
+/// cursor fits at the end of a full row.
+fn compose_cols(width: u16) -> usize {
+    (width as usize).saturating_sub(2).max(4)
+}
+
+/// Hard-wrap one line at `w` columns. A line that exactly fills its last row
+/// gets an empty row after it, which is where the cursor goes next.
+fn wrap_cols(s: &str, w: usize) -> Vec<String> {
+    let mut rows = vec![String::new()];
+    let mut used = 0;
+    for c in s.chars() {
+        let cw = c.width().unwrap_or(0);
+        if used + cw > w {
+            rows.push(String::new());
+            used = 0;
+        }
+        rows.last_mut().unwrap().push(c);
+        used += cw;
+    }
+    if used == w {
+        rows.push(String::new());
+    }
+    rows
 }
 
 fn draw_compose(f: &mut Frame, app: &mut App, area: Rect) {
@@ -702,6 +757,7 @@ fn draw_compose(f: &mut Frame, app: &mut App, area: Rect) {
         ));
     }
     let text_top = inner.y + lines.len() as u16;
+    let cols = compose_cols(area.width);
     if d.text.is_empty() && !insert {
         lines.push(Line::styled(
             " press i to write · ^v pastes an image",
@@ -717,22 +773,33 @@ fn draw_compose(f: &mut Frame, app: &mut App, area: Rect) {
             if is_fence {
                 fence = !fence;
             }
-            let l = crate::draft::expand_tabs(l);
-            lines.push(if shaded {
-                Line::from(Span::styled(
-                    pad_to(&format!(" {l}"), inner.width as usize),
-                    if is_fence {
-                        theme::code_label()
-                    } else {
-                        theme::code()
-                    },
-                ))
-            } else {
-                Line::styled(format!(" {l}"), theme::text())
-            });
+            for l in wrap_cols(&crate::draft::expand_tabs(l), cols) {
+                lines.push(if shaded {
+                    Line::from(Span::styled(
+                        pad_to(&format!(" {l}"), inner.width as usize),
+                        if is_fence {
+                            theme::code_label()
+                        } else {
+                            theme::code()
+                        },
+                    ))
+                } else {
+                    Line::styled(format!(" {l}"), theme::text())
+                });
+            }
         }
     }
+    // Long lines wrap, so turn the cursor's line and column into the row
+    // and column it sits at on screen.
     let (cl, cc) = d.cursor_line_col();
+    let cl = d
+        .text
+        .split('\n')
+        .take(cl)
+        .map(|l| wrap_cols(&crate::draft::expand_tabs(l), cols).len())
+        .sum::<usize>()
+        + cc / cols;
+    let cc = cc % cols;
     let visible = inner.height.saturating_sub(text_top - inner.y) as usize;
     let skip = (cl + 1).saturating_sub(visible);
     let head: Vec<Line> = lines
@@ -1030,18 +1097,21 @@ fn draw_help(f: &mut Frame, area: Rect) {
 }
 
 fn draw_viewer(f: &mut Frame, app: &mut App, area: Rect) {
-    let r = Rect {
-        x: area.x + 2,
-        y: area.y + 1,
-        width: area.width.saturating_sub(4),
-        height: area.height.saturating_sub(3),
-    };
-    f.render_widget(Clear, r);
-    let block = Block::bordered()
-        .border_style(theme::text())
-        .title(Span::styled(" image · esc closes ", theme::bright()));
-    let inner = block.inner(r);
-    f.render_widget(block, r);
+    // Takes the whole screen; the image gets every cell but the title row.
+    f.render_widget(Clear, area);
+    let [title, inner] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    let n = app.viewer_list.len();
+    let at = app
+        .viewer
+        .as_ref()
+        .and_then(|u| app.viewer_list.iter().position(|x| x == u))
+        .map_or(0, |i| i + 1);
+    let mut spans = vec![Span::styled(format!(" image {at}/{n}"), theme::bright())];
+    if n > 1 {
+        spans.push(Span::styled("   ← → move", theme::faint()));
+    }
+    spans.push(Span::styled("   esc closes", theme::faint()));
+    f.render_widget(Paragraph::new(Line::from(spans)), title);
     let Some(url) = app.viewer.clone() else {
         return;
     };
@@ -1283,6 +1353,26 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relative_times() {
+        use chrono::{TimeZone, Utc};
+        let now = Utc.with_ymd_and_hms(2026, 10, 15, 15, 40, 0).unwrap();
+        let ago = |m: i64| relative_time(now - chrono::Duration::minutes(m), now);
+        assert_eq!(ago(0), "just now");
+        assert_eq!(ago(4), "4m ago");
+        assert_eq!(ago(120), "2h ago");
+        assert_eq!(ago(135), "2h 15m ago");
+        assert_eq!(ago(13 * 60), "Oct 15 02:40");
+        assert_eq!(ago(400 * 24 * 60), "Sep 10 2025 15:40");
+    }
+
+    #[test]
+    fn compose_wraps_long_lines() {
+        assert_eq!(super::wrap_cols("", 5), vec![""]);
+        assert_eq!(super::wrap_cols("abcdefg", 5), vec!["abcde", "fg"]);
+        assert_eq!(super::wrap_cols("abcde", 5), vec!["abcde", ""]);
+    }
+
     use super::*;
 
     fn text(lines: &[Line]) -> Vec<String> {

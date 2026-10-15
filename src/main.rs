@@ -27,7 +27,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    EventStream,
+    EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use futures::StreamExt;
@@ -76,14 +77,24 @@ fn main() -> Result<()> {
     std::panic::set_hook(Box::new(move |info| {
         let _ = execute!(
             std::io::stdout(),
+            PopKeyboardEnhancementFlags,
             DisableMouseCapture,
             DisableBracketedPaste
         );
         ratatui_hook(info);
     }));
+    // Terminals that speak the kitty keyboard protocol (iTerm2, kitty,
+    // WezTerm, Ghostty) can then tell Shift+Enter apart from Enter. Others
+    // ignore the request. Probing first costs a stdin round-trip that can
+    // leave the terminal cooked, so just ask.
+    let _ = execute!(
+        std::io::stdout(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
     let res = execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)
         .map_err(anyhow::Error::from)
         .and_then(|_| rt.block_on(run(&mut terminal, cfg, picker)));
+    let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     let _ = execute!(
         std::io::stdout(),
         DisableMouseCapture,
@@ -124,6 +135,7 @@ async fn run(
     let mut restore_active = saved.active.clone();
     let mut last_draw = Instant::now() - Duration::from_secs(1);
     let mut dirty = true;
+    let mut last_minute = 0u64;
 
     loop {
         if dirty && last_draw.elapsed() >= Duration::from_millis(16) {
@@ -176,8 +188,13 @@ async fn run(
             }
             _ = tick.tick() => {
                 app.tick += 1;
-                // Only redraw on ticks when something is animating.
-                if app.animating() {
+                // Only redraw on ticks when something is animating, or
+                // once a minute so "4m ago" stays true.
+                let minute = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs() / 60);
+                if app.animating() || minute != last_minute {
+                    last_minute = minute;
                     dirty = true;
                 }
             }

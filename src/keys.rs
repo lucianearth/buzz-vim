@@ -42,7 +42,7 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("g G", "oldest / newest", false),
             ("d u", "page down / up", true),
             ("^d ^u", "half page down / up", false),
-            ("o", "open image", false),
+            ("o", "full-screen image", false),
             ("^v", "paste image or file", false),
             ("R", "reload sections", false),
             ("q", "quit", false),
@@ -51,7 +51,7 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
         Mode::Insert => &[
             ("esc", "normal mode", true),
             ("⏎", "send", true),
-            ("⌥⏎ ^j", "new line", true),
+            ("⇧⏎ ^j", "new line", true),
             (
                 "```",
                 "code block: ⏎ is a new line until you close it",
@@ -72,7 +72,10 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("esc", "cancel", true),
         ],
         Mode::Confirm => &[("y", "upload to Buzz", true), ("n esc", "cancel", true)],
-        Mode::Viewer => &[("esc q o", "close", true)],
+        Mode::Viewer => &[
+            ("← →", "prev / next image", true),
+            ("esc q o", "close", true),
+        ],
         Mode::Help => &[("esc ?", "close", true)],
     }
 }

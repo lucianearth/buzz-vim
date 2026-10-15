@@ -93,6 +93,8 @@ pub struct App {
     pub media: Media,
     pub picker: Option<Picker>,
     pub viewer: Option<String>,
+    /// Every image in the pane the viewer was opened from, oldest first.
+    pub viewer_list: Vec<String>,
     pub hits: Vec<(Rect, Hit)>,
     /// Timeline/thread page height from the last draw, for ^d/^u.
     pub page: usize,
@@ -134,6 +136,7 @@ impl App {
             media: Media::default(),
             picker,
             viewer: None,
+            viewer_list: vec![],
             hits: vec![],
             page: 20,
             actions: vec![],
@@ -521,15 +524,19 @@ impl App {
                 }
                 _ => {}
             },
-            Mode::Viewer => {
-                if matches!(
-                    k.code,
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('o') | KeyCode::Enter
-                ) {
+            Mode::Viewer => match k.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('o') | KeyCode::Enter => {
                     self.viewer = None;
                     self.mode = Mode::Normal;
                 }
-            }
+                KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('k') | KeyCode::Up => {
+                    self.step_viewer(-1)
+                }
+                KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('j') | KeyCode::Down => {
+                    self.step_viewer(1)
+                }
+                _ => {}
+            },
             Mode::Help => {
                 if matches!(
                     k.code,
@@ -633,11 +640,7 @@ impl App {
             KeyCode::Char('r') => self.open_thread(true),
             KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => {
                 if self.thread.is_some() {
-                    if self.focus == Pane::Thread || k.code != KeyCode::Esc {
-                        self.close_thread();
-                    } else {
-                        self.focus = Pane::Thread;
-                    }
+                    self.close_thread();
                 }
             }
             KeyCode::Char('i') | KeyCode::Char('a') => self.mode = Mode::Insert,
@@ -655,23 +658,74 @@ impl App {
         }
     }
 
+    /// Full-screen image viewer. Opens on the selected message's image (or
+    /// the nearest one above it) and pages through every image in the pane.
     fn open_viewer(&mut self) {
         let Some(id) = self.cursor_message() else {
             return;
         };
-        let url = self.store.find_message(&id).and_then(|(_, m)| {
-            m.media
-                .iter()
-                .find(|x| x.mime.starts_with("image/"))
-                .map(|x| x.url.clone())
-        });
-        match url {
-            Some(u) => {
-                self.actions.push(Action::LoadImage(u.clone()));
-                self.viewer = Some(u);
-                self.mode = Mode::Viewer;
+        let ids = if self.focus == Pane::Thread {
+            self.thread_ids()
+        } else {
+            self.timeline_ids()
+        };
+        let mut list = vec![];
+        let mut start = None;
+        for mid in &ids {
+            let Some((_, m)) = self.store.find_message(mid) else {
+                continue;
+            };
+            let first = list.len();
+            list.extend(
+                m.media
+                    .iter()
+                    .filter(|x| x.mime.starts_with("image/"))
+                    .map(|x| x.url.clone()),
+            );
+            if *mid == id {
+                start = if list.len() > first {
+                    Some(first)
+                } else {
+                    list.len().checked_sub(1)
+                };
             }
-            None => self.say("no image on this message"),
+        }
+        match start {
+            Some(i) => {
+                self.viewer_list = list;
+                self.mode = Mode::Viewer;
+                self.show_image(i);
+            }
+            None => self.say("no images here"),
+        }
+    }
+
+    fn show_image(&mut self, i: usize) {
+        let Some(u) = self.viewer_list.get(i).cloned() else {
+            return;
+        };
+        // Fetch the neighbours too, so paging is instant.
+        for j in [Some(i), i.checked_sub(1), Some(i + 1)]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(n) = self.viewer_list.get(j) {
+                self.actions.push(Action::LoadImage(n.clone()));
+            }
+        }
+        self.viewer = Some(u);
+    }
+
+    fn step_viewer(&mut self, delta: isize) {
+        let n = self.viewer_list.len();
+        let at = self
+            .viewer
+            .as_ref()
+            .and_then(|u| self.viewer_list.iter().position(|x| x == u))
+            .unwrap_or(0);
+        let next = (at as isize + delta).clamp(0, n.saturating_sub(1) as isize) as usize;
+        if next != at {
+            self.show_image(next);
         }
     }
 
