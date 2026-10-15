@@ -1453,32 +1453,54 @@ fn draw_viewer(f: &mut Frame, app: &mut App, area: Rect) {
         .as_ref()
         .and_then(|u| app.viewer_list.iter().position(|x| x == u))
         .map_or(0, |i| i + 1);
-    let mut spans = vec![Span::styled(format!(" image {at}/{n}"), theme::bright())];
+    // Same key chips as the footer, so the legend reads at a glance.
+    let mut spans = vec![Span::styled(format!(" image {at}/{n}  "), theme::bright())];
+    let mut keys = vec![];
     if n > 1 {
-        spans.push(Span::styled("   ← → move", theme::faint()));
+        keys.push(("← →", "move"));
     }
-    spans.push(Span::styled("   esc closes", theme::faint()));
+    keys.push(("esc", "close"));
+    for (k, what) in keys {
+        spans.push(Span::styled(format!(" {k} "), theme::key()));
+        spans.push(Span::styled(format!(" {what}  "), theme::muted()));
+    }
     f.render_widget(Paragraph::new(Line::from(spans)), title);
     let Some(url) = app.viewer.clone() else {
         return;
     };
     let key = (url.clone(), inner.width, inner.height);
-    match app.media.encoded.get(&key) {
-        Some(p) => f.render_widget(Image::new(p), inner),
-        None => {
-            app.actions.push(crate::app::Action::EncodeImage(key));
-            f.render_widget(
-                Paragraph::new(
-                    Line::styled(
-                        format!("loading {}", art::flight(app.tick, 10)),
-                        theme::faint(),
-                    )
-                    .centered(),
-                ),
-                inner,
-            );
-        }
+    if let Some(p) = app.media.encoded.get(&key) {
+        // Fit keeps the aspect ratio, so it rarely fills both ways: center it.
+        let sz = p.size();
+        let (w, h) = (sz.width.min(inner.width), sz.height.min(inner.height));
+        let r = Rect {
+            x: inner.x + (inner.width - w) / 2,
+            y: inner.y + (inner.height - h) / 2,
+            width: w,
+            height: h,
+        };
+        f.render_widget(Image::new(p), r);
+        return;
     }
+    // A failed download or decode used to sit on "loading" forever.
+    let msg = match app.media.images.get(&url) {
+        Some(Slot::Failed(e)) => {
+            Line::styled(format!("couldn't load this image: {e}"), theme::muted())
+        }
+        _ => {
+            app.actions.push(crate::app::Action::EncodeImage(key));
+            Line::styled(
+                format!("loading {}", art::flight(app.tick, 10)),
+                theme::muted(),
+            )
+        }
+    };
+    let mid = Rect {
+        y: inner.y + inner.height / 2,
+        height: 1.min(inner.height),
+        ..inner
+    };
+    f.render_widget(Paragraph::new(msg.centered()), mid);
 }
 
 // ---------- text ----------
@@ -2012,6 +2034,61 @@ mod tests {
         assert!(s.contains("line01") && !s.contains("line60"), "{s}");
         // The left edge runs the pane's full height as a scroll bar.
         assert!(rows[2..16].iter().all(|r| r.starts_with('▌')), "{s}");
+    }
+
+    #[test]
+    fn viewer_shows_a_failed_image() {
+        let mut app = App::new("00".repeat(32), None);
+        app.mode = crate::keys::Mode::Viewer;
+        app.viewer = Some("https://x/a.png".into());
+        app.viewer_list = vec!["https://x/a.png".into()];
+        app.media.images.insert(
+            "https://x/a.png".into(),
+            Slot::Failed("download failed (404)".into()),
+        );
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let s: String = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .map(|p| buf[p].symbol().to_string())
+            .collect();
+        assert!(
+            s.contains("couldn't load this image: download failed (404)"),
+            "{s}"
+        );
+        assert!(s.contains("esc") && !s.contains("loading"), "{s}");
+    }
+
+    #[test]
+    fn viewer_centers_the_image() {
+        let mut app = App::new("00".repeat(32), None);
+        app.mode = crate::keys::Mode::Viewer;
+        let url = "https://x/wide.png".to_string();
+        app.viewer = Some(url.clone());
+        app.viewer_list = vec![url.clone()];
+        // Very wide: fit to 80x19 leaves bands above and below.
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            400,
+            20,
+            image::Rgb([255, 255, 255]),
+        ));
+        let p = ratatui_image::picker::Picker::halfblocks();
+        let proto = crate::media::encode(&p, &img, 80, 19).unwrap();
+        app.media.encoded.insert((url, 80, 19), proto);
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let painted: Vec<u16> = (1..20)
+            .filter(|&y| {
+                (0..80).any(|x| {
+                    let c = &buf[(x, y)];
+                    [c.fg, c.bg].contains(&ratatui::style::Color::Rgb(255, 255, 255))
+                })
+            })
+            .collect();
+        assert!(!painted.is_empty() && painted[0] > 2, "{painted:?}");
+        assert!(*painted.last().unwrap() < 18, "{painted:?}");
     }
 
     #[test]
