@@ -74,6 +74,9 @@ pub struct App {
     pub chosen: Vec<String>,
     pub picker_cursor: usize,
     pub picker_marks: HashSet<String>,
+    /// Marks changed since the picker opened. Until then Enter switches to
+    /// the section under the cursor.
+    pub picker_touched: bool,
     pub focus: Pane,
     /// channel -> selected top-level message (None = follow newest)
     pub selected: HashMap<String, String>,
@@ -124,6 +127,7 @@ impl App {
             chosen: vec![],
             picker_cursor: 0,
             picker_marks: HashSet::new(),
+            picker_touched: false,
             focus: Pane::Timeline,
             selected: HashMap::new(),
             thread: None,
@@ -660,7 +664,12 @@ impl App {
             KeyCode::Char('+') => self.thumbs_up(),
             KeyCode::Char('s') => {
                 self.picker_marks = self.chosen.iter().cloned().collect();
-                self.picker_cursor = 0;
+                self.picker_touched = false;
+                self.picker_cursor = self
+                    .sections
+                    .iter()
+                    .position(|s| self.chosen.contains(&s.id))
+                    .unwrap_or(0);
                 self.mode = Mode::Sections;
             }
             KeyCode::Char('R') => self.actions.push(Action::ReloadSections),
@@ -760,6 +769,7 @@ impl App {
 
     fn toggle_section(&mut self, i: usize) {
         if let Some(s) = self.sections.get(i) {
+            self.picker_touched = true;
             if !self.picker_marks.remove(&s.id) {
                 self.picker_marks.insert(s.id.clone());
             }
@@ -767,9 +777,11 @@ impl App {
     }
 
     fn apply_sections(&mut self) {
-        if self.picker_marks.is_empty() {
+        // The marks start as today's choice, so Enter without toggling
+        // anything means "switch to this one".
+        if !self.picker_touched || self.picker_marks.is_empty() {
             if let Some(s) = self.sections.get(self.picker_cursor) {
-                self.picker_marks.insert(s.id.clone());
+                self.picker_marks = HashSet::from([s.id.clone()]);
             }
         }
         // Keep sidebar order.
@@ -852,5 +864,38 @@ impl App {
             },
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enter_switches_section() {
+        let mut app = App::new("me".into(), None);
+        app.sections = ["a", "b"]
+            .map(|id| Section {
+                id: id.into(),
+                name: id.into(),
+                channels: vec![format!("{id}-ch")],
+            })
+            .to_vec();
+        app.chosen = vec!["a".into()];
+        for code in [KeyCode::Char('s'), KeyCode::Char('j'), KeyCode::Enter] {
+            app.on_key(KeyEvent::from(code));
+        }
+        assert_eq!(app.chosen, vec!["b".to_string()]);
+        assert_eq!(app.tabs, vec!["b-ch".to_string()]);
+        // Space marks several.
+        for code in [
+            KeyCode::Char('s'),
+            KeyCode::Char('k'),
+            KeyCode::Char(' '),
+            KeyCode::Enter,
+        ] {
+            app.on_key(KeyEvent::from(code));
+        }
+        assert_eq!(app.chosen, vec!["a".to_string(), "b".to_string()]);
     }
 }

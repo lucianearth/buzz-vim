@@ -14,18 +14,23 @@ pub struct Agent {
     /// One of your managed agents (kind 30177). Only these are listed.
     pub owned: bool,
     pub name: String,
-    pub busy: bool,
     pub online: bool,
-    pub channel: Option<String>,
-    /// Root of the thread the current turn answers (the triggering message
-    /// when it was top-level).
-    pub thread: Option<String>,
-    pub turn_started: Option<Instant>,
+    /// Turns in flight, by turnId. One agent can run turns in several
+    /// channels at once, so these are tracked one by one.
+    pub turns: BTreeMap<String, Turn>,
     /// newest first
     pub recent: Vec<String>,
     pub thought: String,
     pub last_turn: Option<String>,
-    pub last_seen: Option<Instant>,
+}
+
+pub struct Turn {
+    pub channel: Option<String>,
+    /// Root of the thread the turn answers (the triggering message when it
+    /// was top-level).
+    pub thread: Option<String>,
+    pub started: Instant,
+    pub seen: Instant,
 }
 
 #[derive(Default)]
@@ -47,13 +52,24 @@ pub struct Row {
     pub thought: String,
 }
 
+/// The harness sends turn_liveness every ~10s, so a turn quiet for this
+/// long lost its turn_completed.
+const TURN_STALE: Duration = Duration::from_secs(60);
+
 impl Agent {
-    /// A busy flag with no news for 15 minutes is a lost turn_completed.
+    /// Live turns, newest first.
+    fn live(&self) -> impl Iterator<Item = &Turn> {
+        let mut t: Vec<&Turn> = self
+            .turns
+            .values()
+            .filter(|t| t.seen.elapsed() <= TURN_STALE)
+            .collect();
+        t.sort_by_key(|t| std::cmp::Reverse(t.started));
+        t.into_iter()
+    }
+
     pub fn is_busy(&self) -> bool {
-        self.busy
-            && self
-                .last_seen
-                .is_some_and(|t| t.elapsed() <= Duration::from_secs(900))
+        self.live().next().is_some()
     }
 
     fn display_name(&self, pk: &str, store: &Store) -> String {
@@ -100,54 +116,90 @@ impl Agents {
         }
         let a = self.known(agent);
         a.online = true;
-        a.last_seen = Some(Instant::now());
-        if let Some(c) = frame.get("channelId").and_then(Value::as_str) {
-            a.channel = Some(c.to_string());
-        }
+        let now = Instant::now();
+        let channel = frame
+            .get("channelId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        // Older frames carry no turnId; one turn per channel then.
+        let key = frame
+            .get("turnId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("ch:{}", channel.as_deref().unwrap_or("")));
+        let root = frame
+            .pointer("/payload/threadRootEventId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         match frame.get("kind").and_then(Value::as_str).unwrap_or("") {
             "turn_started" => {
-                a.busy = true;
-                a.turn_started = Some(Instant::now());
                 a.thought.clear();
-                a.thread = frame
-                    .pointer("/payload/threadRootEventId")
-                    .or_else(|| frame.pointer("/payload/triggeringEventIds/0"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
+                let thread = root.or_else(|| {
+                    frame
+                        .pointer("/payload/triggeringEventIds/0")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                });
+                a.turns.insert(
+                    key,
+                    Turn {
+                        channel,
+                        thread,
+                        started: now,
+                        seen: now,
+                    },
+                );
                 push_recent(a, "turn started".into());
             }
             // Ticks while a turn runs: catches turns that began before we
             // connected.
             "turn_liveness" => {
-                a.busy = true;
-                a.turn_started.get_or_insert_with(Instant::now);
-                if let Some(r) = frame
-                    .pointer("/payload/threadRootEventId")
-                    .and_then(Value::as_str)
-                {
-                    a.thread = Some(r.to_string());
+                let t = a.turns.entry(key).or_insert_with(|| Turn {
+                    channel: channel.clone(),
+                    thread: None,
+                    started: now,
+                    seen: now,
+                });
+                t.seen = now;
+                if channel.is_some() {
+                    t.channel = channel;
+                }
+                if root.is_some() {
+                    t.thread = root;
                 }
             }
-            "turn_completed" => {
-                a.busy = false;
-                a.thread = None;
-                let took = a
-                    .turn_started
-                    .take()
-                    .map(|t| format!(" in {}s", t.elapsed().as_secs()))
-                    .unwrap_or_default();
-                push_recent(a, format!("turn done{took}"));
-            }
-            "turn_error" | "agent_panic" => {
-                a.busy = false;
-                a.thread = None;
-                let msg = frame
-                    .pointer("/payload/error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("turn failed");
-                push_recent(a, format!("✗ {msg}"));
+            "turn_completed" | "turn_error" | "agent_panic" => {
+                let ended: Vec<String> = if a.turns.contains_key(&key) {
+                    vec![key]
+                } else {
+                    // No turnId to match: end what ran in that channel, or
+                    // everything when the frame names no channel either.
+                    a.turns
+                        .iter()
+                        .filter(|(_, t)| channel.is_none() || t.channel == channel)
+                        .map(|(k, _)| k.clone())
+                        .collect()
+                };
+                let mut took = String::new();
+                for k in ended {
+                    if let Some(t) = a.turns.remove(&k) {
+                        took = format!(" in {}s", t.started.elapsed().as_secs());
+                    }
+                }
+                if frame.get("kind").and_then(Value::as_str) == Some("turn_completed") {
+                    push_recent(a, format!("turn done{took}"));
+                } else {
+                    let msg = frame
+                        .pointer("/payload/error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("turn failed");
+                    push_recent(a, format!("✗ {msg}"));
+                }
             }
             "acp_read" => {
+                if let Some(t) = a.turns.get_mut(&key) {
+                    t.seen = now;
+                }
                 let Some(update) = frame.pointer("/payload/params/update") else {
                     return;
                 };
@@ -210,8 +262,12 @@ impl Agents {
         let mut names: Vec<String> = self
             .by_pubkey
             .iter()
-            .filter(|(_, a)| a.is_busy() && a.channel.as_deref() == Some(channel))
-            .filter(|(_, a)| root.is_none_or(|r| a.thread.as_deref() == Some(r)))
+            .filter(|(_, a)| {
+                a.live().any(|t| {
+                    t.channel.as_deref() == Some(channel)
+                        && root.is_none_or(|r| t.thread.as_deref() == Some(r))
+                })
+            })
             .map(|(pk, a)| a.display_name(pk, store))
             .collect();
         names.sort();
@@ -224,7 +280,8 @@ impl Agents {
             .iter()
             .filter(|(_, a)| a.owned)
             .filter_map(|(pk, a)| {
-                let busy = a.is_busy();
+                let turn = a.live().next();
+                let busy = turn.is_some();
                 // Offline agents stay off the list; you only see who can answer.
                 if !a.online && !busy {
                     return None;
@@ -239,12 +296,9 @@ impl Agents {
                         .filter(|r| *r != "turn started")
                         .cloned()
                         .collect(),
-                    channel: a.channel.clone(),
-                    thread: a.thread.clone().filter(|_| busy),
-                    secs: a
-                        .turn_started
-                        .filter(|_| busy)
-                        .map(|t| t.elapsed().as_secs()),
+                    channel: turn.and_then(|t| t.channel.clone()),
+                    thread: turn.and_then(|t| t.thread.clone()),
+                    secs: turn.map(|t| t.started.elapsed().as_secs()),
                     last_turn: a.last_turn.clone(),
                     thought: if busy {
                         let w: Vec<&str> = a.thought.split_whitespace().collect();
@@ -300,5 +354,25 @@ mod tests {
         ag.presence("a1", "offline");
         ag.presence("x9", "online");
         assert!(ag.rows(&s).is_empty());
+    }
+
+    #[test]
+    fn concurrent_turns_end_separately() {
+        let mut ag = Agents::default();
+        ag.own("a1", "bot");
+        let s = Store::new("me".into());
+        for (t, c) in [("t1", "c1"), ("t2", "c2")] {
+            ag.frame(
+                "a1",
+                &json!({"kind": "turn_started", "turnId": t, "channelId": c, "payload": {}}),
+            );
+        }
+        ag.frame(
+            "a1",
+            &json!({"kind": "turn_completed", "turnId": "t1", "channelId": "c1", "payload": {}}),
+        );
+        assert!(ag.working(&s, "c1", None).is_empty());
+        assert_eq!(ag.working(&s, "c2", None), vec!["bot"]);
+        assert!(ag.rows(&s)[0].busy);
     }
 }

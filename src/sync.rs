@@ -252,8 +252,8 @@ impl Sync {
         }
     }
 
-    /// Look up what's unread in each tab we haven't checked yet: top-level
-    /// messages since its read position (or the last week, if it has none).
+    /// Look up what's unread in each tab we haven't checked yet: messages
+    /// and thread replies since its read position (or the last week, if it has none).
     pub fn check_unread(&mut self, tabs: &[String]) {
         if !self.read.loaded {
             return;
@@ -270,7 +270,7 @@ impl Sync {
             let channel = id.clone();
             self.spawn(async move {
                 let f = json!({"kinds": model::UNREAD_KINDS, "#h": [channel], "since": since,
-                    "limit": 100, "top_level": true});
+                    "limit": 100});
                 Msg::Unread {
                     events: r.query(&[f]).await,
                     channel,
@@ -694,17 +694,12 @@ pub fn fold(app: &mut App, sync: &mut Sync, ev: &Event, live_channel: bool) -> V
     }
     let applied = app.store.apply(ev);
     let mut want = vec![ev.pubkey.to_hex()];
-    if let Applied::Message {
-        channel,
-        id,
-        top_level,
-    } = applied
-    {
+    if let Applied::Message { channel, id } = applied {
         let active = app.current() == Some(channel.as_str());
         let at = ev.created_at.as_secs();
         let author = ev.pubkey.to_hex();
         let seen = sync.read.read_at(&channel).is_some_and(|r| at <= r);
-        if live_channel && !seen && counts_unread(kind, &author, &app.store.me, active, top_level) {
+        if live_channel && !seen && counts_unread(kind, &author, &app.store.me, active) {
             app.store
                 .channel_mut(&channel)
                 .unread
@@ -735,7 +730,7 @@ pub fn prune_unread(app: &mut App, read: &ReadState) {
     }
 }
 
-/// Unread messages from a lookup: top-level, someone else's, after the read
+/// Unread messages from a lookup: someone else's, after the read
 /// position, in a tab you aren't looking at.
 pub fn fold_unread(app: &mut App, read: &ReadState, channel: &str, evs: &[Event]) {
     if app.current() == Some(channel) {
@@ -746,10 +741,7 @@ pub fn fold_unread(app: &mut App, read: &ReadState, channel: &str, evs: &[Event]
     let ch = app.store.channel_mut(channel);
     for ev in evs {
         let at = ev.created_at.as_secs();
-        if model::UNREAD_KINDS.contains(&ev.kind.as_u16())
-            && ev.pubkey.to_hex() != me
-            && at > after
-            && model::Message::from_event(ev).root.is_none()
+        if model::UNREAD_KINDS.contains(&ev.kind.as_u16()) && ev.pubkey.to_hex() != me && at > after
         {
             ch.unread.insert(ev.id.to_hex(), at);
         }
@@ -757,9 +749,10 @@ pub fn fold_unread(app: &mut App, read: &ReadState, channel: &str, evs: &[Event]
 }
 
 /// A live message marks its tab unread when it's a real message from
-/// someone else, top-level, in a tab you aren't looking at.
-fn counts_unread(kind: u16, author: &str, me: &str, active: bool, top_level: bool) -> bool {
-    model::UNREAD_KINDS.contains(&kind) && author != me && !active && top_level
+/// someone else in a tab you aren't looking at. Thread replies count, as in
+/// Desktop: most agent answers land in threads.
+fn counts_unread(kind: u16, author: &str, me: &str, active: bool) -> bool {
+    model::UNREAD_KINDS.contains(&kind) && author != me && !active
 }
 
 #[cfg(test)]
@@ -768,10 +761,9 @@ mod tests {
 
     #[test]
     fn unread_rules() {
-        assert!(counts_unread(9, "them", "me", false, true));
-        assert!(!counts_unread(9, "me", "me", false, true));
-        assert!(!counts_unread(9, "them", "me", true, true));
-        assert!(!counts_unread(9, "them", "me", false, false));
-        assert!(!counts_unread(40099, "them", "me", false, true));
+        assert!(counts_unread(9, "them", "me", false));
+        assert!(!counts_unread(9, "me", "me", false));
+        assert!(!counts_unread(9, "them", "me", true));
+        assert!(!counts_unread(40099, "them", "me", false));
     }
 }

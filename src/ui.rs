@@ -107,11 +107,9 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
         ConnState::Connecting => format!(" {} connecting ", art::flight(app.tick, 3).trim()),
         ConnState::Offline => " ○ offline, retrying ".to_string(),
     };
-    let busy_w = if busy.is_empty() {
-        0
-    } else {
-        busy.join(", ").width() as u16 + 13
-    };
+    // Fixed room for "who's working", held even when nobody is, so the tabs
+    // never shift as turns start and end.
+    let busy_w = BUSY_W.min(area.width / 3);
     let right_w = right.width() as u16 + 1 + busy_w;
     let limit = area.x + area.width.saturating_sub(right_w);
     let labels: Vec<(String, usize)> = app
@@ -122,17 +120,18 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
             let ch = app.store.channels.get(id);
             let name = ch.map(channel_label).unwrap_or_else(|| "…".into());
             let unread = ch.map_or(0, |c| c.unread.len());
-            let dot = if unread > 0 { "•" } else { "" };
-            // One-cell spinner so the tab bar never shifts while it turns.
-            let dot = if app.agents.working(&app.store, id, None).is_empty() {
-                dot.to_string()
+            // Two fixed cells after the name, unread dot then spinner, so
+            // tabs never change width as these come and go.
+            let dot = if unread > 0 { "•" } else { " " };
+            let spin = if app.agents.working(&app.store, id, None).is_empty() {
+                " "
             } else {
-                format!("{dot} {}", SPIN[app.tick as usize % SPIN.len()])
+                SPIN[app.tick as usize % SPIN.len()]
             };
             let label = if i < 9 {
-                format!(" {} {name}{dot} ", i + 1)
+                format!(" {} {name} {dot}{spin}", i + 1)
             } else {
-                format!(" {name}{dot} ")
+                format!(" {name} {dot}{spin}")
             };
             (label, unread)
         })
@@ -209,25 +208,34 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
     );
     // Who is working, just left of the count. Drawn over the tab row's
     // tail only when there is room.
-    if !busy.is_empty() {
-        let w = format!(
-            "{} {} working   ",
-            SPIN[app.tick as usize % SPIN.len()],
-            busy.join(", ")
-        );
-        let ww = w.width() as u16;
-        if busy_w >= ww {
-            f.render_widget(
-                Paragraph::new(Span::styled(w, theme::bright())),
-                Rect {
-                    x: limit + busy_w - ww,
-                    width: ww,
-                    ..area
-                },
-            );
+    if !busy.is_empty() && busy_w >= 16 {
+        let mut names = busy.join(", ");
+        let room = busy_w as usize - " working   ".len() - 2;
+        if names.width() > room {
+            names = names
+                .chars()
+                .take(room.saturating_sub(1))
+                .collect::<String>()
+                + "…";
         }
+        let w = format!(
+            "{} {names} working   ",
+            SPIN[app.tick as usize % SPIN.len()],
+        );
+        let ww = (w.width() as u16).min(busy_w);
+        f.render_widget(
+            Paragraph::new(Span::styled(w, theme::bright())),
+            Rect {
+                x: limit + busy_w - ww,
+                width: ww,
+                ..area
+            },
+        );
     }
 }
+
+/// Header room kept for the working list.
+const BUSY_W: u16 = 34;
 
 /// One-cell braille spinner.
 const SPIN: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
@@ -1176,7 +1184,10 @@ fn draw_sections(f: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(r);
     f.render_widget(block, r);
     let mut lines = vec![
-        Line::styled(" pick what you're working on today", theme::faint()),
+        Line::styled(
+            " enter switches · space marks more than one",
+            theme::faint(),
+        ),
         Line::raw(""),
     ];
     if app.sections.is_empty() {

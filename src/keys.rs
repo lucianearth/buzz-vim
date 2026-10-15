@@ -66,8 +66,8 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
         ],
         Mode::Sections => &[
             ("j k", "move", true),
-            ("space", "toggle", true),
-            ("⏎", "use these", true),
+            ("space", "mark several", true),
+            ("⏎", "switch", true),
             ("R", "reload from relay", true),
             ("esc", "cancel", true),
         ],

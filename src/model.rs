@@ -203,7 +203,6 @@ pub enum Applied {
     Message {
         channel: String,
         id: String,
-        top_level: bool,
     },
     Changed,
 }
@@ -430,11 +429,7 @@ impl Store {
             None => &mut ch.timeline,
         };
         insert_sorted(list, &ch.messages, id.clone());
-        Applied::Message {
-            channel: ch_id,
-            id,
-            top_level: root.is_none(),
-        }
+        Applied::Message { channel: ch_id, id }
     }
 
     fn apply_reaction(&mut self, ev: &Event) -> Applied {
