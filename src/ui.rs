@@ -1175,7 +1175,7 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 }
 
 fn draw_sections(f: &mut Frame, app: &mut App, area: Rect) {
-    let h = (app.sections.len() as u16 + 6).max(9);
+    let h = (app.sections.len() as u16 + 10).max(13);
     let r = centered(area, 60, h);
     clear(f, r);
     let block = Block::bordered()
@@ -1184,10 +1184,7 @@ fn draw_sections(f: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(r);
     f.render_widget(block, r);
     let mut lines = vec![
-        Line::styled(
-            " enter switches · space marks more than one",
-            theme::faint(),
-        ),
+        Line::styled(" pick what you're working on today", theme::faint()),
         Line::raw(""),
     ];
     if app.sections.is_empty() {
@@ -1234,6 +1231,20 @@ fn draw_sections(f: &mut Frame, app: &mut App, area: Rect) {
             Hit::Section(i),
         ));
         lines.push(line);
+    }
+    // Legend: Enter alone switches; marks are only for several at once.
+    lines.push(Line::raw(""));
+    for (k, what) in [
+        ("j k", "move"),
+        ("⏎", "switch to this section"),
+        ("space", "mark [x] to show several, then ⏎"),
+        ("R", "reload  ·  esc  cancel"),
+    ] {
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(format!(" {k} "), theme::key()),
+            Span::styled(format!("  {what}"), theme::muted()),
+        ]));
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
