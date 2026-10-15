@@ -106,6 +106,13 @@ pub struct App {
     pub hits: Vec<(Rect, Hit)>,
     /// Timeline/thread page height from the last draw, for ^d/^u.
     pub page: usize,
+    /// Line offset into a message taller than the pane: (message id, lines
+    /// from its top). usize::MAX = its bottom. Keyed by id, so moving to
+    /// another message drops it.
+    pub peek: Option<(String, usize)>,
+    /// From the last draw of the focused pane, when its cursor message is
+    /// taller than the pane: (id, message height, pane height, offset shown).
+    pub tall: Option<(String, usize, usize, usize)>,
     pub actions: Vec<Action>,
     /// Drafts of messages in flight, restored if the relay rejects them.
     /// event id -> (channel, thread root, the draft it came from)
@@ -150,6 +157,8 @@ impl App {
             viewer_list: vec![],
             hits: vec![],
             page: 20,
+            peek: None,
+            tall: None,
             actions: vec![],
             pending_sends: HashMap::new(),
             relay_host: String::new(),
@@ -325,6 +334,26 @@ impl App {
         if ids.is_empty() {
             return;
         }
+        // A message taller than the pane pages through its lines first,
+        // like a pager, and only then moves on.
+        if let Some((id, bh, h, off)) = self.tall.clone() {
+            if self.cursor_message().as_deref() == Some(id.as_str()) {
+                let step = delta.unsigned_abs() * 3;
+                let end = bh.saturating_sub(h);
+                if delta > 0 && off < end {
+                    self.peek = Some((id.clone(), (off + step).min(end)));
+                    let last = ids.last() == Some(&id);
+                    self.set_cursor(id, last);
+                    return;
+                }
+                if delta < 0 && off > 0 {
+                    self.peek = Some((id.clone(), off.saturating_sub(step)));
+                    let last = ids.last() == Some(&id);
+                    self.set_cursor(id, last);
+                    return;
+                }
+            }
+        }
         let cur = self
             .cursor_message()
             .and_then(|m| ids.iter().position(|i| *i == m))
@@ -335,6 +364,11 @@ impl App {
                 self.actions.push(Action::LoadOlder(c));
             }
         }
+        // Coming up into a tall message starts at its bottom.
+        if next == cur {
+            return;
+        }
+        self.peek = (delta < 0).then(|| (ids[next].clone(), usize::MAX));
         self.set_cursor(ids[next].clone(), next == ids.len() - 1);
     }
 

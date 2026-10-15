@@ -546,6 +546,30 @@ fn draw_blocks(
             top = a;
         }
     }
+    // The message under the cursor (the newest when following) is taller
+    // than the pane: show the slice the pager offset asks for.
+    let focus_idx =
+        cur_idx.or_else(|| (cursor.is_none() && !blocks.is_empty()).then(|| blocks.len() - 1));
+    let mut more = None;
+    if pane == app.focus {
+        app.tall = None;
+    }
+    if let Some(i) = focus_idx.filter(|&i| heights[i] > h) {
+        let a: usize = heights[..i].iter().sum();
+        let end = heights[i] - h;
+        let id = &blocks[i].id;
+        let off = match &app.peek {
+            Some((p, o)) if p == id => (*o).min(end),
+            // Following the newest shows its end; a picked one its start.
+            _ if cur_idx.is_none() => end,
+            _ => 0,
+        };
+        top = a + off;
+        if pane == app.focus {
+            app.tall = Some((id.clone(), heights[i], h, off));
+        }
+        more = Some((off, end - off));
+    }
     let mut y = 0usize;
     for b in blocks {
         let bh = b.lines.len();
@@ -583,6 +607,31 @@ fn draw_blocks(
                 }
                 images.push((r, key));
             }
+        }
+    }
+    // How much of a tall message is off screen, on the pane's edges.
+    if let Some((above, below)) = more {
+        for (n, arrow, y) in [
+            (above, "↑", area.y),
+            (below, "↓", area.y + area.height.saturating_sub(1)),
+        ] {
+            if n == 0 {
+                continue;
+            }
+            let tag = format!(
+                " {arrow} {n} more {} ",
+                if n == 1 { "line" } else { "lines" }
+            );
+            let w = (tag.width() as u16).min(area.width);
+            f.render_widget(
+                Paragraph::new(Span::styled(tag, theme::badge())),
+                Rect {
+                    x: area.x + area.width - w,
+                    y,
+                    width: w,
+                    height: 1,
+                },
+            );
         }
     }
 }
@@ -1842,6 +1891,60 @@ mod tests {
             rows[1].contains("taskbot thinking"),
             "thread header: {rows:#?}"
         );
+    }
+
+    #[test]
+    fn tall_message_pages_through() {
+        use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent};
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let k = Keys::generate();
+        let mut app = App::new(k.public_key().to_hex(), None);
+        let body: Vec<String> = (1..=60).map(|i| format!("line{i:02}")).collect();
+        for (i, text) in [body.join("\n\n"), "short".into()].iter().enumerate() {
+            let ev = EventBuilder::new(Kind::Custom(9), text)
+                .tags([Tag::parse(["h", "c1"]).unwrap()])
+                .custom_created_at(nostr::Timestamp::from(1_000 + i as u64))
+                .sign_with_keys(&k)
+                .unwrap();
+            app.store.apply(&ev);
+        }
+        app.tabs = vec!["c1".into()];
+        let screen = |app: &mut App| {
+            let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+            t.draw(|f| draw(f, app)).unwrap();
+            let buf = t.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let key =
+            |app: &mut App, c: char| app.on_term(TermEvent::Key(KeyEvent::from(KeyCode::Char(c))));
+        app.on_term(TermEvent::Key(KeyEvent::from(KeyCode::Esc)));
+        screen(&mut app);
+        // Up from "short" lands on the tall one's bottom.
+        key(&mut app, 'k');
+        let s = screen(&mut app);
+        assert!(s.contains("line60") && !s.contains("line01"), "{s}");
+        assert!(s.contains("more lines"), "{s}");
+        // k pages up through it to its top before going anywhere else.
+        for _ in 0..60 {
+            key(&mut app, 'k');
+            screen(&mut app);
+        }
+        let s = screen(&mut app);
+        assert!(s.contains("line01") && !s.contains("↑ "), "{s}");
+        // And j walks back down to its end, then on to the next message.
+        for _ in 0..60 {
+            key(&mut app, 'j');
+            screen(&mut app);
+        }
+        let s = screen(&mut app);
+        assert!(s.contains("short"), "{s}");
     }
 
     #[test]
