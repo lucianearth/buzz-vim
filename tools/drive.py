@@ -15,6 +15,8 @@ Steps (each one argument):
   shot              print the screen
   find:<text>       print "<col>,<row>" of the first match
   clickon:<text>    left click the first place <text> is on screen
+  png:<path>        save the screen as a PNG, colours and all (needs Pillow and
+                    DejaVu Sans Mono; set BUZZ_VIM_FONT_DIR to its folder)
 
 Needs pyte (python -m pip install pyte).
 """
@@ -95,6 +97,55 @@ class Term:
         return None
 
 
+NAMED = {
+    "black": (0, 0, 0), "red": (205, 49, 49), "green": (13, 188, 121),
+    "brown": (229, 229, 16), "blue": (36, 114, 200), "magenta": (188, 63, 188),
+    "cyan": (17, 168, 205), "white": (229, 229, 229),
+}
+
+
+def save_png(screen, path):
+    from PIL import Image, ImageDraw, ImageFont
+    d = os.environ.get("BUZZ_VIM_FONT_DIR", "/usr/share/fonts/truetype/dejavu")
+    size = 16
+    reg = ImageFont.truetype(os.path.join(d, "DejaVuSansMono.ttf"), size)
+    bold = ImageFont.truetype(os.path.join(d, "DejaVuSansMono-Bold.ttf"), size)
+    cw = int(reg.getlength("M"))
+    ch = int(size * 1.25)
+    img = Image.new("RGB", (cw * screen.columns, ch * screen.lines), (0, 0, 0))
+    dr = ImageDraw.Draw(img)
+
+    def rgb(c, default):
+        if c == "default":
+            return default
+        if c in NAMED:
+            return NAMED[c]
+        try:
+            return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+        except ValueError:
+            return default
+
+    for y in range(screen.lines):
+        row = screen.buffer[y]
+        for x in range(screen.columns):
+            c = row[x]
+            fg, bg = rgb(c.fg, (204, 204, 204)), rgb(c.bg, (0, 0, 0))
+            if c.reverse:
+                fg, bg = bg, fg
+            dr.rectangle([x * cw, y * ch, (x + 1) * cw - 1, (y + 1) * ch - 1], fill=bg)
+            if c.data.strip():
+                if c.data in "▀▄█▌▐▎▏":
+                    # Draw block elements as boxes so they tile.
+                    box = {"▀": (0, 0, 1, .5), "▄": (0, .5, 1, 1), "█": (0, 0, 1, 1),
+                           "▌": (0, 0, .5, 1), "▐": (.5, 0, 1, 1), "▎": (0, 0, .25, 1),
+                           "▏": (0, 0, .125, 1)}[c.data]
+                    dr.rectangle([x * cw + box[0] * cw, y * ch + box[1] * ch,
+                                  x * cw + box[2] * cw - 1, y * ch + box[3] * ch - 1], fill=fg)
+                else:
+                    dr.text((x * cw, y * ch + 1), c.data, font=bold if c.bold else reg, fill=fg)
+    img.save(path)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cols", type=int, default=120)
@@ -149,6 +200,9 @@ def main():
             print("-" * a.cols)
             print(t.text())
             print("-" * a.cols)
+        elif kind == "png":
+            t.pump(0.3)
+            save_png(t.screen, arg)
         elif kind == "find":
             print("FOUND", t.find(arg))
         else:

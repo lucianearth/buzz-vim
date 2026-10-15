@@ -7,7 +7,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui_image::Image;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -332,7 +332,7 @@ fn message_block(
         head.push(Span::styled("  (edited)", theme::faint()));
     }
     lines.push(Line::from(head));
-    let inner = width.saturating_sub(3).max(10) as usize;
+    let inner = width.saturating_sub(GUTTER + 3).max(10) as usize;
     if m.deleted {
         lines.push(Line::from(vec![
             bar.clone(),
@@ -369,7 +369,7 @@ fn message_block(
     if !m.deleted {
         for media in &m.media {
             if media.mime.starts_with("image/") && image.is_none() && app.picker.is_some() {
-                let cols = THUMB_COLS.min(width.saturating_sub(4));
+                let cols = THUMB_COLS.min(width.saturating_sub(GUTTER + 4));
                 let rows = crate::media::thumb_rows(media.dim, cols, THUMB_MAX_ROWS);
                 image = Some((lines.len() as u16, rows, media.url.clone(), cols));
                 let label = match app.media.images.get(&media.url) {
@@ -436,7 +436,7 @@ fn message_block(
             lines.push(Line::from(vec![
                 bar.clone(),
                 Span::styled(
-                    format!("  ↳ {n} {}", if n == 1 { "reply" } else { "replies" }),
+                    format!("↳ {n} {}", if n == 1 { "reply" } else { "replies" }),
                     theme::text().add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(when, theme::faint()),
@@ -447,12 +447,69 @@ fn message_block(
             ]));
         }
     }
-    lines.push(Line::raw(""));
+    let mut out = card(&m.author, &bar, lines);
+    out.push(Line::raw(""));
     BlockOut {
         id: m.id.clone(),
-        lines,
-        image,
+        lines: out,
+        image: image.map(|(off, rows, url, cols)| (off + 1, rows, url, cols)),
     }
+}
+
+/// Card layout: a padded row above and below, and an avatar gutter beside
+/// the first two rows. Each line arrives as `[edge, maybe "  ", content…]`;
+/// the indent is dropped so everything lines up after the avatar.
+fn card(pubkey: &str, edge: &Span<'static>, lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    let face = identicon(pubkey);
+    let mut out = vec![Line::from(edge.clone())];
+    for (i, l) in lines.into_iter().enumerate() {
+        let mut spans = l.spans.into_iter();
+        let mut row = vec![spans.next().unwrap_or_else(|| edge.clone()), Span::raw(" ")];
+        match face.get(i) {
+            Some(f) => row.extend(f.spans.clone()),
+            None => row.push(Span::raw("     ")),
+        }
+        row.push(Span::raw("  "));
+        let mut rest: Vec<Span> = spans.collect();
+        if rest.first().is_some_and(|sp| sp.content == "  " || sp.content == " ") {
+            rest.remove(0);
+        }
+        row.extend(rest);
+        out.push(Line::from(row));
+    }
+    out.push(Line::from(edge.clone()));
+    out
+}
+
+/// Columns the avatar gutter takes: the 5-cell face and 2 of space.
+const GUTTER: u16 = 7;
+
+/// A 5×4-pixel grayscale face from a pubkey, drawn as two rows of
+/// half-blocks on a tile, mirrored left to right like a GitHub identicon.
+fn identicon(pubkey: &str) -> [Line<'static>; 2] {
+    let h: Vec<u8> = pubkey
+        .as_bytes()
+        .chunks(2)
+        .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap_or("0"), 16).unwrap_or(0))
+        .collect();
+    let at = |i: usize| h.get(i).copied().unwrap_or(0);
+    let style = Style::new()
+        .fg(theme::gray(13 + at(0) % 10))
+        .bg(theme::gray(6));
+    // 3 distinct columns × 4 rows of bits; columns 3 and 4 mirror 1 and 0.
+    let bits = u16::from_be_bytes([at(1), at(2)]);
+    let px = |r: usize, c: usize| (bits >> (r * 3 + c)) & 1 == 1;
+    let row = |top: usize| {
+        let cell = |c: usize| match (px(top, c), px(top + 1, c)) {
+            (true, true) => '█',
+            (true, false) => '▀',
+            (false, true) => '▄',
+            (false, false) => ' ',
+        };
+        let s: String = [0, 1, 2, 1, 0].iter().map(|&c| cell(c)).collect();
+        Line::from(Span::styled(s, style))
+    };
+    [row(0), row(2)]
 }
 
 /// Lays blocks out bottom-up and keeps the cursor block visible.
@@ -524,7 +581,7 @@ fn draw_blocks(
             // Only draw a picture when it is fully on screen.
             if off >= skip && off + rows as usize <= skip + visible {
                 let r = Rect {
-                    x: area.x + 3,
+                    x: area.x + 2 + GUTTER,
                     y: row + (off - skip) as u16,
                     width: cols,
                     height: rows,
@@ -726,7 +783,7 @@ fn draw_agents(f: &mut Frame, app: &mut App, area: Rect) {
     // Tool calls go in a right-hand column when there is room.
     let split = area.width >= 90;
     let right_w = if split { area.width / 3 } else { 0 };
-    let left_w = area.width.saturating_sub(right_w + 3) as usize;
+    let left_w = area.width.saturating_sub(right_w + 3 + GUTTER) as usize;
     let mut y = area.y + 1;
     for r in rows {
         let edge = if r.busy {
@@ -825,6 +882,9 @@ fn draw_agents(f: &mut Frame, app: &mut App, area: Rect) {
         while left.len() < right.len() {
             left.push(Line::from(edge.clone()));
         }
+        // The card adds a padded row on top; keep the columns level.
+        right.insert(0, Line::raw(""));
+        let left = card(&r.pubkey, &edge, left);
         let h = left.len() as u16;
         if y + h > area.bottom() {
             break;
@@ -894,7 +954,7 @@ fn compose_height(app: &App, width: u16) -> u16 {
 /// Text columns in the compose box: one for the left pad, one so the
 /// cursor fits at the end of a full row.
 fn compose_cols(width: u16) -> usize {
-    (width as usize).saturating_sub(2).max(4)
+    (width as usize).saturating_sub(4).max(4)
 }
 
 /// Hard-wrap one line at `w` columns. A line that exactly fills its last row
@@ -930,7 +990,8 @@ fn draw_compose(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let border = if insert { theme::text() } else { theme::rule() };
     let block = Block::new()
-        .borders(Borders::TOP | Borders::BOTTOM)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(border)
         .title(Span::styled(
             format!(" {target} "),
@@ -1558,6 +1619,101 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>
 
 #[cfg(test)]
 mod tests {
+    /// `BUZZ_VIM_SHOT=dir cargo test shot_` writes cell dumps of screens
+    /// that need data the relay won't give us (your agents' live frames);
+    /// `tools/shot.py` turns them into PNGs.
+    #[test]
+    fn shot_agents_screen() {
+        let Ok(dir) = std::env::var("BUZZ_VIM_SHOT") else {
+            return;
+        };
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let k = Keys::generate();
+        let mut app = App::new(k.public_key().to_hex(), None);
+        let root = EventBuilder::new(
+            Kind::Custom(9),
+            "Can you make timestamps say minutes ago? And hours",
+        )
+        .tags([Tag::parse(["h", "c1"]).unwrap()])
+        .sign_with_keys(&k)
+        .unwrap();
+        let rid = root.id.to_hex();
+        app.store.apply(&root);
+        app.store.channel_mut("c1").name = "buzz-vim".into();
+        app.store.channel_mut("c2").name = "almanac-restructuring".into();
+        app.tabs = vec!["c1".into(), "c2".into()];
+        for (pk, name) in [
+            ("a1", "taskbot"),
+            ("a2", "judgebot"),
+            ("a3", "labbot"),
+            ("a4", "macbot"),
+        ] {
+            app.agents.own(pk, name);
+            app.agents.presence(pk, "online");
+        }
+        let busy = |app: &mut App, pk: &str, ch: &str, root: &str, tools: &[&str], said: &str| {
+            let mut evs = vec![
+                serde_json::json!({"kind": "turn_started", "channelId": ch, "payload": {"threadRootEventId": root}}),
+            ];
+            for t in tools {
+                evs.push(serde_json::json!({"kind": "acp_read", "payload": {"params": {"update": {"sessionUpdate": "tool_call", "title": t}}}}));
+            }
+            evs.push(serde_json::json!({"kind": "acp_read", "payload": {"params": {"update": {"sessionUpdate": "agent_message_chunk", "content": {"text": said}}}}}));
+            app.agents.frame(
+                pk,
+                &serde_json::json!({"kind": "batch", "payload": {"events": evs}}),
+            );
+        };
+        busy(
+            &mut app,
+            "a1",
+            "c1",
+            &rid,
+            &["Read src/ui.rs", "Edit src/ui.rs", "Bash: cargo test"],
+            "the identicons read better on a tile, checking the agents screen next",
+        );
+        busy(
+            &mut app,
+            "a2",
+            "c2",
+            "",
+            &["Bash: buzz pr view 1078", "Read crates/registry.rs"],
+            "reviewing the registry change",
+        );
+        app.agents.metric(
+            "a3",
+            &serde_json::json!({"model": "sonnet", "turn": {"totalTokens": 5200, "costUsd": 0.18}}),
+        );
+        app.agents_view = true;
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 34)).unwrap();
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        dump(t.backend().buffer(), &format!("{dir}/agents.cells"));
+    }
+
+    fn dump(buf: &ratatui::buffer::Buffer, path: &str) {
+        use std::fmt::Write;
+        let mut out = format!("{} {}\n", buf.area.width, buf.area.height);
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let c = &buf[(x, y)];
+                let col = |c: ratatui::style::Color| match c {
+                    ratatui::style::Color::Indexed(i) => i.to_string(),
+                    _ => "-".into(),
+                };
+                let bold = c.modifier.contains(Modifier::BOLD) as u8;
+                let _ = writeln!(
+                    out,
+                    "{}\t{}\t{}\t{}",
+                    c.symbol(),
+                    col(c.fg),
+                    col(c.bg),
+                    bold
+                );
+            }
+        }
+        std::fs::write(path, out).unwrap();
+    }
+
     #[test]
     fn active_tab_stays_visible() {
         let mut app = App::new("me".into(), None);

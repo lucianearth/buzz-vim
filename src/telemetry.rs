@@ -34,6 +34,7 @@ pub struct Agents {
 }
 
 pub struct Row {
+    pub pubkey: String,
     pub name: String,
     pub busy: bool,
     pub online: bool,
@@ -230,10 +231,16 @@ impl Agents {
                     return None;
                 }
                 Some(Row {
+                    pubkey: pk.clone(),
                     name: a.display_name(pk, store),
                     busy,
                     online: true,
-                    recent: a.recent.clone(),
+                    recent: a
+                        .recent
+                        .iter()
+                        .filter(|r| *r != "turn started")
+                        .cloned()
+                        .collect(),
                     channel: a.channel.clone(),
                     thread: a.thread.clone().filter(|_| busy),
                     secs: a
