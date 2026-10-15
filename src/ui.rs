@@ -139,11 +139,9 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
         ConnState::Connecting => format!(" {} connecting ", art::flight(app.tick, 3).trim()),
         ConnState::Offline => " ○ offline, retrying ".to_string(),
     };
-    // Fixed room for "who's working", held even when nobody is, so the tabs
-    // never shift as turns start and end.
-    let busy_w = BUSY_W.min(area.width / 3);
-    let right_w = right.width() as u16 + 1 + busy_w;
-    let limit = area.x + area.width.saturating_sub(right_w);
+    // Tabs get the whole row up to the count; "who's working" only uses
+    // whatever is left after the last tab, so tabs never shift for it.
+    let limit = area.x + area.width.saturating_sub(right.width() as u16 + 1);
     let labels: Vec<(String, usize)> = app
         .tabs
         .iter()
@@ -204,6 +202,7 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
                     height: 1,
                 },
             );
+            x += 2;
             break;
         }
         let hue = theme::hue(&app.tabs[i]);
@@ -234,13 +233,13 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(
         Paragraph::new(Span::styled(right, style)).right_aligned(),
         Rect {
-            x: limit + busy_w,
-            width: area.width.saturating_sub(limit + busy_w - area.x),
+            x: limit,
+            width: area.width.saturating_sub(limit - area.x),
             ..area
         },
     );
-    // Who is working, just left of the count. Drawn over the tab row's
-    // tail only when there is room.
+    // Who is working, just left of the count, in the room the tabs left.
+    let busy_w = limit.saturating_sub(x).min(BUSY_W);
     if !busy.is_empty() && busy_w >= 16 {
         let mut names = busy.join(", ");
         let room = busy_w as usize - " working   ".len() - 2;
@@ -259,7 +258,7 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(
             Paragraph::new(Span::styled(w, theme::bright())),
             Rect {
-                x: limit + busy_w - ww,
+                x: limit - ww,
                 width: ww,
                 ..area
             },
@@ -267,7 +266,7 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-/// Header room kept for the working list.
+/// Most header room the working list takes.
 const BUSY_W: u16 = 34;
 
 /// One-cell braille spinner.
@@ -1993,6 +1992,22 @@ mod tests {
         let buf = t.backend().buffer().clone();
         let top: String = (0..90).map(|x| buf[(x, 0)].symbol()).collect();
         assert!(top.contains("channel-6"), "{top}");
+    }
+
+    /// Tabs run up to the message count; no room is held back for the
+    /// working list when nobody is working.
+    #[test]
+    fn tabs_fill_the_row() {
+        let mut app = App::new("me".into(), None);
+        for i in 0..5 {
+            app.store.channel_mut(&format!("c{i}")).name = format!("chan-{i}");
+        }
+        app.tabs = (0..5).map(|i| format!("c{i}")).collect();
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 10)).unwrap();
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let top: String = (0..100).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(top.contains("chan-4") && !top.contains('…'), "{top}");
     }
 
     #[test]
