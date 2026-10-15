@@ -8,11 +8,13 @@ mod art;
 mod clip;
 mod config;
 mod draft;
+mod garden;
 mod keys;
 mod live;
 mod log;
 mod media;
 mod model;
+mod readstate;
 mod relay;
 mod sections;
 mod state;
@@ -64,6 +66,7 @@ fn main() -> Result<()> {
         None => {}
     }
     let cfg = config::load()?;
+    theme::watch();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -129,6 +132,9 @@ async fn run(
     let saved = state::load(&relay.base, &app.store.me);
     app.chosen = saved.chosen.clone();
     let mut sync = Sync::new(relay, live_cmd, tx);
+    if !saved.read_slot.is_empty() && !saved.read_client.is_empty() {
+        sync.read = readstate::ReadState::new(saved.read_slot.clone(), saved.read_client.clone());
+    }
     sync.start();
     sync.want_profiles([app.store.me.clone()]);
 
@@ -213,35 +219,48 @@ async fn run(
             match a {
                 Action::Quit => quit = true,
                 Action::SaveState => {
-                    state::save(
-                        &sync.relay.base,
-                        &app.store.me,
-                        &state::State {
-                            chosen: app.chosen.clone(),
-                            active: app.current().map(str::to_string),
-                        },
-                    );
+                    state::save(&sync.relay.base, &app.store.me, &saved_state(&app, &sync));
                 }
                 a => sync.run(&mut app, a),
             }
         }
+        sync.check_unread(&app.tabs);
+        sync.flush_read();
         if quit {
-            state::save(
-                &sync.relay.base,
-                &app.store.me,
-                &state::State {
-                    chosen: app.chosen.clone(),
-                    active: app.current().map(str::to_string),
-                },
-            );
+            state::save(&sync.relay.base, &app.store.me, &saved_state(&app, &sync));
+            sync.flush_read_now().await;
             break;
         }
     }
     Ok(())
 }
 
+fn saved_state(app: &App, sync: &Sync) -> state::State {
+    state::State {
+        chosen: app.chosen.clone(),
+        active: app.current().map(str::to_string),
+        read_slot: sync.read.slot().to_string(),
+        read_client: sync.read.client_id().to_string(),
+    }
+}
+
 fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<String>) {
     match msg {
+        Msg::ReadState(r) => {
+            match r {
+                Ok(evs) => {
+                    sync.apply_read(&evs);
+                }
+                Err(e) => log::line(format!("read state load: {e}")),
+            }
+            // Even on failure, so unread still works from the last week.
+            sync.read.loaded = true;
+            sync::prune_unread(app, &sync.read);
+        }
+        Msg::Unread { channel, events } => match events {
+            Ok(evs) => sync::fold_unread(app, &sync.read, &channel, &evs),
+            Err(e) => log::line(format!("unread {channel}: {e}")),
+        },
         Msg::Channels(Ok(evs)) => {
             app.channels_loaded = true;
             for ev in &evs {

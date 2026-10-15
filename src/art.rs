@@ -1,21 +1,10 @@
-//! The goofy bits. Kept to a few spots: the banner, empty channels, the
+//! The goofy bits. Kept to a few spots: the banner, empty-channel lines, the
 //! "thinking" critter for agents, and the little burst when a message sends.
 
 pub const BANNER: &[&str] = &["█▄▄ █ █ ▀█ ▀█   █ █ █ █▀▄▀█", "█▄█ █▄█ █▄ █▄   ▀▄▀ █ █ ▀ █"];
 
-pub const BEE: &[&str] = &[
-    r"        \     /       ",
-    r"     .-. \   / .-.    ",
-    r"    (   )-\ /-(   )   ",
-    r"     `-'  (o)  `-'    ",
-    r"        /|||||\       ",
-    r"       ( ||||| )~     ",
-    r"        \|||||/       ",
-    r"          \_/         ",
-];
-
 pub const EMPTY_LINES: &[&str] = &[
-    "nothing here yet. the bee is waiting.",
+    "nothing here yet. the bees are waiting.",
     "quiet channel. press i and say something.",
     "bzz. no messages.",
 ];

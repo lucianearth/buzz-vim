@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use nostr::nips::nip44;
 use nostr::{Event, EventId, Tag};
@@ -12,6 +13,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::app::{Action, App};
 use crate::live::Cmd;
 use crate::model::{self, Applied};
+use crate::readstate::{self, ReadState};
 use crate::relay::{BlobDescriptor, Relay};
 use crate::sections::{self, Lanes};
 
@@ -28,6 +30,13 @@ pub enum Msg {
     },
     Events(Vec<Event>),
     Lanes(anyhow::Result<Vec<Event>>),
+    /// Our read-state slots at startup (NIP-RS full-state load).
+    ReadState(anyhow::Result<Vec<Event>>),
+    /// Recent top-level messages in a tab, to find what's unread.
+    Unread {
+        channel: String,
+        events: anyhow::Result<Vec<Event>>,
+    },
     Sent {
         id: String,
         result: anyhow::Result<()>,
@@ -57,6 +66,9 @@ pub struct Sync {
     subscribed: HashSet<String>,
     loading_older: HashSet<String>,
     started: u64,
+    pub read: ReadState,
+    /// Tabs whose unread messages we've looked up since startup.
+    unread_checked: HashSet<String>,
 }
 
 pub fn now() -> u64 {
@@ -76,6 +88,8 @@ impl Sync {
             subscribed: HashSet::new(),
             loading_older: HashSet::new(),
             started: now(),
+            read: ReadState::new(readstate::new_id(), readstate::new_id()),
+            unread_checked: HashSet::new(),
         }
     }
 
@@ -113,6 +127,20 @@ impl Sync {
             vec![json!({"kinds": [44200], "#p": [me], "limit": 30})],
         ));
         let _ = self.live.send(sub("lanes", vec![json!({"kinds": [30078], "authors": [me], "#d": [sections::LANE_SECTIONS, sections::LANE_STARS], "limit": 0})]));
+        // Read positions from Desktop and our other devices, as they move.
+        let _ = self.live.send(sub(
+            "readstate",
+            vec![json!({"kinds": [30078], "authors": [me], "#t": ["read-state"], "since": now, "limit": 0})],
+        ));
+        let r = self.relay.clone();
+        let who = me.clone();
+        self.spawn(async move {
+            // No `t` filter: NIP-RS says a full load must not rely on it.
+            Msg::ReadState(
+                r.query(&[json!({"kinds": [30078], "authors": [who], "limit": 500})])
+                    .await,
+            )
+        });
         let _ = self.live.send(sub(
             "membership",
             vec![json!({"kinds": [44100, 44101], "#p": [me], "since": now, "limit": 50})],
@@ -190,6 +218,65 @@ impl Sync {
             changed = true;
         }
         changed
+    }
+
+    /// Fold read-state events. Returns true if a position moved.
+    pub fn apply_read(&mut self, evs: &[Event]) -> bool {
+        let mut moved = false;
+        for ev in evs {
+            moved |= self.read.apply(&self.relay.keys, ev);
+        }
+        moved
+    }
+
+    /// Mark a channel read now, for Desktop and our other devices.
+    pub fn mark_read(&mut self, channel: &str) {
+        self.read.mark(channel, now());
+    }
+
+    /// Publish our read-state slot once it has settled (or now, on quit).
+    pub fn flush_read(&mut self) {
+        if let Some(ev) = self.read.take_publish(&self.relay.keys, false) {
+            let r = self.relay.clone();
+            tokio::spawn(async move {
+                if let Err(e) = r.publish(&ev).await {
+                    crate::log::line(format!("read state: {e}"));
+                }
+            });
+        }
+    }
+
+    pub async fn flush_read_now(&mut self) {
+        if let Some(ev) = self.read.take_publish(&self.relay.keys, true) {
+            let _ = tokio::time::timeout(Duration::from_secs(3), self.relay.publish(&ev)).await;
+        }
+    }
+
+    /// Look up what's unread in each tab we haven't checked yet: top-level
+    /// messages since its read position (or the last week, if it has none).
+    pub fn check_unread(&mut self, tabs: &[String]) {
+        if !self.read.loaded {
+            return;
+        }
+        for id in tabs {
+            if !self.unread_checked.insert(id.clone()) {
+                continue;
+            }
+            let since = self
+                .read
+                .read_at(id)
+                .map_or(now().saturating_sub(7 * 86_400), |t| t + 1);
+            let r = self.relay.clone();
+            let channel = id.clone();
+            self.spawn(async move {
+                let f = json!({"kinds": model::UNREAD_KINDS, "#h": [channel], "since": since,
+                    "limit": 100, "top_level": true});
+                Msg::Unread {
+                    events: r.query(&[f]).await,
+                    channel,
+                }
+            });
+        }
     }
 
     /// Live tail for a channel. Kept open for every tab so unread dots work.
@@ -340,7 +427,10 @@ impl Sync {
 
     pub fn run(&mut self, app: &mut App, action: Action) {
         match action {
-            Action::OpenChannel(id) => self.open_channel(&id),
+            Action::OpenChannel(id) => {
+                self.mark_read(&id);
+                self.open_channel(&id);
+            }
             Action::LoadOlder(id) => self.load_older(&id),
             Action::ReloadSections => {
                 app.say("reloading sections…");
@@ -583,6 +673,12 @@ pub fn fold(app: &mut App, sync: &mut Sync, ev: &Event, live_channel: bool) -> V
             app.agents.presence(&ev.pubkey.to_hex(), &ev.content);
             return vec![];
         }
+        30078 if readstate::is_read_state(ev) => {
+            if sync.apply_read(std::slice::from_ref(ev)) {
+                prune_unread(app, &sync.read);
+            }
+            return vec![];
+        }
         30078 => {
             if sync.apply_lanes(std::slice::from_ref(ev)) {
                 app.sections = sections::build(&sync.lanes, &app.store);
@@ -605,10 +701,17 @@ pub fn fold(app: &mut App, sync: &mut Sync, ev: &Event, live_channel: bool) -> V
     } = applied
     {
         let active = app.current() == Some(channel.as_str());
-        if live_channel
-            && counts_unread(kind, &ev.pubkey.to_hex(), &app.store.me, active, top_level)
-        {
-            app.store.channel_mut(&channel).unread += 1;
+        let at = ev.created_at.as_secs();
+        let author = ev.pubkey.to_hex();
+        let seen = sync.read.read_at(&channel).is_some_and(|r| at <= r);
+        if live_channel && !seen && counts_unread(kind, &author, &app.store.me, active, top_level) {
+            app.store
+                .channel_mut(&channel)
+                .unread
+                .insert(id.clone(), at);
+        } else if live_channel && active && author != app.store.me {
+            // You're looking at it, so it's read.
+            sync.mark_read(&channel);
         }
         if let Some(m) = app
             .store
@@ -620,6 +723,37 @@ pub fn fold(app: &mut App, sync: &mut Sync, ev: &Event, live_channel: bool) -> V
         }
     }
     want
+}
+
+/// Drop unread messages at or before each channel's read position, e.g.
+/// after you read the channel in Desktop.
+pub fn prune_unread(app: &mut App, read: &ReadState) {
+    for (id, ch) in app.store.channels.iter_mut() {
+        if let Some(r) = read.read_at(id) {
+            ch.unread.retain(|_, at| *at > r);
+        }
+    }
+}
+
+/// Unread messages from a lookup: top-level, someone else's, after the read
+/// position, in a tab you aren't looking at.
+pub fn fold_unread(app: &mut App, read: &ReadState, channel: &str, evs: &[Event]) {
+    if app.current() == Some(channel) {
+        return;
+    }
+    let me = app.store.me.clone();
+    let after = read.read_at(channel).unwrap_or(0);
+    let ch = app.store.channel_mut(channel);
+    for ev in evs {
+        let at = ev.created_at.as_secs();
+        if model::UNREAD_KINDS.contains(&ev.kind.as_u16())
+            && ev.pubkey.to_hex() != me
+            && at > after
+            && model::Message::from_event(ev).root.is_none()
+        {
+            ch.unread.insert(ev.id.to_hex(), at);
+        }
+    }
 }
 
 /// A live message marks its tab unread when it's a real message from

@@ -88,6 +88,10 @@ pub struct App {
     pub status: Option<(String, Instant)>,
     pub sent_flash: Option<(usize, Instant)>,
     pub tick: u64,
+    /// The empty/loading screen on show and the tick it appeared, so the
+    /// garden grows from the start each time one comes up.
+    pub empty: Option<(String, u64)>,
+    pub empty_prev: Option<(String, u64)>,
     /// The full-screen agents view (`a`).
     pub agents_view: bool,
     pub agents: Agents,
@@ -132,6 +136,8 @@ impl App {
             status: None,
             sent_flash: None,
             tick: 0,
+            empty: None,
+            empty_prev: None,
             agents_view: false,
             agents: Agents::default(),
             media: Media::default(),
@@ -254,7 +260,7 @@ impl App {
 
     pub fn open_current(&mut self) {
         if let Some(id) = self.current().map(str::to_string) {
-            self.store.channel_mut(&id).unread = 0;
+            self.store.channel_mut(&id).unread.clear();
             self.actions.push(Action::OpenChannel(id));
         }
     }
@@ -399,6 +405,8 @@ impl App {
             root,
             parent,
         });
+        // Sending is the end of typing: back to normal mode, like Esc.
+        self.mode = Mode::Normal;
     }
 
     // ---------- mentions ----------

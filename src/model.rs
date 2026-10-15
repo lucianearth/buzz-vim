@@ -159,7 +159,8 @@ pub struct Channel {
     /// root id -> reply ids, oldest first.
     pub replies: HashMap<String, Vec<String>>,
     pub loaded: bool,
-    pub unread: usize,
+    /// Unread top-level messages: id -> created_at.
+    pub unread: HashMap<String, u64>,
     pub oldest: Option<u64>,
     pub exhausted: bool,
 }

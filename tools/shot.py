@@ -16,6 +16,8 @@ class Cell:
 def xterm(i):
     if i == "-":
         return "default"
+    if len(i) == 6:
+        return i
     i = int(i)
     if i >= 232:
         v = 8 + (i - 232) * 10

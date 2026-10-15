@@ -13,6 +13,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Hit, Pane};
 use crate::art;
+use crate::garden;
 use crate::keys::{Mode, legend};
 use crate::live::ConnState;
 use crate::media::Slot;
@@ -24,6 +25,7 @@ const THUMB_MAX_ROWS: u16 = 12;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.hits.clear();
+    app.empty_prev = app.empty.take();
     let area = f.area();
     f.render_widget(Block::new().style(Style::new().bg(theme::gray(0))), area);
     let compose_h = compose_height(app, area.width);
@@ -119,7 +121,7 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|(i, id)| {
             let ch = app.store.channels.get(id);
             let name = ch.map(channel_label).unwrap_or_else(|| "…".into());
-            let unread = ch.map_or(0, |c| c.unread);
+            let unread = ch.map_or(0, |c| c.unread.len());
             let dot = if unread > 0 { "•" } else { "" };
             // One-cell spinner so the tab bar never shifts while it turns.
             let dot = if app.agents.working(&app.store, id, None).is_empty() {
@@ -471,7 +473,10 @@ fn card(pubkey: &str, edge: &Span<'static>, lines: Vec<Line<'static>>) -> Vec<Li
         }
         row.push(Span::raw("  "));
         let mut rest: Vec<Span> = spans.collect();
-        if rest.first().is_some_and(|sp| sp.content == "  " || sp.content == " ") {
+        if rest
+            .first()
+            .is_some_and(|sp| sp.content == "  " || sp.content == " ")
+        {
             rest.remove(0);
         }
         row.extend(rest);
@@ -744,20 +749,36 @@ fn breadcrumb(
     rest
 }
 
-fn draw_empty(f: &mut Frame, app: &App, area: Rect, msg: &str) {
+/// The garden in the middle of an empty or loading screen. While loading
+/// it grows; an empty screen shows it grown and still.
+fn draw_empty(f: &mut Frame, app: &mut App, area: Rect, msg: &str) {
+    let grow = msg.starts_with("loading");
+    let since = match app.empty_prev.take() {
+        Some((m, t)) if m == msg => t,
+        _ => app.tick,
+    };
+    app.empty = Some((msg.to_string(), since));
+    let grid = garden::frame(app.tick - since, grow);
     let mut lines: Vec<Line> = vec![];
-    let pad = area.height.saturating_sub(art::BEE.len() as u16 + 3) / 2;
+    let pad = area.height.saturating_sub(garden::HEIGHT as u16 + 2) / 2;
     for _ in 0..pad {
         lines.push(Line::raw(""));
     }
-    let bob = (app.tick / 3).is_multiple_of(2);
-    for (i, l) in art::BEE.iter().enumerate() {
-        let s = if bob && i > 0 {
-            format!(" {l}")
-        } else {
-            l.to_string()
-        };
-        lines.push(Line::styled(s, theme::muted()).centered());
+    for row in grid {
+        let spans: Vec<Span> = row
+            .into_iter()
+            .map(|(c, part)| {
+                let style = match part {
+                    garden::Part::Bloom | garden::Part::Bee => theme::bright(),
+                    garden::Part::Bud => theme::text(),
+                    garden::Part::Stem | garden::Part::Leaf => theme::muted(),
+                    garden::Part::Ground => theme::rule(),
+                    garden::Part::Empty => Style::new(),
+                };
+                Span::styled(c.to_string(), style)
+            })
+            .collect();
+        lines.push(Line::from(spans).centered());
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(msg.to_string(), theme::faint()).centered());
@@ -1690,6 +1711,56 @@ mod tests {
         dump(t.backend().buffer(), &format!("{dir}/agents.cells"));
     }
 
+    /// The loading garden as it grows, then a channel in the light theme.
+    #[test]
+    fn shot_garden_and_light() {
+        let Ok(dir) = std::env::var("BUZZ_VIM_SHOT") else {
+            return;
+        };
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let mut app = App::new("me".into(), None);
+        app.store.channel_mut("c1").name = "buzz-vim".into();
+        app.store.channel_mut("c2").name = "beacon".into();
+        app.store.channel_mut("c2").unread.insert("x".into(), 1);
+        app.tabs = vec!["c1".into(), "c2".into()];
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        for tick in [1, 6, 14, 26, 40, 52, 60] {
+            app.tick = tick;
+            t.draw(|f| draw(f, &mut app)).unwrap();
+            dump(
+                t.backend().buffer(),
+                &format!("{dir}/garden-{tick:02}.cells"),
+            );
+        }
+        let mut post = |who: &Keys, text: &str| {
+            let ev = EventBuilder::new(Kind::Custom(9), text)
+                .tags([Tag::parse(["h", "c1"]).unwrap()])
+                .sign_with_keys(who)
+                .unwrap();
+            app.store.apply(&ev);
+        };
+        let (a, b) = (Keys::generate(), Keys::generate());
+        post(&a, "Can you detect the Mac's light versus dark mode?");
+        post(
+            &b,
+            "Yes. It follows the system setting and re-checks every 2 s.",
+        );
+        post(&a, "and unread dots on the tabs too");
+        app.store.channel_mut("c1").loaded = true;
+        for light in [false, true] {
+            crate::theme::set_light(light);
+            t.draw(|f| draw(f, &mut app)).unwrap();
+            dump(
+                t.backend().buffer(),
+                &format!(
+                    "{dir}/channel-{}.cells",
+                    if light { "light" } else { "dark" }
+                ),
+            );
+        }
+        crate::theme::set_light(false);
+    }
+
     fn dump(buf: &ratatui::buffer::Buffer, path: &str) {
         use std::fmt::Write;
         let mut out = format!("{} {}\n", buf.area.width, buf.area.height);
@@ -1697,7 +1768,7 @@ mod tests {
             for x in 0..buf.area.width {
                 let c = &buf[(x, y)];
                 let col = |c: ratatui::style::Color| match c {
-                    ratatui::style::Color::Indexed(i) => i.to_string(),
+                    ratatui::style::Color::Rgb(r, g, b) => format!("{r:02x}{g:02x}{b:02x}"),
                     _ => "-".into(),
                 };
                 let bold = c.modifier.contains(Modifier::BOLD) as u8;

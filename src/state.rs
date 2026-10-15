@@ -6,6 +6,11 @@ use serde::{Deserialize, Serialize};
 pub struct State {
     pub chosen: Vec<String>,
     pub active: Option<String>,
+    /// Our NIP-RS read-state slot and client id (see readstate.rs).
+    #[serde(default)]
+    pub read_slot: String,
+    #[serde(default)]
+    pub read_client: String,
 }
 
 fn path(relay: &str, me: &str) -> Option<std::path::PathBuf> {
