@@ -554,6 +554,7 @@ impl App {
             KeyCode::Tab if !cands.is_empty() => {
                 self.accept_mention();
             }
+            KeyCode::Tab => self.draft_mut().insert(&" ".repeat(crate::draft::TAB)),
             KeyCode::Up if !cands.is_empty() => {
                 self.mention_pick = self.mention_pick.saturating_sub(1)
             }
@@ -571,6 +572,7 @@ impl App {
             {
                 self.accept_mention();
             }
+            KeyCode::Enter if self.draft_ref().in_code_fence() => self.draft_mut().insert("\n"),
             KeyCode::Enter => self.send(),
             KeyCode::Char('w') if ctrl => self.draft_mut().delete_word(),
             KeyCode::Char('u') if ctrl => {

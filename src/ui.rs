@@ -708,8 +708,28 @@ fn draw_compose(f: &mut Frame, app: &mut App, area: Rect) {
             theme::faint(),
         ));
     } else {
+        // Shade ``` blocks while typing so the message looks like what
+        // everyone else will see.
+        let mut fence = false;
         for l in d.text.split('\n') {
-            lines.push(Line::styled(format!(" {l}"), theme::text()));
+            let is_fence = l.trim_start().starts_with("```");
+            let shaded = fence || is_fence;
+            if is_fence {
+                fence = !fence;
+            }
+            let l = crate::draft::expand_tabs(l);
+            lines.push(if shaded {
+                Line::from(Span::styled(
+                    pad_to(&format!(" {l}"), inner.width as usize),
+                    if is_fence {
+                        theme::code_label()
+                    } else {
+                        theme::code()
+                    },
+                ))
+            } else {
+                Line::styled(format!(" {l}"), theme::text())
+            });
         }
     }
     let (cl, cc) = d.cursor_line_col();
@@ -1060,18 +1080,35 @@ fn system_text(raw: &str) -> String {
 pub fn render_markdown(src: &str, width: usize, mentions: &[String]) -> Vec<Line<'static>> {
     let mut out = vec![];
     let mut in_fence = false;
+    let code_line = |out: &mut Vec<Line<'static>>, raw: &str| {
+        let raw = crate::draft::expand_tabs(raw);
+        for chunk in wrap_plain(&raw, width.saturating_sub(2)) {
+            out.push(Line::from(Span::styled(
+                pad_to(&format!(" {chunk}"), width),
+                theme::code(),
+            )));
+        }
+    };
     for raw in src.split('\n') {
-        if raw.trim_start().starts_with("```") {
+        let t = raw.trim();
+        if let Some(fence) = t.strip_prefix("```") {
+            // ```one-liner``` on a single line.
+            if !in_fence && fence.len() > 3 && fence.ends_with("```") {
+                code_line(&mut out, fence.trim_end_matches('`'));
+                continue;
+            }
             in_fence = !in_fence;
+            // The language tag, if any, labels the top of the block.
+            if in_fence && !fence.trim().is_empty() {
+                out.push(Line::from(Span::styled(
+                    pad_to(&format!(" {}", fence.trim()), width),
+                    theme::code_label(),
+                )));
+            }
             continue;
         }
         if in_fence {
-            for chunk in wrap_plain(raw, width.saturating_sub(2)) {
-                out.push(Line::from(Span::styled(
-                    format!(" {chunk} "),
-                    theme::code(),
-                )));
-            }
+            code_line(&mut out, raw);
             continue;
         }
         let (prefix, body) =
@@ -1125,12 +1162,28 @@ fn inline(s: &str, mentions: &[String], heading: bool) -> Vec<Span<'static>> {
     };
     while let Some(c) = rest.chars().next() {
         if c == '`' {
-            if let Some(end) = rest[1..].find('`') {
+            // A run of n backticks closes on the next run of exactly n, so
+            // ``a `tick` b`` works.
+            let n = rest.chars().take_while(|&c| c == '`').count();
+            let tick = "`".repeat(n);
+            let close = rest[n..]
+                .match_indices(&tick)
+                .map(|(i, _)| n + i)
+                .find(|&i| !rest[i + n..].starts_with('`') && !rest[..i].ends_with('`'));
+            if let Some(end) = close {
                 flush(&mut buf, &mut out);
-                out.push(Span::styled(rest[1..1 + end].to_string(), theme::code()));
-                rest = &rest[end + 2..];
+                let code = rest[n..end].to_string();
+                let code = match code.strip_prefix(' ').and_then(|c| c.strip_suffix(' ')) {
+                    Some(c) if !c.trim().is_empty() => c.to_string(),
+                    _ => code,
+                };
+                out.push(Span::styled(code, theme::code()));
+                rest = &rest[end + n..];
                 continue;
             }
+            buf.push_str(&tick);
+            rest = &rest[n..];
+            continue;
         }
         if rest.starts_with("**") {
             if let Some(end) = rest[2..].find("**") {
@@ -1160,6 +1213,13 @@ fn inline(s: &str, mentions: &[String], heading: bool) -> Vec<Span<'static>> {
     }
     flush(&mut buf, &mut out);
     out
+}
+
+/// Right-pad with spaces to `width` display columns, so a background
+/// colour fills the whole row instead of stopping at the text.
+fn pad_to(s: &str, width: usize) -> String {
+    let w = s.width();
+    format!("{s}{}", " ".repeat(width.saturating_sub(w)))
 }
 
 fn wrap_plain(s: &str, width: usize) -> Vec<String> {
@@ -1250,7 +1310,18 @@ mod tests {
             t.join(" ").split_whitespace().collect::<Vec<_>>().join(" "),
             "hello big world and code @judge bot here"
         );
-        let fence = render_markdown("```\nlet x = 1;\n```\n- item", 30, &[]);
-        assert_eq!(text(&fence), vec![" let x = 1; ", "• item"]);
+        let fence = render_markdown("```\nlet x = 1;\n```\n- item", 14, &[]);
+        assert_eq!(text(&fence), vec![" let x = 1;   ", "• item"]);
+        let lang = render_markdown("```rust\n\tif a {\n\n```", 12, &[]);
+        assert_eq!(
+            text(&lang),
+            vec![" rust       ", "     if a { ", "            "]
+        );
+        let one = render_markdown("```ls -la```", 10, &[]);
+        assert_eq!(text(&one), vec![" ls -la   "]);
+        let ticks = render_markdown("run ``a `b` c`` now", 40, &[]);
+        assert_eq!(text(&ticks), vec!["run a `b` c now"]);
+        let lone = render_markdown("it's a ` tick", 40, &[]);
+        assert_eq!(text(&lone), vec!["it's a ` tick"]);
     }
 }

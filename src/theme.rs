@@ -53,3 +53,6 @@ pub fn mention() -> Style {
 pub fn code() -> Style {
     Style::new().fg(gray(19)).bg(gray(2))
 }
+pub fn code_label() -> Style {
+    Style::new().fg(gray(10)).bg(gray(2))
+}

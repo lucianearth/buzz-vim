@@ -146,16 +146,33 @@ impl Draft {
         out
     }
 
-    /// (line, column in chars) of the cursor, for drawing.
+    /// True when the cursor sits inside an unclosed ``` block, so Enter
+    /// should break the line instead of sending half a snippet.
+    pub fn in_code_fence(&self) -> bool {
+        self.text[..self.cursor]
+            .split('\n')
+            .filter(|l| l.trim_start().starts_with("```"))
+            .count()
+            % 2
+            == 1
+    }
+
+    /// (line, display column) of the cursor, for drawing. Tabs count as
+    /// `TAB` spaces, matching how the compose box draws them.
     pub fn cursor_line_col(&self) -> (usize, usize) {
         let before = &self.text[..self.cursor];
         let line = before.matches('\n').count();
-        let col = before
-            .rsplit('\n')
-            .next()
-            .map_or(0, unicode_width::UnicodeWidthStr::width);
+        let col = before.rsplit('\n').next().map_or(0, |l| {
+            unicode_width::UnicodeWidthStr::width(expand_tabs(l).as_str())
+        });
         (line, col)
     }
+}
+
+pub const TAB: usize = 4;
+
+pub fn expand_tabs(s: &str) -> String {
+    s.replace('\t', &" ".repeat(TAB))
 }
 
 #[cfg(test)]
@@ -186,5 +203,11 @@ mod tests {
         let mut e = Draft::default();
         e.insert("mail me@host");
         assert!(e.mention_query().is_none());
+        let mut c = Draft::default();
+        c.insert("look:\n```rust\n\tfn x() {}");
+        assert!(c.in_code_fence());
+        assert_eq!(c.cursor_line_col(), (2, 4 + 9));
+        c.insert("\n```");
+        assert!(!c.in_code_fence());
     }
 }
