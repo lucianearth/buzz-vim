@@ -7,10 +7,13 @@ that always ask first.
 ## Install
 
 ```sh
-cargo install --git https://buzz.gitcoin.co/git/f020f0378f36ade38acadcce6c024b4c1bb77f05d607213f2b7674a1a4817da3/buzz-vim.git
+CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --locked --git https://buzz.gitcoin.co/git/f020f0378f36ade38acadcce6c024b4c1bb77f05d607213f2b7674a1a4817da3/buzz-vim.git
 buzz-vim login   # once: relay (default wss://buzz.gitcoin.co) and your nsec
 buzz-vim
 ```
+
+`CARGO_NET_GIT_FETCH_WITH_CLI` makes cargo fetch with your own git, so the Buzz git auth (the git nostr
+plugin) works. cargo's built-in git client can't authenticate to Buzz.
 
 Your nsec is in Buzz Desktop under Settings → Profile → Private key. `login` saves it to
 `buzz-vim/config.json` in your config dir (`~/Library/Application Support` on macOS), readable only by you.
