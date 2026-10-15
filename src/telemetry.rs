@@ -34,7 +34,6 @@ pub struct Agents {
 }
 
 pub struct Row {
-    pub pubkey: String,
     pub name: String,
     pub busy: bool,
     pub online: bool,
@@ -231,7 +230,6 @@ impl Agents {
                     return None;
                 }
                 Some(Row {
-                    pubkey: pk.clone(),
                     name: a.display_name(pk, store),
                     busy,
                     online: true,

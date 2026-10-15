@@ -334,7 +334,7 @@ fn message_block(
         head.push(Span::styled("  (edited)", theme::faint()));
     }
     lines.push(Line::from(head));
-    let inner = width.saturating_sub(GUTTER + 3).max(10) as usize;
+    let inner = width.saturating_sub(FRAME + 3).max(10) as usize;
     if m.deleted {
         lines.push(Line::from(vec![
             bar.clone(),
@@ -371,7 +371,7 @@ fn message_block(
     if !m.deleted {
         for media in &m.media {
             if media.mime.starts_with("image/") && image.is_none() && app.picker.is_some() {
-                let cols = THUMB_COLS.min(width.saturating_sub(GUTTER + 4));
+                let cols = THUMB_COLS.min(width.saturating_sub(FRAME + 3));
                 let rows = crate::media::thumb_rows(media.dim, cols, THUMB_MAX_ROWS);
                 image = Some((lines.len() as u16, rows, media.url.clone(), cols));
                 let label = match app.media.images.get(&media.url) {
@@ -449,72 +449,65 @@ fn message_block(
             ]));
         }
     }
-    let mut out = card(&m.author, &bar, lines);
+    let mut out = frame(lines, width, selected);
     out.push(Line::raw(""));
     BlockOut {
         id: m.id.clone(),
         lines: out,
-        image: image.map(|(off, rows, url, cols)| (off + 1, rows, url, cols)),
+        image,
     }
 }
 
-/// Card layout: a padded row above and below, and an avatar gutter beside
-/// the first two rows. Each line arrives as `[edge, maybe "  ", content…]`;
-/// the indent is dropped so everything lines up after the avatar.
-fn card(pubkey: &str, edge: &Span<'static>, lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
-    let face = identicon(pubkey);
-    let mut out = vec![Line::from(edge.clone())];
-    for (i, l) in lines.into_iter().enumerate() {
-        let mut spans = l.spans.into_iter();
-        let mut row = vec![spans.next().unwrap_or_else(|| edge.clone()), Span::raw(" ")];
-        match face.get(i) {
-            Some(f) => row.extend(f.spans.clone()),
-            None => row.push(Span::raw("     ")),
-        }
-        row.push(Span::raw("  "));
-        let mut rest: Vec<Span> = spans.collect();
-        if rest
-            .first()
+/// Outline layout: a thin rounded frame per message, no fill. The first
+/// line (name, time, …) goes in the top edge. Each line arrives as
+/// `[edge, maybe "  ", content…]`; edge and indent are dropped.
+fn frame(lines: Vec<Line<'static>>, width: u16, lit: bool) -> Vec<Line<'static>> {
+    let bs = if lit { theme::bright() } else { theme::rule() };
+    let w = width as usize;
+    let rest = |l: Line<'static>| {
+        let mut s: Vec<Span> = l.spans.into_iter().skip(1).collect();
+        if s.first()
             .is_some_and(|sp| sp.content == "  " || sp.content == " ")
         {
-            rest.remove(0);
+            s.remove(0);
         }
-        row.extend(rest);
+        s
+    };
+    let span_w = |s: &[Span]| s.iter().map(|sp| sp.content.width()).sum::<usize>();
+    let mut it = lines.into_iter();
+    let mut top = vec![Span::raw(" "), Span::styled("╭─ ", bs)];
+    top.extend(rest(it.next().unwrap_or_default()));
+    top.push(Span::raw(" "));
+    let used = span_w(&top);
+    top.push(Span::styled(
+        format!("{}╮", "─".repeat(w.saturating_sub(used + 2))),
+        bs,
+    ));
+    let mut out = vec![Line::from(top)];
+    for l in it {
+        let body = rest(l);
+        let pad = w.saturating_sub(FRAME as usize + 2 + span_w(&body));
+        let mut row = vec![Span::raw(" "), Span::styled("│ ", bs)];
+        row.extend(body);
+        row.push(Span::raw(" ".repeat(pad)));
+        row.push(Span::styled("│", bs));
         out.push(Line::from(row));
     }
-    out.push(Line::from(edge.clone()));
+    out.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(format!("╰{}╯", "─".repeat(w.saturating_sub(4))), bs),
+    ]));
     out
 }
 
-/// Columns the avatar gutter takes: the 5-cell face and 2 of space.
-const GUTTER: u16 = 7;
+/// Columns before a framed line's content: margin, border, space.
+const FRAME: u16 = 3;
 
-/// A 5×4-pixel grayscale face from a pubkey, drawn as two rows of
-/// half-blocks on a tile, mirrored left to right like a GitHub identicon.
-fn identicon(pubkey: &str) -> [Line<'static>; 2] {
-    let h: Vec<u8> = pubkey
-        .as_bytes()
-        .chunks(2)
-        .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap_or("0"), 16).unwrap_or(0))
-        .collect();
-    let at = |i: usize| h.get(i).copied().unwrap_or(0);
-    let style = Style::new()
-        .fg(theme::gray(13 + at(0) % 10))
-        .bg(theme::gray(6));
-    // 3 distinct columns × 4 rows of bits; columns 3 and 4 mirror 1 and 0.
-    let bits = u16::from_be_bytes([at(1), at(2)]);
-    let px = |r: usize, c: usize| (bits >> (r * 3 + c)) & 1 == 1;
-    let row = |top: usize| {
-        let cell = |c: usize| match (px(top, c), px(top + 1, c)) {
-            (true, true) => '█',
-            (true, false) => '▀',
-            (false, true) => '▄',
-            (false, false) => ' ',
-        };
-        let s: String = [0, 1, 2, 1, 0].iter().map(|&c| cell(c)).collect();
-        Line::from(Span::styled(s, style))
-    };
-    [row(0), row(2)]
+/// Blank an area for a popup. `Clear` alone leaves the terminal's own
+/// background showing (e.g. a cream iTerm profile), so repaint ours.
+fn clear(f: &mut Frame, area: Rect) {
+    f.render_widget(Clear, area);
+    f.render_widget(Block::new().style(Style::new().bg(theme::gray(0))), area);
 }
 
 /// Lays blocks out bottom-up and keeps the cursor block visible.
@@ -562,23 +555,6 @@ fn draw_blocks(
             height: visible as u16,
         };
         let lines: Vec<Line> = b.lines.into_iter().skip(skip).take(visible).collect();
-        // Shade the card, leaving its trailing spacer row as canvas.
-        let card = Rect {
-            height: if skip + visible == bh {
-                rect.height.saturating_sub(1)
-            } else {
-                rect.height
-            },
-            ..rect
-        };
-        f.render_widget(
-            Block::new().style(if cursor == Some(b.id.as_str()) {
-                theme::card_selected()
-            } else {
-                theme::card()
-            }),
-            card,
-        );
         f.render_widget(Paragraph::new(lines), rect);
         app.hits.push((rect, Hit::Message(pane, b.id.clone())));
         if let Some((off, rows, url, cols)) = b.image {
@@ -586,7 +562,7 @@ fn draw_blocks(
             // Only draw a picture when it is fully on screen.
             if off >= skip && off + rows as usize <= skip + visible {
                 let r = Rect {
-                    x: area.x + 2 + GUTTER,
+                    x: area.x + FRAME,
                     y: row + (off - skip) as u16,
                     width: cols,
                     height: rows,
@@ -804,7 +780,7 @@ fn draw_agents(f: &mut Frame, app: &mut App, area: Rect) {
     // Tool calls go in a right-hand column when there is room.
     let split = area.width >= 90;
     let right_w = if split { area.width / 3 } else { 0 };
-    let left_w = area.width.saturating_sub(right_w + 3 + GUTTER) as usize;
+    let left_w = area.width.saturating_sub(right_w + 3 + FRAME + 2) as usize;
     let mut y = area.y + 1;
     for r in rows {
         let edge = if r.busy {
@@ -900,12 +876,12 @@ fn draw_agents(f: &mut Frame, app: &mut App, area: Rect) {
                 left.push(Line::from(spans));
             }
         }
-        while left.len() < right.len() {
+        while left.len() < right.len() + 1 {
             left.push(Line::from(edge.clone()));
         }
-        // The card adds a padded row on top; keep the columns level.
+        // The frame's top edge holds the head; keep the columns level.
         right.insert(0, Line::raw(""));
-        let left = card(&r.pubkey, &edge, left);
+        let left = frame(left, area.width, r.busy);
         let h = left.len() as u16;
         if y + h > area.bottom() {
             break;
@@ -916,21 +892,13 @@ fn draw_agents(f: &mut Frame, app: &mut App, area: Rect) {
             width: area.width,
             height: h,
         };
-        f.render_widget(
-            Block::new().style(if r.busy {
-                theme::card_selected()
-            } else {
-                theme::card()
-            }),
-            card,
-        );
         f.render_widget(Paragraph::new(left), card);
         if split {
             f.render_widget(
                 Paragraph::new(right),
                 Rect {
                     x: area.right().saturating_sub(right_w),
-                    width: right_w,
+                    width: right_w.saturating_sub(3),
                     ..card
                 },
             );
@@ -1131,7 +1099,7 @@ fn draw_compose(f: &mut Frame, app: &mut App, area: Rect) {
                 width: w,
                 height: h,
             };
-            f.render_widget(Clear, r);
+            clear(f, r);
             let items: Vec<Line> = cands
                 .iter()
                 .enumerate()
@@ -1200,7 +1168,7 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 fn draw_sections(f: &mut Frame, app: &mut App, area: Rect) {
     let h = (app.sections.len() as u16 + 6).max(9);
     let r = centered(area, 60, h);
-    f.render_widget(Clear, r);
+    clear(f, r);
     let block = Block::bordered()
         .border_style(theme::text())
         .title(Span::styled(" your sections ", theme::bright()));
@@ -1261,7 +1229,7 @@ fn draw_sections(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_confirm(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(p) = &app.pending else { return };
     let r = centered(area, 72, 12);
-    f.render_widget(Clear, r);
+    clear(f, r);
     let block = Block::bordered()
         .border_style(theme::bright())
         .title(Span::styled(" upload this? ", theme::bright()));
@@ -1340,7 +1308,7 @@ fn draw_confirm(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_help(f: &mut Frame, area: Rect) {
     let r = centered(area, 84, 27);
-    f.render_widget(Clear, r);
+    clear(f, r);
     let block = Block::bordered()
         .border_style(theme::text())
         .title(Span::styled(" keys ", theme::bright()));
@@ -1385,7 +1353,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
 
 fn draw_viewer(f: &mut Frame, app: &mut App, area: Rect) {
     // Takes the whole screen; the image gets every cell but the title row.
-    f.render_widget(Clear, area);
+    clear(f, area);
     let [title, inner] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     let n = app.viewer_list.len();
     let at = app
@@ -1738,15 +1706,17 @@ mod tests {
                 .sign_with_keys(who)
                 .unwrap();
             app.store.apply(&ev);
+            ev.id.to_hex()
         };
         let (a, b) = (Keys::generate(), Keys::generate());
         post(&a, "Can you detect the Mac's light versus dark mode?");
-        post(
+        let yes = post(
             &b,
             "Yes. It follows the system setting and re-checks every 2 s.",
         );
         post(&a, "and unread dots on the tabs too");
         app.store.channel_mut("c1").loaded = true;
+        app.selected.insert("c1".into(), yes);
         for light in [false, true] {
             crate::theme::set_light(light);
             t.draw(|f| draw(f, &mut app)).unwrap();

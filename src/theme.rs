@@ -91,14 +91,6 @@ pub fn key() -> Style {
         .bg(gray(17))
         .add_modifier(Modifier::BOLD)
 }
-/// Message and agent cards sit a step above the canvas; the selected
-/// one a step more.
-pub fn card() -> Style {
-    Style::new().bg(gray(2))
-}
-pub fn card_selected() -> Style {
-    Style::new().bg(gray(4))
-}
 pub fn mention() -> Style {
     Style::new()
         .fg(gray(23))
