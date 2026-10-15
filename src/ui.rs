@@ -334,7 +334,7 @@ fn message_block(
         head.push(Span::styled("  (edited)", theme::faint()));
     }
     lines.push(Line::from(head));
-    let inner = width.saturating_sub(FRAME + 3).max(10) as usize;
+    let inner = width.saturating_sub(FRAME + 2).max(10) as usize;
     if m.deleted {
         lines.push(Line::from(vec![
             bar.clone(),
@@ -371,7 +371,7 @@ fn message_block(
     if !m.deleted {
         for media in &m.media {
             if media.mime.starts_with("image/") && image.is_none() && app.picker.is_some() {
-                let cols = THUMB_COLS.min(width.saturating_sub(FRAME + 3));
+                let cols = THUMB_COLS.min(width.saturating_sub(FRAME + 2));
                 let rows = crate::media::thumb_rows(media.dim, cols, THUMB_MAX_ROWS);
                 image = Some((lines.len() as u16, rows, media.url.clone(), cols));
                 let label = match app.media.images.get(&media.url) {
@@ -449,7 +449,8 @@ fn message_block(
             ]));
         }
     }
-    let mut out = frame(lines, width, selected);
+    let name = app.store.name_of(&m.author);
+    let mut out = frame(&name, lines, width, selected);
     out.push(Line::raw(""));
     BlockOut {
         id: m.id.clone(),
@@ -458,12 +459,15 @@ fn message_block(
     }
 }
 
-/// Outline layout: a thin rounded frame per message, no fill. The first
-/// line (name, time, …) goes in the top edge. Each line arrives as
-/// `[edge, maybe "  ", content…]`; edge and indent are dropped.
-fn frame(lines: Vec<Line<'static>>, width: u16, lit: bool) -> Vec<Line<'static>> {
-    let bs = if lit { theme::bright() } else { theme::rule() };
-    let w = width as usize;
+/// Header-rule layout: a bold initial, the first line (name, time, …),
+/// then a dotted rule to the edge; the rest indented below. No fill. Each
+/// line arrives as `[edge, maybe "  ", content…]`; the indent is dropped.
+fn frame(name: &str, lines: Vec<Line<'static>>, width: u16, lit: bool) -> Vec<Line<'static>> {
+    let edge = if lit {
+        Span::styled("▌", theme::bright())
+    } else {
+        Span::raw(" ")
+    };
     let rest = |l: Line<'static>| {
         let mut s: Vec<Span> = l.spans.into_iter().skip(1).collect();
         if s.first()
@@ -473,35 +477,32 @@ fn frame(lines: Vec<Line<'static>>, width: u16, lit: bool) -> Vec<Line<'static>>
         }
         s
     };
-    let span_w = |s: &[Span]| s.iter().map(|sp| sp.content.width()).sum::<usize>();
     let mut it = lines.into_iter();
-    let mut top = vec![Span::raw(" "), Span::styled("╭─ ", bs)];
+    let initial: String = name.chars().next().unwrap_or('?').to_uppercase().collect();
+    let mut top = vec![
+        edge.clone(),
+        Span::raw(" "),
+        Span::styled(initial, theme::bright()),
+        Span::raw("  "),
+    ];
     top.extend(rest(it.next().unwrap_or_default()));
     top.push(Span::raw(" "));
-    let used = span_w(&top);
+    let used: usize = top.iter().map(|sp| sp.content.width()).sum();
     top.push(Span::styled(
-        format!("{}╮", "─".repeat(w.saturating_sub(used + 2))),
-        bs,
+        "╌".repeat((width as usize).saturating_sub(used + 1)),
+        theme::rule(),
     ));
     let mut out = vec![Line::from(top)];
     for l in it {
-        let body = rest(l);
-        let pad = w.saturating_sub(FRAME as usize + 2 + span_w(&body));
-        let mut row = vec![Span::raw(" "), Span::styled("│ ", bs)];
-        row.extend(body);
-        row.push(Span::raw(" ".repeat(pad)));
-        row.push(Span::styled("│", bs));
+        let mut row = vec![edge.clone(), Span::raw("    ")];
+        row.extend(rest(l));
         out.push(Line::from(row));
     }
-    out.push(Line::from(vec![
-        Span::raw(" "),
-        Span::styled(format!("╰{}╯", "─".repeat(w.saturating_sub(4))), bs),
-    ]));
     out
 }
 
-/// Columns before a framed line's content: margin, border, space.
-const FRAME: u16 = 3;
+/// Columns before a message's content: edge, initial and spacing.
+const FRAME: u16 = 5;
 
 /// Blank an area for a popup. `Clear` alone leaves the terminal's own
 /// background showing (e.g. a cream iTerm profile), so repaint ours.
@@ -780,7 +781,7 @@ fn draw_agents(f: &mut Frame, app: &mut App, area: Rect) {
     // Tool calls go in a right-hand column when there is room.
     let split = area.width >= 90;
     let right_w = if split { area.width / 3 } else { 0 };
-    let left_w = area.width.saturating_sub(right_w + 3 + FRAME + 2) as usize;
+    let left_w = area.width.saturating_sub(right_w + 2 + FRAME) as usize;
     let mut y = area.y + 1;
     for r in rows {
         let edge = if r.busy {
@@ -879,9 +880,9 @@ fn draw_agents(f: &mut Frame, app: &mut App, area: Rect) {
         while left.len() < right.len() + 1 {
             left.push(Line::from(edge.clone()));
         }
-        // The frame's top edge holds the head; keep the columns level.
+        // The header row holds the head; keep the columns level.
         right.insert(0, Line::raw(""));
-        let left = frame(left, area.width, r.busy);
+        let left = frame(&r.name, left, area.width, r.busy);
         let h = left.len() as u16;
         if y + h > area.bottom() {
             break;
@@ -898,7 +899,7 @@ fn draw_agents(f: &mut Frame, app: &mut App, area: Rect) {
                 Paragraph::new(right),
                 Rect {
                     x: area.right().saturating_sub(right_w),
-                    width: right_w.saturating_sub(3),
+                    width: right_w.saturating_sub(1),
                     ..card
                 },
             );
