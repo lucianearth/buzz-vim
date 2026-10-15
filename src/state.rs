@@ -11,6 +11,9 @@ pub struct State {
     pub read_slot: String,
     #[serde(default)]
     pub read_client: String,
+    /// Reading width set with the slider; None = full width.
+    #[serde(default)]
+    pub read_width: Option<u16>,
 }
 
 fn path(relay: &str, me: &str) -> Option<std::path::PathBuf> {

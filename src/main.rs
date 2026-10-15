@@ -134,6 +134,7 @@ async fn run(
     app.relay_host = relay.base.clone();
     let saved = state::load(&relay.base, &app.store.me);
     app.chosen = saved.chosen.clone();
+    app.read_width = saved.read_width;
     let mut sync = Sync::new(relay, live_cmd, tx);
     if !saved.read_slot.is_empty() && !saved.read_client.is_empty() {
         sync.read = readstate::ReadState::new(saved.read_slot.clone(), saved.read_client.clone());
@@ -244,6 +245,7 @@ fn saved_state(app: &App, sync: &Sync) -> state::State {
         active: app.current().map(str::to_string),
         read_slot: sync.read.slot().to_string(),
         read_client: sync.read.client_id().to_string(),
+        read_width: app.read_width,
     }
 }
 

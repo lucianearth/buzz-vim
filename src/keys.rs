@@ -36,6 +36,7 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("+", "👍", false),
             ("s", "sections", false),
             ("o", "image", true),
+            ("[ ]", "narrower / wider (or drag the right edge)", false),
             ("a", "agents", true),
             ("?", "help", true),
             ("r", "reply in thread", false),

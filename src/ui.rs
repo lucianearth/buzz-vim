@@ -40,7 +40,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     // Threads and the agents view take over the main pane; h, ← or Esc
     // goes back up.
-    let main = body;
+    let main = slider(f, app, body);
     let mut images = vec![];
     if app.agents_view {
         draw_agents(f, app, main);
@@ -69,6 +69,38 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Viewer => draw_viewer(f, app, area),
         _ => {}
     }
+}
+
+/// The reading-width slider: the body's last column is a handle, and the
+/// panes lay out in the width to its left.
+fn slider(f: &mut Frame, app: &mut App, body: Rect) -> Rect {
+    let max = body.width.saturating_sub(1);
+    app.body_max = max;
+    app.body_x = body.x;
+    let w = app.read_width.map_or(max, |w| w.min(max));
+    let handle = Rect {
+        x: body.x + w,
+        width: 1.min(body.width),
+        ..body
+    };
+    let mid = handle.height / 2;
+    let rows: Vec<Line> = (0..handle.height)
+        .map(|r| {
+            if r + 1 >= mid && r <= mid + 1 {
+                let st = if app.dragging {
+                    theme::bright()
+                } else {
+                    theme::muted()
+                };
+                Line::styled("┃", st)
+            } else {
+                Line::styled("│", theme::rule())
+            }
+        })
+        .collect();
+    f.render_widget(Paragraph::new(rows), handle);
+    app.hits.push((handle, Hit::Handle));
+    Rect { width: w, ..body }
 }
 
 // ---------- top bar ----------
@@ -2089,6 +2121,75 @@ mod tests {
             .collect();
         assert!(!painted.is_empty() && painted[0] > 2, "{painted:?}");
         assert!(*painted.last().unwrap() < 18, "{painted:?}");
+    }
+
+    #[test]
+    fn slider_sets_the_reading_width() {
+        use crossterm::event::{
+            Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
+            MouseEventKind,
+        };
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let k = Keys::generate();
+        let mut app = App::new(k.public_key().to_hex(), None);
+        let ev = EventBuilder::new(Kind::Custom(9), "word ".repeat(60))
+            .tags([Tag::parse(["h", "c1"]).unwrap()])
+            .sign_with_keys(&k)
+            .unwrap();
+        app.store.apply(&ev);
+        app.tabs = vec!["c1".into()];
+        app.on_term(TermEvent::Key(KeyEvent::from(KeyCode::Esc)));
+        let screen = |app: &mut App| {
+            let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+            t.draw(|f| draw(f, app)).unwrap();
+            let buf = t.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let mouse = |app: &mut App, kind, column| {
+            app.on_term(TermEvent::Mouse(MouseEvent {
+                kind,
+                column,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            }))
+        };
+        screen(&mut app);
+        let left = MouseButton::Left;
+        mouse(&mut app, MouseEventKind::Down(left), 79);
+        mouse(&mut app, MouseEventKind::Drag(left), 40);
+        mouse(&mut app, MouseEventKind::Up(left), 40);
+        assert_eq!(app.read_width, Some(40));
+        let rows = screen(&mut app);
+        // Words wrap left of the handle; nothing to its right.
+        let words: Vec<&String> = rows.iter().filter(|r| r.contains("word")).collect();
+        assert!(words.len() > 3, "{rows:#?}");
+        for r in &words {
+            let right: String = r.chars().skip(41).collect();
+            assert!(right.trim().is_empty(), "{rows:#?}");
+            assert!(matches!(r.chars().nth(40), Some('│' | '┃')), "{rows:#?}");
+        }
+        // The compose bar keeps the full width.
+        assert!(rows[16].ends_with('╮'), "{rows:#?}");
+        let key = |app: &mut App, c| app.on_term(TermEvent::Key(KeyEvent::from(KeyCode::Char(c))));
+        key(&mut app, '[');
+        assert_eq!(app.read_width, Some(36));
+        for _ in 0..20 {
+            key(&mut app, ']');
+        }
+        assert_eq!(app.read_width, None);
+        // Double-click the handle: back to full width.
+        app.read_width = Some(50);
+        screen(&mut app);
+        mouse(&mut app, MouseEventKind::Down(left), 50);
+        mouse(&mut app, MouseEventKind::Up(left), 50);
+        mouse(&mut app, MouseEventKind::Down(left), 50);
+        assert_eq!(app.read_width, None);
     }
 
     #[test]

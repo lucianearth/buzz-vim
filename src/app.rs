@@ -33,6 +33,8 @@ pub enum Hit {
     ConfirmYes,
     ConfirmNo,
     CloseThread,
+    /// The reading-width slider on the body's right edge.
+    Handle,
 }
 
 /// Things the user asked for that need the network. `main` executes them.
@@ -113,6 +115,14 @@ pub struct App {
     /// From the last draw of the focused pane, when its cursor message is
     /// taller than the pane: (id, message height, pane height, offset shown).
     pub tall: Option<(String, usize, usize, usize)>,
+    /// Reading width from the slider, in columns; None = full width.
+    pub read_width: Option<u16>,
+    /// Widest the body can be, from the last draw (for `[` `]`).
+    pub body_max: u16,
+    pub body_x: u16,
+    /// Dragging the slider, and when it was last clicked (double-click resets).
+    pub dragging: bool,
+    pub handle_click: Option<std::time::Instant>,
     pub actions: Vec<Action>,
     /// Drafts of messages in flight, restored if the relay rejects them.
     /// event id -> (channel, thread root, the draft it came from)
@@ -159,6 +169,11 @@ impl App {
             page: 20,
             peek: None,
             tall: None,
+            read_width: None,
+            body_max: 80,
+            body_x: 0,
+            dragging: false,
+            handle_click: None,
             actions: vec![],
             pending_sends: HashMap::new(),
             relay_host: String::new(),
@@ -711,6 +726,8 @@ impl App {
             KeyCode::Char('R') => self.actions.push(Action::ReloadSections),
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('o') => self.open_viewer(),
+            KeyCode::Char('[') => self.nudge_width(-4),
+            KeyCode::Char(']') => self.nudge_width(4),
             _ => {}
         }
     }
@@ -832,6 +849,21 @@ impl App {
         self.actions.push(Action::SaveState);
     }
 
+    /// Narrowest the slider goes.
+    pub const MIN_WIDTH: u16 = 30;
+
+    fn nudge_width(&mut self, d: i32) {
+        let cur = self.read_width.unwrap_or(self.body_max).min(self.body_max) as i32;
+        self.set_width((cur + d).max(0) as u16);
+        self.actions.push(Action::SaveState);
+    }
+
+    /// At or past the full width means full width, so widening the
+    /// terminal later keeps filling it.
+    fn set_width(&mut self, w: u16) {
+        self.read_width = (w < self.body_max).then_some(w.max(Self::MIN_WIDTH));
+    }
+
     fn on_mouse(&mut self, m: MouseEvent) {
         let hit = self
             .hits
@@ -845,6 +877,26 @@ impl App {
             })
             .map(|(_, h)| h.clone());
         match m.kind {
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
+                self.set_width(m.column.saturating_sub(self.body_x));
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.dragging => {
+                self.dragging = false;
+                self.actions.push(Action::SaveState);
+            }
+            MouseEventKind::Down(MouseButton::Left) if hit == Some(Hit::Handle) => {
+                let now = std::time::Instant::now();
+                let double = self
+                    .handle_click
+                    .is_some_and(|t| now.duration_since(t).as_millis() < 400);
+                self.handle_click = Some(now);
+                if double {
+                    self.read_width = None;
+                    self.actions.push(Action::SaveState);
+                } else {
+                    self.dragging = true;
+                }
+            }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                 let d: isize = if m.kind == MouseEventKind::ScrollDown {
                     3
@@ -896,7 +948,7 @@ impl App {
                 Some(Hit::ConfirmNo) => self.on_key(KeyEvent::from(KeyCode::Char('n'))),
                 Some(Hit::CloseThread) if self.agents_view => self.agents_view = false,
                 Some(Hit::CloseThread) => self.close_thread(),
-                None => {}
+                Some(Hit::Handle) | None => {}
             },
             _ => {}
         }
