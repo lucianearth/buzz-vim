@@ -225,9 +225,17 @@ impl Relay {
         Ok(format!("Nostr {}", URL_SAFE_NO_PAD.encode(ev.as_json())))
     }
 
+    /// True when `url` is on our relay's media host (same scheme, host and
+    /// port), the only place our Blossom auth may go.
+    pub fn is_ours(&self, url: &str) -> bool {
+        same_origin(url, &self.base)
+    }
+
     /// BUD-02 upload. Caller has already checked type and size.
     pub async fn upload(&self, bytes: Vec<u8>, mime: &str) -> Result<BlobDescriptor> {
         let sha = hex::encode(Sha256::digest(&bytes));
+        // Cheap to clone for the legacy-endpoint retry.
+        let bytes = bytes::Bytes::from(bytes);
         let timeout = if mime.starts_with("video/") { 600 } else { 120 };
         let mut url = format!("{}/upload", self.base);
         for legacy in [false, true] {
@@ -284,4 +292,42 @@ fn rand_nonce() -> u128 {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     t ^ (std::process::id() as u128) << 64
+}
+
+fn same_origin(a: &str, b: &str) -> bool {
+    let origin = |u: &str| {
+        reqwest::Url::parse(u).ok().map(|u| {
+            (
+                u.scheme().to_string(),
+                u.host_str().map(str::to_string),
+                u.port_or_known_default(),
+            )
+        })
+    };
+    matches!((origin(a), origin(b)), (Some(x), Some(y)) if x == y)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn same_origin_is_exact() {
+        let base = "https://buzz.gitcoin.co";
+        assert!(super::same_origin(
+            "https://buzz.gitcoin.co/media/a.png",
+            base
+        ));
+        assert!(super::same_origin(
+            "https://buzz.gitcoin.co:443/media/a.png",
+            base
+        ));
+        assert!(!super::same_origin(
+            "https://buzz.gitcoin.co.evil.com/a.png",
+            base
+        ));
+        assert!(!super::same_origin(
+            "https://buzz.gitcoin.co@evil.com/a.png",
+            base
+        ));
+        assert!(!super::same_origin("http://buzz.gitcoin.co/a.png", base));
+    }
 }

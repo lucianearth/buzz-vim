@@ -18,6 +18,21 @@ impl Draft {
         self.text.trim().is_empty() && self.attachments.is_empty()
     }
 
+    /// Put an unsent draft back in front of whatever is being typed.
+    pub fn restore(&mut self, mut old: Draft) {
+        if self.is_empty() {
+            *self = old;
+            return;
+        }
+        let shift = old.text.len() + 1;
+        old.text.push('\n');
+        self.text.insert_str(0, &old.text);
+        self.cursor += shift;
+        self.mentions.append(&mut old.mentions);
+        old.attachments.append(&mut self.attachments);
+        self.attachments = old.attachments;
+    }
+
     pub fn clear(&mut self) {
         *self = Draft::default();
     }

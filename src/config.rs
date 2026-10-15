@@ -97,13 +97,19 @@ pub fn login() -> Result<()> {
     } else {
         relay.trim().to_string()
     };
-    print!("your nsec (Buzz Desktop → Settings → Profile → Private key, reveal it): ");
-    std::io::stdout().flush()?;
-    let mut nsec = String::new();
-    std::io::stdin().read_line(&mut nsec)?;
+    // Not echoed, so the key doesn't end up in scrollback.
+    let nsec = rpassword::prompt_password(
+        "your nsec (Buzz Desktop → Settings → Profile → Private key, reveal it; typing is hidden): ",
+    )?;
     let keys = parse_key(&nsec)?;
     let p = path()?;
-    std::fs::create_dir_all(p.parent().context("bad config path")?)?;
+    let dir = p.parent().context("bad config path")?;
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     let body = serde_json::to_string_pretty(&File {
         relay: Some(relay),
         nsec: Some(keys.secret_key().to_bech32()?),
@@ -119,13 +125,16 @@ pub fn login() -> Result<()> {
 
 #[cfg(unix)]
 fn write_private(p: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
+        .truncate(false)
         .mode(0o600)
         .open(p)?;
+    // `mode` only applies to new files; tighten an older one before the key goes in.
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.set_len(0)?;
     f.write_all(bytes)?;
     Ok(())
 }

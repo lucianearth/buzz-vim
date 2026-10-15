@@ -27,12 +27,14 @@ pub enum Msg {
         events: anyhow::Result<Vec<Event>>,
     },
     Events(Vec<Event>),
-    Lanes(Vec<Event>),
+    Lanes(anyhow::Result<Vec<Event>>),
     Sent {
-        result: anyhow::Result<Event>,
+        id: String,
+        result: anyhow::Result<()>,
     },
     Did(anyhow::Result<String>),
-    Uploaded(anyhow::Result<BlobDescriptor>, bool),
+    /// The upload, and the (channel, thread root) it was meant for.
+    Uploaded(anyhow::Result<BlobDescriptor>, (String, Option<String>)),
     Image {
         url: String,
         result: anyhow::Result<image::DynamicImage>,
@@ -161,8 +163,7 @@ impl Sync {
                     json!({"kinds": [30078], "authors": [me], "#d": [sections::LANE_SECTIONS], "limit": 1}),
                     json!({"kinds": [30078], "authors": [me], "#d": [sections::LANE_STARS], "limit": 1}),
                 ])
-                .await
-                .unwrap_or_default();
+                .await;
             Msg::Lanes(ev)
         });
     }
@@ -354,12 +355,12 @@ impl Sync {
             Action::ThumbsUp { target } => self.thumbs_up(app, target),
             Action::Upload => {
                 let Some(p) = app.pending.take() else { return };
+                let Some(target) = app.draft_target() else {
+                    return;
+                };
                 app.uploading = true;
                 let r = self.relay.clone();
-                let to_thread = app.focus == crate::app::Pane::Thread && app.thread.is_some();
-                self.spawn(
-                    async move { Msg::Uploaded(r.upload(p.bytes, &p.mime).await, to_thread) },
-                );
+                self.spawn(async move { Msg::Uploaded(r.upload(p.bytes, &p.mime).await, target) });
             }
             Action::LoadImage(url) => self.load_image(app, url),
             Action::OpenThread { channel, root } => self.open_thread(&channel, &root),
@@ -413,7 +414,7 @@ impl Sync {
                 }
             }
         }
-        let thread = match (root, parent) {
+        let thread = match (root.clone(), parent) {
             (Some(r), Some(p)) => match (EventId::from_hex(&r), EventId::from_hex(&p)) {
                 (Ok(r), Ok(p)) => Some(buzz_sdk::ThreadRef {
                     root_event_id: r,
@@ -457,11 +458,13 @@ impl Sync {
         };
         // Show it right away; the live tail dedupes the echo.
         app.store.apply(&ev);
-        app.pending_sends.insert(ev.id.to_hex(), draft);
+        let id = ev.id.to_hex();
+        app.pending_sends
+            .insert(id.clone(), (channel.clone(), root.clone(), draft));
         let r = self.relay.clone();
         self.spawn(async move {
-            let result = r.publish(&ev).await.map(|_| ev);
-            Msg::Sent { result }
+            let result = r.publish(&ev).await.map(|_| ());
+            Msg::Sent { id, result }
         });
     }
 
@@ -495,7 +498,7 @@ impl Sync {
             return;
         }
         // Only send our Blossom auth to our own relay.
-        if !url.starts_with(&self.relay.base) {
+        if !self.relay.is_ours(&url) {
             app.media
                 .images
                 .insert(url, crate::media::Slot::Failed("external image".into()));
@@ -554,12 +557,13 @@ pub fn fold(app: &mut App, sync: &mut Sync, ev: &Event, live_channel: bool) -> V
             return vec![];
         }
         44200 => {
-            if let Some(m) = sync.decrypt_for_me(ev) {
-                let agent = model::tag(ev, "agent")
-                    .unwrap_or(&ev.pubkey.to_hex())
-                    .to_string();
-                app.agents.metric(&agent, &m);
-                return vec![agent];
+            // The agent signs its own metrics (buzz-acp pool.rs), like 24200.
+            let agent = ev.pubkey.to_hex();
+            if model::tag(ev, "agent").is_none_or(|a| a == agent) {
+                if let Some(m) = sync.decrypt_for_me(ev) {
+                    app.agents.metric(&agent, &m);
+                    return vec![agent];
+                }
             }
             return vec![];
         }

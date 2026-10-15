@@ -69,6 +69,7 @@ pub struct App {
     pub active: usize,
     pub sections: Vec<Section>,
     pub sections_loaded: bool,
+    pub channels_loaded: bool,
     /// Section ids whose channels are the tabs.
     pub chosen: Vec<String>,
     pub picker_cursor: usize,
@@ -97,7 +98,8 @@ pub struct App {
     pub page: usize,
     pub actions: Vec<Action>,
     /// Drafts of messages in flight, restored if the relay rejects them.
-    pub pending_sends: HashMap<String, Draft>,
+    /// event id -> (channel, thread root, the draft it came from)
+    pub pending_sends: HashMap<String, (String, Option<String>, Draft)>,
     pub relay_host: String,
 }
 
@@ -111,6 +113,7 @@ impl App {
             active: 0,
             sections: vec![],
             sections_loaded: false,
+            channels_loaded: false,
             chosen: vec![],
             picker_cursor: 0,
             picker_marks: HashSet::new(),
@@ -177,6 +180,26 @@ impl App {
             &mut self.thread_draft
         } else {
             &mut self.draft
+        }
+    }
+
+    /// Where typing goes right now: (channel, thread root).
+    pub fn draft_target(&self) -> Option<(String, Option<String>)> {
+        match (&self.thread, self.focus) {
+            (Some((c, r)), Pane::Thread) => Some((c.clone(), Some(r.clone()))),
+            _ => self.current().map(|c| (c.to_string(), None)),
+        }
+    }
+
+    /// The draft for a channel or thread, if it is still open.
+    pub fn draft_for(&mut self, channel: &str, root: Option<&str>) -> Option<&mut Draft> {
+        match root {
+            Some(r) => match &self.thread {
+                Some((c, tr)) if c == channel && tr == r => Some(&mut self.thread_draft),
+                _ => None,
+            },
+            None if self.current() == Some(channel) => Some(&mut self.draft),
+            None => None,
         }
     }
 

@@ -70,13 +70,25 @@ fn main() -> Result<()> {
     // Ask the terminal what image protocol it speaks before taking over the screen.
     let picker = media::picker();
     let mut terminal = ratatui::init();
-    execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
-    let res = rt.block_on(run(&mut terminal, cfg, picker));
-    execute!(
+    // ratatui's panic hook undoes raw mode and the alternate screen; mouse
+    // capture and bracketed paste are ours to undo, before it runs.
+    let ratatui_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(
+            std::io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
+        ratatui_hook(info);
+    }));
+    let res = execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)
+        .map_err(anyhow::Error::from)
+        .and_then(|_| rt.block_on(run(&mut terminal, cfg, picker)));
+    let _ = execute!(
         std::io::stdout(),
         DisableMouseCapture,
         DisableBracketedPaste
-    )?;
+    );
     ratatui::restore();
     res
 }
@@ -125,8 +137,11 @@ async fn run(
         }
         tokio::select! {
             ev = input.next() => {
-                let Some(Ok(ev)) = ev else { break };
-                app.on_term(ev);
+                match ev {
+                    Some(Ok(ev)) => app.on_term(ev),
+                    // The terminal went away: quit the normal way so state is saved.
+                    _ => app.actions.push(Action::Quit),
+                }
                 dirty = true;
             }
             Some(msg) = rx.recv() => {
@@ -205,6 +220,7 @@ async fn run(
 fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<String>) {
     match msg {
         Msg::Channels(Ok(evs)) => {
+            app.channels_loaded = true;
             for ev in &evs {
                 app.store.apply(ev);
             }
@@ -220,11 +236,12 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
             refresh_sections(app, sync, restore_active);
         }
         Msg::Channels(Err(e)) => app.say(format!("couldn't load channels: {e}")),
-        Msg::Lanes(evs) => {
+        Msg::Lanes(Ok(evs)) => {
             sync.apply_lanes(&evs);
             app.sections_loaded = true;
             refresh_sections(app, sync, restore_active);
         }
+        Msg::Lanes(Err(e)) => app.say(format!("couldn't load sections: {e}")),
         Msg::Window {
             channel,
             events,
@@ -282,41 +299,63 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
                 sync.want_presence(app.agents.by_pubkey.keys().cloned().collect());
             }
         }
-        Msg::Sent { result } => match result {
-            Ok(ev) => {
-                app.pending_sends.remove(&ev.id.to_hex());
-                app.sent_flash = Some((app.tick as usize % art::SENT.len(), Instant::now()));
-            }
-            Err(e) => {
-                // Put the text back so nothing is lost.
-                let id = app.pending_sends.keys().next().cloned();
-                if let Some(id) = id {
-                    if let Some(d) = app.pending_sends.remove(&id) {
-                        app.store.remove_message(&id);
-                        if app.draft_ref().is_empty() {
-                            *app.draft_mut() = d;
+        Msg::Sent { id, result } => {
+            let pending = app.pending_sends.remove(&id);
+            match result {
+                Ok(()) => {
+                    app.sent_flash = Some((app.tick as usize % art::SENT.len(), Instant::now()));
+                }
+                Err(e) => {
+                    app.store.remove_message(&id);
+                    // Put the text back so nothing is lost: in its own box if that
+                    // conversation is still open, otherwise in the one in front of you.
+                    let Some((channel, root, d)) = pending else {
+                        app.say(format!("not sent: {e}"));
+                        return;
+                    };
+                    match app.draft_for(&channel, root.as_deref()) {
+                        Some(slot) => {
+                            slot.restore(d);
+                            app.say(format!("not sent: {e}. Your text is back in its box."));
+                        }
+                        None => {
+                            app.draft_mut().restore(d);
+                            let name = app
+                                .store
+                                .channels
+                                .get(&channel)
+                                .map(ui::channel_label)
+                                .unwrap_or(channel);
+                            app.say(format!(
+                                "not sent to {name}: {e}. Your text is in this box now."
+                            ));
                         }
                     }
                 }
-                app.say(format!("not sent: {e}"));
             }
-        },
+        }
         Msg::Did(r) => match r {
             Ok(s) => app.say(s),
             Err(e) => app.say(format!("failed: {e}")),
         },
-        Msg::Uploaded(r, to_thread) => {
+        Msg::Uploaded(r, (channel, root)) => {
             app.uploading = false;
             match r {
                 Ok(d) => {
-                    let draft = if to_thread {
-                        &mut app.thread_draft
-                    } else {
-                        &mut app.draft
-                    };
-                    draft.attachments.push(d);
-                    app.mode = keys::Mode::Insert;
-                    app.say("attached. ⏎ sends it");
+                    let here = app.draft_target() == Some((channel.clone(), root.clone()));
+                    match app.draft_for(&channel, root.as_deref()) {
+                        Some(draft) => {
+                            draft.attachments.push(d);
+                            if here {
+                                app.mode = keys::Mode::Insert;
+                            }
+                            app.say("attached. ⏎ sends it");
+                        }
+                        None => app.say(format!(
+                            "uploaded, but that conversation is closed, so it wasn't attached: {}",
+                            d.url
+                        )),
+                    }
                 }
                 Err(e) => app.say(format!("upload failed: {e}")),
             }
@@ -349,8 +388,12 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
 
 fn refresh_sections(app: &mut App, sync: &mut Sync, restore_active: &mut Option<String>) {
     app.sections = sections::build(&sync.lanes, &app.store);
-    app.chosen
-        .retain(|c| app.sections.iter().any(|s| s.id == *c));
+    // Forget saved choices only once both halves have loaded; before that a
+    // missing section just hasn't arrived yet.
+    if app.sections_loaded && app.channels_loaded {
+        app.chosen
+            .retain(|c| app.sections.iter().any(|s| s.id == *c));
+    }
     app.rebuild_tabs();
     if let Some(want) = restore_active.take() {
         if let Some(i) = app.tabs.iter().position(|t| *t == want) {

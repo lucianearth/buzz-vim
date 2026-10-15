@@ -63,7 +63,13 @@ pub fn sniff(bytes: &[u8]) -> Option<&'static str> {
 }
 
 pub fn check(bytes: &[u8]) -> Result<&'static str> {
-    let Some(mime) = sniff(bytes) else {
+    check_head(bytes, bytes.len())
+}
+
+/// Type from the first bytes, size from `len`, so a file can be refused
+/// before it is read.
+fn check_head(head: &[u8], len: usize) -> Result<&'static str> {
+    let Some(mime) = sniff(head) else {
         bail!("Buzz only takes png, jpeg, gif, webp and mp4 uploads")
     };
     debug_assert!(ALLOWED_MIMES.contains(&mime));
@@ -72,12 +78,8 @@ pub fn check(bytes: &[u8]) -> Result<&'static str> {
     } else {
         MAX_IMAGE_BYTES
     };
-    if bytes.len() > max {
-        bail!(
-            "too big: {} (limit {})",
-            human_size(bytes.len()),
-            human_size(max)
-        );
+    if len > max {
+        bail!("too big: {} (limit {})", human_size(len), human_size(max));
     }
     Ok(mime)
 }
@@ -91,8 +93,15 @@ fn dims(bytes: &[u8]) -> Option<(u32, u32)> {
 }
 
 pub fn from_file(path: &Path, source: &'static str) -> Result<Pending> {
-    let bytes = std::fs::read(path).with_context(|| format!("can't read {}", path.display()))?;
-    let mime = check(&bytes)?;
+    use std::io::Read;
+    let ctx = || format!("can't read {}", path.display());
+    let mut f = std::fs::File::open(path).with_context(ctx)?;
+    let len = f.metadata().with_context(ctx)?.len() as usize;
+    let mut head = Vec::with_capacity(16);
+    (&mut f).take(16).read_to_end(&mut head).with_context(ctx)?;
+    let mime = check_head(&head, len)?;
+    let mut bytes = head;
+    f.read_to_end(&mut bytes).with_context(ctx)?;
     Ok(Pending {
         name: path
             .file_name()
@@ -171,6 +180,7 @@ pub fn from_clipboard() -> Result<Pending> {
         let mut png = Vec::new();
         image::DynamicImage::ImageRgba8(rgba)
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
+        check(&png)?;
         return Ok(Pending {
             name: "pasted image.png".into(),
             mime: "image/png".into(),
