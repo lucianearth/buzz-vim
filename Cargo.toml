@@ -2,6 +2,8 @@
 name = "buzz-vim"
 version = "0.1.0"
 edition = "2024"
+description = "A keyboard-first, vim-style terminal client for Buzz"
+repository = "https://github.com/lucianearth/buzz-vim"
 
 [dependencies]
 anyhow = "1.0.104"

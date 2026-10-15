@@ -7,13 +7,13 @@ that always ask first.
 ## Install
 
 ```sh
-CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --locked --force --git https://buzz.gitcoin.co/git/f020f0378f36ade38acadcce6c024b4c1bb77f05d607213f2b7674a1a4817da3/buzz-vim.git
+cargo install --locked --force --git https://github.com/lucianearth/buzz-vim
 buzz-vim login   # once: relay (default wss://buzz.gitcoin.co) and your nsec
 buzz-vim
 ```
 
-`--force` reinstalls even when the version number has not changed. `CARGO_NET_GIT_FETCH_WITH_CLI` makes cargo fetch with your own git, so the Buzz git auth (the git nostr
-plugin) works. cargo's built-in git client can't authenticate to Buzz.
+`--force` reinstalls even when the version number has not changed. It needs a Rust toolchain
+([rustup](https://rustup.rs)); `rust-toolchain.toml` picks the version.
 
 Your nsec is in Buzz Desktop under Settings → Profile → Private key. `login` saves it to
 `buzz-vim/config.json` in your config dir (`~/Library/Application Support` on macOS), readable only by you.
