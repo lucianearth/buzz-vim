@@ -37,8 +37,14 @@ pub struct Row {
     pub name: String,
     pub busy: bool,
     pub online: bool,
-    pub status: String,
     pub recent: Vec<String>,
+    pub channel: Option<String>,
+    pub thread: Option<String>,
+    /// Seconds into the current turn.
+    pub secs: Option<u64>,
+    pub last_turn: Option<String>,
+    /// Tail of what the agent is saying or thinking right now.
+    pub thought: String,
 }
 
 impl Agent {
@@ -219,32 +225,6 @@ impl Agents {
             .filter(|(_, a)| a.owned)
             .filter_map(|(pk, a)| {
                 let busy = a.is_busy();
-                let mut status = if busy {
-                    let secs = a.turn_started.map_or(0, |t| t.elapsed().as_secs());
-                    let thought = a
-                        .thought
-                        .split_whitespace()
-                        .rev()
-                        .take(8)
-                        .collect::<Vec<_>>();
-                    let tail = thought.into_iter().rev().collect::<Vec<_>>().join(" ");
-                    if tail.is_empty() {
-                        format!("working {secs}s")
-                    } else {
-                        format!("{secs}s · {tail}")
-                    }
-                } else if let Some(m) = &a.last_turn {
-                    m.clone()
-                } else if a.online {
-                    "idle".into()
-                } else {
-                    "offline".into()
-                };
-                if let Some(ch) = a.channel.as_ref().and_then(|c| store.channels.get(c)) {
-                    if busy {
-                        status = format!("#{} · {status}", ch.name);
-                    }
-                }
                 // Offline agents stay off the list; you only see who can answer.
                 if !a.online && !busy {
                     return None;
@@ -253,8 +233,20 @@ impl Agents {
                     name: a.display_name(pk, store),
                     busy,
                     online: true,
-                    status,
                     recent: a.recent.clone(),
+                    channel: a.channel.clone(),
+                    thread: a.thread.clone().filter(|_| busy),
+                    secs: a
+                        .turn_started
+                        .filter(|_| busy)
+                        .map(|t| t.elapsed().as_secs()),
+                    last_turn: a.last_turn.clone(),
+                    thought: if busy {
+                        let w: Vec<&str> = a.thought.split_whitespace().collect();
+                        w[w.len().saturating_sub(16)..].join(" ")
+                    } else {
+                        String::new()
+                    },
                 })
             })
             .collect();
@@ -285,7 +277,7 @@ mod tests {
         ag.frame("a1", &json!({"kind": "turn_liveness", "channelId": "c", "payload": {"threadRootEventId": "t1"}}));
         assert_eq!(ag.working(&s, "c", Some("t1")), vec!["bot"]);
         assert_eq!(r.recent[0], "Bash: cargo test");
-        assert!(r.status.ends_with("checking the gate"), "{}", r.status);
+        assert!(r.thought.ends_with("checking the gate"), "{}", r.thought);
         ag.frame("a1", &json!({"kind": "turn_completed", "payload": {}}));
         ag.metric(
             "a1",
@@ -295,7 +287,10 @@ mod tests {
         assert!(ag.working(&s, "c", None).is_empty());
         let r = &ag.rows(&s)[0];
         assert!(!r.busy);
-        assert_eq!(r.status, "last turn 12k tok $0.50 · opus");
+        assert_eq!(
+            r.last_turn.as_deref(),
+            Some("last turn 12k tok $0.50 · opus")
+        );
         // Offline, or not one of yours: not listed.
         ag.presence("a1", "offline");
         ag.presence("x9", "online");

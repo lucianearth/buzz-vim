@@ -39,11 +39,20 @@ pub fn tab_active() -> Style {
 pub fn tab_idle() -> Style {
     Style::new().fg(gray(15)).bg(gray(4))
 }
+/// Key hints read as inverted chips.
 pub fn key() -> Style {
     Style::new()
-        .fg(gray(23))
-        .bg(gray(5))
+        .fg(gray(1))
+        .bg(gray(17))
         .add_modifier(Modifier::BOLD)
+}
+/// Message and agent cards sit a step above the canvas; the selected
+/// one a step more.
+pub fn card() -> Style {
+    Style::new().bg(gray(2))
+}
+pub fn card_selected() -> Style {
+    Style::new().bg(gray(4))
 }
 pub fn mention() -> Style {
     Style::new()

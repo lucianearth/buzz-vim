@@ -25,11 +25,13 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
 
 - `i` write, `Esc` back to normal, `⏎` send, `⇧⏎` (or `⌥⏎`, `^j`) new line
 - `j` `k` move, `1`–`9` jump to a tab, `H` `L` or `⇥` cycle tabs
-- `⏎` open a thread, `r` reply in it, `+` 👍 the selected message
+- `⏎` open a thread, `r` reply in it, `+` 👍 the selected message; `h`, `←` or `Esc` goes back
+- `a` the agents screen: who is working, where, and their last tool calls. The header shows who is working
+  from anywhere, and a thread shows `taskbot thinking` while an agent answers in it
 - `s` pick which sections become tabs, `R` reload them from the relay
 - `^v` paste an image or file from the clipboard; dropping a file does the same. Either way a box shows what it
   found and where it goes (`<relay>/upload`), and nothing uploads until you press `y`.
-- `t` show or hide the agents pane, `o` open the selected image full screen (`←` `→` page through the images, `Esc` closes), `q` quit
+- `o` open the selected image full screen (`←` `→` page through the images, `Esc` closes), `q` quit
 
 ## Development
 

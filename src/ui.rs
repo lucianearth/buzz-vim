@@ -36,22 +36,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     .areas(area);
     draw_tabs(f, app, top);
 
-    let agents_w = if app.show_agents && body.width >= 100 {
-        34
-    } else {
-        0
-    };
-    let [main, agents] =
-        Layout::horizontal([Constraint::Min(20), Constraint::Length(agents_w)]).areas(body);
-    // A thread takes over the main pane; h, ← or Esc goes back up.
+    // Threads and the agents view take over the main pane; h, ← or Esc
+    // goes back up.
+    let main = body;
     let mut images = vec![];
-    if app.thread.is_some() {
+    if app.agents_view {
+        draw_agents(f, app, main);
+    } else if app.thread.is_some() {
         draw_thread(f, app, main, &mut images);
     } else {
         draw_timeline(f, app, main, &mut images);
-    }
-    if agents_w > 0 {
-        draw_agents(f, app, agents);
     }
     draw_compose(f, app, compose);
     draw_footer(f, app, foot);
@@ -95,30 +89,77 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
         },
     );
     x += logo.width() as u16 + 1;
+    let busy: Vec<String> = app
+        .agents
+        .rows(&app.store)
+        .into_iter()
+        .filter(|r| r.busy)
+        .map(|r| r.name)
+        .collect();
+    let msgs = app
+        .current()
+        .and_then(|c| app.store.channels.get(c))
+        .map_or(0, |c| c.messages.len());
     let right = match app.conn {
-        ConnState::Online => " ● live ".to_string(),
+        ConnState::Online => format!("{msgs} msgs  ● live "),
         ConnState::Connecting => format!(" {} connecting ", art::flight(app.tick, 3).trim()),
         ConnState::Offline => " ○ offline, retrying ".to_string(),
     };
-    let right_w = right.width() as u16 + 1;
+    let busy_w = if busy.is_empty() {
+        0
+    } else {
+        busy.join(", ").width() as u16 + 13
+    };
+    let right_w = right.width() as u16 + 1 + busy_w;
     let limit = area.x + area.width.saturating_sub(right_w);
-    for (i, id) in app.tabs.clone().iter().enumerate() {
-        let ch = app.store.channels.get(id);
-        let name = ch.map(channel_label).unwrap_or_else(|| "…".into());
-        let unread = ch.map_or(0, |c| c.unread);
-        let dot = if unread > 0 { "•" } else { "" };
-        // One-cell spinner so the tab bar never shifts while it turns.
-        let dot = if app.agents.working(&app.store, id, None).is_empty() {
-            dot.to_string()
-        } else {
-            const SPIN: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
-            format!("{dot} {}", SPIN[app.tick as usize % SPIN.len()])
-        };
-        let label = if i < 9 {
-            format!(" {} {name}{dot} ", i + 1)
-        } else {
-            format!(" {name}{dot} ")
-        };
+    let labels: Vec<(String, usize)> = app
+        .tabs
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            let ch = app.store.channels.get(id);
+            let name = ch.map(channel_label).unwrap_or_else(|| "…".into());
+            let unread = ch.map_or(0, |c| c.unread);
+            let dot = if unread > 0 { "•" } else { "" };
+            // One-cell spinner so the tab bar never shifts while it turns.
+            let dot = if app.agents.working(&app.store, id, None).is_empty() {
+                dot.to_string()
+            } else {
+                format!("{dot} {}", SPIN[app.tick as usize % SPIN.len()])
+            };
+            let label = if i < 9 {
+                format!(" {} {name}{dot} ", i + 1)
+            } else {
+                format!(" {name}{dot} ")
+            };
+            (label, unread)
+        })
+        .collect();
+    // Scroll the tab strip so the active tab is always on screen.
+    let room = limit.saturating_sub(x) as usize;
+    let mut start = 0;
+    while start < app.active
+        && labels[start..=app.active.min(labels.len().saturating_sub(1))]
+            .iter()
+            .map(|(l, _)| l.width() + 1)
+            .sum::<usize>()
+            + 2
+            > room
+    {
+        start += 1;
+    }
+    if start > 0 {
+        f.render_widget(
+            Paragraph::new(Span::styled("…", theme::muted())),
+            Rect {
+                x,
+                width: 1,
+                ..area
+            },
+        );
+        x += 2;
+    }
+    for (i, (label, unread)) in labels.into_iter().enumerate().skip(start) {
         let w = label.width() as u16;
         if x + w > limit {
             f.render_widget(
@@ -159,12 +200,35 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(
         Paragraph::new(Span::styled(right, style)).right_aligned(),
         Rect {
-            x: limit,
-            width: area.width.saturating_sub(limit - area.x),
+            x: limit + busy_w,
+            width: area.width.saturating_sub(limit + busy_w - area.x),
             ..area
         },
     );
+    // Who is working, just left of the count. Drawn over the tab row's
+    // tail only when there is room.
+    if !busy.is_empty() {
+        let w = format!(
+            "{} {} working   ",
+            SPIN[app.tick as usize % SPIN.len()],
+            busy.join(", ")
+        );
+        let ww = w.width() as u16;
+        if busy_w >= ww {
+            f.render_widget(
+                Paragraph::new(Span::styled(w, theme::bright())),
+                Rect {
+                    x: limit + busy_w - ww,
+                    width: ww,
+                    ..area
+                },
+            );
+        }
+    }
 }
+
+/// One-cell braille spinner.
+const SPIN: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 pub fn channel_label(c: &Channel) -> String {
     let n = if c.name.is_empty() {
@@ -236,7 +300,7 @@ fn message_block(
     let bar = if selected {
         Span::styled("▌", theme::bright())
     } else {
-        Span::raw(" ")
+        Span::styled("▎", theme::rule())
     };
     let author = app.store.name_of(&m.author);
     let is_agent = app
@@ -436,6 +500,23 @@ fn draw_blocks(
             height: visible as u16,
         };
         let lines: Vec<Line> = b.lines.into_iter().skip(skip).take(visible).collect();
+        // Shade the card, leaving its trailing spacer row as canvas.
+        let card = Rect {
+            height: if skip + visible == bh {
+                rect.height.saturating_sub(1)
+            } else {
+                rect.height
+            },
+            ..rect
+        };
+        f.render_widget(
+            Block::new().style(if cursor == Some(b.id.as_str()) {
+                theme::card_selected()
+            } else {
+                theme::card()
+            }),
+            card,
+        );
         f.render_widget(Paragraph::new(lines), rect);
         app.hits.push((rect, Hit::Message(pane, b.id.clone())));
         if let Some((off, rows, url, cols)) = b.image {
@@ -459,21 +540,6 @@ fn draw_blocks(
     }
 }
 
-fn pane_title(f: &mut Frame, area: Rect, title: String, hint: &str, focused: bool) -> Rect {
-    let style = if focused {
-        theme::bright()
-    } else {
-        theme::muted()
-    };
-    let [t, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
-    let line = Line::from(vec![
-        Span::styled(format!(" {title}"), style),
-        Span::styled(format!("  {hint}"), theme::faint()),
-    ]);
-    f.render_widget(Paragraph::new(line), t);
-    rest
-}
-
 fn draw_timeline(
     f: &mut Frame,
     app: &mut App,
@@ -485,18 +551,12 @@ fn draw_timeline(
         return;
     };
     let focused = app.focus == Pane::Timeline;
-    let (title, hint) = match app.store.channels.get(&id) {
-        Some(c) => (
-            channel_label(c),
-            c.about.lines().next().unwrap_or("").to_string(),
-        ),
-        None => ("…".into(), String::new()),
+    // No title row: the tab says which channel, the header who's working.
+    let area = Rect {
+        y: area.y + 1,
+        height: area.height.saturating_sub(1),
+        ..area
     };
-    let title = match thinking_label(app, &app.agents.working(&app.store, &id, None)) {
-        Some(w) => format!("{title}  · {w}"),
-        None => title,
-    };
-    let area = pane_title(f, area, title, &hint, focused);
     let Some(ch) = app.store.channels.get(&id) else {
         return;
     };
@@ -546,7 +606,10 @@ fn draw_thread(
     let Some(label) = app.store.channels.get(&ch_id).map(channel_label) else {
         return;
     };
-    let area = thread_header(f, app, area, &label);
+    let working = app.thread.as_ref().and_then(|(ch, root)| {
+        thinking_label(app, &app.agents.working(&app.store, ch, Some(root)))
+    });
+    let area = breadcrumb(f, app, area, &label, "thread", working);
     let Some(ch) = app.store.channels.get(&ch_id) else {
         return;
     };
@@ -583,31 +646,35 @@ fn draw_thread(
     );
 }
 
-/// Breadcrumb for a thread that has taken over the main pane:
+/// Breadcrumb for a view that has taken over the main pane:
 /// `‹ #channel › thread`, the back arrow clickable, and a rule under it.
-fn thread_header(f: &mut Frame, app: &mut App, area: Rect, channel: &str) -> Rect {
+fn breadcrumb(
+    f: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    channel: &str,
+    leaf: &str,
+    extra: Option<String>,
+) -> Rect {
     let [t, rule, rest] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(0),
     ])
     .areas(area);
-    let line = Line::from(vec![
+    let mut line = Line::from(vec![
         Span::styled(" ‹ ", theme::key()),
-        Span::styled(channel.to_string(), theme::muted()),
+        Span::styled(format!(" {channel}"), theme::muted()),
         Span::styled("  ›  ", theme::faint()),
-        Span::styled("thread", theme::bright()),
+        Span::styled(leaf.to_string(), theme::bright()),
         Span::styled("    h ← esc back", theme::faint()),
     ]);
-    let mut line = line;
-    if let Some((ch, root)) = &app.thread {
-        if let Some(w) = thinking_label(app, &app.agents.working(&app.store, ch, Some(root))) {
-            line.push_span(Span::styled(format!("    {w}"), theme::bright()));
-        }
+    if let Some(w) = extra {
+        line.push_span(Span::styled(format!("    {w}"), theme::bright()));
     }
     f.render_widget(Paragraph::new(line), t);
     let back = Rect {
-        width: (3 + channel.chars().count() as u16).min(t.width),
+        width: (4 + channel.chars().count() as u16).min(t.width),
         ..t
     };
     app.hits.push((back, Hit::CloseThread));
@@ -642,57 +709,153 @@ fn draw_empty(f: &mut Frame, app: &App, area: Rect, msg: &str) {
 
 // ---------- agents ----------
 
+/// Full-screen agents view (`a`): one card per online agent. Working
+/// agents are bright with a chip and spinner; idle ones fade back.
 fn draw_agents(f: &mut Frame, app: &mut App, area: Rect) {
-    let [rule, area] = Layout::horizontal([Constraint::Length(1), Constraint::Min(0)]).areas(area);
-    f.render_widget(
-        Block::new()
-            .borders(Borders::LEFT)
-            .border_style(theme::rule()),
-        rule,
-    );
-    let mut lines = vec![Line::from(vec![
-        Span::styled(" agents", theme::bright()),
-        Span::styled("  t hides", theme::faint()),
-    ])];
+    let label = app
+        .current()
+        .and_then(|c| app.store.channels.get(c))
+        .map(channel_label)
+        .unwrap_or_default();
+    let area = breadcrumb(f, app, area, &label, "agents", None);
     let rows = app.agents.rows(&app.store);
     if rows.is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            "  none of your agents are online",
-            theme::faint(),
-        ));
+        draw_empty(f, app, area, "none of your agents are online");
+        return;
     }
-    let w = area.width.saturating_sub(4) as usize;
+    // Tool calls go in a right-hand column when there is room.
+    let split = area.width >= 90;
+    let right_w = if split { area.width / 3 } else { 0 };
+    let left_w = area.width.saturating_sub(right_w + 3) as usize;
+    let mut y = area.y + 1;
     for r in rows {
-        lines.push(Line::raw(""));
-        let (dot, st) = if r.busy {
-            (
-                art::THINK[(app.tick as usize / 2) % art::THINK.len()].to_string(),
-                theme::bright(),
-            )
-        } else if r.online {
-            ("●".to_string(), theme::text())
+        let edge = if r.busy {
+            Span::styled("▌", theme::bright())
         } else {
-            ("○".to_string(), theme::faint())
+            Span::styled("▎", theme::rule())
         };
-        lines.push(Line::from(vec![
+        let name_style = if r.busy {
+            theme::bright()
+        } else {
+            theme::muted().add_modifier(Modifier::BOLD)
+        };
+        let mut head = vec![
+            edge.clone(),
             Span::raw(" "),
-            Span::styled(dot, st),
-            Span::raw(" "),
-            Span::styled(r.name.clone(), theme::bright()),
-        ]));
-        lines.push(Line::styled(
-            format!("   {}", clip(&r.status, w)),
-            theme::muted(),
-        ));
-        for a in r.recent.iter().take(4) {
-            lines.push(Line::styled(
-                format!("   ▸ {}", clip(a, w.saturating_sub(2))),
-                theme::faint(),
+            Span::styled(r.name.clone(), name_style),
+            Span::raw("  "),
+        ];
+        if r.busy {
+            head.push(Span::styled(" WORKING ", theme::badge()));
+            head.push(Span::styled(
+                format!(" {}", SPIN[app.tick as usize % SPIN.len()]),
+                theme::bright(),
             ));
+        } else {
+            head.push(Span::styled("[ IDLE ]", theme::faint()));
         }
+        let mut left = vec![Line::from(head)];
+        let mut place = vec![];
+        if let Some(s) = r.secs {
+            place.push(format!("{s}s"));
+        }
+        if let Some(ch) = r.channel.as_ref().and_then(|c| app.store.channels.get(c)) {
+            let mut p = channel_label(ch);
+            if let Some(m) = r
+                .thread
+                .as_ref()
+                .and_then(|t| app.store.find_message(t))
+                .map(|(_, m)| m)
+            {
+                let first = m.content.lines().next().unwrap_or("");
+                p.push_str(&format!(" › thread: {first}"));
+            }
+            place.push(p);
+        }
+        if place.is_empty() {
+            place.push("idle".into());
+        }
+        left.push(Line::from(vec![
+            edge.clone(),
+            Span::raw(" "),
+            Span::styled(
+                clip(&place.join(" · "), left_w),
+                if r.busy {
+                    theme::text()
+                } else {
+                    theme::faint()
+                },
+            ),
+        ]));
+        if !r.thought.is_empty() {
+            left.push(Line::from(vec![
+                edge.clone(),
+                Span::raw(" "),
+                Span::styled(clip(&r.thought, left_w), theme::muted()),
+            ]));
+        }
+        let mut right: Vec<Line> = r
+            .recent
+            .iter()
+            .take(3)
+            .map(|a| {
+                Line::styled(
+                    format!(
+                        "▸ {}",
+                        clip(a, (right_w as usize).max(left_w).saturating_sub(4))
+                    ),
+                    if r.busy {
+                        theme::text()
+                    } else {
+                        theme::faint()
+                    },
+                )
+            })
+            .collect();
+        if let Some(t) = &r.last_turn {
+            right.push(Line::styled(t.clone(), theme::faint()));
+        }
+        if !split {
+            for l in right.drain(..) {
+                let mut spans = vec![edge.clone(), Span::raw(" ")];
+                spans.extend(l.spans);
+                left.push(Line::from(spans));
+            }
+        }
+        while left.len() < right.len() {
+            left.push(Line::from(edge.clone()));
+        }
+        let h = left.len() as u16;
+        if y + h > area.bottom() {
+            break;
+        }
+        let card = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: h,
+        };
+        f.render_widget(
+            Block::new().style(if r.busy {
+                theme::card_selected()
+            } else {
+                theme::card()
+            }),
+            card,
+        );
+        f.render_widget(Paragraph::new(left), card);
+        if split {
+            f.render_widget(
+                Paragraph::new(right),
+                Rect {
+                    x: area.right().saturating_sub(right_w),
+                    width: right_w,
+                    ..card
+                },
+            );
+        }
+        y += h + 1;
     }
-    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn clip(s: &str, w: usize) -> String {
@@ -1396,6 +1559,22 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>
 #[cfg(test)]
 mod tests {
     #[test]
+    fn active_tab_stays_visible() {
+        let mut app = App::new("me".into(), None);
+        for i in 0..8 {
+            let c = app.store.channel_mut(&format!("c{i}"));
+            c.name = format!("a-fairly-long-channel-{i}");
+        }
+        app.tabs = (0..8).map(|i| format!("c{i}")).collect();
+        app.active = 6;
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 10)).unwrap();
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let top: String = (0..90).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(top.contains("channel-6"), "{top}");
+    }
+
+    #[test]
     fn thinking_shows_on_thread_and_channel() {
         use nostr::{EventBuilder, Keys, Kind, Tag};
         let k = Keys::generate();
@@ -1436,10 +1615,7 @@ mod tests {
         let rows = screen(&mut app);
         let replies = rows.iter().find(|r| r.contains("↳ 1 reply")).unwrap();
         assert!(replies.contains("taskbot thinking"), "{rows:#?}");
-        assert!(
-            rows[1].contains("taskbot thinking"),
-            "channel title: {rows:#?}"
-        );
+        assert!(rows[0].contains("taskbot working"), "header: {rows:#?}");
         app.thread = Some(("c1".into(), rid));
         let rows = screen(&mut app);
         assert!(

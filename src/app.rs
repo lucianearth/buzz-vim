@@ -88,7 +88,8 @@ pub struct App {
     pub status: Option<(String, Instant)>,
     pub sent_flash: Option<(usize, Instant)>,
     pub tick: u64,
-    pub show_agents: bool,
+    /// The full-screen agents view (`a`).
+    pub agents_view: bool,
     pub agents: Agents,
     pub media: Media,
     pub picker: Option<Picker>,
@@ -131,7 +132,7 @@ impl App {
             status: None,
             sent_flash: None,
             tick: 0,
-            show_agents: true,
+            agents_view: false,
             agents: Agents::default(),
             media: Media::default(),
             picker,
@@ -638,12 +639,16 @@ impl App {
                 }
             }
             KeyCode::Char('r') => self.open_thread(true),
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc if self.agents_view => {
+                self.agents_view = false;
+            }
             KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => {
                 if self.thread.is_some() {
                     self.close_thread();
                 }
             }
-            KeyCode::Char('i') | KeyCode::Char('a') => self.mode = Mode::Insert,
+            KeyCode::Char('i') => self.mode = Mode::Insert,
+            KeyCode::Char('a') => self.agents_view = !self.agents_view,
             KeyCode::Char('+') => self.thumbs_up(),
             KeyCode::Char('s') => {
                 self.picker_marks = self.chosen.iter().cloned().collect();
@@ -651,7 +656,6 @@ impl App {
                 self.mode = Mode::Sections;
             }
             KeyCode::Char('R') => self.actions.push(Action::ReloadSections),
-            KeyCode::Char('t') => self.show_agents = !self.show_agents,
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('o') => self.open_viewer(),
             _ => {}
@@ -834,6 +838,7 @@ impl App {
                 }
                 Some(Hit::ConfirmYes) => self.on_key(KeyEvent::from(KeyCode::Char('y'))),
                 Some(Hit::ConfirmNo) => self.on_key(KeyEvent::from(KeyCode::Char('n'))),
+                Some(Hit::CloseThread) if self.agents_view => self.agents_view = false,
                 Some(Hit::CloseThread) => self.close_thread(),
                 None => {}
             },
