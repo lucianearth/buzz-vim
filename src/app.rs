@@ -149,7 +149,7 @@ impl App {
     pub fn animating(&self) -> bool {
         self.uploading
             || self.conn != ConnState::Online
-            || self.agents.by_pubkey.values().any(|a| a.busy)
+            || self.agents.by_pubkey.values().any(|a| a.is_busy())
             || self
                 .sent_flash
                 .is_some_and(|(_, t)| t.elapsed().as_millis() < 1600)

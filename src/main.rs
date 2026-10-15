@@ -84,12 +84,18 @@ fn main() -> Result<()> {
         ratatui_hook(info);
     }));
     // Terminals that speak the kitty keyboard protocol (iTerm2, kitty,
-    // WezTerm, Ghostty) can then tell Shift+Enter apart from Enter. Others
+    // WezTerm, Ghostty) can then tell Shift+Enter apart from Enter. That
+    // takes reporting every key: with less, Enter keeps its legacy byte
+    // whatever the modifiers. Alternate keys turn Shift+a back into 'A'. Others
     // ignore the request. Probing first costs a stdin round-trip that can
     // leave the terminal cooked, so just ask.
     let _ = execute!(
         std::io::stdout(),
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        )
     );
     let res = execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)
         .map_err(anyhow::Error::from)

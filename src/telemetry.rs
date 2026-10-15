@@ -17,6 +17,9 @@ pub struct Agent {
     pub busy: bool,
     pub online: bool,
     pub channel: Option<String>,
+    /// Root of the thread the current turn answers (the triggering message
+    /// when it was top-level).
+    pub thread: Option<String>,
     pub turn_started: Option<Instant>,
     /// newest first
     pub recent: Vec<String>,
@@ -36,6 +39,24 @@ pub struct Row {
     pub online: bool,
     pub status: String,
     pub recent: Vec<String>,
+}
+
+impl Agent {
+    /// A busy flag with no news for 15 minutes is a lost turn_completed.
+    pub fn is_busy(&self) -> bool {
+        self.busy
+            && self
+                .last_seen
+                .is_some_and(|t| t.elapsed() <= Duration::from_secs(900))
+    }
+
+    fn display_name(&self, pk: &str, store: &Store) -> String {
+        match store.profiles.get(pk) {
+            Some(p) if !p.name.is_empty() => p.name.clone(),
+            _ if !self.name.is_empty() => self.name.clone(),
+            _ => store.name_of(pk),
+        }
+    }
 }
 
 fn push_recent(a: &mut Agent, s: String) {
@@ -82,10 +103,28 @@ impl Agents {
                 a.busy = true;
                 a.turn_started = Some(Instant::now());
                 a.thought.clear();
+                a.thread = frame
+                    .pointer("/payload/threadRootEventId")
+                    .or_else(|| frame.pointer("/payload/triggeringEventIds/0"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 push_recent(a, "turn started".into());
+            }
+            // Ticks while a turn runs: catches turns that began before we
+            // connected.
+            "turn_liveness" => {
+                a.busy = true;
+                a.turn_started.get_or_insert_with(Instant::now);
+                if let Some(r) = frame
+                    .pointer("/payload/threadRootEventId")
+                    .and_then(Value::as_str)
+                {
+                    a.thread = Some(r.to_string());
+                }
             }
             "turn_completed" => {
                 a.busy = false;
+                a.thread = None;
                 let took = a
                     .turn_started
                     .take()
@@ -95,6 +134,7 @@ impl Agents {
             }
             "turn_error" | "agent_panic" => {
                 a.busy = false;
+                a.thread = None;
                 let msg = frame
                     .pointer("/payload/error")
                     .and_then(Value::as_str)
@@ -159,17 +199,26 @@ impl Agents {
         self.known(agent).online = status == "online" || status == "away";
     }
 
+    /// Agents mid-turn in `channel`, and in thread `root` if given.
+    pub fn working(&self, store: &Store, channel: &str, root: Option<&str>) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .by_pubkey
+            .iter()
+            .filter(|(_, a)| a.is_busy() && a.channel.as_deref() == Some(channel))
+            .filter(|(_, a)| root.is_none_or(|r| a.thread.as_deref() == Some(r)))
+            .map(|(pk, a)| a.display_name(pk, store))
+            .collect();
+        names.sort();
+        names
+    }
+
     pub fn rows(&self, store: &Store) -> Vec<Row> {
         let mut rows: Vec<Row> = self
             .by_pubkey
             .iter()
             .filter(|(_, a)| a.owned)
             .filter_map(|(pk, a)| {
-                // A busy flag with no news for 15 minutes is a lost turn_completed.
-                let stale = a
-                    .last_seen
-                    .is_none_or(|t| t.elapsed() > Duration::from_secs(900));
-                let busy = a.busy && !stale;
+                let busy = a.is_busy();
                 let mut status = if busy {
                     let secs = a.turn_started.map_or(0, |t| t.elapsed().as_secs());
                     let thought = a
@@ -200,13 +249,8 @@ impl Agents {
                 if !a.online && !busy {
                     return None;
                 }
-                let name = match store.profiles.get(pk.as_str()) {
-                    Some(p) if !p.name.is_empty() => p.name.clone(),
-                    _ if !a.name.is_empty() => a.name.clone(),
-                    _ => store.name_of(pk),
-                };
                 Some(Row {
-                    name,
+                    name: a.display_name(pk, store),
                     busy,
                     online: true,
                     status,
@@ -236,6 +280,10 @@ mod tests {
         let s = Store::new("me".into());
         let r = &ag.rows(&s)[0];
         assert!(r.busy);
+        assert_eq!(ag.working(&s, "c", None), vec!["bot"]);
+        assert!(ag.working(&s, "c", Some("t1")).is_empty());
+        ag.frame("a1", &json!({"kind": "turn_liveness", "channelId": "c", "payload": {"threadRootEventId": "t1"}}));
+        assert_eq!(ag.working(&s, "c", Some("t1")), vec!["bot"]);
         assert_eq!(r.recent[0], "Bash: cargo test");
         assert!(r.status.ends_with("checking the gate"), "{}", r.status);
         ag.frame("a1", &json!({"kind": "turn_completed", "payload": {}}));
@@ -244,6 +292,7 @@ mod tests {
             &json!({"model": "opus", "turn": {"totalTokens": 12400, "costUsd": 0.5}}),
         );
         ag.presence("a1", "online");
+        assert!(ag.working(&s, "c", None).is_empty());
         let r = &ag.rows(&s)[0];
         assert!(!r.busy);
         assert_eq!(r.status, "last turn 12k tok $0.50 · opus");

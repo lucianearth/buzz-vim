@@ -107,6 +107,13 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
         let name = ch.map(channel_label).unwrap_or_else(|| "…".into());
         let unread = ch.map_or(0, |c| c.unread);
         let dot = if unread > 0 { "•" } else { "" };
+        // One-cell spinner so the tab bar never shifts while it turns.
+        let dot = if app.agents.working(&app.store, id, None).is_empty() {
+            dot.to_string()
+        } else {
+            const SPIN: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+            format!("{dot} {}", SPIN[app.tick as usize % SPIN.len()])
+        };
         let label = if i < 9 {
             format!(" {} {name}{dot} ", i + 1)
         } else {
@@ -208,6 +215,15 @@ where
     }
 }
 
+/// "taskbot thinking ( ·.·)" for whoever is mid-turn, or None.
+fn thinking_label(app: &App, names: &[String]) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    let face = art::THINK[(app.tick as usize / 2) % art::THINK.len()];
+    Some(format!("{} thinking {face}", names.join(", ")))
+}
+
 fn message_block(
     app: &App,
     ch: &Channel,
@@ -236,6 +252,18 @@ fn message_block(
         format!("  {}", time_label(m.created_at)),
         theme::faint(),
     ));
+    // Agents answering this message: on the replies line when it has one,
+    // else here, so a reply arriving doesn't shift anything twice.
+    let working = if show_replies {
+        thinking_label(app, &app.agents.working(&app.store, &ch.id, Some(&m.id)))
+    } else {
+        None
+    };
+    if ch.reply_count(&m.id) == 0 {
+        if let Some(w) = &working {
+            head.push(Span::styled(format!("  · {w}"), theme::bright()));
+        }
+    }
     if m.edited {
         head.push(Span::styled("  (edited)", theme::faint()));
     }
@@ -348,6 +376,10 @@ fn message_block(
                     theme::text().add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(when, theme::faint()),
+                Span::styled(
+                    working.map(|w| format!("  · {w}")).unwrap_or_default(),
+                    theme::bright(),
+                ),
             ]));
         }
     }
@@ -460,6 +492,10 @@ fn draw_timeline(
         ),
         None => ("…".into(), String::new()),
     };
+    let title = match thinking_label(app, &app.agents.working(&app.store, &id, None)) {
+        Some(w) => format!("{title}  · {w}"),
+        None => title,
+    };
     let area = pane_title(f, area, title, &hint, focused);
     let Some(ch) = app.store.channels.get(&id) else {
         return;
@@ -563,6 +599,12 @@ fn thread_header(f: &mut Frame, app: &mut App, area: Rect, channel: &str) -> Rec
         Span::styled("thread", theme::bright()),
         Span::styled("    h ← esc back", theme::faint()),
     ]);
+    let mut line = line;
+    if let Some((ch, root)) = &app.thread {
+        if let Some(w) = thinking_label(app, &app.agents.working(&app.store, ch, Some(root))) {
+            line.push_span(Span::styled(format!("    {w}"), theme::bright()));
+        }
+    }
     f.render_widget(Paragraph::new(line), t);
     let back = Rect {
         width: (3 + channel.chars().count() as u16).min(t.width),
@@ -1353,6 +1395,59 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn thinking_shows_on_thread_and_channel() {
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let k = Keys::generate();
+        let mut app = App::new(k.public_key().to_hex(), None);
+        let ev = |content: &str, tags: Vec<Vec<&str>>| {
+            EventBuilder::new(Kind::Custom(9), content)
+                .tags(tags.into_iter().map(|t| Tag::parse(t).unwrap()))
+                .sign_with_keys(&k)
+                .unwrap()
+        };
+        let root = ev("long question", vec![vec!["h", "c1"]]);
+        let rid = root.id.to_hex();
+        app.store.apply(&root);
+        app.store.apply(&ev(
+            "answer",
+            vec![vec!["h", "c1"], vec!["e", &rid, "", "reply"]],
+        ));
+        app.tabs = vec!["c1".into()];
+        app.agents.own("ag", "taskbot");
+        app.agents.frame(
+            "ag",
+            &serde_json::json!({"kind": "turn_started", "channelId": "c1",
+                "payload": {"threadRootEventId": rid}}),
+        );
+        let screen = |app: &mut App| {
+            let mut t =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+            t.draw(|f| draw(f, app)).unwrap();
+            let buf = t.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let rows = screen(&mut app);
+        let replies = rows.iter().find(|r| r.contains("↳ 1 reply")).unwrap();
+        assert!(replies.contains("taskbot thinking"), "{rows:#?}");
+        assert!(
+            rows[1].contains("taskbot thinking"),
+            "channel title: {rows:#?}"
+        );
+        app.thread = Some(("c1".into(), rid));
+        let rows = screen(&mut app);
+        assert!(
+            rows[1].contains("taskbot thinking"),
+            "thread header: {rows:#?}"
+        );
+    }
+
     #[test]
     fn relative_times() {
         use chrono::{TimeZone, Utc};
