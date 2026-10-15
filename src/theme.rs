@@ -3,9 +3,9 @@
 //! dim. There is a dark and a light ramp; which one follows the Mac's
 //! appearance (see `watch`).
 //!
-//! Palettes tint the ramp with soft pastels, one hue per role, and keep each
-//! step's luminance exactly. Under a grayscale filter every palette looks the
-//! same as plain gray.
+//! In color mode every role and every person, channel and key chip gets
+//! its own hue, all at the luminance of the gray step they replace. Under a
+//! grayscale filter the screen looks exactly like plain gray.
 
 use ratatui::style::{Color, Modifier, Style};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -14,12 +14,12 @@ use std::time::Duration;
 static LIGHT: AtomicBool = AtomicBool::new(false);
 static PALETTE: AtomicUsize = AtomicUsize::new(0);
 
-/// What a color is for. Each palette gives a role its own hue.
+/// What a color is for. Each role has its own hue.
 #[derive(Clone, Copy)]
 pub enum Role {
     /// Canvas, cards, rules, chip text.
     Surface,
-    /// Body text and names.
+    /// Body text.
     Text,
     /// Selected tab, key chips, badges, mentions.
     Accent,
@@ -29,53 +29,42 @@ pub enum Role {
     Code,
 }
 
-/// (name, [(hue in degrees, chroma)] per role in `Role` order). Chroma is
-/// OKLab; pastel stays low. Surfaces are the faintest so the canvas stays calm.
-pub const PALETTES: &[(&str, [(f32, f32); 5])] = &[
-    ("gray", [(0.0, 0.0); 5]),
-    (
-        "honey",
-        [
-            (75.0, 0.018),
-            (60.0, 0.035),
-            (300.0, 0.07),
-            (140.0, 0.04),
-            (230.0, 0.05),
-        ],
-    ),
-    (
-        "sea",
-        [
-            (240.0, 0.022),
-            (220.0, 0.03),
-            (35.0, 0.07),
-            (175.0, 0.04),
-            (290.0, 0.05),
-        ],
-    ),
-    (
-        "garden",
-        [
-            (150.0, 0.02),
-            (130.0, 0.03),
-            (0.0, 0.07),
-            (95.0, 0.045),
-            (260.0, 0.05),
-        ],
-    ),
+/// (hue in degrees, OKLab chroma) per role in `Role` order. Surfaces and
+/// body text stay faint so reading is calm; the rest carry color.
+const ROLES: [(f32, f32); 5] = [
+    (265.0, 0.016),
+    (80.0, 0.02),
+    (330.0, 0.12),
+    (200.0, 0.07),
+    (150.0, 0.11),
 ];
+
+/// Hues handed out to names, channels and chips, spread around the wheel.
+const WHEEL: [f32; 12] = [
+    0.0, 140.0, 260.0, 40.0, 180.0, 300.0, 80.0, 220.0, 340.0, 110.0, 20.0, 240.0,
+];
+
+/// Chroma for named things. Asked for high; `tint` shrinks it until the
+/// color fits sRGB at that luminance.
+const VIVID: f32 = 0.14;
+
+pub const PALETTES: &[&str] = &["color", "gray"];
+
+fn colored() -> bool {
+    palette() == 0
+}
 
 pub fn palette() -> usize {
     PALETTE.load(Ordering::Relaxed)
 }
 
 pub fn palette_name() -> &'static str {
-    PALETTES[palette()].0
+    PALETTES[palette()]
 }
 
 /// Select a palette by name; unknown names leave it alone.
 pub fn set_palette(name: &str) {
-    if let Some(i) = PALETTES.iter().position(|(n, _)| *n == name) {
+    if let Some(i) = PALETTES.iter().position(|n| *n == name) {
         PALETTE.store(i, Ordering::Relaxed);
     }
 }
@@ -83,6 +72,25 @@ pub fn set_palette(name: &str) {
 pub fn next_palette() -> &'static str {
     PALETTE.store((palette() + 1) % PALETTES.len(), Ordering::Relaxed);
     palette_name()
+}
+
+/// The `i`th hue on the wheel, for things in a row (chips, flowers).
+pub fn nth(i: usize) -> f32 {
+    WHEEL[i % WHEEL.len()]
+}
+
+/// A stable hue for a key (pubkey, channel id): the same person or channel
+/// always gets the same color.
+pub fn hue(key: &str) -> f32 {
+    let h = key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
+    });
+    nth(((h >> 40) % WHEEL.len() as u64) as usize)
+}
+
+/// Step `level` in `hue` at full color (gray when color is off).
+pub fn ink(hue: f32, level: u8) -> Color {
+    shade(hue, VIVID, level)
 }
 
 /// Step `level` (0 = canvas, 23 = strongest text) on the current ramp.
@@ -93,14 +101,18 @@ pub fn gray(level: u8) -> Color {
 
 /// Step `level` for `role`: the ramp's gray, tinted by the palette.
 pub fn tone(role: Role, level: u8) -> Color {
+    let (hue, chroma) = ROLES[role as usize];
+    shade(hue, chroma, level)
+}
+
+fn shade(hue: f32, chroma: f32, level: u8) -> Color {
     let l = level.min(23);
     let v = if LIGHT.load(Ordering::Relaxed) {
         250 - 10 * l
     } else {
         8 + 10 * l
     };
-    let (hue, chroma) = PALETTES[palette()].1[role as usize];
-    if chroma == 0.0 {
+    if chroma == 0.0 || !colored() {
         return Color::Rgb(v, v, v);
     }
     let [r, g, b] = tint(v, hue, chroma);
@@ -244,6 +256,20 @@ pub fn mention() -> Style {
         .fg(tone(Role::Accent, 23))
         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
 }
+/// A person's name in its own color. A few steps under the brightest
+/// text, where there is room in sRGB for the hue to show.
+pub fn name(key: &str) -> Style {
+    Style::new()
+        .fg(ink(hue(key), 18))
+        .add_modifier(Modifier::BOLD)
+}
+/// A chip (key hint, active tab) in `hue`.
+pub fn chip(hue: f32) -> Style {
+    Style::new()
+        .fg(gray(1))
+        .bg(ink(hue, 17))
+        .add_modifier(Modifier::BOLD)
+}
 pub fn code() -> Style {
     Style::new().fg(tone(Role::Code, 19)).bg(gray(2))
 }
@@ -259,10 +285,11 @@ mod tests {
     /// shows exactly the plain ramp (within rounding).
     #[test]
     fn palettes_match_the_gray_ramp() {
-        for &(name, roles) in PALETTES {
-            for v in (8..=238).step_by(10) {
+        let wheel = WHEEL.map(|h| (h, VIVID));
+        for (name, set) in [("roles", &ROLES[..]), ("wheel", &wheel[..])] {
+            for v in (8..=250).step_by(10) {
                 let y = lin(v as f32 / 255.0);
-                for (hue, chroma) in roles {
+                for &(hue, chroma) in set {
                     let c = tint(v as u8, hue, chroma);
                     let got = luma(c.map(|x| lin(x as f32 / 255.0)));
                     let gray_of = enc(got) * 255.0;

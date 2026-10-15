@@ -206,12 +206,13 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
             );
             break;
         }
+        let hue = theme::hue(&app.tabs[i]);
         let style = if i == app.active {
-            theme::tab_active()
+            theme::chip(hue)
         } else if unread > 0 {
             theme::tab_idle()
                 .add_modifier(Modifier::BOLD)
-                .fg(theme::tone(theme::Role::Text, 23))
+                .fg(theme::ink(hue, 23))
         } else {
             theme::tab_idle()
         };
@@ -350,7 +351,8 @@ fn message_block(
         .profiles
         .get(&m.author)
         .is_some_and(|p| p.is_agent);
-    let mut head = vec![bar.clone(), Span::styled(author, theme::bright())];
+    let who = theme::name(&author);
+    let mut head = vec![bar.clone(), Span::styled(author, who)];
     if is_agent {
         head.push(Span::styled(" ⚙", theme::faint()));
     }
@@ -503,8 +505,9 @@ fn message_block(
 /// then a dotted rule to the edge; the rest indented below. No fill. Each
 /// line arrives as `[edge, maybe "  ", content…]`; the indent is dropped.
 fn frame(name: &str, lines: Vec<Line<'static>>, width: u16, lit: bool) -> Vec<Line<'static>> {
+    let hue = theme::hue(name);
     let edge = if lit {
-        Span::styled("▌", theme::bright())
+        Span::styled("▌", Style::new().fg(theme::ink(hue, 23)))
     } else {
         Span::raw(" ")
     };
@@ -522,7 +525,7 @@ fn frame(name: &str, lines: Vec<Line<'static>>, width: u16, lit: bool) -> Vec<Li
     let mut top = vec![
         edge.clone(),
         Span::raw(" "),
-        Span::styled(initial, theme::bright()),
+        Span::styled(initial, theme::name(name)),
         Span::raw("  "),
     ];
     top.extend(rest(it.next().unwrap_or_default()));
@@ -530,7 +533,7 @@ fn frame(name: &str, lines: Vec<Line<'static>>, width: u16, lit: bool) -> Vec<Li
     let used: usize = top.iter().map(|sp| sp.content.width()).sum();
     top.push(Span::styled(
         "╌".repeat((width as usize).saturating_sub(used + 1)),
-        theme::rule(),
+        Style::new().fg(theme::ink(hue, 6)),
     ));
     let mut out = vec![Line::from(top)];
     for l in it {
@@ -853,9 +856,11 @@ fn draw_empty(f: &mut Frame, app: &mut App, area: Rect, msg: &str) {
     for row in grid {
         let spans: Vec<Span> = row
             .into_iter()
-            .map(|(c, part)| {
+            .enumerate()
+            .map(|(x, (c, part))| {
                 let style = match part {
-                    garden::Part::Bloom | garden::Part::Bee => theme::bright(),
+                    garden::Part::Bloom => theme::bright().fg(theme::ink(theme::nth(x / 5), 22)),
+                    garden::Part::Bee => theme::bright(),
                     garden::Part::Bud => theme::text(),
                     garden::Part::Stem | garden::Part::Leaf => theme::muted(),
                     garden::Part::Ground => theme::rule(),
@@ -899,7 +904,7 @@ fn draw_agents(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled("▎", theme::rule())
         };
         let name_style = if r.busy {
-            theme::bright()
+            theme::name(&r.name)
         } else {
             theme::muted().add_modifier(Modifier::BOLD)
         };
@@ -1252,9 +1257,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     } else if let Some(s) = status {
         spans.push(Span::styled(s, theme::bright()));
     } else {
-        for (k, what, footer) in legend(app.mode) {
-            if *footer {
-                spans.push(Span::styled(format!(" {k} "), theme::key()));
+        for (i, (k, what, _)) in legend(app.mode).iter().filter(|l| l.2).enumerate() {
+            {
+                spans.push(Span::styled(format!(" {k} "), theme::chip(theme::nth(i))));
                 spans.push(Span::styled(format!(" {what}  "), theme::muted()));
             }
         }
@@ -1335,15 +1340,18 @@ fn draw_sections(f: &mut Frame, app: &mut App, area: Rect) {
     }
     // Legend: Enter alone switches; marks are only for several at once.
     lines.push(Line::raw(""));
-    for (k, what) in [
+    for (i, (k, what)) in [
         ("j k", "move"),
         ("⏎", "switch to this section"),
         ("space", "mark [x] to show several, then ⏎"),
         ("R", "reload  ·  esc  cancel"),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         lines.push(Line::from(vec![
             Span::raw(" "),
-            Span::styled(format!(" {k} "), theme::key()),
+            Span::styled(format!(" {k} "), theme::chip(theme::nth(i))),
             Span::styled(format!("  {what}"), theme::muted()),
         ]));
     }
@@ -1492,8 +1500,8 @@ fn draw_viewer(f: &mut Frame, app: &mut App, area: Rect) {
         keys.push(("← →", "move"));
     }
     keys.push(("esc", "close"));
-    for (k, what) in keys {
-        spans.push(Span::styled(format!(" {k} "), theme::key()));
+    for (i, (k, what)) in keys.into_iter().enumerate() {
+        spans.push(Span::styled(format!(" {k} "), theme::chip(theme::nth(i))));
         spans.push(Span::styled(format!(" {what}  "), theme::muted()));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), title);
@@ -1675,7 +1683,10 @@ fn inline(s: &str, mentions: &[String], heading: bool) -> Vec<Span<'static>> {
                 .max_by_key(|m| m.len())
             {
                 flush(&mut buf, &mut out);
-                out.push(Span::styled(m.clone(), theme::mention()));
+                out.push(Span::styled(
+                    m.clone(),
+                    theme::mention().fg(theme::ink(theme::hue(&m[1..]), 18)),
+                ));
                 rest = &rest[m.len()..];
                 continue;
             }
@@ -1891,7 +1902,16 @@ mod tests {
         app.store.channel_mut("c3").name = "almanac".into();
         app.store.channel_mut("c2").unread.insert("x".into(), 1);
         app.tabs = vec!["c1".into(), "c2".into(), "c3".into()];
-        let (a, b) = (Keys::generate(), Keys::generate());
+        let (a, b, c) = (Keys::generate(), Keys::generate(), Keys::generate());
+        for (k, name) in [(&a, "lucian"), (&b, "taskbot"), (&c, "judgebot")] {
+            app.store.profiles.insert(
+                k.public_key().to_hex(),
+                crate::model::Profile {
+                    name: name.into(),
+                    is_agent: name != "lucian",
+                },
+            );
+        }
         let mut post = |who: &Keys, text: &str| {
             let ev = EventBuilder::new(Kind::Custom(9), text)
                 .tags([Tag::parse(["h", "c1"]).unwrap()])
@@ -1906,13 +1926,17 @@ mod tests {
         );
         let sel = post(
             &b,
-            "Yes. Each step keeps its gray's luminance:\n```rust\nlet y = 0.2126 * r + 0.7152 * g + 0.0722 * b;\n```\nPress `P` to switch palettes live.",
+            "Yes. Each step keeps its gray's luminance:\n```rust\nlet y = 0.2126 * r + 0.7152 * g + 0.0722 * b;\n```\nPress `P` to turn color off and on.",
         );
         post(&a, "@taskbot nice, trying it with the Mac filter on");
+        post(
+            &c,
+            "@lucian every name gets its own hue, same gray underneath",
+        );
         app.store.channel_mut("c1").loaded = true;
         app.selected.insert("c1".into(), sel);
         let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
-        for (name, _) in crate::theme::PALETTES {
+        for name in crate::theme::PALETTES {
             crate::theme::set_palette(name);
             for light in [false, true] {
                 crate::theme::set_light(light);
@@ -1924,7 +1948,7 @@ mod tests {
                 );
             }
         }
-        crate::theme::set_palette("gray");
+        crate::theme::set_palette("color");
         crate::theme::set_light(false);
     }
 
