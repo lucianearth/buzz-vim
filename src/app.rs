@@ -621,11 +621,11 @@ impl App {
             KeyCode::Char('u') if ctrl => self.move_cursor(-((self.page / 2).max(1) as isize)),
             KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
-            KeyCode::PageDown => self.move_cursor(self.page.max(1) as isize),
-            KeyCode::PageUp => self.move_cursor(-(self.page.max(1) as isize)),
+            KeyCode::Char('d') | KeyCode::PageDown => self.move_cursor(self.page.max(1) as isize),
+            KeyCode::Char('u') | KeyCode::PageUp => self.move_cursor(-(self.page.max(1) as isize)),
             KeyCode::Char('g') | KeyCode::Home => self.move_cursor(-100_000),
             KeyCode::Char('G') | KeyCode::End => self.move_cursor(100_000),
-            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+            KeyCode::Enter | KeyCode::Right => {
                 if self.focus == Pane::Timeline {
                     self.open_thread(false);
                 }
