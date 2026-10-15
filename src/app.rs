@@ -772,7 +772,7 @@ impl App {
             KeyCode::Char('u') | KeyCode::PageUp => self.move_cursor(-(self.page.max(1) as isize)),
             KeyCode::Char('g') | KeyCode::Home => self.move_cursor(-100_000),
             KeyCode::Char('G') | KeyCode::End => self.move_cursor(100_000),
-            KeyCode::Enter | KeyCode::Right => {
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if self.focus == Pane::Timeline {
                     self.open_thread(false);
                 }
@@ -1061,6 +1061,21 @@ mod tests {
             app.on_key(KeyEvent::from(code));
         }
         assert_eq!(app.chosen, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn l_opens_thread() {
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let k = Keys::generate();
+        let mut app = App::new(k.public_key().to_hex(), None);
+        let root = EventBuilder::new(Kind::Custom(9), "hi")
+            .tags([Tag::parse(["h", "c1"]).unwrap()])
+            .sign_with_keys(&k)
+            .unwrap();
+        app.store.apply(&root);
+        app.tabs = vec!["c1".into()];
+        app.on_key(KeyEvent::from(KeyCode::Char('l')));
+        assert_eq!(app.thread, Some(("c1".into(), root.id.to_hex())));
     }
 
     #[test]

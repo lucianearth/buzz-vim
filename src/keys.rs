@@ -31,7 +31,7 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("j k ↑↓", "move", true),
             ("1-9", "tab", false),
             ("H L ⇥", "prev/next tab", false),
-            ("⏎ →", "thread", true),
+            ("⏎ l →", "thread", true),
             ("i", "write", true),
             ("+", "👍", false),
             ("s", "sections", false),
