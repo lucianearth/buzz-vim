@@ -135,6 +135,10 @@ async fn run(
     let saved = state::load(&relay.base, &app.store.me);
     app.chosen = saved.chosen.clone();
     app.read_width = saved.read_width;
+    theme::set_palette(&saved.palette);
+    if let Ok(p) = std::env::var("BUZZ_VIM_PALETTE") {
+        theme::set_palette(&p);
+    }
     let mut sync = Sync::new(relay, live_cmd, tx);
     if !saved.read_slot.is_empty() && !saved.read_client.is_empty() {
         sync.read = readstate::ReadState::new(saved.read_slot.clone(), saved.read_client.clone());
@@ -246,6 +250,7 @@ fn saved_state(app: &App, sync: &Sync) -> state::State {
         read_slot: sync.read.slot().to_string(),
         read_client: sync.read.client_id().to_string(),
         read_width: app.read_width,
+        palette: theme::palette_name().to_string(),
     }
 }
 

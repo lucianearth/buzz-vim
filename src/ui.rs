@@ -211,7 +211,7 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
         } else if unread > 0 {
             theme::tab_idle()
                 .add_modifier(Modifier::BOLD)
-                .fg(theme::gray(23))
+                .fg(theme::tone(theme::Role::Text, 23))
         } else {
             theme::tab_idle()
         };
@@ -1661,7 +1661,8 @@ fn inline(s: &str, mentions: &[String], heading: bool) -> Vec<Span<'static>> {
                 flush(&mut buf, &mut out);
                 out.push(Span::styled(
                     rest[2..2 + end].to_string(),
-                    base.add_modifier(Modifier::BOLD).fg(theme::gray(23)),
+                    base.add_modifier(Modifier::BOLD)
+                        .fg(theme::tone(theme::Role::Text, 23)),
                 ));
                 rest = &rest[end + 4..];
                 continue;
@@ -1874,6 +1875,56 @@ mod tests {
                 ),
             );
         }
+        crate::theme::set_light(false);
+    }
+
+    /// A busy channel in every palette, dark and light.
+    #[test]
+    fn shot_palettes() {
+        let Ok(dir) = std::env::var("BUZZ_VIM_SHOT") else {
+            return;
+        };
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let mut app = App::new("me".into(), None);
+        app.store.channel_mut("c1").name = "buzz-vim".into();
+        app.store.channel_mut("c2").name = "beacon".into();
+        app.store.channel_mut("c3").name = "almanac".into();
+        app.store.channel_mut("c2").unread.insert("x".into(), 1);
+        app.tabs = vec!["c1".into(), "c2".into(), "c3".into()];
+        let (a, b) = (Keys::generate(), Keys::generate());
+        let mut post = |who: &Keys, text: &str| {
+            let ev = EventBuilder::new(Kind::Custom(9), text)
+                .tags([Tag::parse(["h", "c1"]).unwrap()])
+                .sign_with_keys(who)
+                .unwrap();
+            app.store.apply(&ev);
+            ev.id.to_hex()
+        };
+        post(
+            &a,
+            "Can we get **soft pastels** that read the same in grayscale?",
+        );
+        let sel = post(
+            &b,
+            "Yes. Each step keeps its gray's luminance:\n```rust\nlet y = 0.2126 * r + 0.7152 * g + 0.0722 * b;\n```\nPress `P` to switch palettes live.",
+        );
+        post(&a, "@taskbot nice, trying it with the Mac filter on");
+        app.store.channel_mut("c1").loaded = true;
+        app.selected.insert("c1".into(), sel);
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        for (name, _) in crate::theme::PALETTES {
+            crate::theme::set_palette(name);
+            for light in [false, true] {
+                crate::theme::set_light(light);
+                t.draw(|f| draw(f, &mut app)).unwrap();
+                let mode = if light { "light" } else { "dark" };
+                dump(
+                    t.backend().buffer(),
+                    &format!("{dir}/pal-{name}-{mode}.cells"),
+                );
+            }
+        }
+        crate::theme::set_palette("gray");
         crate::theme::set_light(false);
     }
 
