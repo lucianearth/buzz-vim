@@ -14,9 +14,6 @@ pub struct State {
     /// Reading width set with the slider; None = full width.
     #[serde(default)]
     pub read_width: Option<u16>,
-    /// Theme palette name (theme::PALETTES); empty = default.
-    #[serde(default)]
-    pub palette: String,
 }
 
 fn path(relay: &str, me: &str) -> Option<std::path::PathBuf> {

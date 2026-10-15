@@ -726,11 +726,6 @@ impl App {
             KeyCode::Char('R') => self.actions.push(Action::ReloadSections),
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('o') => self.open_viewer(),
-            KeyCode::Char('P') => {
-                let name = crate::theme::next_palette();
-                self.say(format!("palette: {name}"));
-                self.actions.push(Action::SaveState);
-            }
             KeyCode::Char('[') => self.nudge_width(-4),
             KeyCode::Char(']') => self.nudge_width(4),
             _ => {}

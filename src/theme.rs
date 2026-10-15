@@ -3,16 +3,15 @@
 //! dim. There is a dark and a light ramp; which one follows the Mac's
 //! appearance (see `watch`).
 //!
-//! In color mode every role and every person, channel and key chip gets
-//! its own hue, all at the luminance of the gray step they replace. Under a
-//! grayscale filter the screen looks exactly like plain gray.
+//! Every role and every person, channel and key chip gets its own hue, all
+//! at the luminance of the gray step they replace. Under a grayscale filter
+//! the screen reads as the plain gray ramp.
 
 use ratatui::style::{Color, Modifier, Style};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 static LIGHT: AtomicBool = AtomicBool::new(false);
-static PALETTE: AtomicUsize = AtomicUsize::new(0);
 
 /// What a color is for. Each role has its own hue.
 #[derive(Clone, Copy)]
@@ -48,32 +47,6 @@ const WHEEL: [f32; 12] = [
 /// color fits sRGB at that luminance.
 const VIVID: f32 = 0.14;
 
-pub const PALETTES: &[&str] = &["color", "gray"];
-
-fn colored() -> bool {
-    palette() == 0
-}
-
-pub fn palette() -> usize {
-    PALETTE.load(Ordering::Relaxed)
-}
-
-pub fn palette_name() -> &'static str {
-    PALETTES[palette()]
-}
-
-/// Select a palette by name; unknown names leave it alone.
-pub fn set_palette(name: &str) {
-    if let Some(i) = PALETTES.iter().position(|n| *n == name) {
-        PALETTE.store(i, Ordering::Relaxed);
-    }
-}
-
-pub fn next_palette() -> &'static str {
-    PALETTE.store((palette() + 1) % PALETTES.len(), Ordering::Relaxed);
-    palette_name()
-}
-
 /// The `i`th hue on the wheel, for things in a row (chips, flowers).
 pub fn nth(i: usize) -> f32 {
     WHEEL[i % WHEEL.len()]
@@ -88,7 +61,7 @@ pub fn hue(key: &str) -> f32 {
     nth(((h >> 40) % WHEEL.len() as u64) as usize)
 }
 
-/// Step `level` in `hue` at full color (gray when color is off).
+/// Step `level` in `hue` at full color.
 pub fn ink(hue: f32, level: u8) -> Color {
     shade(hue, VIVID, level)
 }
@@ -99,7 +72,7 @@ pub fn gray(level: u8) -> Color {
     tone(Role::Surface, level)
 }
 
-/// Step `level` for `role`: the ramp's gray, tinted by the palette.
+/// Step `level` for `role`: the ramp's gray, tinted by the role's hue.
 pub fn tone(role: Role, level: u8) -> Color {
     let (hue, chroma) = ROLES[role as usize];
     shade(hue, chroma, level)
@@ -112,7 +85,7 @@ fn shade(hue: f32, chroma: f32, level: u8) -> Color {
     } else {
         8 + 10 * l
     };
-    if chroma == 0.0 || !colored() {
+    if chroma == 0.0 {
         return Color::Rgb(v, v, v);
     }
     let [r, g, b] = tint(v, hue, chroma);

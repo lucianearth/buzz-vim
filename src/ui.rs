@@ -1899,7 +1899,7 @@ mod tests {
         crate::theme::set_light(false);
     }
 
-    /// A busy channel in every palette, dark and light.
+    /// A busy channel, dark and light.
     #[test]
     fn shot_palettes() {
         let Ok(dir) = std::env::var("BUZZ_VIM_SHOT") else {
@@ -1936,7 +1936,7 @@ mod tests {
         );
         let sel = post(
             &b,
-            "Yes. Each step keeps its gray's luminance:\n```rust\nlet y = 0.2126 * r + 0.7152 * g + 0.0722 * b;\n```\nPress `P` to turn color off and on.",
+            "Yes. Each step keeps its gray's luminance:\n```rust\nlet y = 0.2126 * r + 0.7152 * g + 0.0722 * b;\n```\nUnder the Mac filter it reads as gray.",
         );
         post(&a, "@taskbot nice, trying it with the Mac filter on");
         post(
@@ -1946,19 +1946,12 @@ mod tests {
         app.store.channel_mut("c1").loaded = true;
         app.selected.insert("c1".into(), sel);
         let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
-        for name in crate::theme::PALETTES {
-            crate::theme::set_palette(name);
-            for light in [false, true] {
-                crate::theme::set_light(light);
-                t.draw(|f| draw(f, &mut app)).unwrap();
-                let mode = if light { "light" } else { "dark" };
-                dump(
-                    t.backend().buffer(),
-                    &format!("{dir}/pal-{name}-{mode}.cells"),
-                );
-            }
+        for light in [false, true] {
+            crate::theme::set_light(light);
+            t.draw(|f| draw(f, &mut app)).unwrap();
+            let mode = if light { "light" } else { "dark" };
+            dump(t.backend().buffer(), &format!("{dir}/pal-{mode}.cells"));
         }
-        crate::theme::set_palette("color");
         crate::theme::set_light(false);
     }
 
