@@ -609,6 +609,26 @@ fn draw_blocks(
             }
         }
     }
+    // On a tall message the left edge becomes a scroll bar: a dim track the
+    // pane's height, lit for the slice on screen.
+    if let Some((above, below)) = more {
+        let bh = h + above + below;
+        let thumb = (h * h / bh).max(1);
+        let at = (h - thumb) * above / (above + below);
+        let rows: Vec<Line> = (0..h)
+            .map(|r| {
+                let lit = r >= at && r < at + thumb;
+                Line::styled("▌", if lit { theme::bright() } else { theme::rule() })
+            })
+            .collect();
+        f.render_widget(
+            Paragraph::new(rows),
+            Rect {
+                width: 1.min(area.width),
+                ..area
+            },
+        );
+    }
     // How much of a tall message is off screen, on the pane's edges.
     if let Some((above, below)) = more {
         for (n, arrow, y) in [
@@ -1945,6 +1965,53 @@ mod tests {
         }
         let s = screen(&mut app);
         assert!(s.contains("short"), "{s}");
+    }
+
+    #[test]
+    fn tall_newest_entered_from_above_starts_at_top() {
+        use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent};
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let k = Keys::generate();
+        let mut app = App::new(k.public_key().to_hex(), None);
+        let body: Vec<String> = (1..=60).map(|i| format!("line{i:02}")).collect();
+        for (i, text) in ["short".to_string(), body.join("\n\n")].iter().enumerate() {
+            let ev = EventBuilder::new(Kind::Custom(9), text)
+                .tags([Tag::parse(["h", "c1"]).unwrap()])
+                .custom_created_at(nostr::Timestamp::from(1_000 + i as u64))
+                .sign_with_keys(&k)
+                .unwrap();
+            app.store.apply(&ev);
+        }
+        app.tabs = vec!["c1".into()];
+        let screen = |app: &mut App| {
+            let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+            t.draw(|f| draw(f, app)).unwrap();
+            let buf = t.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let key =
+            |app: &mut App, c: char| app.on_term(TermEvent::Key(KeyEvent::from(KeyCode::Char(c))));
+        app.on_term(TermEvent::Key(KeyEvent::from(KeyCode::Esc)));
+        screen(&mut app);
+        // Page all the way up and onto "short".
+        for _ in 0..60 {
+            key(&mut app, 'k');
+            screen(&mut app);
+        }
+        assert!(screen(&mut app).join("\n").contains("short"));
+        // j into the tall newest one lands on its top, not its end.
+        key(&mut app, 'j');
+        let rows = screen(&mut app);
+        let s = rows.join("\n");
+        assert!(s.contains("line01") && !s.contains("line60"), "{s}");
+        // The left edge runs the pane's full height as a scroll bar.
+        assert!(rows[2..16].iter().all(|r| r.starts_with('▌')), "{s}");
     }
 
     #[test]

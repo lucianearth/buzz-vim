@@ -364,11 +364,13 @@ impl App {
                 self.actions.push(Action::LoadOlder(c));
             }
         }
-        // Coming up into a tall message starts at its bottom.
+        // A tall message starts at the end you come in from: its bottom going
+        // up, its top going down (even as the newest, which would show its end).
         if next == cur {
             return;
         }
-        self.peek = (delta < 0).then(|| (ids[next].clone(), usize::MAX));
+        let off = if delta < 0 { usize::MAX } else { 0 };
+        self.peek = Some((ids[next].clone(), off));
         self.set_cursor(ids[next].clone(), next == ids.len() - 1);
     }
 
