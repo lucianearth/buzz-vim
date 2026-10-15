@@ -84,6 +84,7 @@ fn main() -> Result<()> {
             DisableMouseCapture,
             DisableBracketedPaste
         );
+        tmux_keys(false);
         ratatui_hook(info);
     }));
     // Terminals that speak the kitty keyboard protocol (iTerm2, kitty,
@@ -100,10 +101,12 @@ fn main() -> Result<()> {
                 | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
         )
     );
+    tmux_keys(true);
     let res = execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)
         .map_err(anyhow::Error::from)
         .and_then(|_| rt.block_on(run(&mut terminal, cfg, picker)));
     let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    tmux_keys(false);
     let _ = execute!(
         std::io::stdout(),
         DisableMouseCapture,
@@ -450,4 +453,17 @@ fn refresh_sections(app: &mut App, sync: &mut Sync, restore_active: &mut Option<
     }
     let tabs = app.tabs.clone();
     sync.unsubscribe_others(&tabs);
+}
+
+/// tmux drops the kitty keyboard request, so inside it Shift+Enter arrives
+/// as a plain Enter. It does forward modifyOtherKeys to apps that ask, given
+/// `extended-keys on`; crossterm reads that only in tmux's `csi-u` format.
+fn tmux_keys(on: bool) {
+    use std::io::Write;
+    if std::env::var_os("TMUX").is_none() {
+        return;
+    }
+    let mut out = std::io::stdout();
+    let _ = out.write_all(if on { b"\x1b[>4;2m" } else { b"\x1b[>4m" });
+    let _ = out.flush();
 }
