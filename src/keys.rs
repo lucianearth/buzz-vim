@@ -29,7 +29,7 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
     match mode {
         Mode::Normal => &[
             ("j k ↑↓", "move", true),
-            ("1-9", "tab", false),
+            ("0-9", "tab", false),
             ("H L ⇥", "prev/next tab", false),
             ("⏎ l →", "thread", true),
             ("i", "write", true),

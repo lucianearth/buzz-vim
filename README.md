@@ -24,7 +24,7 @@ Your nsec is in Buzz Desktop under Settings → Profile → Private key. `login`
 Normal mode shows the common keys in the footer. Press `?` for all of them.
 
 - `i` write, `Esc` back to normal, `⏎` send, `⇧⏎` (or `⌥⏎`, `^j`) new line
-- `j` `k` move, `1`–`9` jump to a tab, `H` `L` or `⇥` cycle tabs
+- `j` `k` move, `0`–`9` jump to a tab, `H` `L` or `⇥` cycle tabs
 - `⏎` or `l` open a thread, `r` reply in it, `+` 👍 the selected message; `h`, `←` or `Esc` goes back
 - `a` the agents screen: who is working, where, and their last tool calls. The header shows who is working
   from anywhere, and a thread shows `taskbot thinking` while an agent answers in it

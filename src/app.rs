@@ -753,7 +753,7 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
             KeyCode::Char('q') => self.actions.push(Action::Quit),
-            KeyCode::Char(c @ '1'..='9') => self.switch_tab(c as usize - '1' as usize),
+            KeyCode::Char(c @ '0'..='9') => self.switch_tab(c as usize - '0' as usize),
             KeyCode::Char('L') | KeyCode::Tab => {
                 if !self.tabs.is_empty() {
                     self.switch_tab((self.active + 1) % self.tabs.len());

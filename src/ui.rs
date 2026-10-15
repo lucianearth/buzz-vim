@@ -158,8 +158,8 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 SPIN[app.tick as usize % SPIN.len()]
             };
-            let label = if i < 9 {
-                format!(" {} {name} {dot}{spin}", i + 1)
+            let label = if i < 10 {
+                format!(" {i} {name} {dot}{spin}")
             } else {
                 format!(" {name} {dot}{spin}")
             };
