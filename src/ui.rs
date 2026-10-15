@@ -125,7 +125,7 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
     x += logo.width() as u16 + 1;
     let busy: Vec<String> = app
         .agents
-        .rows(&app.store)
+        .rows(&app.store, None)
         .into_iter()
         .filter(|r| r.busy)
         .map(|r| r.name)
@@ -887,7 +887,8 @@ fn draw_agents(f: &mut Frame, app: &mut App, area: Rect) {
         .map(channel_label)
         .unwrap_or_default();
     let area = breadcrumb(f, app, area, &label, "agents", None);
-    let rows = app.agents.rows(&app.store);
+    let here = app.current().map(str::to_string);
+    let rows = app.agents.rows(&app.store, here.as_deref());
     if rows.is_empty() {
         draw_empty(f, app, area, "none of your agents are online");
         return;
@@ -940,6 +941,15 @@ fn draw_agents(f: &mut Frame, app: &mut App, area: Rect) {
                 p.push_str(&format!(" › thread: {first}"));
             }
             place.push(p);
+        }
+        if let Some(c) = &r.elsewhere {
+            let label = app
+                .store
+                .channels
+                .get(c)
+                .map(channel_label)
+                .unwrap_or_else(|| "another channel".into());
+            place.push(format!("working in {label}"));
         }
         if place.is_empty() {
             place.push("idle".into());

@@ -18,10 +18,17 @@ pub struct Agent {
     /// Turns in flight, by turnId. One agent can run turns in several
     /// channels at once, so these are tracked one by one.
     pub turns: BTreeMap<String, Turn>,
+    /// What the agent did and said, kept per channel ("" when a frame
+    /// names none) so each channel's agents screen shows only its own turns.
+    pub activity: BTreeMap<String, Activity>,
+    pub last_turn: Option<String>,
+}
+
+#[derive(Default)]
+pub struct Activity {
     /// newest first
     pub recent: Vec<String>,
     pub thought: String,
-    pub last_turn: Option<String>,
 }
 
 pub struct Turn {
@@ -50,6 +57,8 @@ pub struct Row {
     pub last_turn: Option<String>,
     /// Tail of what the agent is saying or thinking right now.
     pub thought: String,
+    /// Busy in another channel (not the one asked about), by channel id.
+    pub elsewhere: Option<String>,
 }
 
 /// The harness sends turn_liveness every ~10s, so a turn quiet for this
@@ -81,12 +90,13 @@ impl Agent {
     }
 }
 
-fn push_recent(a: &mut Agent, s: String) {
-    if a.recent.first() == Some(&s) {
+fn push_recent(a: &mut Agent, channel: &str, s: String) {
+    let r = &mut a.activity.entry(channel.to_string()).or_default().recent;
+    if r.first() == Some(&s) {
         return;
     }
-    a.recent.insert(0, s);
-    a.recent.truncate(6);
+    r.insert(0, s);
+    r.truncate(6);
 }
 
 impl Agents {
@@ -127,13 +137,26 @@ impl Agents {
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| format!("ch:{}", channel.as_deref().unwrap_or("")));
+        // Where this frame's activity is filed: its channel, else its turn's,
+        // else the only turn running.
+        let here = channel
+            .clone()
+            .or_else(|| a.turns.get(&key).and_then(|t| t.channel.clone()))
+            .or_else(|| {
+                let mut live = a.live();
+                match (live.next(), live.next()) {
+                    (Some(t), None) => t.channel.clone(),
+                    _ => None,
+                }
+            })
+            .unwrap_or_default();
         let root = frame
             .pointer("/payload/threadRootEventId")
             .and_then(Value::as_str)
             .map(str::to_string);
         match frame.get("kind").and_then(Value::as_str).unwrap_or("") {
             "turn_started" => {
-                a.thought.clear();
+                a.activity.entry(here.clone()).or_default().thought.clear();
                 let thread = root.or_else(|| {
                     frame
                         .pointer("/payload/triggeringEventIds/0")
@@ -149,7 +172,7 @@ impl Agents {
                         seen: now,
                     },
                 );
-                push_recent(a, "turn started".into());
+                push_recent(a, &here, "turn started".into());
             }
             // Ticks while a turn runs: catches turns that began before we
             // connected.
@@ -180,20 +203,28 @@ impl Agents {
                         .map(|(k, _)| k.clone())
                         .collect()
                 };
-                let mut took = String::new();
+                let done = frame.get("kind").and_then(Value::as_str) == Some("turn_completed");
+                let msg = frame
+                    .pointer("/payload/error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("turn failed");
+                let mut chans = vec![];
                 for k in ended {
                     if let Some(t) = a.turns.remove(&k) {
-                        took = format!(" in {}s", t.started.elapsed().as_secs());
+                        let took = format!(" in {}s", t.started.elapsed().as_secs());
+                        chans.push((t.channel.unwrap_or_default(), took));
                     }
                 }
-                if frame.get("kind").and_then(Value::as_str) == Some("turn_completed") {
-                    push_recent(a, format!("turn done{took}"));
-                } else {
-                    let msg = frame
-                        .pointer("/payload/error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("turn failed");
-                    push_recent(a, format!("✗ {msg}"));
+                if chans.is_empty() {
+                    chans.push((here, String::new()));
+                }
+                for (ch, took) in chans {
+                    let line = if done {
+                        format!("turn done{took}")
+                    } else {
+                        format!("✗ {msg}")
+                    };
+                    push_recent(a, &ch, line);
                 }
             }
             "acp_read" => {
@@ -213,19 +244,21 @@ impl Agents {
                             .get("title")
                             .and_then(Value::as_str)
                             .unwrap_or("tool");
-                        push_recent(a, title.lines().next().unwrap_or(title).to_string());
+                        let line = title.lines().next().unwrap_or(title).to_string();
+                        push_recent(a, &here, line);
                     }
                     "tool_call_update" => {
                         if update.get("status").and_then(Value::as_str) == Some("failed") {
-                            push_recent(a, "✗ tool failed".into());
+                            push_recent(a, &here, "✗ tool failed".into());
                         }
                     }
                     "agent_thought_chunk" | "agent_message_chunk" => {
                         if let Some(t) = update.pointer("/content/text").and_then(Value::as_str) {
-                            a.thought.push_str(t);
-                            let keep = a.thought.len().saturating_sub(400);
-                            let cut = a.thought.ceil_char_boundary(keep);
-                            a.thought.drain(..cut);
+                            let th = &mut a.activity.entry(here).or_default().thought;
+                            th.push_str(t);
+                            let keep = th.len().saturating_sub(400);
+                            let cut = th.ceil_char_boundary(keep);
+                            th.drain(..cut);
                         }
                     }
                     _ => {}
@@ -274,24 +307,40 @@ impl Agents {
         names
     }
 
-    pub fn rows(&self, store: &Store) -> Vec<Row> {
+    /// Your online agents as seen from channel `here`: busy means a turn in
+    /// that channel, and steps and thoughts are only that channel's. An
+    /// agent busy somewhere else is idle here with `elsewhere` set. `None`
+    /// looks across every channel.
+    pub fn rows(&self, store: &Store, here: Option<&str>) -> Vec<Row> {
         let mut rows: Vec<Row> = self
             .by_pubkey
             .iter()
             .filter(|(_, a)| a.owned)
             .filter_map(|(pk, a)| {
-                let turn = a.live().next();
+                let any = a.live().next();
+                let turn = a
+                    .live()
+                    .find(|t| here.is_none_or(|h| t.channel.as_deref() == Some(h)));
                 let busy = turn.is_some();
                 // Offline agents stay off the list; you only see who can answer.
-                if !a.online && !busy {
+                if !a.online && any.is_none() {
                     return None;
                 }
+                let elsewhere = if busy {
+                    None
+                } else {
+                    any.map(|t| t.channel.clone().unwrap_or_default())
+                };
+                let act = here
+                    .or(any.and_then(|t| t.channel.as_deref()))
+                    .and_then(|c| a.activity.get(c));
+                let (recent, thought) = act.map_or((&[][..], ""), |x| (&x.recent[..], &x.thought));
                 Some(Row {
                     name: a.display_name(pk, store),
                     busy,
                     online: true,
-                    recent: a
-                        .recent
+                    elsewhere,
+                    recent: recent
                         .iter()
                         .filter(|r| *r != "turn started")
                         .cloned()
@@ -301,7 +350,7 @@ impl Agents {
                     secs: turn.map(|t| t.started.elapsed().as_secs()),
                     last_turn: a.last_turn.clone(),
                     thought: if busy {
-                        let w: Vec<&str> = a.thought.split_whitespace().collect();
+                        let w: Vec<&str> = thought.split_whitespace().collect();
                         w[w.len().saturating_sub(16)..].join(" ")
                     } else {
                         String::new()
@@ -329,7 +378,7 @@ mod tests {
             {"kind": "acp_read", "payload": {"params": {"update": {"sessionUpdate": "agent_thought_chunk", "content": {"text": "checking the gate"}}}}}
         ]}}));
         let s = Store::new("me".into());
-        let r = &ag.rows(&s)[0];
+        let r = &ag.rows(&s, Some("c"))[0];
         assert!(r.busy);
         assert_eq!(ag.working(&s, "c", None), vec!["bot"]);
         assert!(ag.working(&s, "c", Some("t1")).is_empty());
@@ -344,7 +393,7 @@ mod tests {
         );
         ag.presence("a1", "online");
         assert!(ag.working(&s, "c", None).is_empty());
-        let r = &ag.rows(&s)[0];
+        let r = &ag.rows(&s, Some("c"))[0];
         assert!(!r.busy);
         assert_eq!(
             r.last_turn.as_deref(),
@@ -353,7 +402,7 @@ mod tests {
         // Offline, or not one of yours: not listed.
         ag.presence("a1", "offline");
         ag.presence("x9", "online");
-        assert!(ag.rows(&s).is_empty());
+        assert!(ag.rows(&s, Some("c")).is_empty());
     }
 
     #[test]
@@ -373,6 +422,39 @@ mod tests {
         );
         assert!(ag.working(&s, "c1", None).is_empty());
         assert_eq!(ag.working(&s, "c2", None), vec!["bot"]);
-        assert!(ag.rows(&s)[0].busy);
+        assert!(ag.rows(&s, None)[0].busy);
+        // Seen from c1 it is idle here and working in c2.
+        let r = &ag.rows(&s, Some("c1"))[0];
+        assert!(!r.busy);
+        assert_eq!(r.elsewhere.as_deref(), Some("c2"));
+        assert!(ag.rows(&s, Some("c2"))[0].busy);
+    }
+
+    #[test]
+    fn steps_and_thoughts_stay_in_their_channel() {
+        let mut ag = Agents::default();
+        ag.own("a1", "bot");
+        ag.presence("a1", "online");
+        let s = Store::new("me".into());
+        for (t, c) in [("t1", "c1"), ("t2", "c2")] {
+            ag.frame(
+                "a1",
+                &json!({"kind": "turn_started", "turnId": t, "channelId": c, "payload": {}}),
+            );
+            ag.frame("a1", &json!({"kind": "acp_read", "turnId": t, "payload": {"params": {"update": {"sessionUpdate": "tool_call", "title": format!("step in {c}")}}}}));
+            ag.frame("a1", &json!({"kind": "acp_read", "turnId": t, "payload": {"params": {"update": {"sessionUpdate": "agent_thought_chunk", "content": {"text": format!("thinking about {c}")}}}}}));
+        }
+        for c in ["c1", "c2"] {
+            let r = &ag.rows(&s, Some(c))[0];
+            assert_eq!(r.recent, vec![format!("step in {c}")]);
+            assert_eq!(r.thought, format!("thinking about {c}"));
+        }
+        ag.frame(
+            "a1",
+            &json!({"kind": "turn_completed", "turnId": "t1", "payload": {}}),
+        );
+        assert!(ag.rows(&s, Some("c1"))[0].recent[0].starts_with("turn done"));
+        assert_eq!(ag.rows(&s, Some("c2"))[0].recent[0], "step in c2");
+        assert!(ag.rows(&s, Some("c3"))[0].recent.is_empty());
     }
 }
