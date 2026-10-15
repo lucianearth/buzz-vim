@@ -38,3 +38,7 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
 `./scripts/green.sh` is the gate: `cargo fmt --check`, clippy with `-D warnings`, tests.
 `tools/drive.py` drives the real binary in a fake terminal (needs `pyte`); set `BUZZ_VIM_IMAGES=halfblocks`
 there, because the fake terminal can't answer image-protocol queries.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
