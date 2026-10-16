@@ -140,13 +140,6 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
         },
     );
     x += logo.width() as u16 + 1;
-    let busy: Vec<String> = app
-        .agents
-        .rows(&app.store, None)
-        .into_iter()
-        .filter(|r| r.busy)
-        .map(|r| r.name)
-        .collect();
     let msgs = app
         .current()
         .and_then(|c| app.store.channels.get(c))
@@ -156,8 +149,7 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
         ConnState::Connecting => format!(" {} connecting ", art::flight(app.tick, 3).trim()),
         ConnState::Offline => " ○ offline, retrying ".to_string(),
     };
-    // Tabs get the whole row up to the count; "who's working" only uses
-    // whatever is left after the last tab, so tabs never shift for it.
+    // Tabs get the whole row up to the count.
     let limit = area.x + area.width.saturating_sub(right.width() as u16 + 1);
     let labels: Vec<(String, usize)> = app
         .tabs
@@ -234,7 +226,6 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
                     height: 1,
                 },
             );
-            x += 2;
             break;
         }
         let hue = theme::hue(&app.tabs[i]);
@@ -270,36 +261,7 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
             ..area
         },
     );
-    // Who is working, just left of the count, in the room the tabs left.
-    let busy_w = limit.saturating_sub(x).min(BUSY_W);
-    if !busy.is_empty() && busy_w >= 16 {
-        let mut names = busy.join(", ");
-        let room = busy_w as usize - " working   ".len() - 2;
-        if names.width() > room {
-            names = names
-                .chars()
-                .take(room.saturating_sub(1))
-                .collect::<String>()
-                + "…";
-        }
-        let w = format!(
-            "{} {names} working   ",
-            SPIN[app.tick as usize % SPIN.len()],
-        );
-        let ww = (w.width() as u16).min(busy_w);
-        f.render_widget(
-            Paragraph::new(Span::styled(w, theme::bright())),
-            Rect {
-                x: limit - ww,
-                width: ww,
-                ..area
-            },
-        );
-    }
 }
-
-/// Most header room the working list takes.
-const BUSY_W: u16 = 34;
 
 /// One-cell braille spinner.
 const SPIN: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
@@ -2300,8 +2262,7 @@ mod tests {
         assert!(line.contains("⌫ … › #beacon-ask-release thread"), "{line}");
     }
 
-    /// Tabs run up to the message count; no room is held back for the
-    /// working list when nobody is working.
+    /// Tabs run up to the message count.
     #[test]
     fn tabs_fill_the_row() {
         let mut app = App::new("me".into(), None);
@@ -2396,7 +2357,7 @@ mod tests {
         let rows = screen(&mut app);
         let replies = rows.iter().find(|r| r.contains("↳ 1 reply")).unwrap();
         assert!(replies.contains("taskbot thinking"), "{rows:#?}");
-        assert!(rows[0].contains("taskbot working"), "header: {rows:#?}");
+        assert!(!rows[0].contains("taskbot working"), "header: {rows:#?}");
         app.thread = Some(("c1".into(), rid));
         let rows = screen(&mut app);
         assert!(
