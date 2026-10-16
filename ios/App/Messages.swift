@@ -97,10 +97,11 @@ struct Edges: Equatable {
 
     init() {}
 
+    /// From the visible rect, in content coordinates: the inset math was
+    /// off by the compose bar, so at the bottom it still read "away".
     init(_ g: ScrollGeometry) {
-        let y = g.contentOffset.y
-        top = y + g.contentInsets.top <= 80
-        bottom = y + g.containerSize.height - g.contentInsets.bottom >= g.contentSize.height - 80
+        top = g.visibleRect.minY <= 80
+        bottom = g.visibleRect.maxY >= g.contentSize.height - 80
     }
 }
 
