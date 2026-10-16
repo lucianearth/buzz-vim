@@ -150,9 +150,12 @@ struct Home: View {
         }
     }
 
+    /// Key-row moves only, so the keyboard is up: no page slide. An animated
+    /// selection change on a paged TabView while a field inside it holds
+    /// the keyboard can stall halfway between pages.
     private func go(_ id: String) {
         path = []
-        withAnimation(.easeOut(duration: 0.2)) { selected = id }
+        selected = id
     }
 
     /// Keep the selection on a tab that exists, and tell Rust what's open.
