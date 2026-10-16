@@ -121,15 +121,8 @@ final class Model {
         didSet { UserDefaults.standard.set(tabOrder, forKey: "tabOrder") }
     }
 
-    /// Drag `id` to where `target` sits. Tabs only move within their section.
-    func move(_ id: String, to target: String, in tabs: [ChannelTab]) {
-        guard id != target,
-              let section = tabs.first(where: { $0.id == id })?.section,
-              tabs.first(where: { $0.id == target })?.section == section else { return }
-        var ids = tabs.filter { $0.section == section }.map(\.id)
-        guard let from = ids.firstIndex(of: id), let to = ids.firstIndex(of: target) else { return }
-        ids.remove(at: from)
-        ids.insert(id, at: to)
+    /// Save a section's whole tab order.
+    func order(_ section: String, _ ids: [String]) {
         tabOrder[section] = ids
         client?.setOrder(section: section, ids: ids)
         bump()

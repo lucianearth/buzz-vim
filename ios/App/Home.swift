@@ -1,5 +1,4 @@
 import SwiftUI
-import UniformTypeIdentifiers
 
 struct Route: Hashable {
     let channel: String
@@ -27,7 +26,8 @@ extension EnvironmentValues {
 
 /// Tabs across the top, one channel per page: swipe sideways between them,
 /// tap a message for its thread, pull the header down for the agents,
-/// hold a tab to drag it, hold the status line for sections.
+/// hold a tab to drag it (the row unfolds into a column), hold the status
+/// line for sections.
 struct Home: View {
     let client: Client
     @Environment(Model.self) private var model
@@ -40,6 +40,7 @@ struct Home: View {
     @State private var fallback = false
     @State private var showAgents = false
     @State private var showSections = false
+    @State private var lift: Lift?
 
     var body: some View {
         let _ = model.version
@@ -47,7 +48,7 @@ struct Home: View {
         NavigationStack(path: $path) {
             VStack(spacing: 0) {
                 Header(client: client, tabs: tabs, selected: $selected,
-                       showAgents: $showAgents, showSections: $showSections)
+                       showAgents: $showAgents, showSections: $showSections, lift: $lift)
                 if tabs.isEmpty {
                     Spacer()
                     Text(client.ready() ? "no channels yet" : "loading channels…")
@@ -84,6 +85,13 @@ struct Home: View {
                 ThreadView(client: client, route: r)
             }
         }
+        .overlay {
+            if lift != nil {
+                TabColumn(lift: $lift, tabs: tabs)
+                    .transition(.opacity)
+            }
+        }
+        .sensoryFeedback(.impact, trigger: lift?.held)
         .environment(\.nav, Nav(step: step, nextUnread: nextUnread))
         .onAppear { settle(tabs) }
         .onChange(of: tabs.map(\.id)) { _, _ in settle(client.tabs()) }
@@ -184,9 +192,11 @@ struct Header: View {
     @Binding var selected: String?
     @Binding var showAgents: Bool
     @Binding var showSections: Bool
+    @Binding var lift: Lift?
     @Environment(Model.self) private var model
     @Environment(\.theme) private var theme
-    @State private var dragging: String?
+    /// False again if the system cancels the hold, so the column can't stick.
+    @GestureState private var holding = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -201,13 +211,9 @@ struct Header: View {
                             chip(t)
                                 .id(t.id)
                                 .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { selected = t.id } }
-                                // Hold a tab and drag it to reorder its section.
-                                .onDrag {
-                                    dragging = t.id
-                                    return NSItemProvider(object: t.id as NSString)
-                                }
-                                .onDrop(of: [.text], delegate: TabDrop(target: t.id, tabs: tabs,
-                                                                       dragging: $dragging, model: model))
+                                // Hold a tab: its section unfolds into a column
+                                // to slide it up or down in.
+                                .gesture(hold(t))
                         }
                     }
                     .padding(.horizontal, 22)
@@ -221,6 +227,7 @@ struct Header: View {
                     DispatchQueue.main.async { proxy.scrollTo(selected, anchor: .center) }
                 }
             }
+            .onChange(of: holding) { _, now in if !now { drop() } }
             dots
         }
         .padding(.top, 16)
@@ -231,6 +238,32 @@ struct Header: View {
                 showAgents = true
             }
         })
+    }
+
+    private func hold(_ t: ChannelTab) -> some Gesture {
+        LongPressGesture(minimumDuration: 0.3)
+            .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .global))
+            .updating($holding) { v, state, _ in
+                if case .second(true, _) = v { state = true }
+            }
+            .onChanged { v in
+                guard case .second(true, let drag) = v else { return }
+                if lift == nil {
+                    let ids = tabs.filter { $0.section == t.section }.map(\.id)
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        lift = Lift(section: t.section, ids: ids, held: t.id)
+                    }
+                }
+                lift?.dy = drag?.translation.height ?? 0
+            }
+            .onEnded { _ in drop() }
+    }
+
+    /// Let go: save the new order and fold the column away.
+    private func drop() {
+        guard let l = lift else { return }
+        if l.order != l.ids { model.order(l.section, l.order) }
+        withAnimation(.easeOut(duration: 0.2)) { lift = nil }
     }
 
     private var status: some View {
@@ -294,23 +327,93 @@ struct Header: View {
     }
 }
 
-/// Tabs shuffle as a dragged tab passes over them; the order saves as it goes.
-struct TabDrop: DropDelegate {
-    let target: String
-    let tabs: [ChannelTab]
-    @Binding var dragging: String?
-    let model: Model
+/// A held tab and its section's tabs, while it's being dragged.
+struct Lift {
+    let section: String
+    /// The section's tabs as they were when the hold started.
+    let ids: [String]
+    let held: String
+    /// How far the finger has moved since, and one row's height.
+    var dy: CGFloat = 0
+    var rowH: CGFloat = 56
 
-    func dropEntered(info: DropInfo) {
-        guard let id = dragging else { return }
-        withAnimation(.easeOut(duration: 0.15)) { model.move(id, to: target, in: tabs) }
+    var start: Int { ids.firstIndex(of: held) ?? 0 }
+    var target: Int { min(max(start + Int((dy / rowH).rounded()), 0), ids.count - 1) }
+    var order: [String] {
+        var o = ids.filter { $0 != held }
+        o.insert(held, at: target)
+        return o
+    }
+}
+
+/// The section the held tab is in, unfolded into tall rows. The held one
+/// follows the finger; the rest make room as it passes.
+struct TabColumn: View {
+    @Binding var lift: Lift?
+    let tabs: [ChannelTab]
+    @Environment(\.theme) private var theme
+    @State private var open = false
+
+    var body: some View {
+        GeometryReader { geo in
+            if let l = lift {
+                let byId = Dictionary(tabs.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+                ZStack(alignment: .top) {
+                    theme.canvas.opacity(0.97).ignoresSafeArea()
+                    ForEach(Array(l.order.enumerated()), id: \.element) { i, id in
+                        if let t = byId[id] {
+                            let held = id == l.held
+                            let slot = held
+                                ? min(max(CGFloat(l.start) * l.rowH + l.dy, 0), CGFloat(l.ids.count - 1) * l.rowH)
+                                : CGFloat(i) * l.rowH
+                            row(t, held: held)
+                                .frame(height: l.rowH - 8)
+                                .padding(.horizontal, 22)
+                                // Unfold: each row drops down from the tab row
+                                // and flips open, one just after another.
+                                .rotation3DEffect(.degrees(open ? 0 : -80), axis: (1, 0, 0),
+                                                  anchor: .top, perspective: 0.6)
+                                .offset(y: 16 + (open ? slot : 0))
+                                .opacity(open ? 1 : 0)
+                                .animation(.spring(duration: 0.35).delay(Double(i) * 0.02), value: open)
+                                .animation(held ? nil : .snappy(duration: 0.2), value: l.target)
+                                .zIndex(held ? 1 : 0)
+                        }
+                    }
+                }
+                .onAppear {
+                    lift?.rowH = min(64, max(36, (geo.size.height - 32) / CGFloat(max(l.ids.count, 1))))
+                    open = true
+                }
+                .sensoryFeedback(.selection, trigger: l.target)
+            }
+        }
     }
 
-    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
-
-    func performDrop(info: DropInfo) -> Bool {
-        dragging = nil
-        return true
+    private func row(_ t: ChannelTab, held: Bool) -> some View {
+        let name = t.label.hasPrefix("#") ? String(t.label.dropFirst()) : t.label
+        return HStack(spacing: 8) {
+            Text(name)
+                .font(held ? .chipOn : .chip)
+                .lineLimit(1)
+            Spacer()
+            if t.mentions > 0 {
+                Text("\(t.mentions)")
+                    .font(.tiny)
+                    .foregroundStyle(theme.onAccent)
+                    .padding(.horizontal, 5)
+                    .frame(minWidth: 17, minHeight: 17)
+                    .background(theme.badge, in: Capsule())
+            } else if t.unread > 0 {
+                Circle().fill(theme.badge).frame(width: 6, height: 6)
+            }
+        }
+        .foregroundStyle(held ? theme.onAccent : theme.muted)
+        .padding(.horizontal, 16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .background(held ? theme.chipOn : theme.chipOff, in: RoundedRectangle(cornerRadius: 10))
+        .scaleEffect(held ? 1.03 : 1)
+        .shadow(color: .black.opacity(held ? 0.35 : 0), radius: 10, y: 4)
     }
 }
 
