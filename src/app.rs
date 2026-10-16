@@ -375,7 +375,7 @@ impl App {
             .collect()
     }
 
-    fn here(&self) -> Option<Jump> {
+    pub fn here(&self) -> Option<Jump> {
         Some(Jump {
             channel: self.current()?.to_string(),
             selected: self.current().and_then(|c| self.selected.get(c).cloned()),
@@ -414,7 +414,29 @@ impl App {
                     }),
                     channel,
                 };
-                if let Some(h) = self.here().filter(|h| *h != jump) {
+                let newest = known.and_then(|c| c.timeline.last());
+                let here = self.here();
+                let same = here.as_ref().is_some_and(|h| {
+                    h.channel == jump.channel
+                        && match (&h.thread, &jump.thread) {
+                            (Some((a, _)), Some((b, _))) => a == b,
+                            // Following the bottom is already at the newest.
+                            (None, None) => {
+                                h.selected == jump.selected
+                                    || (h.selected.is_none() && jump.selected.as_ref() == newest)
+                            }
+                            _ => false,
+                        }
+                });
+                if same {
+                    // Already here: just pick the reply, keep the timeline as is.
+                    if let Some((_, Some(pick))) = jump.thread {
+                        self.thread_selected = Some(pick);
+                        self.focus = Pane::Thread;
+                    }
+                    return;
+                }
+                if let Some(h) = here {
                     self.jumps.push(h);
                 }
                 self.goto(jump);
@@ -1316,6 +1338,21 @@ mod tests {
         // Following a link to where you already are adds no step.
         let n = app.jumps.len();
         app.follow("buzz://channel/y");
+        assert_eq!(app.jumps.len(), n);
+        // A reply in the open thread picks it, keeping the timeline selection.
+        app.on_key(KeyEvent::from(KeyCode::Char('0')));
+        app.store.channel_mut("a").timeline = vec!["m1".into(), "m2".into()];
+        app.selected.insert("a".into(), "m1".into());
+        app.thread = Some(("a".into(), "m1".into()));
+        let n = app.jumps.len();
+        app.follow("buzz://message?channel=a&id=r9&thread=m1");
+        assert_eq!(app.jumps.len(), n);
+        assert_eq!(app.thread_selected.as_deref(), Some("r9"));
+        assert_eq!(app.selected.get("a").map(String::as_str), Some("m1"));
+        // The newest message while following the bottom is where you are.
+        app.thread = None;
+        app.selected.remove("a");
+        app.follow("buzz://message?channel=a&id=m2");
         assert_eq!(app.jumps.len(), n);
         // Desktop and web links go to the OS.
         app.follow("buzz://pr?id=1");

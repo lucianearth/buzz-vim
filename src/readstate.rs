@@ -21,6 +21,10 @@ pub struct ReadState {
     mine: HashMap<String, u64>,
     /// When our slot changed and hasn't been published yet.
     pending: Option<Instant>,
+    /// The startup load finished, ok or not; unread checks can start.
+    pub tried: bool,
+    /// The startup load succeeded, so publishing our slot won't drop
+    /// positions we never saw.
     pub loaded: bool,
 }
 
@@ -56,6 +60,7 @@ impl ReadState {
             merged: HashMap::new(),
             mine: HashMap::new(),
             pending: None,
+            tried: false,
             loaded: false,
         }
     }

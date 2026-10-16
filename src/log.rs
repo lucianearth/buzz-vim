@@ -7,11 +7,12 @@ pub fn line(s: impl AsRef<str>) {
     let Ok(p) = std::env::var("BUZZ_VIM_LOG") else {
         return;
     };
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(p)
-    {
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).append(true);
+    // It records opened URLs; only you should read it.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    if let Ok(mut f) = o.open(p) {
         let _ = writeln!(
             f,
             "{} {}",

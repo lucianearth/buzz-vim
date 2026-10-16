@@ -81,6 +81,7 @@ pub fn label(url: &str, channel_name: &dyn Fn(&str) -> Option<String>) -> Option
             Some(match (get("d"), get("commit")) {
                 (Some(d), Some(c)) => format!("{d} @ {}", c.chars().take(7).collect::<String>()),
                 (Some(d), None) => format!("{d} {host}"),
+                _ if host.is_empty() => return None,
                 _ => host.to_string(),
             })
         }
@@ -109,6 +110,9 @@ pub fn at(s: &str) -> Option<Found> {
     if let Some(inner) = s.strip_prefix('[') {
         let close = inner.find("](")?;
         let text = &inner[..close];
+        if text.contains('[') {
+            return None;
+        }
         let after = &inner[close + 2..];
         let end = after.find(')')?;
         let url = &after[..end];
@@ -153,16 +157,9 @@ pub fn at(s: &str) -> Option<Found> {
 /// Hand a URL to the OS: the browser for the web, Buzz Desktop for `buzz://`.
 pub fn open(url: &str) -> std::io::Result<()> {
     use std::process::{Command, Stdio};
-    let mut cmd = if cfg!(target_os = "macos") {
-        Command::new("open")
-    } else if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.args(["/C", "start", ""]);
-        c
-    } else {
-        Command::new("xdg-open")
-    };
-    let mut child = cmd
+    let (prog, args) = opener(std::env::consts::OS);
+    let mut child = Command::new(prog)
+        .args(args)
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -171,6 +168,17 @@ pub fn open(url: &str) -> std::io::Result<()> {
     // Reap it so it doesn't linger as a zombie.
     std::thread::spawn(move || child.wait());
     Ok(())
+}
+
+/// The program and leading args that open a URL on `os`; the URL goes last,
+/// as its own argument.
+fn opener(os: &str) -> (&'static str, &'static [&'static str]) {
+    match os {
+        "macos" => ("open", &[]),
+        // No shell: `cmd /C start` would run `&`, `|` and `%VAR%` in the URL.
+        "windows" => ("rundll32", &["url.dll,FileProtocolHandler"]),
+        _ => ("xdg-open", &[]),
+    }
 }
 
 /// Hint labels for `n` links, home row first, all the same length so none
@@ -226,6 +234,9 @@ mod tests {
             ("the docs", "https://a.com/d", 27)
         );
         assert!(at("[x](not a link)").is_none());
+        // A stray bracket isn't the start of the markdown link after it.
+        assert!(at("[1] see [docs](https://x.com)").is_none());
+        assert_eq!(at("[docs](https://x.com)").unwrap().text, "docs");
         assert!(at("https:// nothing").is_none());
         assert!(at("plain").is_none());
     }
@@ -252,6 +263,17 @@ mod tests {
             Some("x @ ééééé")
         );
         assert_eq!(label("https://a.com", &name), None);
+        // Nothing to show: keep the URL so the link stays clickable.
+        assert_eq!(label("buzz://?a=b", &name), None);
+    }
+
+    #[test]
+    fn opening_never_goes_through_a_shell() {
+        for os in ["windows", "macos", "linux"] {
+            let (prog, args) = opener(os);
+            assert!(!["cmd", "sh", "powershell"].contains(&prog), "{os}");
+            assert!(args.iter().all(|a| !a.contains("start")), "{os}");
+        }
     }
 
     #[test]

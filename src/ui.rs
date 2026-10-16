@@ -704,7 +704,7 @@ fn draw_blocks(
     if let Some((above, below)) = more {
         let bh = h + above + below;
         let thumb = (h * h / bh).max(1);
-        let at = (h - thumb) * above / (above + below);
+        let at = h.saturating_sub(thumb) * above / (above + below);
         let rows: Vec<Line> = (0..h)
             .map(|r| {
                 let lit = r >= at && r < at + thumb;
@@ -1264,7 +1264,7 @@ fn draw_compose(f: &mut Frame, app: &mut App, area: Rect) {
     }
     if insert {
         let x = inner.x + 1 + cc as u16;
-        let y = text_top + (cl - skip) as u16;
+        let y = text_top + cl.saturating_sub(skip) as u16;
         f.set_cursor_position((
             x.min(inner.right().saturating_sub(1)),
             y.min(inner.bottom().saturating_sub(1)),
@@ -1319,17 +1319,69 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             format!("uploading {}", art::flight(app.tick, 8)),
             theme::bright(),
         ));
-    } else if let Some(s) = status {
-        spans.push(Span::styled(s, theme::bright()));
+    } else if let Some(s) = &status {
+        spans.push(Span::styled(s.clone(), theme::bright()));
+    }
+    // Where Backspace goes: each step back, then where you are now. It
+    // outranks the key legend, which drops entries to make room.
+    let here = app.here();
+    let chain = if app.jumps.is_empty() {
+        None
     } else {
+        let mut all: Vec<String> = app
+            .jumps
+            .iter()
+            .chain(here.as_ref())
+            .map(|j| {
+                let name = app
+                    .store
+                    .channels
+                    .get(&j.channel)
+                    .map(channel_label)
+                    .unwrap_or_else(|| "…".into());
+                if j.thread.is_some() {
+                    format!("{name} thread")
+                } else {
+                    name
+                }
+            })
+            .collect();
+        // Keep the newest steps when the line is too narrow.
+        let room = (area.width as usize).saturating_sub(Line::from(spans.clone()).width() + 2);
+        let mut text = format!("⌫ {} ", all.join(" › "));
+        while text.width() > room && all.len() > 1 {
+            all.remove(0);
+            text = format!("⌫ … › {} ", all.join(" › "));
+        }
+        (text.width() <= room).then_some(text)
+    };
+    if !app.uploading && status.is_none() {
+        let mut room = (area.width as usize).saturating_sub(
+            Line::from(spans.clone()).width() + chain.as_ref().map_or(0, |c| c.width() + 1),
+        );
         for (i, (k, what, _)) in legend(app.mode).iter().filter(|l| l.2).enumerate() {
-            {
-                spans.push(Span::styled(format!(" {k} "), theme::chip(theme::nth(i))));
-                spans.push(Span::styled(format!(" {what}  "), theme::muted()));
+            let (key, desc) = (format!(" {k} "), format!(" {what}  "));
+            let w = key.width() + desc.width();
+            if chain.is_some() && w > room {
+                break;
             }
+            room = room.saturating_sub(w);
+            spans.push(Span::styled(key, theme::chip(theme::nth(i))));
+            spans.push(Span::styled(desc, theme::muted()));
         }
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+    if let Some(text) = chain {
+        let w = text.width() as u16;
+        f.render_widget(
+            Paragraph::new(Span::styled(text, theme::muted())),
+            Rect {
+                x: area.right() - w,
+                width: w,
+                ..area
+            },
+        );
+    }
 }
 
 // ---------- overlays ----------
@@ -2118,6 +2170,31 @@ mod tests {
         let buf = t.backend().buffer().clone();
         let top: String = (0..90).map(|x| buf[(x, 0)].symbol()).collect();
         assert!(top.contains("channel-6"), "{top}");
+    }
+
+    /// After following links, the footer shows the way back.
+    #[test]
+    fn footer_shows_the_link_chain() {
+        let mut app = App::new("me".into(), None);
+        app.store.channel_mut("a").name = "buzz-vim".into();
+        app.store.channel_mut("x").name = "beacon-ask-release".into();
+        app.tabs = vec!["a".into()];
+        let bottom = |app: &mut App, w: u16| {
+            let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 12)).unwrap();
+            t.draw(|f| draw(f, app)).unwrap();
+            let buf = t.backend().buffer().clone();
+            (0..w).map(|x| buf[(x, 11)].symbol()).collect::<String>()
+        };
+        assert!(!bottom(&mut app, 100).contains('⌫'));
+        app.follow("buzz://message?channel=x&id=r1");
+        let line = bottom(&mut app, 100);
+        assert!(
+            line.contains("⌫ #buzz-vim › #beacon-ask-release thread"),
+            "{line}"
+        );
+        // Narrow: the oldest steps go first.
+        let line = bottom(&mut app, 44);
+        assert!(line.contains("⌫ … › #beacon-ask-release thread"), "{line}");
     }
 
     /// Tabs run up to the message count; no room is held back for the

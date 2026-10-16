@@ -12,6 +12,9 @@ use nostr::{Event, Keys};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
+/// How long the relay may say nothing before we call the socket dead.
+const SILENCE: Duration = Duration::from_secs(90);
+
 pub enum Cmd {
     Sub {
         id: String,
@@ -92,6 +95,11 @@ async fn run(
                 break;
             }
         }
+        // One deadline for the whole connection, pushed back only by what the
+        // relay sends. The 60 s presence heartbeat gets an OK back, so a live
+        // socket never goes 90 s quiet.
+        let dead = tokio::time::sleep(SILENCE);
+        tokio::pin!(dead);
         while ok {
             tokio::select! {
                 cmd = rx.recv() => {
@@ -104,30 +112,38 @@ async fn run(
                     apply(&mut subs, cmd);
                     ok = res.is_ok();
                 }
-                msg = conn.next_event(Duration::from_secs(90)) => match msg {
-                    Ok(RelayMessage::Event { subscription_id, event }) => {
-                        let _ = out.send(Live::Event { sub: subscription_id, event });
+                _ = &mut dead => {
+                    crate::log::line("ws silent, reconnecting");
+                    ok = false;
+                }
+                msg = conn.next_event(Duration::from_secs(3600)) => {
+                    if msg.is_ok() {
+                        dead.as_mut().reset(tokio::time::Instant::now() + SILENCE);
                     }
-                    Ok(RelayMessage::Eose { subscription_id }) => {
-                        let _ = out.send(Live::Eose { sub: subscription_id });
+                    match msg {
+                        Ok(RelayMessage::Event { subscription_id, event }) => {
+                            let _ = out.send(Live::Event { sub: subscription_id, event });
+                        }
+                        Ok(RelayMessage::Eose { subscription_id }) => {
+                            let _ = out.send(Live::Eose { sub: subscription_id });
+                        }
+                        Ok(RelayMessage::Closed { subscription_id, message }) => {
+                            subs.remove(&subscription_id);
+                            let _ = out.send(Live::Closed { sub: subscription_id, reason: message });
+                        }
+                        Ok(_) => {}
+                        Err(
+                            buzz_ws_client::WsClientError::Timeout
+                            | buzz_ws_client::WsClientError::ConnectionClosed
+                            | buzz_ws_client::WsClientError::WebSocket(_),
+                        ) => {
+                            crate::log::line("ws dropped");
+                            ok = false
+                        }
+                        // A frame we couldn't parse isn't a reason to drop the socket.
+                        Err(_) => {}
                     }
-                    Ok(RelayMessage::Closed { subscription_id, message }) => {
-                        subs.remove(&subscription_id);
-                        let _ = out.send(Live::Closed { sub: subscription_id, reason: message });
-                    }
-                    Ok(_) => {}
-                    // The relay pings every 30 s, so 90 s of silence means the socket is dead.
-                    Err(
-                        buzz_ws_client::WsClientError::Timeout
-                        | buzz_ws_client::WsClientError::ConnectionClosed
-                        | buzz_ws_client::WsClientError::WebSocket(_),
-                    ) => {
-                        crate::log::line("ws dropped");
-                        ok = false
-                    }
-                    // A frame we couldn't parse isn't a reason to drop the socket.
-                    Err(_) => {}
-                },
+                }
             }
         }
         let _ = out.send(Live::Status(ConnState::Offline));

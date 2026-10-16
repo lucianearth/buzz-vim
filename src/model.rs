@@ -218,7 +218,7 @@ impl Store {
     pub fn name_of(&self, pubkey: &str) -> String {
         match self.profiles.get(pubkey) {
             Some(p) if !p.name.is_empty() => p.name.clone(),
-            _ => format!("{}…", &pubkey[..pubkey.len().min(8)]),
+            _ => format!("{}…", pubkey.chars().take(8).collect::<String>()),
         }
     }
 
@@ -519,6 +519,15 @@ mod tests {
             .custom_created_at(nostr::Timestamp::from(at))
             .sign_with_keys(keys)
             .unwrap()
+    }
+
+    #[test]
+    fn unknown_names_cut_by_character() {
+        let s = Store::new("me".into());
+        // Mention tags are untrusted; a non-hex one mustn't panic the draw.
+        assert_eq!(s.name_of("aaaaaaaé"), "aaaaaaaé…");
+        assert_eq!(s.name_of("ééééééééé"), "éééééééé…");
+        assert_eq!(s.name_of(&"ab".repeat(32)), "abababab…");
     }
 
     #[test]

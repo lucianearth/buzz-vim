@@ -258,11 +258,12 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
             match r {
                 Ok(evs) => {
                     sync.apply_read(&evs);
+                    sync.read.loaded = true;
                 }
                 Err(e) => log::line(format!("read state load: {e}")),
             }
             // Even on failure, so unread still works from the last week.
-            sync.read.loaded = true;
+            sync.read.tried = true;
             sync::prune_unread(app, &sync.read);
         }
         Msg::Unread { channel, events } => match events {

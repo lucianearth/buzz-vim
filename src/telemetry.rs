@@ -296,10 +296,11 @@ impl Agents {
             .by_pubkey
             .iter()
             .filter(|(_, a)| {
-                a.live().any(|t| {
-                    t.channel.as_deref() == Some(channel)
-                        && root.is_none_or(|r| t.thread.as_deref() == Some(r))
-                })
+                a.owned
+                    && a.live().any(|t| {
+                        t.channel.as_deref() == Some(channel)
+                            && root.is_none_or(|r| t.thread.as_deref() == Some(r))
+                    })
             })
             .map(|(pk, a)| a.display_name(pk, store))
             .collect();
@@ -403,6 +404,12 @@ mod tests {
         ag.presence("a1", "offline");
         ag.presence("x9", "online");
         assert!(ag.rows(&s, Some("c")).is_empty());
+        // Frames from someone who isn't your agent don't show as thinking.
+        ag.frame(
+            "x9",
+            &json!({"kind": "turn_started", "channelId": "c", "payload": {}}),
+        );
+        assert!(ag.working(&s, "c", None).is_empty());
     }
 
     #[test]

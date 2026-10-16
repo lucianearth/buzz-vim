@@ -82,7 +82,11 @@ impl Draft {
     pub fn delete_word(&mut self) {
         let before = &self.text[..self.cursor];
         let trimmed = before.trim_end();
-        let start = trimmed.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+        let start = trimmed
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map_or(0, |(i, c)| i + c.len_utf8());
         self.text.replace_range(start..self.cursor, "");
         self.cursor = start;
     }
@@ -178,6 +182,17 @@ pub fn expand_tabs(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delete_word_after_wide_whitespace() {
+        for ws in ['\u{3000}', '\u{a0}'] {
+            let mut d = Draft::default();
+            d.insert(&format!("ab{ws}cd"));
+            d.delete_word();
+            assert_eq!(d.text, format!("ab{ws}"));
+            assert_eq!(d.cursor, d.text.len());
+        }
+    }
 
     #[test]
     fn editing_and_mentions() {

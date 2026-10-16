@@ -255,7 +255,7 @@ impl Sync {
     /// Look up what's unread in each tab we haven't checked yet: messages
     /// and thread replies since its read position (or the last week, if it has none).
     pub fn check_unread(&mut self, tabs: &[String]) {
-        if !self.read.loaded {
+        if !self.read.tried {
             return;
         }
         for id in tabs {
@@ -520,6 +520,7 @@ impl Sync {
             _ => None,
         };
         let Ok(uuid) = uuid::Uuid::parse_str(&channel) else {
+            *app.draft_mut() = draft;
             app.say("bad channel id");
             return;
         };
