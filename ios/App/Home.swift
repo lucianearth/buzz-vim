@@ -55,17 +55,26 @@ struct Home: View {
                         .foregroundStyle(theme.muted)
                     Spacer()
                 } else {
-                    TabView(selection: $selected) {
-                        ForEach(tabs, id: \.id) { t in
-                            ChannelView(client: client, channel: t.id) { root in
-                                path.append(Route(channel: t.id, root: root))
+                    // A paging scroll view, not a paged TabView: the TabView
+                    // stalls halfway between pages when the selection moves
+                    // while a compose field holds the keyboard.
+                    ScrollView(.horizontal) {
+                        LazyHStack(spacing: 0) {
+                            ForEach(tabs, id: \.id) { t in
+                                ChannelView(client: client, channel: t.id) { root in
+                                    path.append(Route(channel: t.id, root: root))
+                                }
+                                .containerRelativeFrame([.horizontal, .vertical])
+                                .id(t.id)
                             }
-                            .tag(Optional(t.id))
                         }
+                        .scrollTargetLayout()
                     }
-                    .tabViewStyle(.page(indexDisplayMode: .never))
-                    // A paged TabView whose pages change under a restored
-                    // selection can show a blank page; rebuild it instead.
+                    .scrollIndicators(.hidden)
+                    .scrollTargetBehavior(.paging)
+                    .scrollPosition(id: $selected)
+                    // Rebuild when the tab list changes, so a restored
+                    // selection lands on its page.
                     .id(tabs.map(\.id))
                 }
             }
@@ -150,9 +159,7 @@ struct Home: View {
         }
     }
 
-    /// Key-row moves only, so the keyboard is up: no page slide. An animated
-    /// selection change on a paged TabView while a field inside it holds
-    /// the keyboard can stall halfway between pages.
+    /// Key-row moves only, so the keyboard is up: jump, no page slide.
     private func go(_ id: String) {
         path = []
         selected = id

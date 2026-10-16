@@ -7,6 +7,7 @@ struct ThreadView: View {
     @Environment(Model.self) private var model
     @Environment(\.theme) private var theme
     @Environment(\.dismiss) private var dismiss
+    @State private var landed = false
 
     var body: some View {
         let _ = model.version
@@ -40,27 +41,27 @@ struct ThreadView: View {
                         if !tl.working.isEmpty {
                             Working(names: tl.working)
                         }
-                        Color.clear.frame(height: 1).id("end")
+                        // Room below, so a reply near the end can still sit at the top.
+                        Color.clear.frame(height: route.focus == nil ? 1 : geo.size.height).id("end")
                     }
                     .padding(.horizontal, 22)
                     .padding(.top, 4)
                     // A short thread starts under the header, not at the bottom.
                     .frame(minHeight: geo.size.height, alignment: .top)
                 }
-                .defaultScrollAnchor(.bottom)
+                // Opened on a reply by the bell key: hold the top, so the
+                // keyboard coming up doesn't push the reply off screen.
+                .defaultScrollAnchor(route.focus == nil ? .bottom : .top)
                 .scrollDismissesKeyboard(.interactively)
                 .onChange(of: tl.messages.last?.id) { _, _ in
                     // Opened on a reply by the bell key: stay on it.
                     guard route.focus == nil else { return }
                     withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("end", anchor: .bottom) }
                 }
-                .onAppear {
-                    // The bell key: the first new reply at the top.
-                    guard let f = route.focus else { return }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                        proxy.scrollTo(f, anchor: .top)
-                    }
-                }
+                // The bell key: the first new reply at the top, once it has
+                // loaded, and again after the push and keyboard settle.
+                .onAppear { land(proxy, tl) }
+                .onChange(of: tl.messages.count) { _, _ in land(proxy, tl) }
             }
             }
         }
@@ -73,6 +74,15 @@ struct ThreadView: View {
         .onDisappear {
             client.closeThread(root: route.root)
             model.bump()
+        }
+    }
+
+    private func land(_ proxy: ScrollViewProxy, _ tl: Timeline) {
+        guard !landed, let f = route.focus, tl.messages.contains(where: { $0.id == f }) else { return }
+        landed = true
+        proxy.scrollTo(f, anchor: .top)
+        for delay in [0.35, 0.7] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { proxy.scrollTo(f, anchor: .top) }
         }
     }
 }

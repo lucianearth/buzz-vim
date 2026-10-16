@@ -122,8 +122,11 @@ struct ComposeBar: View {
     private func claimFocus() {
         guard model.focusKey == key else { return }
         model.focusKey = nil
-        // After the page swipe, so the field is on screen to take it.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { focused = true }
+        model.focusClaim = key
+        // After a thread push settles, so the field is on screen to take it.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            if model.focusClaim == key { focused = true }
+        }
     }
 
     // ---------- sticky agents ----------

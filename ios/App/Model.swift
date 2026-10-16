@@ -38,6 +38,8 @@ final class Model {
     /// A compose box (draft key) that should take the keyboard when it
     /// shows: tab moves from the key row keep you typing.
     var focusKey: String?
+    /// The last box to claim it; a later claim cancels an earlier pending one.
+    var focusClaim: String?
     /// A message to scroll to the top of its channel: (channel, id).
     var scrollTarget: (channel: String, id: String)?
 
