@@ -2,3 +2,4 @@ Generated/
 BuzzVimCore.xcframework/
 BuzzVim.xcodeproj/
 build/
+build.log

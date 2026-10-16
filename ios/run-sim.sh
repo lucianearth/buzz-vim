@@ -18,7 +18,8 @@ print(max(found, key=lambda f: ver(f[0]))[1] if found else "")
 [ -n "$udid" ] || { echo "no simulator named $device"; exit 1; }
 xcodebuild -project BuzzVim.xcodeproj -scheme BuzzVim -configuration Debug \
   -destination "id=$udid" -derivedDataPath build \
-  CODE_SIGNING_ALLOWED=NO build | tail -n 30
+  CODE_SIGNING_ALLOWED=NO build > build.log 2>&1 \
+  || { grep -E " error: " build.log | sort -u; echo "full log: ios/build.log"; exit 1; }
 app=build/Build/Products/Debug-iphonesimulator/BuzzVim.app
 xcrun simctl boot "$udid" 2>/dev/null || true
 xcrun simctl install "$udid" "$app"
