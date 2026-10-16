@@ -188,19 +188,29 @@ pub fn file_name(url: &str, given: Option<&str>) -> String {
 }
 
 /// `name` in `dir`, or `name (1)`, `name (2)`… if that's taken, the way a
-/// browser saves downloads.
-pub fn free_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+/// browser saves downloads. Created empty, so a second download started
+/// before this one finishes can't pick the same name.
+pub fn free_path(dir: &std::path::Path, name: &str) -> std::io::Result<std::path::PathBuf> {
     let (stem, ext) = match name.rsplit_once('.') {
         Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
         _ => (name, String::new()),
     };
-    (0..)
-        .map(|i| match i {
+    for i in 0.. {
+        let p = match i {
             0 => dir.join(name),
             i => dir.join(format!("{stem} ({i}){ext}")),
-        })
-        .find(|p| !p.exists())
-        .expect("some name is free")
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&p)
+        {
+            Ok(_) => return Ok(p),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("some name is free")
 }
 
 /// Show a downloaded file in the file manager (Finder selects it) rather
@@ -302,11 +312,13 @@ mod tests {
     fn free_paths_number_like_a_browser() {
         let dir = std::env::temp_dir().join(format!("bv-free-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(free_path(&dir, "a.log"), dir.join("a.log"));
-        std::fs::write(dir.join("a.log"), "").unwrap();
-        assert_eq!(free_path(&dir, "a.log"), dir.join("a (1).log"));
-        std::fs::write(dir.join("Makefile"), "").unwrap();
-        assert_eq!(free_path(&dir, "Makefile"), dir.join("Makefile (1)"));
+        let free = |n| free_path(&dir, n).unwrap();
+        assert_eq!(free("a.log"), dir.join("a.log"));
+        // The first call took the name, so the next gets the next one.
+        assert_eq!(free("a.log"), dir.join("a (1).log"));
+        assert_eq!(free("a.log"), dir.join("a (2).log"));
+        assert_eq!(free("Makefile"), dir.join("Makefile"));
+        assert_eq!(free("Makefile"), dir.join("Makefile (1)"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

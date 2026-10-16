@@ -707,7 +707,7 @@ impl Sync {
                 let dir = dirs::download_dir()
                     .or_else(dirs::home_dir)
                     .ok_or_else(|| anyhow::anyhow!("no Downloads folder"))?;
-                let path = crate::links::free_path(&dir, &name);
+                let path = crate::links::free_path(&dir, &name)?;
                 let n = r.download_to(&url, &path).await?;
                 crate::links::reveal(&path)?;
                 anyhow::Ok(format!(

@@ -895,7 +895,8 @@ impl Client {
         }
         let dir = std::path::Path::new(&dir);
         std::fs::create_dir_all(dir).map_err(|e| BuzzError::Failed(e.to_string()))?;
-        let path = links::free_path(dir, &links::file_name(&url, name.as_deref()));
+        let path = links::free_path(dir, &links::file_name(&url, name.as_deref()))
+            .map_err(|e| BuzzError::Failed(e.to_string()))?;
         relay.download_to(&url, &path).await?;
         Ok(path.to_string_lossy().into_owned())
     }
