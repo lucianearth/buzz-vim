@@ -9,6 +9,7 @@ license = "MIT"
 
 [workspace]
 members = [".", "core", "ffi"]
+default-members = [".", "core", "ffi"]
 
 [dependencies]
 buzz-vim-core = { path = "core" }

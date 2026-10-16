@@ -17,8 +17,8 @@ if [ ! -f Cargo.toml ]; then
   exit 0
 fi
 phase fmt cargo fmt --check
-phase clippy cargo clippy --workspace --all-targets --locked -- -D warnings
+phase clippy cargo clippy --all-targets --locked -- -D warnings
 echo "== test"
-cargo test --workspace --locked 2>&1 | tee .green/test.log || { echo "RED phase=test"; exit 1; }
+cargo test --locked 2>&1 | tee .green/test.log || { echo "RED phase=test"; exit 1; }
 passed=$(grep -o '[0-9]* passed' .green/test.log | awk '{s+=$1} END {print s+0}')
 echo "GREEN passed=$passed"
