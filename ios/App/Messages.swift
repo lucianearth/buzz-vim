@@ -429,6 +429,15 @@ func rich(_ src: String, mentions: [String], theme: Theme) -> AttributedString {
         return start..<end
     }
 
+    // buzz:// links first: the data detector doesn't know the scheme.
+    for m in plain.matches(of: #/buzz:\/\/[^\s<>()\[\]"']+/#) {
+        var r = m.range
+        while r.upperBound > r.lowerBound, ".,;:!?".contains(plain[plain.index(before: r.upperBound)]) {
+            r = r.lowerBound..<plain.index(before: r.upperBound)
+        }
+        guard let url = URL(string: String(plain[r])), let s = span(r), a[s].link == nil else { continue }
+        a[s].link = url
+    }
     if let det = detector {
         let ns = NSRange(plain.startIndex..., in: plain)
         for match in det.matches(in: plain, range: ns) {

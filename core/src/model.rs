@@ -58,6 +58,8 @@ pub struct Media {
     pub url: String,
     pub mime: String,
     pub dim: Option<(u32, u32)>,
+    /// The uploader's file name (`filename`), when it gave one.
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -94,11 +96,13 @@ impl Message {
                 let mut url = None;
                 let mut mime = String::new();
                 let mut dim = None;
+                let mut name = None;
                 for part in &t[1..] {
                     let (k, v) = part.split_once(' ')?;
                     match k {
                         "url" => url = Some(v.to_string()),
                         "m" => mime = v.to_string(),
+                        "filename" => name = Some(v.to_string()),
                         "dim" => {
                             dim = v
                                 .split_once('x')
@@ -111,6 +115,7 @@ impl Message {
                     url: url?,
                     mime,
                     dim,
+                    name,
                 })
             })
             .collect();
@@ -431,6 +436,17 @@ impl Store {
         self.channels
             .values()
             .find_map(|c| c.messages.get(id).map(|m| (c, m)))
+    }
+
+    /// The file name an attachment was uploaded with, if any message
+    /// carries it.
+    pub fn media_name(&self, url: &str) -> Option<String> {
+        self.channels
+            .values()
+            .flat_map(|c| c.messages.values())
+            .flat_map(|m| &m.media)
+            .find(|x| x.url == url)
+            .and_then(|x| x.name.clone())
     }
 
     fn apply_message(&mut self, ev: &Event) -> Applied {

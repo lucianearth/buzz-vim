@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
+use buzz_vim_core::links;
 use buzz_vim_core::live::{self, Cmd, ConnState, Live};
 use buzz_vim_core::model::{self, Applied, Store};
 use buzz_vim_core::palette::{self, Role};
@@ -85,6 +86,20 @@ pub struct ChannelTab {
     pub section: String,
 }
 
+/// Where a tapped `buzz://` message or channel link lands.
+#[derive(uniffi::Record, Clone)]
+pub struct Follow {
+    pub channel: String,
+    /// The thread to open, if any.
+    pub root: Option<String>,
+    /// The reply to open the thread on, or the message to show in the
+    /// channel; None: the bottom.
+    pub id: Option<String>,
+    /// The section to show when the channel isn't a tab now; None when it
+    /// is one, or is in no section.
+    pub section: Option<String>,
+}
+
 #[derive(uniffi::Record, Clone)]
 pub struct SectionInfo {
     pub id: String,
@@ -116,6 +131,8 @@ pub struct Media {
     pub mime: String,
     pub width: u32,
     pub height: u32,
+    /// The uploader's file name, when it gave one.
+    pub name: Option<String>,
 }
 
 #[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq)]
@@ -448,6 +465,12 @@ impl Client {
         Ok(Arc::new(Client { engine, stop }))
     }
 
+    /// A link to a file on our relay: tapping it downloads with our auth
+    /// (`save_file`) instead of opening a browser that has none.
+    pub fn is_file(&self, url: String) -> bool {
+        self.engine.lock().unwrap().relay.is_file(&url)
+    }
+
     pub fn me(&self) -> String {
         self.engine.lock().unwrap().store.me.clone()
     }
@@ -481,24 +504,58 @@ impl Client {
         let e = self.engine.lock().unwrap();
         e.tabs
             .iter()
-            .map(|id| {
-                let ch = e.store.channels.get(id);
-                ChannelTab {
-                    id: id.clone(),
-                    label: e.label(id),
-                    unread: ch.map_or(0, |c| c.unread.len() as u32),
-                    mentions: ch.map_or(0, |c| {
-                        (if c.is_dm {
-                            c.unread.len()
-                        } else {
-                            c.mentioned.len()
-                        }) as u32
-                    }),
-                    is_dm: ch.is_some_and(|c| c.is_dm),
-                    section: e.tab_section.get(id).cloned().unwrap_or_default(),
-                }
-            })
+            .map(|id| e.tab(id, e.tab_section.get(id).cloned().unwrap_or_default()))
             .collect()
+    }
+
+    /// Any section's channels as tabs, whether or not it is the one showing.
+    pub fn section_tabs(&self, section: String) -> Vec<ChannelTab> {
+        let e = self.engine.lock().unwrap();
+        let Some(s) = e.sections.iter().find(|s| s.id == section) else {
+            return vec![];
+        };
+        s.channels
+            .iter()
+            .filter(|c| e.store.channels.get(*c).is_none_or(|ch| !ch.archived))
+            .map(|c| e.tab(c, section.clone()))
+            .collect()
+    }
+
+    /// A tapped link that we show ourselves (a channel, a message in one),
+    /// or None for the system to open.
+    pub fn follow(&self, url: String) -> Option<Follow> {
+        let links::Target::Message {
+            channel,
+            id,
+            thread,
+        } = links::target(&url)
+        else {
+            return None;
+        };
+        let e = self.engine.lock().unwrap();
+        let l = links::land(e.store.channels.get(&channel), id, thread);
+        let section = if e.tabs.contains(&channel) {
+            None
+        } else {
+            e.sections
+                .iter()
+                .find(|s| s.channels.contains(&channel))
+                .map(|s| s.id.clone())
+        };
+        Some(match l.thread {
+            Some((root, pick)) => Follow {
+                channel,
+                root: Some(root),
+                id: pick,
+                section,
+            },
+            None => Follow {
+                channel,
+                root: None,
+                id: l.selected,
+                section,
+            },
+        })
     }
 
     pub fn sections(&self) -> Vec<SectionInfo> {
@@ -873,6 +930,24 @@ impl Client {
         }
         Ok(relay.download(&url).await?)
     }
+
+    /// Download a file on our relay into `dir` under the name it was sent
+    /// with, for the share sheet. Returns its path.
+    pub async fn save_file(&self, url: String, dir: String) -> Result<String, BuzzError> {
+        let (relay, name) = {
+            let e = self.engine.lock().unwrap();
+            (e.relay.clone(), e.store.media_name(&url))
+        };
+        if !relay.is_file(&url) {
+            return Err(BuzzError::Failed("not a file on this relay".into()));
+        }
+        let dir = std::path::Path::new(&dir);
+        std::fs::create_dir_all(dir).map_err(|e| BuzzError::Failed(e.to_string()))?;
+        let path = links::free_path(dir, &links::file_name(&url, name.as_deref()))
+            .map_err(|e| BuzzError::Failed(e.to_string()))?;
+        relay.download_to(&url, &path).await?;
+        Ok(path.to_string_lossy().into_owned())
+    }
 }
 
 async fn run(
@@ -952,6 +1027,24 @@ impl Engine {
             id: id.to_string(),
             filters,
         });
+    }
+
+    fn tab(&self, id: &str, section: String) -> ChannelTab {
+        let ch = self.store.channels.get(id);
+        ChannelTab {
+            id: id.to_string(),
+            label: self.label(id),
+            unread: ch.map_or(0, |c| c.unread.len() as u32),
+            mentions: ch.map_or(0, |c| {
+                (if c.is_dm {
+                    c.unread.len()
+                } else {
+                    c.mentioned.len()
+                }) as u32
+            }),
+            is_dm: ch.is_some_and(|c| c.is_dm),
+            section,
+        }
     }
 
     fn label(&self, id: &str) -> String {
@@ -1867,6 +1960,7 @@ impl Engine {
                     mime: x.mime.clone(),
                     width: x.dim.map_or(0, |d| d.0),
                     height: x.dim.map_or(0, |d| d.1),
+                    name: x.name.clone(),
                 })
                 .collect(),
             reactions,

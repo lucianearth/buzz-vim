@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 import UIKit
 import Observation
 import Security
@@ -42,6 +43,8 @@ final class Model {
     var focusClaim: String?
     /// A message to scroll to the top of its channel: (channel, id).
     var scrollTarget: (channel: String, id: String)?
+    /// Where Home goes for a tapped channel or message link.
+    @ObservationIgnored var follow: (Follow) -> Void = { _ in }
 
     static let defaultRelay = "wss://buzz.gitcoin.co"
 
@@ -85,6 +88,7 @@ final class Model {
         Keychain.delete()
         UserDefaults.standard.removeObject(forKey: "chosen")
         UserDefaults.standard.removeObject(forKey: "tabOrder")
+        UserDefaults.standard.removeObject(forKey: "threads")
         drafts = [:]
         sticky = [:]
         // Unsent text belongs to this account; the next one mustn't get it.
@@ -186,6 +190,44 @@ final class Model {
             outbox[id] = nil
         }
         say("a message from last time may not have sent. It's back in its compose box.")
+    }
+
+    /// A tapped link. A channel or message link opens here. Files on our
+    /// relay need our auth, which Safari doesn't have: download them
+    /// ourselves and offer the share sheet (Save to Files, AirDrop, another
+    /// app). Anything else opens as usual.
+    func open(_ url: URL, client: Client) -> OpenURLAction.Result {
+        if let f = client.follow(url: url.absoluteString) {
+            follow(f)
+            return .handled
+        }
+        guard client.isFile(url: url.absoluteString) else { return .systemAction }
+        say("downloading…")
+        // A folder of its own, so the file keeps the name it was sent with.
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("downloads", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        Task { @MainActor in
+            do {
+                let path = try await client.saveFile(url: url.absoluteString, dir: dir.path)
+                notice = nil
+                share(URL(fileURLWithPath: path))
+            } catch let BuzzError.Failed(message) {
+                say("download failed: \(message)")
+            } catch {
+                say("download failed: \(error.localizedDescription)")
+            }
+        }
+        return .handled
+    }
+
+    private func share(_ file: URL) {
+        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        guard var top = scene?.keyWindow?.rootViewController else { return }
+        while let p = top.presentedViewController { top = p }
+        let sheet = UIActivityViewController(activityItems: [file], applicationActivities: nil)
+        sheet.popoverPresentationController?.sourceView = top.view
+        top.present(sheet, animated: true)
     }
 
     func say(_ s: String) {

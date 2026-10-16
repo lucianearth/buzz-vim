@@ -252,6 +252,12 @@ impl Relay {
         same_origin(url, &self.base)
     }
 
+    /// A file in our relay's media store: a link to it needs our auth, so
+    /// we download it ourselves instead of handing it to a browser.
+    pub fn is_file(&self, url: &str) -> bool {
+        self.is_ours(url) && reqwest::Url::parse(url).is_ok_and(|u| u.path().starts_with("/media/"))
+    }
+
     /// BUD-02 upload. Caller has already checked type and size.
     pub async fn upload(&self, bytes: Vec<u8>, mime: &str) -> Result<BlobDescriptor> {
         let sha = hex::encode(Sha256::digest(&bytes));
@@ -328,6 +334,50 @@ impl Relay {
         Ok(out)
     }
 
+    /// Authenticated GET of any file on this relay, streamed into `path`
+    /// (no size cap: it goes to disk, not memory). A failed download,
+    /// refused or cut off, leaves nothing behind, not even the empty file
+    /// the caller made to claim the name.
+    pub async fn download_to(&self, url: &str, path: &std::path::Path) -> Result<u64> {
+        use tokio::io::AsyncWriteExt;
+        // A big video on a slow link can take a long time; what counts as
+        // failure is the bytes stopping.
+        const STALL: Duration = Duration::from_secs(60);
+        let res = async {
+            let auth = self.blossom_auth("get", None, url)?;
+            let mut r = tokio::time::timeout(
+                STALL,
+                self.authed(self.http.get(url))
+                    // The client's 30 s total is for small calls.
+                    .timeout(Duration::from_secs(24 * 3600))
+                    .header("Authorization", auth)
+                    .send(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("download timed out"))??;
+            let s = r.status();
+            if !s.is_success() {
+                bail!("download failed ({s})");
+            }
+            let mut f = tokio::fs::File::create(path).await?;
+            let mut n = 0u64;
+            while let Some(chunk) = tokio::time::timeout(STALL, r.chunk())
+                .await
+                .map_err(|_| anyhow::anyhow!("download stalled"))??
+            {
+                f.write_all(&chunk).await?;
+                n += chunk.len() as u64;
+            }
+            f.flush().await?;
+            anyhow::Ok(n)
+        }
+        .await;
+        if res.is_err() {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+        res
+    }
+
     /// Archived identities (NIP-IA): the `p` tags of the newest kind 13535
     /// signed by the relay's own NIP-11 `self` key.
     pub async fn archived(&self) -> Result<Vec<String>> {
@@ -382,6 +432,39 @@ fn same_origin(a: &str, b: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A refused download takes the claimed name back out of the folder.
+    #[tokio::test]
+    async fn refused_download_leaves_nothing() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = l.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = c.read(&mut buf).await;
+                let _ = c
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+        });
+        let relay = super::Relay::new(
+            &format!("ws://127.0.0.1:{port}"),
+            nostr::Keys::generate(),
+            None,
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("bv-dl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("http://127.0.0.1:{port}/media/abc.pdf");
+        let path = crate::links::free_path(&dir, "my doc.pdf").unwrap();
+        let err = relay.download_to(&url, &path).await.unwrap_err();
+        assert!(err.to_string().contains("404"), "{err}");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn same_origin_is_exact() {
         let base = "https://buzz.gitcoin.co";

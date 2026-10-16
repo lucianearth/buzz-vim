@@ -76,7 +76,7 @@ struct ComposeBar: View {
                     }
                 }
                 ComposeField(text: text, focused: $focused, lines: 6) { data, type in
-                    pending = PendingUpload.make(data, type)
+                    Task { prepare(await PendingUpload.make(data, type)) }
                 }
                 .overlay(alignment: .topLeading) {
                     if text.wrappedValue.isEmpty {
@@ -113,7 +113,7 @@ struct ComposeBar: View {
         .onChange(of: picked) { _, item in
             guard let item else { return }
             picked = nil
-            Task { pending = await PendingUpload.load(item) }
+            Task { prepare(await PendingUpload.load(item)) }
         }
         .sheet(item: $pending) { p in
             UploadSheet(upload: p, host: model.relayHost) { yes in
@@ -258,6 +258,15 @@ struct ComposeBar: View {
         }
     }
 
+    /// Ask about a prepared image, or say why there's nothing to ask about.
+    private func prepare(_ p: PendingUpload?) {
+        if let p {
+            pending = p
+        } else {
+            model.say("couldn't read that image")
+        }
+    }
+
     private func upload(_ p: PendingUpload) {
         uploading = true
         Task {
@@ -285,12 +294,17 @@ struct PendingUpload: Identifiable {
 
     static func load(_ item: PhotosPickerItem) async -> PendingUpload? {
         guard let raw = try? await item.loadTransferable(type: Data.self) else { return nil }
-        return make(raw, item.supportedContentTypes.first)
+        return await make(raw, item.supportedContentTypes.first)
     }
 
     /// The relay takes no metadata at all, so every image is redrawn and
     /// re-encoded clean (see Sanitize): PNG stays PNG, the rest go as JPEG.
-    static func make(_ raw: Data, _ type: UTType?) -> PendingUpload? {
+    /// Off the main thread: a 48 MP photo takes a moment to redraw.
+    static func make(_ raw: Data, _ type: UTType?) async -> PendingUpload? {
+        await Task.detached(priority: .userInitiated) { build(raw, type) }.value
+    }
+
+    private static func build(_ raw: Data, _ type: UTType?) -> PendingUpload? {
         guard let img = UIImage(data: raw) else { return nil }
         let png = type?.conforms(to: .png) ?? false
         guard let data = Sanitize.image(img, png: png) else { return nil }
@@ -379,7 +393,10 @@ struct ComposeField: UIViewRepresentable {
         v.pasted = pasted
         v.textColor = UIColor(theme.text)
         v.tintColor = UIColor(theme.accent)
-        if v.text != text, v.markedTextRange == nil { v.text = text }
+        if v.text != text, v.markedTextRange == nil {
+            v.text = text
+            v.followCaret()
+        }
         if focused, !v.isFirstResponder, v.window != nil {
             DispatchQueue.main.async { v.becomeFirstResponder() }
         } else if !focused, v.isFirstResponder {
@@ -393,7 +410,10 @@ struct ComposeField: UIViewRepresentable {
         let most = (v.font?.lineHeight ?? 18) * CGFloat(lines)
         let scroll = fit.height > most + 1
         if v.isScrollEnabled != scroll {
-            DispatchQueue.main.async { v.isScrollEnabled = scroll }
+            DispatchQueue.main.async {
+                v.isScrollEnabled = scroll
+                v.followCaret()
+            }
         }
         return CGSize(width: width, height: min(fit.height, most))
     }
@@ -404,7 +424,10 @@ struct ComposeField: UIViewRepresentable {
         var parent: ComposeField
         init(_ parent: ComposeField) { self.parent = parent }
 
-        func textViewDidChange(_ v: UITextView) { parent.text = v.text }
+        func textViewDidChange(_ v: UITextView) {
+            parent.text = v.text
+            (v as? PasteTextView)?.followCaret()
+        }
         func textViewDidBeginEditing(_ v: UITextView) { if !parent.focused { parent.focused = true } }
         func textViewDidEndEditing(_ v: UITextView) { if parent.focused { parent.focused = false } }
     }
@@ -413,6 +436,17 @@ struct ComposeField: UIViewRepresentable {
 /// Paste takes an image when the clipboard holds one; text pastes as usual.
 final class PasteTextView: UITextView {
     var pasted: ((Data, UTType) -> Void)?
+
+    /// Keep the caret in view once the box is at its full height. Without
+    /// this, the box stopped at its last line before scrolling turned on
+    /// and new text went on below, out of sight.
+    func followCaret() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isScrollEnabled else { return }
+            self.layoutIfNeeded()
+            self.scrollRangeToVisible(self.selectedRange)
+        }
+    }
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
         if action == #selector(paste(_:)), UIPasteboard.general.hasImages { return true }

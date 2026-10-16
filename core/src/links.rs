@@ -51,6 +51,40 @@ pub fn target(url: &str) -> Target {
     }
 }
 
+/// Where a message link lands, given what we hold of its channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Landing {
+    /// A loaded top-level message to pick in the timeline.
+    pub selected: Option<String>,
+    /// A thread to open, and the reply to pick in it (None: its bottom).
+    pub thread: Option<(String, Option<String>)>,
+}
+
+/// A reply opens its thread. So does a message older than what's loaded:
+/// the thread fetch gets it by id.
+pub fn land(
+    ch: Option<&crate::model::Channel>,
+    id: Option<String>,
+    thread: Option<String>,
+) -> Landing {
+    let in_timeline = |id: &String| ch.is_some_and(|c| c.timeline.contains(id));
+    let thread = thread.or_else(|| {
+        let id = id.as_ref()?;
+        match ch.and_then(|c| c.messages.get(id)) {
+            Some(m) => m.root.clone(),
+            None if in_timeline(id) => None,
+            None => Some(id.clone()),
+        }
+    });
+    Landing {
+        selected: id.clone().filter(|i| thread.is_none() && in_timeline(i)),
+        thread: thread.map(|r| {
+            let pick = id.filter(|i| *i != r);
+            (r, pick)
+        }),
+    }
+}
+
 /// The short label a bare `buzz://` link shows instead of its whole URL,
 /// given a way to name channels. None keeps the URL.
 pub fn label(url: &str, channel_name: &dyn Fn(&str) -> Option<String>) -> Option<String> {
@@ -170,6 +204,80 @@ pub fn open(url: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// A safe file name to save `url` as: the uploader's name if there is
+/// one, else the URL's last segment. Never a path, never hidden.
+pub fn file_name(url: &str, given: Option<&str>) -> String {
+    let tail = url.split(['?', '#']).next().unwrap_or(url);
+    let tail = tail.rsplit('/').next().unwrap_or("");
+    let clean = |s: &str| {
+        let s = s.rsplit(['/', '\\']).next().unwrap_or("");
+        // No control characters, and no direction overrides (U+202E can
+        // make "evil\u{202E}fdp.exe" show as "evilexe.pdf").
+        let s: String = s
+            .chars()
+            .filter(|c| {
+                !c.is_control()
+                    && !matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+            })
+            .collect();
+        s.trim().trim_start_matches('.').to_string()
+    };
+    [given.map(clean), Some(clean(tail))]
+        .into_iter()
+        .flatten()
+        .find(|s| !s.is_empty())
+        .unwrap_or_else(|| "download".into())
+}
+
+/// `name` in `dir`, or `name (1)`, `name (2)`… if that's taken, the way a
+/// browser saves downloads. Created empty, so a second download started
+/// before this one finishes can't pick the same name.
+pub fn free_path(dir: &std::path::Path, name: &str) -> std::io::Result<std::path::PathBuf> {
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
+        _ => (name, String::new()),
+    };
+    for i in 0.. {
+        let p = match i {
+            0 => dir.join(name),
+            i => dir.join(format!("{stem} ({i}){ext}")),
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&p)
+        {
+            Ok(_) => return Ok(p),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("some name is free")
+}
+
+/// Show a downloaded file in the file manager (Finder selects it) rather
+/// than opening it: a file someone sent could be a script.
+pub fn reveal(path: &std::path::Path) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    let mut cmd = if std::env::consts::OS == "macos" {
+        let mut c = Command::new("open");
+        c.arg("-R").arg(path);
+        c
+    } else {
+        let (prog, args) = opener(std::env::consts::OS);
+        let mut c = Command::new(prog);
+        c.args(args).arg(path.parent().unwrap_or(path));
+        c
+    };
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
 /// Open several files at once. On a Mac one `open` call puts them in one
 /// Preview window, where the arrow keys page through them; opening
 /// `paths[focus]` again once that's done makes Preview select it.
@@ -230,6 +338,92 @@ pub fn hint_labels(n: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_names_are_names_not_paths() {
+        let u = "https://buzz.gitcoin.co/media/abc123.bin";
+        assert_eq!(file_name(u, Some("gate.log")), "gate.log");
+        assert_eq!(file_name(u, None), "abc123.bin");
+        assert_eq!(file_name(u, Some("../../etc/passwd")), "passwd");
+        assert_eq!(file_name(u, Some("a\\..\\.bashrc")), "bashrc");
+        assert_eq!(file_name(u, Some("")), "abc123.bin");
+        assert_eq!(file_name(u, Some("evil\u{202E}fdp.exe")), "evilfdp.exe");
+        assert_eq!(file_name("https://x/y/?a=b", Some("..")), "download");
+    }
+
+    #[test]
+    fn free_paths_number_like_a_browser() {
+        let dir = std::env::temp_dir().join(format!("bv-free-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let free = |n| free_path(&dir, n).unwrap();
+        assert_eq!(free("a.log"), dir.join("a.log"));
+        // The first call took the name, so the next gets the next one.
+        assert_eq!(free("a.log"), dir.join("a (1).log"));
+        assert_eq!(free("a.log"), dir.join("a (2).log"));
+        assert_eq!(free("Makefile"), dir.join("Makefile"));
+        assert_eq!(free("Makefile"), dir.join("Makefile (1)"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn landings() {
+        use crate::model::{Channel, Message};
+        let mut ch = Channel {
+            timeline: vec!["top".into()],
+            ..Default::default()
+        };
+        for (id, root) in [("top", None), ("reply", Some("top"))] {
+            ch.messages.insert(
+                id.into(),
+                Message {
+                    id: id.into(),
+                    root: root.map(Into::into),
+                    ..Default::default()
+                },
+            );
+        }
+        let s = |v: &str| Some(v.to_string());
+        let land = |id, thread| land(Some(&ch), id, thread);
+        // A loaded top-level message is picked in the timeline.
+        assert_eq!(
+            land(s("top"), None),
+            Landing {
+                selected: s("top"),
+                thread: None
+            }
+        );
+        // A reply opens its thread on it.
+        assert_eq!(
+            land(s("reply"), None),
+            Landing {
+                selected: None,
+                thread: Some(("top".into(), s("reply")))
+            }
+        );
+        // Unknown: fetched as a thread root.
+        assert_eq!(
+            land(s("old"), None),
+            Landing {
+                selected: None,
+                thread: Some(("old".into(), None))
+            }
+        );
+        // A thread link to its root opens the thread at the bottom.
+        assert_eq!(
+            land(s("top"), s("top")),
+            Landing {
+                selected: None,
+                thread: Some(("top".into(), None))
+            }
+        );
+        assert_eq!(
+            land(None, None),
+            Landing {
+                selected: None,
+                thread: None
+            }
+        );
+    }
 
     #[test]
     fn targets() {

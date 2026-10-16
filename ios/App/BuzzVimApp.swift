@@ -35,6 +35,7 @@ struct Root: View {
             theme.canvas.ignoresSafeArea()
             if let client = model.client {
                 Home(client: client)
+                    .environment(\.openURL, OpenURLAction { model.open($0, client: client) })
             } else {
                 LoginView()
             }
