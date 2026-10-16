@@ -1,6 +1,8 @@
 //! Desktop's sidebar, read from the encrypted kind 30078 lanes it syncs:
 //! `channel-sections` and `channel-stars`. We write only a channel move; the picker's choice
-//! of which sections are today's tabs is kept locally.
+//! of which sections are today's tabs is kept locally. Tab order within a
+//! section is ours alone (Desktop sorts by name): its own lane,
+//! `buzz-vim-tab-order`, shared by the terminal and the phone.
 //!
 //! The order matches Desktop's sidebar: Starred, each section, the
 //! unsectioned "Channels" group, then DMs.
@@ -13,6 +15,7 @@ use crate::model::Store;
 
 pub const LANE_SECTIONS: &str = "channel-sections";
 pub const LANE_STARS: &str = "channel-stars";
+pub const LANE_ORDER: &str = "buzz-vim-tab-order";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Section {
@@ -28,6 +31,11 @@ pub struct Lanes {
     /// channel -> section id
     pub assignments: HashMap<String, String>,
     pub starred: HashSet<String>,
+    /// section id -> its tabs in the order you put them.
+    pub order: HashMap<String, Vec<String>>,
+    /// The newest tab-order doc applied or written: an older one (our own
+    /// echo of an earlier move) doesn't undo a later move.
+    pub order_at: u64,
 }
 
 /// LWW register `[v_ms, dev, value]` -> value.
@@ -118,6 +126,67 @@ pub fn parse_stars(doc: &Value, lanes: &mut Lanes) {
         .collect();
 }
 
+/// `{"order": {section: [channel, ...]}}`, unless it is older than what we have.
+pub fn parse_order(doc: &Value, at: u64, lanes: &mut Lanes) {
+    if at <= lanes.order_at {
+        return;
+    }
+    lanes.order_at = at;
+    lanes.order = doc
+        .get("order")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(k, v)| {
+            let ids = v
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|c| c.as_str().map(str::to_string))
+                .collect();
+            (k.clone(), ids)
+        })
+        .collect();
+}
+
+/// Write the whole tab order to its lane.
+pub async fn publish_order(
+    relay: &crate::relay::Relay,
+    order: &HashMap<String, Vec<String>>,
+    at: u64,
+) -> anyhow::Result<nostr::Event> {
+    use nostr::nips::nip44;
+    let keys = &relay.keys;
+    let me = keys.public_key();
+    let doc = json!({ "order": order });
+    let ct = nip44::encrypt(keys.secret_key(), &me, doc.to_string(), nip44::Version::V2)?;
+    let ev = relay.sign(
+        nostr::EventBuilder::new(nostr::Kind::Custom(30078), ct)
+            .tags([
+                nostr::Tag::parse(["d", LANE_ORDER])?,
+                nostr::Tag::parse(["t", LANE_ORDER])?,
+            ])
+            .custom_created_at(nostr::Timestamp::from(at)),
+    )?;
+    relay.publish(&ev).await?;
+    Ok(ev)
+}
+
+/// `channel` one place along (`by` = -1 or 1) in `section`, whose tabs
+/// are `tabs` as shown. None at the end of the section.
+pub fn shift(tabs: &[String], channel: &str, by: isize) -> Option<Vec<String>> {
+    let i = tabs.iter().position(|c| c == channel)?;
+    let j = i.checked_add_signed(by).filter(|&j| j < tabs.len())?;
+    let mut out = tabs.to_vec();
+    out.swap(i, j);
+    Some(out)
+}
+
+/// The time for a new tab-order write: now, or just past the last one.
+pub fn next_order_at(lanes: &Lanes) -> u64 {
+    (chrono::Utc::now().timestamp() as u64).max(lanes.order_at + 1)
+}
+
 /// The picker list, in sidebar order. Only channels you belong to, not archived.
 pub fn build(lanes: &Lanes, store: &Store) -> Vec<Section> {
     let mut chans: Vec<&crate::model::Channel> = store
@@ -178,6 +247,13 @@ pub fn build(lanes: &Lanes, store: &Store) -> Vec<Section> {
             name: "DMs".into(),
             channels: dms,
         });
+    }
+    // Your own tab order; channels it doesn't list follow, by name.
+    for sec in &mut out {
+        if let Some(o) = lanes.order.get(&sec.id) {
+            sec.channels
+                .sort_by_key(|c| o.iter().position(|x| x == c).unwrap_or(usize::MAX));
+        }
     }
     out
 }
@@ -487,5 +563,37 @@ mod tests {
         let mut l = Lanes::default();
         parse_sections(&out, &mut l);
         assert_eq!(l.assignments["c1"], "s");
+    }
+
+    #[test]
+    fn tab_order_sorts_a_section_and_ignores_older_docs() {
+        let mut store = Store::new("me".into());
+        for (id, name) in [
+            ("a", "alpha"),
+            ("b", "beta"),
+            ("c", "gamma"),
+            ("d", "delta"),
+        ] {
+            let c = store.channel_mut(id);
+            c.name = name.into();
+            c.is_member = true;
+        }
+        let mut lanes = Lanes::default();
+        parse_order(&json!({"order": {"channels": ["c", "a"]}}), 10, &mut lanes);
+        let s = build(&lanes, &store);
+        // Listed ones first, the rest by name.
+        assert_eq!(s[0].channels, vec!["c", "a", "b", "d"]);
+        // Our own echo of an earlier write doesn't undo a later one.
+        parse_order(&json!({"order": {"channels": ["a"]}}), 10, &mut lanes);
+        assert_eq!(lanes.order["channels"], vec!["c", "a"]);
+        parse_order(&json!({"order": {"channels": ["b"]}}), 11, &mut lanes);
+        assert_eq!(lanes.order["channels"], vec!["b"]);
+        let tabs: Vec<String> = ["x", "y", "z"].map(String::from).to_vec();
+        assert_eq!(
+            shift(&tabs, "y", 1),
+            Some(["x", "z", "y"].map(String::from).to_vec())
+        );
+        assert_eq!(shift(&tabs, "x", -1), None);
+        assert_eq!(shift(&tabs, "z", 1), None);
     }
 }

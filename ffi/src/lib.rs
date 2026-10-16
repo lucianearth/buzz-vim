@@ -308,6 +308,7 @@ enum Msg {
         result: anyhow::Result<()>,
     },
     Moved(anyhow::Result<(Event, String)>),
+    Ordered(anyhow::Result<Event>),
     Notice(String),
 }
 
@@ -322,8 +323,6 @@ struct Engine {
     tabs: Vec<String>,
     /// tab -> the section it came from ("" for the all-channels fallback).
     tab_section: HashMap<String, String>,
-    /// Section -> the user's own tab order, set by dragging tabs.
-    order: HashMap<String, Vec<String>>,
     channels_loaded: bool,
     sections_loaded: bool,
     agents: Agents,
@@ -414,7 +413,6 @@ impl Client {
             chosen,
             tabs: vec![],
             tab_section: HashMap::new(),
-            order: HashMap::new(),
             channels_loaded: false,
             sections_loaded: false,
             agents: Agents::default(),
@@ -529,11 +527,16 @@ impl Client {
     }
 
     /// A section's tab order, as dragged. Channels it doesn't list (new
-    /// ones) follow in sidebar order. Save it and pass it back next launch.
+    /// ones) follow by name. Synced: the terminal app shows it too.
     pub fn set_order(&self, section: String, ids: Vec<String>) {
         let mut e = self.engine.lock().unwrap();
-        e.order.insert(section, ids);
-        e.rebuild_tabs();
+        e.lanes.order.insert(section, ids);
+        let at = sections::next_order_at(&e.lanes);
+        e.lanes.order_at = at;
+        e.refresh_sections();
+        let order = e.lanes.order.clone();
+        let r = e.relay.clone();
+        e.spawn(async move { Msg::Ordered(sections::publish_order(&r, &order, at).await) });
     }
 
     /// Move the channel on screen into `section` ("channels" = out of its
@@ -989,7 +992,7 @@ impl Engine {
             "metrics",
             vec![json!({"kinds": [44200], "#p": [me], "limit": 30})],
         );
-        self.sub("lanes", vec![json!({"kinds": [30078], "authors": [me], "#d": [sections::LANE_SECTIONS, sections::LANE_STARS], "limit": 0})]);
+        self.sub("lanes", vec![json!({"kinds": [30078], "authors": [me], "#d": [sections::LANE_SECTIONS, sections::LANE_STARS, sections::LANE_ORDER], "limit": 0})]);
         self.sub(
             "readstate",
             vec![json!({"kinds": [30078], "authors": [me], "#t": ["read-state"], "since": now, "limit": 0})],
@@ -1060,6 +1063,7 @@ impl Engine {
                 r.query(&[
                     json!({"kinds": [30078], "authors": [me], "#d": [sections::LANE_SECTIONS], "limit": 1}),
                     json!({"kinds": [30078], "authors": [me], "#d": [sections::LANE_STARS], "limit": 1}),
+                    json!({"kinds": [30078], "authors": [me], "#d": [sections::LANE_ORDER], "limit": 1}),
                 ])
                 .await,
             )
@@ -1091,6 +1095,9 @@ impl Engine {
             match model::tag(ev, "d") {
                 Some(sections::LANE_SECTIONS) => sections::parse_sections(&doc, &mut self.lanes),
                 Some(sections::LANE_STARS) => sections::parse_stars(&doc, &mut self.lanes),
+                Some(sections::LANE_ORDER) => {
+                    sections::parse_order(&doc, ev.created_at.as_secs(), &mut self.lanes)
+                }
                 _ => continue,
             }
             changed = true;
@@ -1121,11 +1128,7 @@ impl Engine {
                 .collect()
         };
         for s in chosen {
-            let mut chans: Vec<&String> = s.channels.iter().collect();
-            if let Some(o) = self.order.get(&s.id) {
-                chans.sort_by_key(|c| o.iter().position(|x| x == *c).unwrap_or(usize::MAX));
-            }
-            for c in chans {
+            for c in &s.channels {
                 if !tabs.contains(c) && self.store.channels.get(c).is_none_or(|ch| !ch.archived) {
                     tabs.push(c.clone());
                     tab_section.insert(c.clone(), s.id.clone());
@@ -1400,6 +1403,8 @@ impl Engine {
                 self.notices.push(label);
             }
             Msg::Moved(Err(e)) => self.notices.push(format!("couldn't move: {e}")),
+            Msg::Ordered(Ok(_)) => {}
+            Msg::Ordered(Err(e)) => self.notices.push(format!("tab order not saved: {e}")),
             Msg::Window {
                 channel,
                 events,
@@ -1944,7 +1949,6 @@ mod tests {
             chosen: vec![],
             tabs: vec![],
             tab_section: HashMap::new(),
-            order: HashMap::new(),
             channels_loaded: false,
             sections_loaded: false,
             agents: Agents::default(),
@@ -2043,10 +2047,9 @@ mod tests {
         e.sections = vec![Section {
             id: "s".into(),
             name: "S".into(),
-            channels: vec!["a".into(), "b".into(), "c".into(), "x".into()],
+            channels: vec!["c".into(), "a".into(), "b".into(), "x".into()],
         }];
         e.chosen = vec!["s".into()];
-        e.order.insert("s".into(), vec!["c".into(), "a".into()]);
         e.rebuild_tabs();
         assert_eq!(e.tabs, vec!["c", "a", "b"]);
         assert_eq!(e.tab_section["b"], "s");

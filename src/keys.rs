@@ -6,6 +6,7 @@ pub enum Mode {
     Normal,
     Insert,
     Sections,
+    Order,
     Confirm,
     Viewer,
     Help,
@@ -18,6 +19,7 @@ impl Mode {
             Mode::Normal => "NORMAL",
             Mode::Insert => "INSERT",
             Mode::Sections => "SECTIONS",
+            Mode::Order => "TAB ORDER",
             Mode::Confirm => "UPLOAD?",
             Mode::Viewer => "IMAGE",
             Mode::Help => "HELP",
@@ -31,9 +33,11 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
     match mode {
         Mode::Normal => &[
             ("j k ↑↓", "move", true),
-            ("n", "next unread (into threads too)", true),
+            ("n", "latest message (into its thread)", true),
             ("0-9", "tab", false),
             ("H L ⇥", "prev/next tab", false),
+            ("< >", "move this tab left / right", false),
+            ("T", "tab order", false),
             ("⏎ l →", "thread", true),
             ("i", "write", true),
             ("+", "👍", false),
@@ -78,6 +82,12 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("m", "move this channel here", true),
             ("R", "reload from relay", true),
             ("esc", "cancel", true),
+        ],
+        Mode::Order => &[
+            ("j k", "pick a tab", true),
+            ("J K", "move it down / up", true),
+            ("⏎", "go to it", true),
+            ("esc", "done", true),
         ],
         Mode::Confirm => &[("y", "upload to Buzz", true), ("n esc", "cancel", true)],
         Mode::Viewer => &[

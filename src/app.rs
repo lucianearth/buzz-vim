@@ -80,6 +80,11 @@ pub enum Action {
         channel: String,
         section: Option<String>,
     },
+    /// A section's tabs in a new order (synced, see sections::LANE_ORDER).
+    Order {
+        section: String,
+        ids: Vec<String>,
+    },
     LoadImage(String),
     EncodeImage((String, u16, u16)),
     /// Decode the pending upload so the confirm box can show it.
@@ -115,6 +120,8 @@ pub struct App {
     /// Section ids whose channels are the tabs.
     pub chosen: Vec<String>,
     pub picker_cursor: usize,
+    /// The tab the reorder pop-up (T) is on.
+    pub order_cursor: usize,
     pub picker_marks: HashSet<String>,
     /// Marks changed since the picker opened. Until then Enter switches to
     /// the section under the cursor.
@@ -205,6 +212,7 @@ impl App {
             channels_loaded: false,
             chosen: vec![],
             picker_cursor: 0,
+            order_cursor: 0,
             picker_marks: HashSet::new(),
             picker_touched: false,
             focus: Pane::Timeline,
@@ -972,6 +980,7 @@ impl App {
             Mode::Insert => self.key_insert(k),
             Mode::Normal => self.key_normal(k),
             Mode::Sections => self.key_sections(k),
+            Mode::Order => self.key_order(k),
             Mode::Confirm => match k.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     self.mode = Mode::Insert;
@@ -1125,6 +1134,15 @@ impl App {
                 self.mode = Mode::Sections;
             }
             KeyCode::Char('R') => self.actions.push(Action::ReloadSections),
+            KeyCode::Char('<') | KeyCode::Char('>') => {
+                if let Some(c) = self.current().map(str::to_string) {
+                    self.shift_tab(&c, if k.code == KeyCode::Char('<') { -1 } else { 1 });
+                }
+            }
+            KeyCode::Char('T') => {
+                self.order_cursor = self.active;
+                self.mode = Mode::Order;
+            }
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('o') if ctrl => self.back(),
             KeyCode::Backspace => self.back(),
@@ -1279,6 +1297,73 @@ impl App {
             KeyCode::Char('R') => self.actions.push(Action::ReloadSections),
             _ => {}
         }
+    }
+
+    fn key_order(&mut self, k: KeyEvent) {
+        let n = self.tabs.len();
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('T') => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down if n > 0 => {
+                self.order_cursor = (self.order_cursor + 1).min(n - 1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.order_cursor = self.order_cursor.saturating_sub(1)
+            }
+            KeyCode::Char('J') | KeyCode::Char('K') => {
+                if let Some(c) = self.tabs.get(self.order_cursor).cloned() {
+                    self.shift_tab(&c, if k.code == KeyCode::Char('K') { -1 } else { 1 });
+                    if let Some(i) = self.tabs.iter().position(|t| *t == c) {
+                        self.order_cursor = i;
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                self.mode = Mode::Normal;
+                self.switch_tab(self.order_cursor);
+            }
+            _ => {}
+        }
+    }
+
+    /// The section a tab comes from: the first of today's that holds it.
+    fn tab_section(&self, channel: &str) -> Option<&Section> {
+        let mut today = self
+            .sections
+            .iter()
+            .filter(|s| self.chosen.is_empty() || self.chosen.contains(&s.id));
+        if self.chosen.is_empty() {
+            return today
+                .next()
+                .filter(|s| s.channels.iter().any(|c| c == channel));
+        }
+        today.find(|s| s.channels.iter().any(|c| c == channel))
+    }
+
+    /// Move a tab one place left (-1) or right (1) within its section,
+    /// here at once and synced to the phone.
+    fn shift_tab(&mut self, channel: &str, by: isize) {
+        let Some(s) = self.tab_section(channel) else {
+            return self.say("tabs keep their order inside a section; pick sections with s");
+        };
+        let section = s.id.clone();
+        // Past archived channels too: they hold a place but show no tab.
+        let mut ids = s.channels.clone();
+        loop {
+            let Some(next) = crate::sections::shift(&ids, channel, by) else {
+                return self.say(format!("end of {}", s.name));
+            };
+            ids = next;
+            let i = ids.iter().position(|c| c == channel).unwrap_or(0);
+            let past = ids[(i as isize - by) as usize].clone();
+            if self.store.channels.get(&past).is_none_or(|c| !c.archived) {
+                break;
+            }
+        }
+        if let Some(s) = self.sections.iter_mut().find(|s| s.id == section) {
+            s.channels = ids.clone();
+        }
+        self.rebuild_tabs();
+        self.actions.push(Action::Order { section, ids });
     }
 
     /// Move the current channel into the section under the cursor.
@@ -1793,5 +1878,48 @@ mod tests {
         key(&mut app);
         assert_eq!(app.thread, None);
         assert_eq!(app.cursor_message().as_deref(), Some("a3"));
+    }
+
+    #[test]
+    fn tabs_move_within_their_section_and_sync() {
+        let mut app = App::new("me".into(), None);
+        for id in ["a", "b", "c", "x"] {
+            let c = app.store.channel_mut(id);
+            c.name = id.into();
+            c.is_member = true;
+        }
+        app.store.channel_mut("b").archived = true;
+        app.sections = vec![Section {
+            id: "s".into(),
+            name: "S".into(),
+            channels: vec!["a".into(), "b".into(), "c".into(), "x".into()],
+        }];
+        app.chosen = vec!["s".into()];
+        app.rebuild_tabs();
+        assert_eq!(app.tabs, vec!["a", "c", "x"]);
+        let key = |app: &mut App, c: char| app.on_key(KeyEvent::from(KeyCode::Char(c)));
+        // > on a: past the archived b too, so the tab visibly moves.
+        key(&mut app, '>');
+        assert_eq!(app.tabs, vec!["c", "a", "x"]);
+        assert_eq!(app.current(), Some("a"));
+        assert!(
+            app.actions
+                .iter()
+                .any(|a| matches!(a, Action::Order { section, ids }
+            if section == "s" && ids == &["b", "c", "a", "x"]))
+        );
+        key(&mut app, '<');
+        key(&mut app, '<');
+        assert_eq!(app.tabs, vec!["a", "c", "x"]);
+        // T: J moves the picked tab down, the cursor going with it.
+        key(&mut app, 'T');
+        assert_eq!(app.mode, Mode::Order);
+        key(&mut app, 'j');
+        key(&mut app, 'J');
+        assert_eq!(app.tabs, vec!["a", "x", "c"]);
+        assert_eq!(app.order_cursor, 2);
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.current(), Some("c"));
     }
 }

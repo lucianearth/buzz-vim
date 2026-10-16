@@ -319,6 +319,8 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
             app.say(label);
         }
         Msg::Moved(Err(e)) => app.say(format!("couldn't move: {e}")),
+        Msg::Ordered(Ok(_)) => {}
+        Msg::Ordered(Err(e)) => app.say(format!("tab order not saved: {e}")),
         Msg::Lanes(Err(e)) => app.say(format!("couldn't load sections: {e}")),
         Msg::Window {
             channel,

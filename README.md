@@ -25,6 +25,9 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
 
 - `i` write, `Esc` back to normal, `⏎` send, `⇧⏎` (or `⌥⏎`, `^j`) new line
 - `j` `k` move, `0`–`9` jump to a tab, `H` `L` or `⇥` cycle tabs
+- `n` the bell: the latest message in this tab, read or not. In a thread it opens on your first unread reply
+- `<` `>` move the current tab left or right within its section; `T` opens the tab order list (`J` `K` move
+  the picked tab). The order is synced: dragging tabs on the phone moves them here too, and the other way round
 - `⏎` or `l` open a thread, `r` reply in it, `+` 👍 the selected message; `h`, `←` or `Esc` goes back
 - `a` the agents screen: who is working, where, and their last tool calls. A tab spins while an agent
   works in that channel, and a thread shows `taskbot thinking` while an agent answers in it
