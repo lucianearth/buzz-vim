@@ -7,10 +7,13 @@ that always ask first.
 ## Install
 
 ```sh
-cargo install --git https://buzz.gitcoin.co/git/f020f0378f36ade38acadcce6c024b4c1bb77f05d607213f2b7674a1a4817da3/buzz-vim.git
+cargo install --locked --force --git https://github.com/lucianearth/buzz-vim
 buzz-vim login   # once: relay (default wss://buzz.gitcoin.co) and your nsec
 buzz-vim
 ```
+
+`--force` reinstalls even when the version number has not changed. It needs a Rust toolchain
+([rustup](https://rustup.rs)); `rust-toolchain.toml` picks the version.
 
 Your nsec is in Buzz Desktop under Settings → Profile → Private key. `login` saves it to
 `buzz-vim/config.json` in your config dir (`~/Library/Application Support` on macOS), readable only by you.
@@ -20,16 +23,26 @@ Your nsec is in Buzz Desktop under Settings → Profile → Private key. `login`
 
 Normal mode shows the common keys in the footer. Press `?` for all of them.
 
-- `i` write, `Esc` back to normal, `⏎` send, `⌥⏎` or `^j` new line
-- `j` `k` move, `1`–`9` jump to a tab, `H` `L` or `⇥` cycle tabs
-- `⏎` open a thread, `r` reply in it, `+` 👍 the selected message
+- `i` write, `Esc` back to normal, `⏎` send, `⇧⏎` (or `⌥⏎`, `^j`) new line
+- `j` `k` move, `0`–`9` jump to a tab, `H` `L` or `⇥` cycle tabs
+- `⏎` or `l` open a thread, `r` reply in it, `+` 👍 the selected message; `h`, `←` or `Esc` goes back
+- `a` the agents screen: who is working, where, and their last tool calls. The header shows who is working
+  from anywhere, and a thread shows `taskbot thinking` while an agent answers in it
 - `s` pick which sections become tabs, `R` reload them from the relay
 - `^v` paste an image or file from the clipboard; dropping a file does the same. Either way a box shows what it
   found and where it goes (`<relay>/upload`), and nothing uploads until you press `y`.
-- `t` show or hide the agents pane, `o` open the selected image, `q` quit
+- Links: click one, or press `f` and type the letter on its chip. A `buzz://` message link opens here: its
+  channel's tab, or an extra tab at the end when the channel isn't in your sections (it goes away when you
+  leave it). Links marked 🐝 (pr, issue, repo) open in Buzz Desktop, and web links in your browser.
+  `⌫` or `^o` goes back to where you were, as many steps as you followed.
+- `o` open the selected image full screen (`←` `→` page through the images, `Esc` closes), `q` quit
 
 ## Development
 
 `./scripts/green.sh` is the gate: `cargo fmt --check`, clippy with `-D warnings`, tests.
 `tools/drive.py` drives the real binary in a fake terminal (needs `pyte`); set `BUZZ_VIM_IMAGES=halfblocks`
 there, because the fake terminal can't answer image-protocol queries.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

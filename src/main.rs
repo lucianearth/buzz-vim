@@ -1,0 +1,475 @@
+//! buzz-vim: a small, keyboard-first terminal client for Buzz.
+
+// Nested `if`s read better than let-chains in the key handlers.
+#![allow(clippy::collapsible_if, clippy::collapsible_match)]
+
+mod app;
+mod art;
+mod clip;
+mod config;
+mod draft;
+mod garden;
+mod keys;
+mod links;
+mod live;
+mod log;
+mod media;
+mod model;
+mod readstate;
+mod relay;
+mod sections;
+mod state;
+mod sync;
+mod telemetry;
+mod theme;
+mod ui;
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
+use crossterm::execute;
+use futures::StreamExt;
+use serde_json::Value;
+use tokio::sync::mpsc;
+
+use app::{Action, App};
+use live::{ConnState, Live};
+use sync::{Msg, Sync};
+
+const HELP: &str = "buzz-vim: a small vim-style terminal client for Buzz
+
+usage:
+  buzz-vim          open it
+  buzz-vim login    save your relay and nsec (once)
+
+env: BUZZ_PRIVATE_KEY, BUZZ_RELAY_URL override the saved login.
+inside: press ? for every key, q to quit.";
+
+fn main() -> Result<()> {
+    let arg = std::env::args().nth(1);
+    match arg.as_deref() {
+        Some("login") => return config::login(),
+        Some("-h" | "--help" | "help") => {
+            println!("{HELP}");
+            return Ok(());
+        }
+        Some("-V" | "--version") => {
+            println!("buzz-vim {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some(other) => anyhow::bail!("unknown argument {other:?}\n\n{HELP}"),
+        None => {}
+    }
+    let cfg = config::load()?;
+    theme::watch();
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    // Ask the terminal what image protocol it speaks before taking over the screen.
+    let picker = media::picker();
+    let mut terminal = ratatui::init();
+    // ratatui's panic hook undoes raw mode and the alternate screen; mouse
+    // capture and bracketed paste are ours to undo, before it runs.
+    let ratatui_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(
+            std::io::stdout(),
+            PopKeyboardEnhancementFlags,
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
+        tmux_keys(false);
+        ratatui_hook(info);
+    }));
+    // Terminals that speak the kitty keyboard protocol (iTerm2, kitty,
+    // WezTerm, Ghostty) can then tell Shift+Enter apart from Enter. That
+    // takes reporting every key: with less, Enter keeps its legacy byte
+    // whatever the modifiers. Alternate keys turn Shift+a back into 'A'. Others
+    // ignore the request. Probing first costs a stdin round-trip that can
+    // leave the terminal cooked, so just ask.
+    let _ = execute!(
+        std::io::stdout(),
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        )
+    );
+    tmux_keys(true);
+    let res = execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)
+        .map_err(anyhow::Error::from)
+        .and_then(|_| rt.block_on(run(&mut terminal, cfg, picker)));
+    let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    tmux_keys(false);
+    let _ = execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
+    ratatui::restore();
+    res
+}
+
+async fn run(
+    terminal: &mut ratatui::DefaultTerminal,
+    cfg: config::Config,
+    picker: Option<ratatui_image::picker::Picker>,
+) -> Result<()> {
+    let relay = relay::Relay::new(&cfg.relay, cfg.keys.clone(), cfg.auth_tag.clone())?;
+    let (live_tx, mut live_rx) = mpsc::unbounded_channel::<Live>();
+    let live_cmd = live::spawn(
+        relay.ws_url.clone(),
+        cfg.keys.clone(),
+        cfg.auth_tag.clone(),
+        live_tx,
+    );
+    let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+    let mut app = App::new(cfg.keys.public_key().to_hex(), picker);
+    app.relay_host = relay.base.clone();
+    let saved = state::load(&relay.base, &app.store.me);
+    app.chosen = saved.chosen.clone();
+    app.read_width = saved.read_width;
+    app.last_bot = saved.last_bot.clone();
+    let mut sync = Sync::new(relay, live_cmd, tx);
+    if !saved.read_slot.is_empty() && !saved.read_client.is_empty() {
+        sync.read = readstate::ReadState::new(saved.read_slot.clone(), saved.read_client.clone());
+    }
+    sync.start();
+    sync.want_profiles([app.store.me.clone()]);
+
+    let mut input = EventStream::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(150));
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(60));
+    let mut channels_poll = tokio::time::interval(Duration::from_secs(300));
+    channels_poll.tick().await;
+    let mut was_online = false;
+    let mut restore_active = saved.active.clone();
+    let mut last_draw = Instant::now() - Duration::from_secs(1);
+    let mut dirty = true;
+    let mut last_minute = 0u64;
+
+    loop {
+        if dirty && last_draw.elapsed() >= Duration::from_millis(16) {
+            terminal.draw(|f| ui::draw(f, &mut app))?;
+            last_draw = Instant::now();
+            dirty = false;
+            // Drawing can ask for images.
+            for a in std::mem::take(&mut app.actions) {
+                sync.run(&mut app, a);
+            }
+        }
+        tokio::select! {
+            ev = input.next() => {
+                match ev {
+                    Some(Ok(ev)) => app.on_term(ev),
+                    // The terminal went away: quit the normal way so state is saved.
+                    _ => app.actions.push(Action::Quit),
+                }
+                dirty = true;
+            }
+            Some(msg) = rx.recv() => {
+                handle(&mut app, &mut sync, msg, &mut restore_active);
+                dirty = true;
+            }
+            Some(l) = live_rx.recv() => {
+                match l {
+                    Live::Event { sub, event } => {
+                        let want = sync::fold(&mut app, &mut sync, &event, sub.starts_with("ch:"));
+                        sync.want_profiles(want);
+                    }
+                    Live::Status(s) => {
+                        app.conn = s;
+                        if s == ConnState::Online {
+                            sync.heartbeat();
+                            if was_online {
+                                sync.refetch_open();
+                            }
+                            was_online = true;
+                        }
+                    }
+                    Live::Closed { sub, reason } => {
+                        log::line(format!("closed {sub}: {reason}"));
+                        if !reason.is_empty() {
+                            app.say(format!("relay closed {sub}: {reason}"));
+                        }
+                    }
+                    Live::Eose { sub } => log::line(format!("eose {sub}")),
+                }
+                dirty = true;
+            }
+            _ = tick.tick() => {
+                app.tick += 1;
+                // Only redraw on ticks when something is animating, or
+                // once a minute so "4m ago" stays true.
+                let minute = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs() / 60);
+                if app.animating() || minute != last_minute {
+                    last_minute = minute;
+                    dirty = true;
+                }
+            }
+            _ = heartbeat.tick() => sync.heartbeat(),
+            _ = channels_poll.tick() => sync.load_channels(),
+        }
+        let actions = std::mem::take(&mut app.actions);
+        let mut quit = false;
+        for a in actions {
+            match a {
+                Action::Quit => quit = true,
+                Action::SaveState => {
+                    state::save(&sync.relay.base, &app.store.me, &saved_state(&app, &sync));
+                }
+                a => sync.run(&mut app, a),
+            }
+        }
+        sync.check_unread(&app.tabs);
+        sync.flush_read();
+        if quit {
+            state::save(&sync.relay.base, &app.store.me, &saved_state(&app, &sync));
+            sync.flush_read_now().await;
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn saved_state(app: &App, sync: &Sync) -> state::State {
+    state::State {
+        chosen: app.chosen.clone(),
+        active: app.current().map(str::to_string),
+        read_slot: sync.read.slot().to_string(),
+        read_client: sync.read.client_id().to_string(),
+        read_width: app.read_width,
+        last_bot: app.last_bot.clone(),
+    }
+}
+
+fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<String>) {
+    match msg {
+        Msg::ReadState(r) => {
+            match r {
+                Ok(evs) => {
+                    sync.apply_read(&evs);
+                    sync.read.loaded = true;
+                }
+                Err(e) => log::line(format!("read state load: {e}")),
+            }
+            // Even on failure, so unread still works from the last week.
+            sync.read.tried = true;
+            sync::prune_unread(app, &sync.read);
+        }
+        Msg::Unread { channel, events } => match events {
+            Ok(evs) => sync::fold_unread(app, &sync.read, &channel, &evs),
+            Err(e) => log::line(format!("unread {channel}: {e}")),
+        },
+        Msg::Channels(Ok(evs)) => {
+            app.channels_loaded = true;
+            for ev in &evs {
+                app.store.apply(ev);
+            }
+            // DM names come from the other participants' profiles.
+            let people: Vec<String> = app
+                .store
+                .channels
+                .values()
+                .filter(|c| c.is_dm)
+                .flat_map(|c| c.members.clone())
+                .collect();
+            sync.want_profiles(people);
+            refresh_sections(app, sync, restore_active);
+        }
+        Msg::Channels(Err(e)) => app.say(format!("couldn't load channels: {e}")),
+        Msg::Lanes(Ok(evs)) => {
+            sync.apply_lanes(&evs);
+            app.sections_loaded = true;
+            refresh_sections(app, sync, restore_active);
+        }
+        Msg::Lanes(Err(e)) => app.say(format!("couldn't load sections: {e}")),
+        Msg::Window {
+            channel,
+            events,
+            older,
+        } => {
+            sync.window_done(&channel);
+            match events {
+                Ok(evs) => {
+                    let mut want = vec![];
+                    for ev in &evs {
+                        if ev.kind.as_u16() == 39006 {
+                            let v: Value = serde_json::from_str(&ev.content).unwrap_or_default();
+                            let more = v.get("has_more").and_then(Value::as_bool).unwrap_or(false);
+                            let cur = v.get("next_cursor").and_then(|c| {
+                                Some((
+                                    c.get("created_at")?.as_u64()?,
+                                    c.get("id")?.as_str()?.to_string(),
+                                ))
+                            });
+                            sync.cursors
+                                .insert(channel.clone(), if more { cur } else { None });
+                            continue;
+                        }
+                        want.extend(sync::fold(app, sync, ev, false));
+                    }
+                    let ch = app.store.channel_mut(&channel);
+                    ch.loaded = true;
+                    if older && evs.len() <= 1 {
+                        ch.exhausted = true;
+                    }
+                    sync.want_profiles(want);
+                }
+                Err(e) => app.say(format!("couldn't load messages: {e}")),
+            }
+        }
+        Msg::Thread { events } => match events {
+            Ok(evs) => {
+                let mut want = vec![];
+                for ev in &evs {
+                    want.extend(sync::fold(app, sync, ev, false));
+                }
+                sync.want_profiles(want);
+            }
+            Err(e) => app.say(format!("couldn't load thread: {e}")),
+        },
+        Msg::Events(evs) => {
+            let mut want = vec![];
+            let mut agents = false;
+            for ev in &evs {
+                agents |= ev.kind.as_u16() == 30177;
+                want.extend(sync::fold(app, sync, ev, false));
+            }
+            sync.want_profiles(want);
+            if agents {
+                sync.want_presence(app.agents.by_pubkey.keys().cloned().collect());
+            }
+        }
+        Msg::Sent { id, result } => {
+            let pending = app.pending_sends.remove(&id);
+            match result {
+                Ok(()) => {
+                    app.sent_flash = Some((app.tick as usize % art::SENT.len(), Instant::now()));
+                }
+                Err(e) => {
+                    app.store.remove_message(&id);
+                    // Put the text back so nothing is lost: in its own box if that
+                    // conversation is still open, otherwise in the one in front of you.
+                    let Some((channel, root, d)) = pending else {
+                        app.say(format!("not sent: {e}"));
+                        return;
+                    };
+                    match app.draft_for(&channel, root.as_deref()) {
+                        Some(slot) => {
+                            slot.restore(d);
+                            app.say(format!("not sent: {e}. Your text is back in its box."));
+                        }
+                        None => {
+                            app.draft_mut().restore(d);
+                            let name = app
+                                .store
+                                .channels
+                                .get(&channel)
+                                .map(ui::channel_label)
+                                .unwrap_or(channel);
+                            app.say(format!(
+                                "not sent to {name}: {e}. Your text is in this box now."
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Msg::Did(r) => match r {
+            Ok(s) => app.say(s),
+            Err(e) => app.say(format!("failed: {e}")),
+        },
+        Msg::Uploaded(r, (channel, root)) => {
+            app.uploading = false;
+            match r {
+                Ok(d) => {
+                    let here = app.draft_target() == Some((channel.clone(), root.clone()));
+                    match app.draft_for(&channel, root.as_deref()) {
+                        Some(draft) => {
+                            draft.attachments.push(d);
+                            if here {
+                                app.mode = keys::Mode::Insert;
+                            }
+                            app.say("attached. ⏎ sends it");
+                        }
+                        None => app.say(format!(
+                            "uploaded, but that conversation is closed, so it wasn't attached: {}",
+                            d.url
+                        )),
+                    }
+                }
+                Err(e) => app.say(format!("upload failed: {e}")),
+            }
+        }
+        Msg::Image { url, result } => {
+            let slot = match result {
+                Ok(img) => media::Slot::Ready(Arc::new(img)),
+                Err(e) => media::Slot::Failed(e.to_string()),
+            };
+            app.media.images.insert(url, slot);
+        }
+        Msg::Encoded { key, result } => {
+            app.media.encoding.remove(&key);
+            match result {
+                Ok(p) => {
+                    if app.media.encoded.len() > 64 {
+                        app.media.encoded.clear();
+                    }
+                    app.media.encoded.insert(key, p);
+                }
+                Err(e) => {
+                    app.media
+                        .images
+                        .insert(key.0, media::Slot::Failed(e.to_string()));
+                }
+            }
+        }
+    }
+}
+
+fn refresh_sections(app: &mut App, sync: &mut Sync, restore_active: &mut Option<String>) {
+    app.sections = sections::build(&sync.lanes, &app.store);
+    // Forget saved choices only once both halves have loaded; before that a
+    // missing section just hasn't arrived yet.
+    if app.sections_loaded && app.channels_loaded {
+        app.chosen
+            .retain(|c| app.sections.iter().any(|s| s.id == *c));
+    }
+    app.rebuild_tabs();
+    if let Some(want) = restore_active.take() {
+        if let Some(i) = app.tabs.iter().position(|t| *t == want) {
+            app.active = i;
+            app.open_current();
+        } else {
+            *restore_active = Some(want);
+        }
+    }
+    for t in app.tabs.clone() {
+        sync.subscribe_channel(&t);
+    }
+    let tabs = app.tabs.clone();
+    sync.unsubscribe_others(&tabs);
+}
+
+/// tmux drops the kitty keyboard request, so inside it Shift+Enter arrives
+/// as a plain Enter. It does forward modifyOtherKeys to apps that ask, given
+/// `extended-keys on`; crossterm reads that only in tmux's `csi-u` format.
+fn tmux_keys(on: bool) {
+    use std::io::Write;
+    if std::env::var_os("TMUX").is_none() {
+        return;
+    }
+    let mut out = std::io::stdout();
+    let _ = out.write_all(if on { b"\x1b[>4;2m" } else { b"\x1b[>4m" });
+    let _ = out.flush();
+}

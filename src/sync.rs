@@ -1,0 +1,775 @@
+//! Relay IO: turns `Action`s into requests and folds the answers back into
+//! the app. Every request runs as its own task and reports on `Msg`.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
+
+use nostr::nips::nip44;
+use nostr::{Event, EventId, Tag};
+use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
+
+use crate::app::{Action, App};
+use crate::live::Cmd;
+use crate::model::{self, Applied};
+use crate::readstate::{self, ReadState};
+use crate::relay::{BlobDescriptor, Relay};
+use crate::sections::{self, Lanes};
+
+pub enum Msg {
+    Channels(anyhow::Result<Vec<Event>>),
+    /// A page of channel history. `older` = it was a "load more" request.
+    Window {
+        channel: String,
+        events: anyhow::Result<Vec<Event>>,
+        older: bool,
+    },
+    Thread {
+        events: anyhow::Result<Vec<Event>>,
+    },
+    Events(Vec<Event>),
+    Lanes(anyhow::Result<Vec<Event>>),
+    /// Our read-state slots at startup (NIP-RS full-state load).
+    ReadState(anyhow::Result<Vec<Event>>),
+    /// Recent top-level messages in a tab, to find what's unread.
+    Unread {
+        channel: String,
+        events: anyhow::Result<Vec<Event>>,
+    },
+    Sent {
+        id: String,
+        result: anyhow::Result<()>,
+    },
+    Did(anyhow::Result<String>),
+    /// The upload, and the (channel, thread root) it was meant for.
+    Uploaded(anyhow::Result<BlobDescriptor>, (String, Option<String>)),
+    Image {
+        url: String,
+        result: anyhow::Result<image::DynamicImage>,
+    },
+    Encoded {
+        key: (String, u16, u16),
+        result: anyhow::Result<ratatui_image::protocol::Protocol>,
+    },
+}
+
+pub struct Sync {
+    pub relay: Relay,
+    pub live: UnboundedSender<Cmd>,
+    pub tx: UnboundedSender<Msg>,
+    pub lanes: Lanes,
+    /// channel -> (has_more, cursor) from the 39006 page marker
+    pub cursors: std::collections::HashMap<String, Option<(u64, String)>>,
+    requested_profiles: HashSet<String>,
+    opened: HashSet<String>,
+    subscribed: HashSet<String>,
+    loading_older: HashSet<String>,
+    started: u64,
+    pub read: ReadState,
+    /// Tabs whose unread messages we've looked up since startup.
+    unread_checked: HashSet<String>,
+}
+
+pub fn now() -> u64 {
+    nostr::Timestamp::now().as_secs()
+}
+
+impl Sync {
+    pub fn new(relay: Relay, live: UnboundedSender<Cmd>, tx: UnboundedSender<Msg>) -> Self {
+        Sync {
+            relay,
+            live,
+            tx,
+            lanes: Lanes::default(),
+            cursors: Default::default(),
+            requested_profiles: HashSet::new(),
+            opened: HashSet::new(),
+            subscribed: HashSet::new(),
+            loading_older: HashSet::new(),
+            started: now(),
+            read: ReadState::new(readstate::new_id(), readstate::new_id()),
+            unread_checked: HashSet::new(),
+        }
+    }
+
+    fn me(&self) -> String {
+        self.relay.keys.public_key().to_hex()
+    }
+
+    fn spawn<F>(&self, f: F)
+    where
+        F: std::future::Future<Output = Msg> + Send + 'static,
+    {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(f.await);
+        });
+    }
+
+    /// Startup: channels, sidebar lanes, and the global live subscriptions.
+    pub fn start(&mut self) {
+        let me = self.me();
+        self.load_channels();
+        self.load_lanes();
+        let now = now();
+        let sub = |id: &str, filters: Vec<Value>| Cmd::Sub {
+            id: id.to_string(),
+            filters,
+        };
+        // Agent telemetry (never stored) and turn metrics; both p-gated to exactly [me].
+        let _ = self.live.send(sub(
+            "obs",
+            vec![json!({"kinds": [24200], "#p": [me], "since": now - 300, "limit": 1000})],
+        ));
+        let _ = self.live.send(sub(
+            "metrics",
+            vec![json!({"kinds": [44200], "#p": [me], "limit": 30})],
+        ));
+        let _ = self.live.send(sub("lanes", vec![json!({"kinds": [30078], "authors": [me], "#d": [sections::LANE_SECTIONS, sections::LANE_STARS], "limit": 0})]));
+        // Read positions from Desktop and our other devices, as they move.
+        let _ = self.live.send(sub(
+            "readstate",
+            vec![json!({"kinds": [30078], "authors": [me], "#t": ["read-state"], "since": now, "limit": 0})],
+        ));
+        let r = self.relay.clone();
+        let who = me.clone();
+        self.spawn(async move {
+            // No `t` filter: NIP-RS says a full load must not rely on it.
+            Msg::ReadState(
+                r.query(&[json!({"kinds": [30078], "authors": [who], "limit": 500})])
+                    .await,
+            )
+        });
+        let _ = self.live.send(sub(
+            "membership",
+            vec![json!({"kinds": [44100, 44101], "#p": [me], "since": now, "limit": 50})],
+        ));
+        // Managed agents you own (Desktop's agent list).
+        let r = self.relay.clone();
+        self.spawn(async move {
+            Msg::Events(
+                r.query(&[json!({"kinds": [30177], "authors": [me], "limit": 200})])
+                    .await
+                    .unwrap_or_default(),
+            )
+        });
+    }
+
+    pub fn load_channels(&self) {
+        let r = self.relay.clone();
+        let me = self.me();
+        self.spawn(async move {
+            let res = async {
+                let membership = r
+                    .query(&[json!({"kinds": [39002], "#p": [me], "limit": 500})])
+                    .await?;
+                let ids: Vec<String> = membership
+                    .iter()
+                    .filter_map(|e| model::tag(e, "d").map(str::to_string))
+                    .collect();
+                let mut all = membership;
+                for chunk in ids.chunks(200) {
+                    all.extend(
+                        r.query(&[json!({"kinds": [39000], "#d": chunk, "limit": chunk.len()})])
+                            .await?,
+                    );
+                }
+                Ok(all)
+            }
+            .await;
+            Msg::Channels(res)
+        });
+    }
+
+    pub fn load_lanes(&self) {
+        let r = self.relay.clone();
+        let me = self.me();
+        self.spawn(async move {
+            let ev = r
+                .query(&[
+                    json!({"kinds": [30078], "authors": [me], "#d": [sections::LANE_SECTIONS], "limit": 1}),
+                    json!({"kinds": [30078], "authors": [me], "#d": [sections::LANE_STARS], "limit": 1}),
+                ])
+                .await;
+            Msg::Lanes(ev)
+        });
+    }
+
+    /// Decrypt and fold sidebar lane events. Returns true if anything changed.
+    pub fn apply_lanes(&mut self, evs: &[Event]) -> bool {
+        let mut changed = false;
+        for ev in evs {
+            if ev.pubkey != self.relay.keys.public_key() {
+                continue;
+            }
+            let Ok(plain) = nip44::decrypt(self.relay.keys.secret_key(), &ev.pubkey, &ev.content)
+            else {
+                continue;
+            };
+            let Ok(doc) = serde_json::from_str::<Value>(&plain) else {
+                continue;
+            };
+            match model::tag(ev, "d") {
+                Some(sections::LANE_SECTIONS) => sections::parse_sections(&doc, &mut self.lanes),
+                Some(sections::LANE_STARS) => sections::parse_stars(&doc, &mut self.lanes),
+                _ => continue,
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    /// Fold read-state events. Returns true if a position moved.
+    pub fn apply_read(&mut self, evs: &[Event]) -> bool {
+        let mut moved = false;
+        for ev in evs {
+            moved |= self.read.apply(&self.relay.keys, ev);
+        }
+        moved
+    }
+
+    /// Mark a channel read now, for Desktop and our other devices.
+    pub fn mark_read(&mut self, channel: &str) {
+        self.read.mark(channel, now());
+    }
+
+    /// Publish our read-state slot once it has settled (or now, on quit).
+    pub fn flush_read(&mut self) {
+        if let Some(ev) = self.read.take_publish(&self.relay.keys, false) {
+            let r = self.relay.clone();
+            tokio::spawn(async move {
+                if let Err(e) = r.publish(&ev).await {
+                    crate::log::line(format!("read state: {e}"));
+                }
+            });
+        }
+    }
+
+    pub async fn flush_read_now(&mut self) {
+        if let Some(ev) = self.read.take_publish(&self.relay.keys, true) {
+            let _ = tokio::time::timeout(Duration::from_secs(3), self.relay.publish(&ev)).await;
+        }
+    }
+
+    /// Look up what's unread in each tab we haven't checked yet: messages
+    /// and thread replies since its read position (or the last week, if it has none).
+    pub fn check_unread(&mut self, tabs: &[String]) {
+        if !self.read.tried {
+            return;
+        }
+        for id in tabs {
+            if !self.unread_checked.insert(id.clone()) {
+                continue;
+            }
+            let since = self
+                .read
+                .read_at(id)
+                .map_or(now().saturating_sub(7 * 86_400), |t| t + 1);
+            let r = self.relay.clone();
+            let channel = id.clone();
+            self.spawn(async move {
+                let f = json!({"kinds": model::UNREAD_KINDS, "#h": [channel], "since": since,
+                    "limit": 100});
+                Msg::Unread {
+                    events: r.query(&[f]).await,
+                    channel,
+                }
+            });
+        }
+    }
+
+    /// Live tail for a channel. Kept open for every tab so unread dots work.
+    pub fn subscribe_channel(&mut self, id: &str) {
+        if !self.subscribed.insert(id.to_string()) {
+            return;
+        }
+        let since = now().min(self.started);
+        let _ = self.live.send(Cmd::Sub {
+            id: format!("ch:{id}"),
+            filters: vec![
+                json!({"kinds": model::LIVE_KINDS, "#h": [id], "since": since, "limit": 1000}),
+            ],
+        });
+    }
+
+    pub fn unsubscribe_others(&mut self, keep: &[String]) {
+        let drop: Vec<String> = self
+            .subscribed
+            .iter()
+            .filter(|s| !keep.contains(s))
+            .cloned()
+            .collect();
+        for id in drop {
+            self.subscribed.remove(&id);
+            let _ = self.live.send(Cmd::Close {
+                id: format!("ch:{id}"),
+            });
+        }
+    }
+
+    fn window(&self, channel: &str, older: Option<(u64, String)>) {
+        let r = self.relay.clone();
+        let ch = channel.to_string();
+        let mut f = json!({"#h": [channel], "kinds": model::TIMELINE_KINDS, "limit": 60,
+            "top_level": true, "include_summaries": true, "include_aux": true});
+        let is_older = older.is_some();
+        if let Some((until, id)) = older {
+            f["until"] = json!(until);
+            f["before_id"] = json!(id);
+        }
+        self.spawn(async move {
+            Msg::Window {
+                channel: ch,
+                events: r.query(&[f]).await,
+                older: is_older,
+            }
+        });
+    }
+
+    pub fn open_channel(&mut self, id: &str) {
+        self.subscribe_channel(id);
+        if self.opened.insert(id.to_string()) {
+            self.window(id, None);
+        }
+    }
+
+    pub fn load_older(&mut self, id: &str) {
+        if let Some(Some(cursor)) = self.cursors.get(id) {
+            if self.loading_older.insert(id.to_string()) {
+                self.window(id, Some(cursor.clone()));
+            }
+        }
+    }
+
+    pub fn window_done(&mut self, id: &str) {
+        self.loading_older.remove(id);
+    }
+
+    /// After a reconnect the live tail replays from `since`, but a channel
+    /// opened before the drop also refetches its window, as Desktop does.
+    pub fn refetch_open(&mut self) {
+        for id in self.opened.clone() {
+            self.window(&id, None);
+        }
+    }
+
+    pub fn open_thread(&self, channel: &str, root: &str) {
+        let r = self.relay.clone();
+        let filters = [
+            json!({"ids": [root]}),
+            json!({"#e": [root], "#h": [channel], "kinds": model::TIMELINE_KINDS, "depth_limit": 64, "limit": 200, "include_aux": true}),
+        ];
+        self.spawn(async move {
+            // The relay answers one extension filter per request.
+            let res = async {
+                let mut evs = r.query(&filters[..1]).await?;
+                evs.extend(r.query(&filters[1..]).await?);
+                Ok(evs)
+            }
+            .await;
+            Msg::Thread { events: res }
+        });
+    }
+
+    /// Fetch kind 0 for any pubkeys we haven't asked about yet.
+    pub fn want_profiles(&mut self, pubkeys: impl IntoIterator<Item = String>) {
+        let fresh: Vec<String> = pubkeys
+            .into_iter()
+            .filter(|p| self.requested_profiles.insert(p.clone()))
+            .collect();
+        for chunk in fresh.chunks(100) {
+            let r = self.relay.clone();
+            let chunk = chunk.to_vec();
+            self.spawn(async move {
+                Msg::Events(
+                    r.query(&[json!({"kinds": [0], "authors": chunk, "limit": 100})])
+                        .await
+                        .unwrap_or_default(),
+                )
+            });
+        }
+    }
+
+    pub fn want_presence(&self, agents: Vec<String>) {
+        if agents.is_empty() {
+            return;
+        }
+        let r = self.relay.clone();
+        let _ = self.live.send(Cmd::Sub {
+            id: "presence".into(),
+            filters: vec![json!({"kinds": [20001], "authors": agents, "limit": 0})],
+        });
+        self.spawn(async move {
+            Msg::Events(
+                r.query(&[json!({"kinds": [20001], "authors": agents, "limit": 200})])
+                    .await
+                    .unwrap_or_default(),
+            )
+        });
+    }
+
+    pub fn heartbeat(&self) {
+        if let Ok(b) = buzz_sdk::build_presence_update("online") {
+            if let Ok(ev) = self.relay.sign(b) {
+                let _ = self.live.send(Cmd::Publish(Box::new(ev)));
+            }
+        }
+    }
+
+    /// Decrypt an observer frame or turn metric addressed to us.
+    pub fn decrypt_for_me(&self, ev: &Event) -> Option<Value> {
+        let plain = nip44::decrypt(self.relay.keys.secret_key(), &ev.pubkey, &ev.content).ok()?;
+        serde_json::from_str(&plain).ok()
+    }
+
+    // ---------- writes ----------
+
+    pub fn run(&mut self, app: &mut App, action: Action) {
+        match action {
+            Action::OpenChannel(id) => {
+                self.mark_read(&id);
+                self.open_channel(&id);
+            }
+            Action::LoadOlder(id) => self.load_older(&id),
+            Action::ReloadSections => {
+                app.say("reloading sections…");
+                self.load_channels();
+                self.load_lanes();
+            }
+            Action::Send {
+                channel,
+                root,
+                parent,
+            } => self.send(app, channel, root, parent),
+            Action::ThumbsUp { target } => self.thumbs_up(app, target),
+            Action::Upload => {
+                let Some(p) = app.pending.take() else { return };
+                let Some(target) = app.draft_target() else {
+                    return;
+                };
+                app.uploading = true;
+                let r = self.relay.clone();
+                self.spawn(async move { Msg::Uploaded(r.upload(p.bytes, &p.mime).await, target) });
+            }
+            Action::LoadImage(url) => self.load_image(app, url),
+            Action::OpenThread { channel, root } => self.open_thread(&channel, &root),
+            Action::OpenUrl(url) => {
+                if let Err(e) = crate::links::open(&url) {
+                    app.say(format!("couldn't open {url}: {e}"));
+                }
+            }
+            Action::PreviewPending => {
+                let Some(p) = &app.pending else { return };
+                if !p.mime.starts_with("image/") || app.picker.is_none() {
+                    return;
+                }
+                let url = p.preview_key();
+                let bytes = p.bytes.clone();
+                app.media
+                    .images
+                    .insert(url.clone(), crate::media::Slot::Loading);
+                self.spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || crate::media::decode(&bytes))
+                        .await
+                        .map_err(anyhow::Error::from)
+                        .and_then(|r| r);
+                    Msg::Image { url, result }
+                });
+            }
+            Action::EncodeImage(key) => self.encode(app, key),
+            Action::SaveState | Action::Quit => {}
+        }
+    }
+
+    fn send(
+        &mut self,
+        app: &mut App,
+        channel: String,
+        root: Option<String>,
+        parent: Option<String>,
+    ) {
+        let draft = std::mem::take(app.draft_mut());
+        let mut content = draft.text.trim_end().to_string();
+        for a in &draft.attachments {
+            let label = if a.mime_type.starts_with("video/") {
+                "video"
+            } else {
+                "image"
+            };
+            content.push_str(&format!("\n![{label}]({})", a.url));
+        }
+        let content = content.trim_start_matches('\n').to_string();
+        let mut mentions = draft.mention_pubkeys();
+        // In a DM everyone else is notified, as Desktop does.
+        if let Some(ch) = app.store.channels.get(&channel).filter(|c| c.is_dm) {
+            for m in &ch.members {
+                if *m != app.store.me && !mentions.contains(m) {
+                    mentions.push(m.clone());
+                }
+            }
+        }
+        let thread = match (root.clone(), parent) {
+            (Some(r), Some(p)) => match (EventId::from_hex(&r), EventId::from_hex(&p)) {
+                (Ok(r), Ok(p)) => Some(buzz_sdk::ThreadRef {
+                    root_event_id: r,
+                    parent_event_id: p,
+                }),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Ok(uuid) = uuid::Uuid::parse_str(&channel) else {
+            *app.draft_mut() = draft;
+            app.say("bad channel id");
+            return;
+        };
+        let refs: Vec<&str> = mentions.iter().map(String::as_str).collect();
+        let media: Vec<Vec<String>> = draft
+            .attachments
+            .iter()
+            .map(BlobDescriptor::imeta_tag)
+            .collect();
+        let built =
+            buzz_sdk::build_message(uuid, &content, thread.as_ref(), &refs, false, &media, &[])
+                .map(|b| {
+                    // Non-notifying label refs so Desktop renders mention chips.
+                    b.tags(
+                        draft
+                            .mention_pubkeys()
+                            .iter()
+                            .filter_map(|pk| Tag::parse(["mention", pk.as_str()]).ok()),
+                    )
+                });
+        let ev = match built
+            .map_err(anyhow::Error::from)
+            .and_then(|b| self.relay.sign(b))
+        {
+            Ok(ev) => ev,
+            Err(e) => {
+                app.say(format!("couldn't build message: {e}"));
+                *app.draft_mut() = draft;
+                return;
+            }
+        };
+        // Show it right away; the live tail dedupes the echo.
+        app.store.apply(&ev);
+        let id = ev.id.to_hex();
+        app.pending_sends
+            .insert(id.clone(), (channel.clone(), root.clone(), draft));
+        let r = self.relay.clone();
+        self.spawn(async move {
+            let result = r.publish(&ev).await.map(|_| ());
+            Msg::Sent { id, result }
+        });
+    }
+
+    fn thumbs_up(&mut self, app: &mut App, target: String) {
+        let Ok(id) = EventId::from_hex(&target) else {
+            return;
+        };
+        let mine = app.store.my_reaction(&target, model::THUMBS_UP);
+        let built = match &mine {
+            Some(rid) => EventId::from_hex(rid)
+                .map_err(anyhow::Error::from)
+                .and_then(|r| Ok(buzz_sdk::build_remove_reaction(r)?)),
+            None => buzz_sdk::build_reaction(id, model::THUMBS_UP).map_err(anyhow::Error::from),
+        };
+        let ev = match built.and_then(|b| self.relay.sign(b)) {
+            Ok(ev) => ev,
+            Err(e) => return app.say(format!("couldn't react: {e}")),
+        };
+        app.store.apply(&ev);
+        let label = if mine.is_some() {
+            "removed 👍"
+        } else {
+            "👍"
+        };
+        let r = self.relay.clone();
+        self.spawn(async move { Msg::Did(r.publish(&ev).await.map(|_| label.to_string())) });
+    }
+
+    fn load_image(&mut self, app: &mut App, url: String) {
+        if app.media.images.contains_key(&url) || app.picker.is_none() {
+            return;
+        }
+        // Only send our Blossom auth to our own relay.
+        if !self.relay.is_ours(&url) {
+            app.media
+                .images
+                .insert(url, crate::media::Slot::Failed("external image".into()));
+            return;
+        }
+        app.media
+            .images
+            .insert(url.clone(), crate::media::Slot::Loading);
+        let r = self.relay.clone();
+        self.spawn(async move {
+            let result = async {
+                let bytes = r.download(&url).await?;
+                tokio::task::spawn_blocking(move || crate::media::decode(&bytes)).await?
+            }
+            .await;
+            Msg::Image { url, result }
+        });
+    }
+
+    pub fn encode(&mut self, app: &mut App, key: (String, u16, u16)) {
+        let Some(picker) = app.picker.clone() else {
+            return;
+        };
+        let img = match app.media.images.get(&key.0) {
+            Some(crate::media::Slot::Ready(img)) => Arc::clone(img),
+            Some(_) => return,
+            None => return self.load_image(app, key.0.clone()),
+        };
+        if !app.media.encoding.insert(key.clone()) {
+            return;
+        }
+        self.spawn(async move {
+            let k = key.clone();
+            let result =
+                tokio::task::spawn_blocking(move || crate::media::encode(&picker, &img, k.1, k.2))
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|r| r);
+            Msg::Encoded { key, result }
+        });
+    }
+}
+
+/// Fold one live or queried event into the app. Returns pubkeys we should
+/// look up profiles for.
+pub fn fold(app: &mut App, sync: &mut Sync, ev: &Event, live_channel: bool) -> Vec<String> {
+    let kind = ev.kind.as_u16();
+    match kind {
+        24200 => {
+            if model::tag(ev, "agent") == Some(&ev.pubkey.to_hex()) {
+                if let Some(frame) = sync.decrypt_for_me(ev) {
+                    app.agents.frame(&ev.pubkey.to_hex(), &frame);
+                    return vec![ev.pubkey.to_hex()];
+                }
+            }
+            return vec![];
+        }
+        44200 => {
+            // The agent signs its own metrics (buzz-acp pool.rs), like 24200.
+            let agent = ev.pubkey.to_hex();
+            if model::tag(ev, "agent").is_none_or(|a| a == agent) {
+                if let Some(m) = sync.decrypt_for_me(ev) {
+                    app.agents.metric(&agent, &m);
+                    return vec![agent];
+                }
+            }
+            return vec![];
+        }
+        30177 => {
+            // Managed agent you own: d = agent pubkey.
+            if let Some(pk) = model::tag(ev, "d").filter(|d| d.len() == 64) {
+                let name = serde_json::from_str::<serde_json::Value>(&ev.content)
+                    .ok()
+                    .and_then(|v| v.get("name")?.as_str().map(str::to_string))
+                    .unwrap_or_default();
+                app.agents.own(pk, &name);
+                return vec![pk.to_string()];
+            }
+            return vec![];
+        }
+        20001 => {
+            app.agents.presence(&ev.pubkey.to_hex(), &ev.content);
+            return vec![];
+        }
+        30078 if readstate::is_read_state(ev) => {
+            if sync.apply_read(std::slice::from_ref(ev)) {
+                prune_unread(app, &sync.read);
+            }
+            return vec![];
+        }
+        30078 => {
+            if sync.apply_lanes(std::slice::from_ref(ev)) {
+                app.sections = sections::build(&sync.lanes, &app.store);
+                app.rebuild_tabs();
+            }
+            return vec![];
+        }
+        44100 | 44101 => {
+            sync.load_channels();
+            return vec![];
+        }
+        _ => {}
+    }
+    let applied = app.store.apply(ev);
+    let mut want = vec![ev.pubkey.to_hex()];
+    if let Applied::Message { channel, id } = applied {
+        let active = app.current() == Some(channel.as_str());
+        let at = ev.created_at.as_secs();
+        let author = ev.pubkey.to_hex();
+        let seen = sync.read.read_at(&channel).is_some_and(|r| at <= r);
+        if live_channel && !seen && counts_unread(kind, &author, &app.store.me, active) {
+            app.store
+                .channel_mut(&channel)
+                .unread
+                .insert(id.clone(), at);
+        } else if live_channel && active && author != app.store.me {
+            // You're looking at it, so it's read.
+            sync.mark_read(&channel);
+        }
+        if let Some(m) = app
+            .store
+            .channels
+            .get(&channel)
+            .and_then(|c| c.messages.get(&id))
+        {
+            want.extend(m.mentions.iter().cloned());
+        }
+    }
+    want
+}
+
+/// Drop unread messages at or before each channel's read position, e.g.
+/// after you read the channel in Desktop.
+pub fn prune_unread(app: &mut App, read: &ReadState) {
+    for (id, ch) in app.store.channels.iter_mut() {
+        if let Some(r) = read.read_at(id) {
+            ch.unread.retain(|_, at| *at > r);
+        }
+    }
+}
+
+/// Unread messages from a lookup: someone else's, after the read
+/// position, in a tab you aren't looking at.
+pub fn fold_unread(app: &mut App, read: &ReadState, channel: &str, evs: &[Event]) {
+    if app.current() == Some(channel) {
+        return;
+    }
+    let me = app.store.me.clone();
+    let after = read.read_at(channel).unwrap_or(0);
+    let ch = app.store.channel_mut(channel);
+    for ev in evs {
+        let at = ev.created_at.as_secs();
+        if model::UNREAD_KINDS.contains(&ev.kind.as_u16()) && ev.pubkey.to_hex() != me && at > after
+        {
+            ch.unread.insert(ev.id.to_hex(), at);
+        }
+    }
+}
+
+/// A live message marks its tab unread when it's a real message from
+/// someone else in a tab you aren't looking at. Thread replies count, as in
+/// Desktop: most agent answers land in threads.
+fn counts_unread(kind: u16, author: &str, me: &str, active: bool) -> bool {
+    model::UNREAD_KINDS.contains(&kind) && author != me && !active
+}
+
+#[cfg(test)]
+mod tests {
+    use super::counts_unread;
+
+    #[test]
+    fn unread_rules() {
+        assert!(counts_unread(9, "them", "me", false));
+        assert!(!counts_unread(9, "me", "me", false));
+        assert!(!counts_unread(9, "them", "me", true));
+        assert!(!counts_unread(40099, "them", "me", false));
+    }
+}
