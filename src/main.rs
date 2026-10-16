@@ -259,15 +259,6 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
         Msg::ReadState(r) => {
             match r {
                 Ok(evs) => {
-                    // Where the open channel was read up to before this
-                    // run marked it, for the jump key.
-                    let mut before = readstate::ReadState::new(String::new(), String::new());
-                    sync.apply_read(&mut before, &evs);
-                    if let Some(c) = app.current().map(str::to_string) {
-                        if let Some(at) = before.read_at(&c) {
-                            app.entry.insert(c, at);
-                        }
-                    }
                     sync.apply_read(&mut app.read, &evs);
                     app.read.loaded = true;
                 }
@@ -279,7 +270,7 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
         }
         Msg::Unread { channel, events } => match events {
             Ok(evs) => {
-                // Replies go in the store: they make "(N new)" and the jump key.
+                // Replies go in the store: they make "(N new)" and the bell.
                 let mut want = vec![];
                 for ev in evs
                     .iter()
@@ -328,6 +319,8 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
             app.say(label);
         }
         Msg::Moved(Err(e)) => app.say(format!("couldn't move: {e}")),
+        Msg::Ordered(Ok(_)) => {}
+        Msg::Ordered(Err(e)) => app.say(format!("tab order not saved: {e}")),
         Msg::Lanes(Err(e)) => app.say(format!("couldn't load sections: {e}")),
         Msg::Window {
             channel,

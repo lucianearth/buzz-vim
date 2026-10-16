@@ -56,7 +56,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // graphics sit on top of text, and a popup can't cover them otherwise.
     let overlay = matches!(
         app.mode,
-        Mode::Sections | Mode::Confirm | Mode::Help | Mode::Viewer
+        Mode::Sections | Mode::Order | Mode::Confirm | Mode::Help | Mode::Viewer
     ) || (app.mode == Mode::Insert && !app.mention_candidates().is_empty());
     for (rect, key) in images.into_iter().filter(|_| !overlay) {
         if let Some(p) = app.media.encoded.get(&key) {
@@ -65,6 +65,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     match app.mode {
         Mode::Sections => draw_sections(f, app, area),
+        Mode::Order => draw_order(f, app, area),
         Mode::Confirm => draw_confirm(f, app, area),
         Mode::Help => draw_help(f, area),
         Mode::Viewer => draw_viewer(f, app, area),
@@ -602,7 +603,7 @@ fn draw_blocks(
     let cur_idx = cursor.and_then(|c| blocks.iter().position(|b| b.id == c));
     // Default: newest at the bottom. With a cursor, scroll just enough.
     let mut top = total.saturating_sub(h);
-    // The cursor has moved off the jump key's landing: stop pinning it.
+    // The cursor has moved off the bell's landing: stop pinning it.
     if app
         .anchor
         .as_ref()
@@ -619,7 +620,7 @@ fn draw_blocks(
         let a: usize = heights[..i].iter().sum();
         let b = a + heights[i];
         if anchored(i) {
-            // The jump key's landing: this message at the top.
+            // The bell's landing: this message at the top.
             top = a.min(top);
         }
         if b > top + h {
@@ -1410,7 +1411,7 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 }
 
 fn draw_sections(f: &mut Frame, app: &mut App, area: Rect) {
-    let h = (app.sections.len() as u16 + 10).max(13);
+    let h = (app.sections.len() as u16 + 11).max(14);
     let r = centered(area, 60, h);
     clear(f, r);
     let block = Block::bordered()
@@ -1432,7 +1433,7 @@ fn draw_sections(f: &mut Frame, app: &mut App, area: Rect) {
     }
     // Rows left for the list after the heading and the legend. A long list
     // scrolls to keep the cursor in view.
-    let rows = (inner.height as usize).saturating_sub(7).max(1);
+    let rows = (inner.height as usize).saturating_sub(8).max(1);
     let first = app
         .picker_cursor
         .saturating_sub(rows / 2)
@@ -1487,11 +1488,68 @@ fn draw_sections(f: &mut Frame, app: &mut App, area: Rect) {
         ("j k", "move"),
         ("⏎", "switch to this section"),
         ("space", "mark [x] to show several, then ⏎"),
+        ("m", "move this channel into it"),
         ("R", "reload  ·  esc  cancel"),
     ]
     .into_iter()
     .enumerate()
     {
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(format!(" {k} "), theme::chip(theme::nth(i))),
+            Span::styled(format!("  {what}"), theme::muted()),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// T: today's tabs top to bottom, each with its section. The order is
+/// synced, so the phone shows it too.
+fn draw_order(f: &mut Frame, app: &mut App, area: Rect) {
+    let h = (app.tabs.len() as u16 + 9).max(12);
+    let r = centered(area, 60, h);
+    clear(f, r);
+    let block = Block::bordered()
+        .border_style(theme::text())
+        .title(Span::styled(" tab order ", theme::bright()));
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    let mut lines = vec![
+        Line::styled(" synced with the phone", theme::faint()),
+        Line::raw(""),
+    ];
+    let legend = crate::keys::legend(Mode::Order);
+    let rows = (inner.height as usize)
+        .saturating_sub(3 + legend.len())
+        .max(1);
+    let first = app
+        .order_cursor
+        .saturating_sub(rows / 2)
+        .min(app.tabs.len().saturating_sub(rows));
+    for (i, id) in app.tabs.iter().enumerate().skip(first).take(rows) {
+        let name = app
+            .store
+            .channels
+            .get(id)
+            .map_or_else(|| id.chars().take(8).collect(), channel_label);
+        let section = app
+            .sections
+            .iter()
+            .filter(|s| app.chosen.is_empty() || app.chosen.contains(&s.id))
+            .find(|s| s.channels.contains(id))
+            .map_or("", |s| s.name.as_str());
+        let st = if i == app.order_cursor {
+            theme::tab_active()
+        } else {
+            theme::text()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {name} "), st),
+            Span::styled(format!("  {section}"), theme::faint()),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    for (i, (k, what, _)) in legend.iter().enumerate() {
         lines.push(Line::from(vec![
             Span::raw(" "),
             Span::styled(format!(" {k} "), theme::chip(theme::nth(i))),
@@ -1620,6 +1678,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Paragraph::new(column(&[
             (Mode::Insert, "insert (i)"),
             (Mode::Sections, "sections (s)"),
+            (Mode::Order, "tab order (T)"),
             (Mode::Confirm, "upload"),
         ])),
         right,
@@ -2235,6 +2294,41 @@ mod tests {
         assert!(hit.bottom() < 24);
         let row: String = (0..80).map(|x| buf[(x, hit.y)].symbol()).collect();
         assert!(row.contains("section-25"), "{row}");
+    }
+
+    /// T lists today's tabs with their legend; ? lists the new keys.
+    #[test]
+    fn tab_order_popup_and_help_show_their_keys() {
+        let mut app = App::new("me".into(), None);
+        for id in ["a", "b"] {
+            let c = app.store.channel_mut(id);
+            c.name = format!("chan-{id}");
+            c.is_member = true;
+        }
+        app.sections = vec![crate::sections::Section {
+            id: "s".into(),
+            name: "Work".into(),
+            channels: vec!["a".into(), "b".into()],
+        }];
+        app.chosen = vec!["s".into()];
+        app.rebuild_tabs();
+        let screen = |app: &mut App| {
+            let mut t =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+            t.draw(|f| draw(f, app)).unwrap();
+            let buf = t.backend().buffer().clone();
+            (0..40)
+                .map(|y| (0..100).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
+                .collect::<String>()
+        };
+        app.mode = crate::keys::Mode::Order;
+        let s = screen(&mut app);
+        assert!(s.contains("#chan-b") && s.contains("Work"), "{s}");
+        assert!(s.contains("move it down / up"), "{s}");
+        app.mode = crate::keys::Mode::Help;
+        let s = screen(&mut app);
+        assert!(s.contains("move this tab left / right"), "{s}");
+        assert!(s.contains("tab order (T)"), "{s}");
     }
 
     /// After following links, the footer shows the way back.

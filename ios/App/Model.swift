@@ -101,8 +101,13 @@ final class Model {
         let chosen = d.stringArray(forKey: "chosen") ?? []
         client = try Client(relayUrl: relay, secret: secret, chosen: chosen,
                             readSlot: slot, readClient: cid, authTag: authTag, listener: Poke(model: self))
-        for (section, ids) in tabOrder {
-            client?.setOrder(section: section, ids: ids)
+        // Tab order used to live only on this phone: send it up once, and
+        // from then on it is synced (the terminal app shares it).
+        if let old = d.dictionary(forKey: "tabOrder") as? [String: [String]] {
+            for (section, ids) in old {
+                client?.setOrder(section: section, ids: ids)
+            }
+            d.removeObject(forKey: "tabOrder")
         }
         restoreUnsent()
     }
@@ -119,14 +124,8 @@ final class Model {
         bump()
     }
 
-    /// Section -> tab order, as the user dragged it.
-    private var tabOrder: [String: [String]] = UserDefaults.standard.dictionary(forKey: "tabOrder") as? [String: [String]] ?? [:] {
-        didSet { UserDefaults.standard.set(tabOrder, forKey: "tabOrder") }
-    }
-
-    /// Save a section's whole tab order.
+    /// Save a section's whole tab order (synced with the terminal app).
     func order(_ section: String, _ ids: [String]) {
-        tabOrder[section] = ids
         client?.setOrder(section: section, ids: ids)
         bump()
     }

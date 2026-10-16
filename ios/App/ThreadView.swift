@@ -12,6 +12,8 @@ struct ThreadView: View {
     /// Where the bell key's reply is put: ScrollViewReader's scrollTo
     /// left the thread on its root.
     @State private var position = ScrollPosition(idType: String.self)
+    @State private var edges = Edges()
+    @State private var fling = Fling()
 
     var body: some View {
         let _ = model.version
@@ -47,14 +49,14 @@ struct ThreadView: View {
                         if !tl.working.isEmpty {
                             Working(names: tl.working)
                         }
-                        // Room below, so a reply near the end can still sit at the top.
-                        Color.clear.frame(height: route.focus == nil ? 1 : geo.size.height).id("end")
+                        Color.clear.frame(height: 1).id("end")
                     }
                     .scrollTargetLayout()
                     .padding(.horizontal, 22)
                     .padding(.top, 4)
                     // A short thread starts under the header, not at the bottom.
                     .frame(minHeight: geo.size.height, alignment: .top)
+                    .background(FlingStop(fling: fling))
                 }
                 // Opened on a reply by the bell key: hold the top, so the
                 // keyboard coming up doesn't push the reply off screen.
@@ -62,6 +64,13 @@ struct ThreadView: View {
                 .defaultScrollAnchor(route.focus == nil ? .bottom : .top, for: .sizeChanges)
                 .scrollPosition($position, anchor: .top)
                 .scrollDismissesKeyboard(.interactively)
+                .onScrollGeometryChange(for: Edges.self, of: Edges.init) { _, now in edges = now }
+                .overlay(alignment: .bottomTrailing) {
+                    EdgeButtons(edges: edges) { top in
+                        fling.stop()
+                        withAnimation(.easeOut(duration: 0.25)) { position.scrollTo(edge: top ? .top : .bottom) }
+                    }
+                }
                 .onChange(of: tl.messages.last?.id) { _, _ in
                     // Opened on a reply by the bell key: stay on it.
                     guard route.focus == nil else { return }
