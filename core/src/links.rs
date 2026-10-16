@@ -177,7 +177,15 @@ pub fn file_name(url: &str, given: Option<&str>) -> String {
     let tail = tail.rsplit('/').next().unwrap_or("");
     let clean = |s: &str| {
         let s = s.rsplit(['/', '\\']).next().unwrap_or("");
-        let s: String = s.chars().filter(|c| !c.is_control()).collect();
+        // No control characters, and no direction overrides (U+202E can
+        // make "evil\u{202E}fdp.exe" show as "evilexe.pdf").
+        let s: String = s
+            .chars()
+            .filter(|c| {
+                !c.is_control()
+                    && !matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+            })
+            .collect();
         s.trim().trim_start_matches('.').to_string()
     };
     [given.map(clean), Some(clean(tail))]
@@ -305,6 +313,7 @@ mod tests {
         assert_eq!(file_name(u, Some("../../etc/passwd")), "passwd");
         assert_eq!(file_name(u, Some("a\\..\\.bashrc")), "bashrc");
         assert_eq!(file_name(u, Some("")), "abc123.bin");
+        assert_eq!(file_name(u, Some("evil\u{202E}fdp.exe")), "evilfdp.exe");
         assert_eq!(file_name("https://x/y/?a=b", Some("..")), "download");
     }
 

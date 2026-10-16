@@ -335,26 +335,36 @@ impl Relay {
     }
 
     /// Authenticated GET of any file on this relay, streamed into `path`
-    /// (no size cap: it goes to disk, not memory). A failed download
-    /// leaves nothing behind.
+    /// (no size cap: it goes to disk, not memory). A failed download,
+    /// refused or cut off, leaves nothing behind, not even the empty file
+    /// the caller made to claim the name.
     pub async fn download_to(&self, url: &str, path: &std::path::Path) -> Result<u64> {
         use tokio::io::AsyncWriteExt;
-        let auth = self.blossom_auth("get", None, url)?;
-        let mut r = self
-            .authed(self.http.get(url))
-            // Files can be big videos; the client's 30 s is for small calls.
-            .timeout(Duration::from_secs(600))
-            .header("Authorization", auth)
-            .send()
-            .await?;
-        let s = r.status();
-        if !s.is_success() {
-            bail!("download failed ({s})");
-        }
+        // A big video on a slow link can take a long time; what counts as
+        // failure is the bytes stopping.
+        const STALL: Duration = Duration::from_secs(60);
         let res = async {
+            let auth = self.blossom_auth("get", None, url)?;
+            let mut r = tokio::time::timeout(
+                STALL,
+                self.authed(self.http.get(url))
+                    // The client's 30 s total is for small calls.
+                    .timeout(Duration::from_secs(24 * 3600))
+                    .header("Authorization", auth)
+                    .send(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("download timed out"))??;
+            let s = r.status();
+            if !s.is_success() {
+                bail!("download failed ({s})");
+            }
             let mut f = tokio::fs::File::create(path).await?;
             let mut n = 0u64;
-            while let Some(chunk) = r.chunk().await? {
+            while let Some(chunk) = tokio::time::timeout(STALL, r.chunk())
+                .await
+                .map_err(|_| anyhow::anyhow!("download stalled"))??
+            {
                 f.write_all(&chunk).await?;
                 n += chunk.len() as u64;
             }
@@ -422,6 +432,39 @@ fn same_origin(a: &str, b: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A refused download takes the claimed name back out of the folder.
+    #[tokio::test]
+    async fn refused_download_leaves_nothing() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = l.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = c.read(&mut buf).await;
+                let _ = c
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+        });
+        let relay = super::Relay::new(
+            &format!("ws://127.0.0.1:{port}"),
+            nostr::Keys::generate(),
+            None,
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("bv-dl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("http://127.0.0.1:{port}/media/abc.pdf");
+        let path = crate::links::free_path(&dir, "my doc.pdf").unwrap();
+        let err = relay.download_to(&url, &path).await.unwrap_err();
+        assert!(err.to_string().contains("404"), "{err}");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn same_origin_is_exact() {
         let base = "https://buzz.gitcoin.co";
