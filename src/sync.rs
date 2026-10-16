@@ -52,6 +52,11 @@ pub enum Msg {
         key: (String, u16, u16),
         result: anyhow::Result<ratatui_image::protocol::Protocol>,
     },
+    /// A dropped file (`label` is its path) or the clipboard, read.
+    Attachment {
+        label: Option<String>,
+        result: anyhow::Result<crate::clip::Pending>,
+    },
 }
 
 pub struct Sync {
@@ -459,6 +464,17 @@ impl Sync {
                     app.say(format!("couldn't open {url}: {e}"));
                 }
             }
+            Action::ReadAttachment(path) => self.spawn(async move {
+                let label = path.as_ref().map(|p| p.display().to_string());
+                let result = tokio::task::spawn_blocking(move || match path {
+                    Some(p) => crate::clip::from_file(&p, "dropped file"),
+                    None => crate::clip::from_clipboard(),
+                })
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|r| r);
+                Msg::Attachment { label, result }
+            }),
             Action::PreviewPending => {
                 let Some(p) = &app.pending else { return };
                 if !p.mime.starts_with("image/") || app.picker.is_none() {
@@ -530,6 +546,12 @@ impl Sync {
             .iter()
             .map(BlobDescriptor::imeta_tag)
             .collect();
+        // Unchanged since a send that failed: the same event again.
+        let again = draft
+            .sent_as
+            .as_ref()
+            .filter(|s| s.channel == channel && s.root == root && s.content == content)
+            .map(|s| Ok(*s.event.clone()));
         let built =
             buzz_sdk::build_message(uuid, &content, thread.as_ref(), &refs, false, &media, &[])
                 .map(|b| {
@@ -541,10 +563,11 @@ impl Sync {
                             .filter_map(|pk| Tag::parse(["mention", pk.as_str()]).ok()),
                     )
                 });
-        let ev = match built
-            .map_err(anyhow::Error::from)
-            .and_then(|b| self.relay.sign(b))
-        {
+        let ev = match again.unwrap_or_else(|| {
+            built
+                .map_err(anyhow::Error::from)
+                .and_then(|b| self.relay.sign(b))
+        }) {
             Ok(ev) => ev,
             Err(e) => {
                 app.say(format!("couldn't build message: {e}"));
@@ -555,6 +578,13 @@ impl Sync {
         // Show it right away; the live tail dedupes the echo.
         app.store.apply(&ev);
         let id = ev.id.to_hex();
+        let mut draft = draft;
+        draft.sent_as = Some(crate::draft::SentAs {
+            channel: channel.clone(),
+            root: root.clone(),
+            content,
+            event: Box::new(ev.clone()),
+        });
         app.pending_sends
             .insert(id.clone(), (channel.clone(), root.clone(), draft));
         let r = self.relay.clone();

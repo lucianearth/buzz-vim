@@ -4,7 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crossterm::event::{
-    Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    Event as TermEvent, KeyCode, KeyEvent, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use ratatui::layout::Rect;
 use ratatui_image::picker::Picker;
@@ -46,6 +47,9 @@ pub struct LinkHit {
     pub key: (String, usize),
 }
 
+/// A cursor move this big is g / G: to the first or last message.
+const JUMP: usize = 100_000;
+
 /// Where a link took you from, for Backspace / ^o.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Jump {
@@ -73,6 +77,9 @@ pub enum Action {
     EncodeImage((String, u16, u16)),
     /// Decode the pending upload so the confirm box can show it.
     PreviewPending,
+    /// Read a dropped file (or the clipboard, for None) off the UI loop;
+    /// files can be hundreds of MB.
+    ReadAttachment(Option<std::path::PathBuf>),
     OpenThread {
         channel: String,
         root: String,
@@ -563,9 +570,11 @@ impl App {
         if ids.is_empty() {
             return;
         }
+        // g / G go straight to the first or last message, top or bottom.
+        let jump = delta.unsigned_abs() >= JUMP;
         // A message taller than the pane pages through its lines first,
         // like a pager, and only then moves on.
-        if let Some((id, bh, h, off)) = self.tall.clone() {
+        if let Some((id, bh, h, off)) = self.tall.clone().filter(|_| !jump) {
             if self.cursor_message().as_deref() == Some(id.as_str()) {
                 let step = delta.unsigned_abs() * 3;
                 let end = bh.saturating_sub(h);
@@ -595,10 +604,12 @@ impl App {
         }
         // A tall message starts at the end you come in from: its bottom going
         // up, its top going down (even as the newest, which would show its end).
-        if next == cur {
+        // g shows the top of the first, G the bottom of the last.
+        let bottom = if jump { delta > 0 } else { delta < 0 };
+        let off = if bottom { usize::MAX } else { 0 };
+        if next == cur && !jump {
             return;
         }
-        let off = if delta < 0 { usize::MAX } else { 0 };
         self.peek = Some((ids[next].clone(), off));
         self.set_cursor(ids[next].clone(), next == ids.len() - 1);
     }
@@ -808,14 +819,8 @@ impl App {
     fn on_paste(&mut self, s: String) {
         let paths = crate::clip::dropped_paths(&s);
         if let Some(p) = paths.first() {
-            match crate::clip::from_file(p, "dropped file") {
-                Ok(pending) => {
-                    self.pending = Some(pending);
-                    self.mode = Mode::Confirm;
-                    self.actions.push(Action::PreviewPending);
-                }
-                Err(e) => self.say(format!("can't attach {}: {e}", p.display())),
-            }
+            self.say(format!("reading {}…", p.display()));
+            self.actions.push(Action::ReadAttachment(Some(p.clone())));
             return;
         }
         if self.mode != Mode::Insert {
@@ -826,17 +831,33 @@ impl App {
     }
 
     fn paste_clipboard(&mut self) {
-        match crate::clip::from_clipboard() {
-            Ok(p) => {
-                self.pending = Some(p);
-                self.mode = Mode::Confirm;
-                self.actions.push(Action::PreviewPending);
-            }
-            Err(e) => self.say(e.to_string()),
-        }
+        self.actions.push(Action::ReadAttachment(None));
     }
 
-    fn on_key(&mut self, k: KeyEvent) {
+    /// A file or clipboard image has been read: ask before uploading it.
+    pub fn attach(&mut self, p: Pending) {
+        // Don't pull the rug from under a popup or the confirm box.
+        if !matches!(self.mode, Mode::Normal | Mode::Insert) {
+            self.say(format!("{} is ready; drop or paste it again", p.name));
+            return;
+        }
+        self.pending = Some(p);
+        self.mode = Mode::Confirm;
+        self.actions.push(Action::PreviewPending);
+    }
+
+    fn on_key(&mut self, mut k: KeyEvent) {
+        // With all keys reported as escape codes (kitty, WezTerm, Ghostty),
+        // Caps Lock comes as a state bit on the lowercase key.
+        if k.state.contains(KeyEventState::CAPS_LOCK)
+            && !k
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            if let KeyCode::Char(c) = k.code {
+                k.code = KeyCode::Char(c.to_uppercase().next().unwrap_or(c));
+            }
+        }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && k.code == KeyCode::Char('c') {
             if self.mode == Mode::Insert && !self.draft_ref().is_empty() {
@@ -978,8 +999,8 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
             KeyCode::Char('d') | KeyCode::PageDown => self.move_cursor(self.page.max(1) as isize),
             KeyCode::Char('u') | KeyCode::PageUp => self.move_cursor(-(self.page.max(1) as isize)),
-            KeyCode::Char('g') | KeyCode::Home => self.move_cursor(-100_000),
-            KeyCode::Char('G') | KeyCode::End => self.move_cursor(100_000),
+            KeyCode::Char('g') | KeyCode::Home => self.move_cursor(-(JUMP as isize)),
+            KeyCode::Char('G') | KeyCode::End => self.move_cursor(JUMP as isize),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if self.focus == Pane::Timeline {
                     self.open_thread(false);
@@ -1299,6 +1320,40 @@ mod tests {
             app.on_key(KeyEvent::from(code));
         }
         assert_eq!(app.chosen, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn caps_lock_state_types_capitals() {
+        let mut app = App::new("me".into(), None);
+        app.tabs = vec!["a".into()];
+        app.mode = Mode::Insert;
+        for c in ['h', 'é', '1'] {
+            app.on_key(KeyEvent::new_with_kind_and_state(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+                crossterm::event::KeyEventKind::Press,
+                KeyEventState::CAPS_LOCK,
+            ));
+        }
+        assert_eq!(app.draft_ref().text, "HÉ1");
+    }
+
+    #[test]
+    fn g_and_shift_g_skip_paging_a_tall_message() {
+        let mut app = App::new("me".into(), None);
+        app.tabs = vec!["a".into()];
+        app.store.channel_mut("a").timeline = vec!["m1".into(), "m2".into()];
+        app.selected.insert("a".into(), "m1".into());
+        // On a tall first message, G goes to the bottom of the last at once.
+        app.tall = Some(("m1".into(), 100, 10, 0));
+        app.on_key(KeyEvent::from(KeyCode::Char('G')));
+        assert_eq!(app.selected.get("a"), None);
+        assert_eq!(app.peek, Some(("m2".into(), usize::MAX)));
+        // On a tall last message, g goes to the top of the first.
+        app.tall = Some(("m2".into(), 100, 10, 50));
+        app.on_key(KeyEvent::from(KeyCode::Char('g')));
+        assert_eq!(app.selected.get("a").map(String::as_str), Some("m1"));
+        assert_eq!(app.peek, Some(("m1".into(), 0)));
     }
 
     #[test]

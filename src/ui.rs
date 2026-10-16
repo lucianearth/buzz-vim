@@ -1418,7 +1418,21 @@ fn draw_sections(f: &mut Frame, app: &mut App, area: Rect) {
         };
         lines.push(Line::styled(msg, theme::muted()));
     }
-    for (i, s) in app.sections.iter().enumerate() {
+    // Rows left for the list after the heading and the legend. A long list
+    // scrolls to keep the cursor in view.
+    let rows = (inner.height as usize).saturating_sub(7).max(1);
+    let first = app
+        .picker_cursor
+        .saturating_sub(rows / 2)
+        .min(app.sections.len().saturating_sub(rows));
+    for (row, (i, s)) in app
+        .sections
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+        .enumerate()
+    {
         let mark = if app.picker_marks.contains(&s.id) {
             "[x]"
         } else {
@@ -1447,7 +1461,7 @@ fn draw_sections(f: &mut Frame, app: &mut App, area: Rect) {
         app.hits.push((
             Rect {
                 x: inner.x,
-                y: inner.y + 2 + i as u16,
+                y: inner.y + 2 + row as u16,
                 width: inner.width,
                 height: 1,
             },
@@ -2170,6 +2184,39 @@ mod tests {
         let buf = t.backend().buffer().clone();
         let top: String = (0..90).map(|x| buf[(x, 0)].symbol()).collect();
         assert!(top.contains("channel-6"), "{top}");
+    }
+
+    /// A long section list scrolls; the cursor row and its click area stay
+    /// inside the popup.
+    #[test]
+    fn section_picker_scrolls_to_the_cursor() {
+        let mut app = App::new("me".into(), None);
+        app.sections = (0..30)
+            .map(|i| crate::sections::Section {
+                id: format!("s{i}"),
+                name: format!("section-{i}"),
+                channels: vec![],
+            })
+            .collect();
+        app.mode = crate::keys::Mode::Sections;
+        app.picker_cursor = 25;
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let screen: String = (0..24)
+            .map(|y| (0..80).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
+            .collect();
+        assert!(screen.contains("section-25"), "{screen}");
+        assert!(!screen.contains("section-0 "), "{screen}");
+        let hit = app
+            .hits
+            .iter()
+            .find(|(_, h)| matches!(h, Hit::Section(25)))
+            .map(|(r, _)| *r)
+            .unwrap();
+        assert!(hit.bottom() < 24);
+        let row: String = (0..80).map(|x| buf[(x, hit.y)].symbol()).collect();
+        assert!(row.contains("section-25"), "{row}");
     }
 
     /// After following links, the footer shows the way back.
