@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Build the app for the simulator and launch it. Needs build-rust.sh first
 # (SIM_ONLY=1 is enough) and xcodegen. DEVICE picks the simulator by name
-# (newest iOS when the name repeats); BUZZ_VIM_NSEC logs in on launch.
+# (newest iOS when the name repeats); BUZZ_VIM_NSEC (+ BUZZ_VIM_AUTH_TAG for an
+# agent key) logs in on launch.
 set -euo pipefail
 cd "$(dirname "$0")"
 xcodegen generate --quiet
@@ -23,4 +24,4 @@ xcodebuild -project BuzzVim.xcodeproj -scheme BuzzVim -configuration Debug \
 app=build/Build/Products/Debug-iphonesimulator/BuzzVim.app
 xcrun simctl boot "$udid" 2>/dev/null || true
 xcrun simctl install "$udid" "$app"
-SIMCTL_CHILD_BUZZ_VIM_NSEC="${BUZZ_VIM_NSEC:-}" xcrun simctl launch "$udid" com.lucianhymer.buzzvim
+SIMCTL_CHILD_BUZZ_VIM_NSEC="${BUZZ_VIM_NSEC:-}" SIMCTL_CHILD_BUZZ_VIM_AUTH_TAG="${BUZZ_VIM_AUTH_TAG:-}" xcrun simctl launch "$udid" com.lucianhymer.buzzvim

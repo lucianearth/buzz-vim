@@ -564,14 +564,18 @@ name = "buzz-vim-ffi"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "buzz-core",
  "buzz-sdk",
  "buzz-vim-core",
+ "buzz-ws-client",
  "nostr",
+ "rustls",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "uniffi",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

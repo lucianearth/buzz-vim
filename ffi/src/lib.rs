@@ -25,9 +25,16 @@ use nostr::{Event, EventId, Keys, Tag};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
+mod pairing;
+pub use pairing::{PairStep, Pairing};
+
 uniffi::setup_scaffolding!();
 
 static RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    // reqwest and the websocket both link rustls with more than one crypto
+    // backend, so rustls won't pick one itself: without this every TLS
+    // connection panics inside its task and the app sits at "connecting".
+    let _ = rustls::crypto::ring::default_provider().install_default();
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -313,6 +320,7 @@ impl Client {
     /// Log in and start syncing. `chosen` = section ids picked as tabs;
     /// the read ids come from `new_read_id` the first time, then from
     /// `read_slot`/`read_client`, so Desktop sees one device, not many.
+    /// `auth_tag` is a NIP-OA tag (JSON) for agent keys; people pass none.
     #[uniffi::constructor]
     pub fn new(
         relay_url: String,
@@ -320,14 +328,27 @@ impl Client {
         chosen: Vec<String>,
         read_slot: String,
         read_client: String,
+        auth_tag: Option<String>,
         listener: Box<dyn Listener>,
     ) -> Result<Arc<Self>, BuzzError> {
         let keys = Keys::parse(secret.trim())
             .map_err(|e| BuzzError::Failed(format!("that isn't a private key: {e}")))?;
+        // A managed agent's key also needs its NIP-OA tag (simulator runs).
+        let auth = match auth_tag.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(json) => {
+                buzz_sdk::nip_oa::verify_auth_tag(json, &keys.public_key())
+                    .map_err(|e| BuzzError::Failed(format!("bad auth tag: {e}")))?;
+                Some(
+                    buzz_sdk::nip_oa::parse_auth_tag(json)
+                        .map_err(|e| BuzzError::Failed(format!("bad auth tag: {e}")))?,
+                )
+            }
+            None => None,
+        };
         let _guard = RT.enter();
-        let relay = Relay::new(&relay_url, keys.clone(), None)?;
+        let relay = Relay::new(&relay_url, keys.clone(), auth.clone())?;
         let (live_tx, live_rx) = mpsc::unbounded_channel::<Live>();
-        let live_cmd = live::spawn(relay.ws_url.clone(), keys.clone(), None, live_tx);
+        let live_cmd = live::spawn(relay.ws_url.clone(), keys.clone(), auth, live_tx);
         let (tx, rx) = mpsc::unbounded_channel::<Msg>();
         let me = keys.public_key().to_hex();
         let engine = Engine {

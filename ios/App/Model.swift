@@ -30,10 +30,12 @@ final class Model {
         if let secret = Keychain.read() {
             let relay = UserDefaults.standard.string(forKey: "relay") ?? Model.defaultRelay
             try? start(relay: relay, secret: secret)
-        } else if let secret = ProcessInfo.processInfo.environment["BUZZ_VIM_NSEC"] {
-            // Simulator runs log in from the environment (SIMCTL_CHILD_BUZZ_VIM_NSEC).
+        } else if let secret = ProcessInfo.processInfo.environment["BUZZ_VIM_NSEC"], !secret.isEmpty {
+            // Simulator runs log in from the environment (SIMCTL_CHILD_BUZZ_VIM_*);
+            // an agent's key also needs its NIP-OA tag.
             let env = ProcessInfo.processInfo.environment
-            try? start(relay: env["BUZZ_VIM_RELAY"] ?? Model.defaultRelay, secret: secret)
+            try? start(relay: env["BUZZ_VIM_RELAY"] ?? Model.defaultRelay, secret: secret,
+                       authTag: env["BUZZ_VIM_AUTH_TAG"])
         }
     }
 
@@ -60,7 +62,7 @@ final class Model {
         drafts = [:]
     }
 
-    private func start(relay: String, secret: String) throws {
+    private func start(relay: String, secret: String, authTag: String? = nil) throws {
         let d = UserDefaults.standard
         let slot = d.string(forKey: "readSlot") ?? newReadId()
         let cid = d.string(forKey: "readClient") ?? newReadId()
@@ -68,7 +70,7 @@ final class Model {
         d.set(cid, forKey: "readClient")
         let chosen = d.stringArray(forKey: "chosen") ?? []
         client = try Client(relayUrl: relay, secret: secret, chosen: chosen,
-                            readSlot: slot, readClient: cid, listener: Poke(model: self))
+                            readSlot: slot, readClient: cid, authTag: authTag, listener: Poke(model: self))
     }
 
     func setChosen(_ ids: [String]) {
