@@ -228,14 +228,14 @@ func rich(_ src: String, mentions: [String], theme: Theme) -> AttributedString {
     }
     for run in a.runs where run.link != nil {
         a[run.range].foregroundColor = theme.link
-        a[run.range].underlineStyle = .single
+        a[run.range].underlineStyle = Text.LineStyle.single
     }
     for name in Set(mentions) {
         var from = plain.startIndex
         while let r = plain.range(of: "@" + name, range: from..<plain.endIndex) {
             if let s = span(r) {
                 a[s].foregroundColor = theme.accent
-                a[s].font = .body.weight(.semibold)
+                a[s].font = Font.body.weight(.semibold)
             }
             from = r.upperBound
         }
