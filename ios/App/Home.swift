@@ -197,6 +197,8 @@ struct Header: View {
     @Environment(\.theme) private var theme
     /// A reorder that ends dragging down mustn't also open the agents.
     @State private var droppedAt = Date.distantPast
+    /// Each tab's place in the row, to tell which one a hold landed on.
+    @State private var chipFrames: [String: CGRect] = [:]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -211,13 +213,18 @@ struct Header: View {
                             chip(t)
                                 .id(t.id)
                                 .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { selected = t.id } }
-                                // Hold a tab: its section unfolds into a column
-                                // to slide it up or down in. A UIKit long press,
-                                // so the row's scroll view keeps quick swipes.
-                                .gesture(Hold(began: { pickUp(t, $0) }, moved: moved, ended: drop))
+                                .onGeometryChange(for: CGRect.self) { $0.frame(in: .named("tabrow")) } action: {
+                                    chipFrames[t.id] = $0
+                                }
                         }
                     }
                     .padding(.horizontal, 22)
+                    .coordinateSpace(.named("tabrow"))
+                    // Hold a tab: its section unfolds into a column to slide
+                    // it up or down in. One UIKit long press for the whole
+                    // row (one per tab missed some tabs); it fails if the
+                    // finger moves early, so the scroll view keeps swipes.
+                    .gesture(Hold(began: pickUp, moved: moved, ended: drop))
                 }
                 .scrollDisabled(lift != nil)
                 .onChange(of: selected) { _, now in
@@ -243,7 +250,8 @@ struct Header: View {
         })
     }
 
-    private func pickUp(_ t: ChannelTab, _ y: CGFloat) {
+    private func pickUp(_ at: CGPoint, _ y: CGFloat) {
+        guard let t = tabs.first(where: { chipFrames[$0.id]?.contains(at) == true }) else { return }
         let ids = tabs.filter { $0.section == t.section }.map(\.id)
         withAnimation(.easeOut(duration: 0.15)) {
             lift = Lift(section: t.section, ids: ids, held: t.id, y: y, startY: y)
@@ -327,10 +335,11 @@ struct Header: View {
 }
 
 /// Hold 0.3 s, then report where the finger is (global y) until it lifts.
+/// `began` also gets the point in the view the hold is on.
 /// UIKit's long press fails as soon as the finger moves early, which hands
 /// the touch to the scroll view; a SwiftUI long press + drag kept it.
 struct Hold: UIGestureRecognizerRepresentable {
-    let began: (CGFloat) -> Void
+    let began: (CGPoint, CGFloat) -> Void
     let moved: (CGFloat) -> Void
     let ended: () -> Void
 
@@ -343,7 +352,7 @@ struct Hold: UIGestureRecognizerRepresentable {
     func handleUIGestureRecognizerAction(_ g: UILongPressGestureRecognizer, context: Context) {
         let y = context.converter.location(in: .global).y
         switch g.state {
-        case .began: began(y)
+        case .began: began(context.converter.location(in: .local), y)
         case .changed: moved(y)
         case .ended, .cancelled, .failed: ended()
         default: break
