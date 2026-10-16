@@ -1342,20 +1342,24 @@ impl App {
     /// Move a tab one place left (-1) or right (1) within its section,
     /// here at once and synced to the phone.
     fn shift_tab(&mut self, channel: &str, by: isize) {
+        if !self.sections_loaded {
+            return self.say("sections are still loading");
+        }
         let Some(s) = self.tab_section(channel) else {
             return self.say("tabs keep their order inside a section; pick sections with s");
         };
-        let section = s.id.clone();
-        // Past archived channels too: they hold a place but show no tab.
+        let (section, name) = (s.id.clone(), s.name.clone());
+        // Past channels that hold a place here but show no tab in it (a
+        // starred one shown under Starred): swapping with them moves nothing.
         let mut ids = s.channels.clone();
         loop {
             let Some(next) = crate::sections::shift(&ids, channel, by) else {
-                return self.say(format!("end of {}", s.name));
+                return self.say(format!("end of {name}"));
             };
             ids = next;
             let i = ids.iter().position(|c| c == channel).unwrap_or(0);
-            let past = ids[(i as isize - by) as usize].clone();
-            if self.store.channels.get(&past).is_none_or(|c| !c.archived) {
+            let past = &ids[(i as isize - by) as usize];
+            if self.tabs.contains(past) && self.tab_section(past).is_some_and(|t| t.id == section) {
                 break;
             }
         }
@@ -1898,6 +1902,14 @@ mod tests {
         app.rebuild_tabs();
         assert_eq!(app.tabs, vec!["a", "c", "x"]);
         let key = |app: &mut App, c: char| app.on_key(KeyEvent::from(KeyCode::Char(c)));
+        // Not before the synced order has loaded: it would write over it.
+        key(&mut app, '>');
+        assert!(
+            !app.actions
+                .iter()
+                .any(|a| matches!(a, Action::Order { .. }))
+        );
+        app.sections_loaded = true;
         // > on a: past the archived b too, so the tab visibly moves.
         key(&mut app, '>');
         assert_eq!(app.tabs, vec!["c", "a", "x"]);

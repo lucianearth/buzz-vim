@@ -12,9 +12,14 @@ enum Sanitize {
         guard img.size.width > 0, img.size.height > 0 else { return nil }
         let format = UIGraphicsImageRendererFormat()
         format.scale = img.scale
-        format.opaque = false
+        // JPEG has no transparency: clear areas go white, not black.
+        format.opaque = !png
         format.preferredRange = .standard
-        let flat = UIGraphicsImageRenderer(size: img.size, format: format).image { _ in
+        let flat = UIGraphicsImageRenderer(size: img.size, format: format).image { ctx in
+            if !png {
+                UIColor.white.setFill()
+                ctx.fill(CGRect(origin: .zero, size: img.size))
+            }
             img.draw(in: CGRect(origin: .zero, size: img.size))
         }
         if png {

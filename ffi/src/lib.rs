@@ -325,6 +325,9 @@ struct Engine {
     tab_section: HashMap<String, String>,
     channels_loaded: bool,
     sections_loaded: bool,
+    /// Tab orders set before the synced one loaded (the phone's old local
+    /// order at launch): folded in under it once it has, then written.
+    order_pending: HashMap<String, Vec<String>>,
     agents: Agents,
     read: ReadState,
     conn: Conn,
@@ -415,6 +418,7 @@ impl Client {
             tab_section: HashMap::new(),
             channels_loaded: false,
             sections_loaded: false,
+            order_pending: HashMap::new(),
             agents: Agents::default(),
             read: ReadState::new(read_slot, read_client),
             conn: Conn::Connecting,
@@ -530,13 +534,13 @@ impl Client {
     /// ones) follow by name. Synced: the terminal app shows it too.
     pub fn set_order(&self, section: String, ids: Vec<String>) {
         let mut e = self.engine.lock().unwrap();
+        if !e.sections_loaded {
+            e.order_pending.insert(section, ids);
+            return;
+        }
         e.lanes.order.insert(section, ids);
-        let at = sections::next_order_at(&e.lanes);
-        e.lanes.order_at = at;
         e.refresh_sections();
-        let order = e.lanes.order.clone();
-        let r = e.relay.clone();
-        e.spawn(async move { Msg::Ordered(sections::publish_order(&r, &order, at).await) });
+        e.publish_order();
     }
 
     /// Move the channel on screen into `section` ("channels" = out of its
@@ -1105,6 +1109,15 @@ impl Engine {
         changed
     }
 
+    /// Write the whole tab order (see sections::LANE_ORDER).
+    fn publish_order(&mut self) {
+        let at = sections::next_order_at(&self.lanes);
+        self.lanes.order_at = at;
+        let order = self.lanes.order.clone();
+        let r = self.relay.clone();
+        self.spawn(async move { Msg::Ordered(sections::publish_order(&r, &order, at).await) });
+    }
+
     fn refresh_sections(&mut self) {
         self.sections = sections::build(&self.lanes, &self.store);
         if self.sections_loaded && self.channels_loaded {
@@ -1394,6 +1407,20 @@ impl Engine {
             Msg::Lanes(Ok(evs)) => {
                 self.apply_lanes(&evs);
                 self.sections_loaded = true;
+                if !self.order_pending.is_empty() {
+                    let mut changed = false;
+                    for (k, v) in std::mem::take(&mut self.order_pending) {
+                        if let std::collections::hash_map::Entry::Vacant(slot) =
+                            self.lanes.order.entry(k)
+                        {
+                            slot.insert(v);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        self.publish_order();
+                    }
+                }
                 self.refresh_sections();
             }
             Msg::Lanes(Err(e)) => self.notices.push(format!("couldn't load sections: {e}")),
@@ -1951,6 +1978,7 @@ mod tests {
             tab_section: HashMap::new(),
             channels_loaded: false,
             sections_loaded: false,
+            order_pending: HashMap::new(),
             agents: Agents::default(),
             read: ReadState::new(new_read_id(), new_read_id()),
             conn: Conn::Connecting,
