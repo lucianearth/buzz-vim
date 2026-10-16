@@ -1,4 +1,7 @@
+import OSLog
 import SwiftUI
+
+private let holdLog = Logger(subsystem: "com.lucianhymer.buzzvim", category: "hold")
 
 struct Route: Hashable {
     let channel: String
@@ -226,7 +229,6 @@ struct Header: View {
                     // finger moves early, so the scroll view keeps swipes.
                     .gesture(Hold(began: pickUp, moved: moved, ended: drop))
                 }
-                .scrollDisabled(lift != nil)
                 .onChange(of: selected) { _, now in
                     withAnimation { proxy.scrollTo(now, anchor: .center) }
                 }
@@ -251,7 +253,11 @@ struct Header: View {
     }
 
     private func pickUp(_ at: CGPoint, _ y: CGFloat) {
-        guard let t = tabs.first(where: { chipFrames[$0.id]?.contains(at) == true }) else { return }
+        guard let t = tabs.first(where: { chipFrames[$0.id]?.contains(at) == true }) else {
+            holdLog.info("hold missed at \(at.x), \(at.y); \(chipFrames.count) frames")
+            return
+        }
+        holdLog.info("hold on \(t.id, privacy: .public) at \(at.x), \(at.y)")
         let ids = tabs.filter { $0.section == t.section }.map(\.id)
         withAnimation(.easeOut(duration: 0.15)) {
             lift = Lift(section: t.section, ids: ids, held: t.id, y: y, startY: y)
@@ -268,6 +274,7 @@ struct Header: View {
     /// Let go: save the new order and fold the column away.
     private func drop() {
         guard let l = lift else { return }
+        holdLog.info("drop \(l.held, privacy: .public) \(l.start) -> \(l.target)")
         if l.order != l.ids { model.order(l.section, l.order) }
         droppedAt = Date()
         withAnimation(.easeOut(duration: 0.2)) { lift = nil }
@@ -351,6 +358,9 @@ struct Hold: UIGestureRecognizerRepresentable {
 
     func handleUIGestureRecognizerAction(_ g: UILongPressGestureRecognizer, context: Context) {
         let y = context.converter.location(in: .global).y
+        if g.state != .changed {
+            holdLog.info("hold state \(g.state.rawValue) y=\(y)")
+        }
         switch g.state {
         case .began: began(context.converter.location(in: .local), y)
         case .changed: moved(y)
