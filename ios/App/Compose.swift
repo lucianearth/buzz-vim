@@ -1,4 +1,3 @@
-import ImageIO
 import PhotosUI
 import SwiftUI
 import UIKit
@@ -289,32 +288,14 @@ struct PendingUpload: Identifiable {
         return make(raw, item.supportedContentTypes.first)
     }
 
-    /// The relay takes JPEG, PNG, GIF and WebP; anything else (HEIC) becomes JPEG.
+    /// The relay takes no metadata at all, so every image is redrawn and
+    /// re-encoded clean (see Sanitize): PNG stays PNG, the rest go as JPEG.
     static func make(_ raw: Data, _ type: UTType?) -> PendingUpload? {
-        let keep: [(UTType, String, String)] = [
-            (.png, "image/png", "png"), (.gif, "image/gif", "gif"), (.webP, "image/webp", "webp"),
-            (.jpeg, "image/jpeg", "jpg"),
-        ]
-        if let t = type, let k = keep.first(where: { t.conforms(to: $0.0) }),
-           let data = withoutLocation(raw, k.0) {
-            return PendingUpload(data: data, mime: k.1, name: "photo.\(k.2)", preview: UIImage(data: data))
-        }
-        guard let img = UIImage(data: raw), let jpg = img.jpegData(compressionQuality: 0.85) else { return nil }
-        return PendingUpload(data: jpg, mime: "image/jpeg", name: "photo.jpg", preview: img)
-    }
-
-    /// The same image without GPS in its metadata (a lossless copy). JPEG
-    /// and PNG only; GIF and WebP go as they are. Nil if ImageIO can't copy
-    /// it, and then the caller re-encodes, which drops all metadata.
-    private static func withoutLocation(_ data: Data, _ type: UTType) -> Data? {
-        guard type.conforms(to: .jpeg) || type.conforms(to: .png) else { return data }
-        guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
-        let out = NSMutableData()
-        guard let dst = CGImageDestinationCreateWithData(out, type.identifier as CFString, 1, nil) else { return nil }
-        let opts: [CFString: Any] = [kCGImageMetadataShouldExcludeGPS: true]
-        var err: Unmanaged<CFError>?
-        guard CGImageDestinationCopyImageSource(dst, src, opts as CFDictionary, &err) else { return nil }
-        return out as Data
+        guard let img = UIImage(data: raw) else { return nil }
+        let png = type?.conforms(to: .png) ?? false
+        guard let data = Sanitize.image(img, png: png) else { return nil }
+        let (mime, ext) = png ? ("image/png", "png") : ("image/jpeg", "jpg")
+        return PendingUpload(data: data, mime: mime, name: "photo.\(ext)", preview: UIImage(data: data))
     }
 }
 
