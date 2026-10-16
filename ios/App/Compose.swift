@@ -393,7 +393,10 @@ struct ComposeField: UIViewRepresentable {
         v.pasted = pasted
         v.textColor = UIColor(theme.text)
         v.tintColor = UIColor(theme.accent)
-        if v.text != text, v.markedTextRange == nil { v.text = text }
+        if v.text != text, v.markedTextRange == nil {
+            v.text = text
+            v.followCaret()
+        }
         if focused, !v.isFirstResponder, v.window != nil {
             DispatchQueue.main.async { v.becomeFirstResponder() }
         } else if !focused, v.isFirstResponder {
@@ -407,7 +410,10 @@ struct ComposeField: UIViewRepresentable {
         let most = (v.font?.lineHeight ?? 18) * CGFloat(lines)
         let scroll = fit.height > most + 1
         if v.isScrollEnabled != scroll {
-            DispatchQueue.main.async { v.isScrollEnabled = scroll }
+            DispatchQueue.main.async {
+                v.isScrollEnabled = scroll
+                v.followCaret()
+            }
         }
         return CGSize(width: width, height: min(fit.height, most))
     }
@@ -418,7 +424,10 @@ struct ComposeField: UIViewRepresentable {
         var parent: ComposeField
         init(_ parent: ComposeField) { self.parent = parent }
 
-        func textViewDidChange(_ v: UITextView) { parent.text = v.text }
+        func textViewDidChange(_ v: UITextView) {
+            parent.text = v.text
+            (v as? PasteTextView)?.followCaret()
+        }
         func textViewDidBeginEditing(_ v: UITextView) { if !parent.focused { parent.focused = true } }
         func textViewDidEndEditing(_ v: UITextView) { if parent.focused { parent.focused = false } }
     }
@@ -427,6 +436,17 @@ struct ComposeField: UIViewRepresentable {
 /// Paste takes an image when the clipboard holds one; text pastes as usual.
 final class PasteTextView: UITextView {
     var pasted: ((Data, UTType) -> Void)?
+
+    /// Keep the caret in view once the box is at its full height. Without
+    /// this, the box stopped at its last line before scrolling turned on
+    /// and new text went on below, out of sight.
+    func followCaret() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isScrollEnabled else { return }
+            self.layoutIfNeeded()
+            self.scrollRangeToVisible(self.selectedRange)
+        }
+    }
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
         if action == #selector(paste(_:)), UIPasteboard.general.hasImages { return true }

@@ -86,6 +86,20 @@ pub struct ChannelTab {
     pub section: String,
 }
 
+/// Where a tapped `buzz://` message or channel link lands.
+#[derive(uniffi::Record, Clone)]
+pub struct Follow {
+    pub channel: String,
+    /// The thread to open, if any.
+    pub root: Option<String>,
+    /// The reply to open the thread on, or the message to show in the
+    /// channel; None: the bottom.
+    pub id: Option<String>,
+    /// The section to show when the channel isn't a tab now; None when it
+    /// is one, or is in no section.
+    pub section: Option<String>,
+}
+
 #[derive(uniffi::Record, Clone)]
 pub struct SectionInfo {
     pub id: String,
@@ -490,24 +504,58 @@ impl Client {
         let e = self.engine.lock().unwrap();
         e.tabs
             .iter()
-            .map(|id| {
-                let ch = e.store.channels.get(id);
-                ChannelTab {
-                    id: id.clone(),
-                    label: e.label(id),
-                    unread: ch.map_or(0, |c| c.unread.len() as u32),
-                    mentions: ch.map_or(0, |c| {
-                        (if c.is_dm {
-                            c.unread.len()
-                        } else {
-                            c.mentioned.len()
-                        }) as u32
-                    }),
-                    is_dm: ch.is_some_and(|c| c.is_dm),
-                    section: e.tab_section.get(id).cloned().unwrap_or_default(),
-                }
-            })
+            .map(|id| e.tab(id, e.tab_section.get(id).cloned().unwrap_or_default()))
             .collect()
+    }
+
+    /// Any section's channels as tabs, whether or not it is the one showing.
+    pub fn section_tabs(&self, section: String) -> Vec<ChannelTab> {
+        let e = self.engine.lock().unwrap();
+        let Some(s) = e.sections.iter().find(|s| s.id == section) else {
+            return vec![];
+        };
+        s.channels
+            .iter()
+            .filter(|c| e.store.channels.get(*c).is_none_or(|ch| !ch.archived))
+            .map(|c| e.tab(c, section.clone()))
+            .collect()
+    }
+
+    /// A tapped link that we show ourselves (a channel, a message in one),
+    /// or None for the system to open.
+    pub fn follow(&self, url: String) -> Option<Follow> {
+        let links::Target::Message {
+            channel,
+            id,
+            thread,
+        } = links::target(&url)
+        else {
+            return None;
+        };
+        let e = self.engine.lock().unwrap();
+        let l = links::land(e.store.channels.get(&channel), id, thread);
+        let section = if e.tabs.contains(&channel) {
+            None
+        } else {
+            e.sections
+                .iter()
+                .find(|s| s.channels.contains(&channel))
+                .map(|s| s.id.clone())
+        };
+        Some(match l.thread {
+            Some((root, pick)) => Follow {
+                channel,
+                root: Some(root),
+                id: pick,
+                section,
+            },
+            None => Follow {
+                channel,
+                root: None,
+                id: l.selected,
+                section,
+            },
+        })
     }
 
     pub fn sections(&self) -> Vec<SectionInfo> {
@@ -979,6 +1027,24 @@ impl Engine {
             id: id.to_string(),
             filters,
         });
+    }
+
+    fn tab(&self, id: &str, section: String) -> ChannelTab {
+        let ch = self.store.channels.get(id);
+        ChannelTab {
+            id: id.to_string(),
+            label: self.label(id),
+            unread: ch.map_or(0, |c| c.unread.len() as u32),
+            mentions: ch.map_or(0, |c| {
+                (if c.is_dm {
+                    c.unread.len()
+                } else {
+                    c.mentioned.len()
+                }) as u32
+            }),
+            is_dm: ch.is_some_and(|c| c.is_dm),
+            section,
+        }
     }
 
     fn label(&self, id: &str) -> String {

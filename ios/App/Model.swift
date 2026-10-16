@@ -43,6 +43,8 @@ final class Model {
     var focusClaim: String?
     /// A message to scroll to the top of its channel: (channel, id).
     var scrollTarget: (channel: String, id: String)?
+    /// Where Home goes for a tapped channel or message link.
+    @ObservationIgnored var follow: (Follow) -> Void = { _ in }
 
     static let defaultRelay = "wss://buzz.gitcoin.co"
 
@@ -189,10 +191,15 @@ final class Model {
         say("a message from last time may not have sent. It's back in its compose box.")
     }
 
-    /// A tapped link. Files on our relay need our auth, which Safari
-    /// doesn't have: download them ourselves and offer the share sheet
-    /// (Save to Files, AirDrop, another app). Anything else opens as usual.
+    /// A tapped link. A channel or message link opens here. Files on our
+    /// relay need our auth, which Safari doesn't have: download them
+    /// ourselves and offer the share sheet (Save to Files, AirDrop, another
+    /// app). Anything else opens as usual.
     func open(_ url: URL, client: Client) -> OpenURLAction.Result {
+        if let f = client.follow(url: url.absoluteString) {
+            follow(f)
+            return .handled
+        }
         guard client.isFile(url: url.absoluteString) else { return .systemAction }
         say("downloading…")
         // A folder of its own, so the file keeps the name it was sent with.

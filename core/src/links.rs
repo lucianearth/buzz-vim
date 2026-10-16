@@ -51,6 +51,40 @@ pub fn target(url: &str) -> Target {
     }
 }
 
+/// Where a message link lands, given what we hold of its channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Landing {
+    /// A loaded top-level message to pick in the timeline.
+    pub selected: Option<String>,
+    /// A thread to open, and the reply to pick in it (None: its bottom).
+    pub thread: Option<(String, Option<String>)>,
+}
+
+/// A reply opens its thread. So does a message older than what's loaded:
+/// the thread fetch gets it by id.
+pub fn land(
+    ch: Option<&crate::model::Channel>,
+    id: Option<String>,
+    thread: Option<String>,
+) -> Landing {
+    let in_timeline = |id: &String| ch.is_some_and(|c| c.timeline.contains(id));
+    let thread = thread.or_else(|| {
+        let id = id.as_ref()?;
+        match ch.and_then(|c| c.messages.get(id)) {
+            Some(m) => m.root.clone(),
+            None if in_timeline(id) => None,
+            None => Some(id.clone()),
+        }
+    });
+    Landing {
+        selected: id.clone().filter(|i| thread.is_none() && in_timeline(i)),
+        thread: thread.map(|r| {
+            let pick = id.filter(|i| *i != r);
+            (r, pick)
+        }),
+    }
+}
+
 /// The short label a bare `buzz://` link shows instead of its whole URL,
 /// given a way to name channels. None keeps the URL.
 pub fn label(url: &str, channel_name: &dyn Fn(&str) -> Option<String>) -> Option<String> {
@@ -329,6 +363,66 @@ mod tests {
         assert_eq!(free("Makefile"), dir.join("Makefile"));
         assert_eq!(free("Makefile"), dir.join("Makefile (1)"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn landings() {
+        use crate::model::{Channel, Message};
+        let mut ch = Channel {
+            timeline: vec!["top".into()],
+            ..Default::default()
+        };
+        for (id, root) in [("top", None), ("reply", Some("top"))] {
+            ch.messages.insert(
+                id.into(),
+                Message {
+                    id: id.into(),
+                    root: root.map(Into::into),
+                    ..Default::default()
+                },
+            );
+        }
+        let s = |v: &str| Some(v.to_string());
+        let land = |id, thread| land(Some(&ch), id, thread);
+        // A loaded top-level message is picked in the timeline.
+        assert_eq!(
+            land(s("top"), None),
+            Landing {
+                selected: s("top"),
+                thread: None
+            }
+        );
+        // A reply opens its thread on it.
+        assert_eq!(
+            land(s("reply"), None),
+            Landing {
+                selected: None,
+                thread: Some(("top".into(), s("reply")))
+            }
+        );
+        // Unknown: fetched as a thread root.
+        assert_eq!(
+            land(s("old"), None),
+            Landing {
+                selected: None,
+                thread: Some(("old".into(), None))
+            }
+        );
+        // A thread link to its root opens the thread at the bottom.
+        assert_eq!(
+            land(s("top"), s("top")),
+            Landing {
+                selected: None,
+                thread: Some(("top".into(), None))
+            }
+        );
+        assert_eq!(
+            land(None, None),
+            Landing {
+                selected: None,
+                thread: None
+            }
+        );
     }
 
     #[test]

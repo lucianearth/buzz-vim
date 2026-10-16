@@ -14,6 +14,8 @@ struct Route: Hashable {
 struct Nav {
     var step: (Int) -> Void = { _ in }
     var bell: () -> Void = {}
+    /// Open the tab switcher (holding the thread header).
+    var switcher: () -> Void = {}
 }
 
 private struct NavKey: EnvironmentKey {
@@ -29,8 +31,8 @@ extension EnvironmentValues {
 
 /// Tabs across the top, one channel per page: swipe sideways between them,
 /// tap a message for its thread, pull the header down for the agents,
-/// hold a tab for the switcher (every tab in tall rows, drag handles to
-/// reorder, a Sections button), hold the status line for sections.
+/// hold a tab, the status line or a thread's header for the switcher
+/// (a page of tall rows per section, drag handles to reorder).
 struct Home: View {
     let client: Client
     @Environment(Model.self) private var model
@@ -42,7 +44,6 @@ struct Home: View {
     @State private var wanted: String? = UserDefaults.standard.string(forKey: "active")
     @State private var fallback = false
     @State private var showAgents = false
-    @State private var showSections = false
     @State private var switcher = false
 
     var body: some View {
@@ -51,7 +52,7 @@ struct Home: View {
         NavigationStack(path: $path) {
             VStack(spacing: 0) {
                 Header(client: client, tabs: tabs, selected: $selected,
-                       showAgents: $showAgents, showSections: $showSections, switcher: $switcher)
+                       showAgents: $showAgents, switcher: $switcher, openSwitcher: openSwitcher)
                 if tabs.isEmpty {
                     Spacer()
                     Text(client.ready() ? "no channels yet" : "loading channels…")
@@ -90,14 +91,19 @@ struct Home: View {
         }
         .overlay {
             if switcher {
-                TabSwitcher(client: client, tabs: tabs, selected: $selected,
-                            shown: $switcher, showSections: $showSections)
+                TabSwitcher(client: client, selected: selected, shown: $switcher,
+                            page: tabs.first { $0.id == selected }?.section
+                                ?? client.sections().first(where: \.chosen)?.id,
+                            pick: pick)
                     .transition(.opacity)
             }
         }
         .sensoryFeedback(.impact, trigger: switcher) { _, now in now }
-        .environment(\.nav, Nav(step: step, bell: bell))
-        .onAppear { settle(tabs) }
+        .environment(\.nav, Nav(step: step, bell: bell, switcher: openSwitcher))
+        .onAppear {
+            model.follow = follow
+            settle(tabs)
+        }
         .onChange(of: tabs.map(\.id)) { _, _ in settle(client.tabs()) }
         .onChange(of: selected) { _, now in
             client.openChannel(channel: now)
@@ -110,12 +116,6 @@ struct Home: View {
         }
         .sheet(isPresented: $showAgents) {
             AgentsView(client: client)
-                .presentationDetents([.medium, .large])
-                .presentationDragIndicator(.visible)
-                .modifier(Themed())
-        }
-        .sheet(isPresented: $showSections) {
-            SectionsView(client: client)
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
                 .modifier(Themed())
@@ -152,6 +152,44 @@ struct Home: View {
         }
     }
 
+    /// The switcher comes down over everything, keyboard first.
+    private func openSwitcher() {
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+        withAnimation(.easeOut(duration: 0.15)) { switcher = true }
+    }
+
+    /// A tab picked in the switcher. One from a section the tab row isn't
+    /// showing makes that section the tab row.
+    private func pick(_ t: ChannelTab) {
+        if !client.tabs().contains(where: { $0.section == t.section }) {
+            model.setChosen([t.section])
+        }
+        go(t.id)
+    }
+
+    /// A tapped channel or message link: its tab (its section's tab row
+    /// when it isn't showing), then its thread or the message.
+    private func follow(_ f: Follow) {
+        if let s = f.section {
+            model.setChosen([s])
+        } else if !client.tabs().contains(where: { $0.id == f.channel }) {
+            // In no section: a thread still opens, a channel can't.
+            guard let root = f.root else {
+                model.say("that channel isn't in your sidebar")
+                return
+            }
+            path = [Route(channel: f.channel, root: root, focus: f.id)]
+            return
+        }
+        selected = f.channel
+        if let root = f.root {
+            path = [Route(channel: f.channel, root: root, focus: f.id)]
+        } else {
+            path = []
+            if let id = f.id { model.scrollTarget = (f.channel, id) }
+        }
+    }
+
     /// Key-row moves only, so the keyboard is up: jump, no page slide.
     private func go(_ id: String) {
         path = []
@@ -176,8 +214,8 @@ struct Header: View {
     let tabs: [ChannelTab]
     @Binding var selected: String?
     @Binding var showAgents: Bool
-    @Binding var showSections: Bool
     @Binding var switcher: Bool
+    let openSwitcher: () -> Void
     @Environment(Model.self) private var model
     @Environment(\.theme) private var theme
     /// Each tab's place in the row, to tell which one a hold landed on.
@@ -188,7 +226,7 @@ struct Header: View {
             status
                 .padding(.horizontal, 22)
                 .onTapGesture { showAgents = true }
-                .onLongPressGesture { showSections = true }
+                .onLongPressGesture { openSwitcher() }
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
@@ -236,7 +274,7 @@ struct Header: View {
             holdLog.info("hold missed at \(at.x), \(at.y); \(chipFrames.count) frames")
             return
         }
-        withAnimation(.easeOut(duration: 0.15)) { switcher = true }
+        openSwitcher()
     }
 
     private var status: some View {
@@ -317,62 +355,68 @@ struct Hold: UIGestureRecognizerRepresentable {
     }
 }
 
-/// Every tab in tall rows, by section: tap one to go there, drag a handle
-/// to reorder it within its section. It flips down from the tab row and
-/// stays until a tab, Sections or Close.
+/// Every section's tabs in tall rows, a page per section. Swipe sideways
+/// to look at another section; that alone changes nothing. Tap a tab to go
+/// there (its section becomes the tab row), drag a handle to reorder. On a
+/// section the tab you're on isn't in, the top row moves it there. It
+/// flips down from the tab row and stays until a tab or Close.
 struct TabSwitcher: View {
     let client: Client
-    let tabs: [ChannelTab]
-    @Binding var selected: String?
+    let selected: String?
     @Binding var shown: Bool
-    @Binding var showSections: Bool
+    /// The section on screen: starts on the open tab's.
+    @State var page: String?
+    let pick: (ChannelTab) -> Void
     @Environment(Model.self) private var model
     @Environment(\.theme) private var theme
     @State private var open = false
 
     var body: some View {
-        let names = Dictionary(client.sections().map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+        let _ = model.version
+        let sections = client.sections()
+        let name = sections.first { $0.id == page }?.name ?? ""
         VStack(spacing: 0) {
-            ScrollViewReader { proxy in
-                List {
-                    ForEach(groups, id: \.0) { section, items in
-                        Section {
-                            ForEach(items, id: \.id) { t in
-                                Button { pick(t.id) } label: { row(t) }
-                                    .buttonStyle(.plain)
-                                    .id(t.id)
-                                    .listRowBackground(theme.canvas)
-                                    .listRowSeparator(.hidden)
-                                    .listRowInsets(EdgeInsets(top: 4, leading: 22, bottom: 4, trailing: 12))
-                            }
-                            .onMove { from, to in
-                                var ids = items.map(\.id)
-                                ids.move(fromOffsets: from, toOffset: to)
-                                model.order(section, ids)
-                            }
-                        } header: {
-                            Text(names[section] ?? section)
-                                .font(.small)
-                                .foregroundStyle(theme.faint)
-                        }
+            HStack(spacing: 6) {
+                Text(name).font(.label).foregroundStyle(theme.text).lineLimit(1)
+                Spacer()
+                ForEach(sections, id: \.id) { s in
+                    Circle()
+                        .fill(s.id == page ? theme.chipOn : theme.rule)
+                        .frame(width: 7, height: 7)
+                }
+            }
+            .padding(.horizontal, 22)
+            .padding(.top, 14)
+            .padding(.bottom, 6)
+            ScrollView(.horizontal) {
+                LazyHStack(spacing: 0) {
+                    ForEach(sections, id: \.id) { s in
+                        SectionPage(client: client, section: s, selected: selected, pick: { t in
+                            pick(t)
+                            close()
+                        })
+                        .containerRelativeFrame([.horizontal, .vertical])
+                        .id(s.id)
                     }
                 }
-                .listStyle(.plain)
-                .scrollContentBackground(.hidden)
-                // Edit mode for the drag handles; there's no delete.
-                .environment(\.editMode, .constant(.active))
-                .onAppear { proxy.scrollTo(selected, anchor: .center) }
+                .scrollTargetLayout()
             }
-            HStack {
-                Button("Sections") {
-                    close()
-                    showSections = true
-                }
+            .scrollIndicators(.hidden)
+            .scrollTargetBehavior(.paging)
+            .scrollPosition(id: $page)
+            HStack(spacing: 12) {
+                Text("signed in as \(client.myName())")
+                    .font(.small)
+                    .foregroundStyle(theme.muted)
+                    .lineLimit(1)
+                Button("Log out") { model.logout() }
+                    .font(.small)
+                    .foregroundStyle(theme.badge)
                 Spacer()
                 Button("Close") { close() }
+                    .font(.label)
+                    .foregroundStyle(theme.accent)
             }
-            .font(.label)
-            .foregroundStyle(theme.accent)
             .padding(.horizontal, 22)
             .padding(.vertical, 14)
         }
@@ -383,26 +427,61 @@ struct TabSwitcher: View {
         .onAppear { withAnimation(.spring(duration: 0.35)) { open = true } }
     }
 
-    /// Sections in tab order, each with its tabs.
-    private var groups: [(String, [ChannelTab])] {
-        var out: [(String, [ChannelTab])] = []
-        for t in tabs {
-            if let i = out.firstIndex(where: { $0.0 == t.section }) {
-                out[i].1.append(t)
-            } else {
-                out.append((t.section, [t]))
-            }
-        }
-        return out
-    }
-
-    private func pick(_ id: String) {
-        selected = id
-        close()
-    }
-
     private func close() {
         withAnimation(.easeOut(duration: 0.2)) { shown = false }
+    }
+}
+
+/// One section's tabs in the switcher.
+private struct SectionPage: View {
+    let client: Client
+    let section: SectionInfo
+    let selected: String?
+    let pick: (ChannelTab) -> Void
+    @Environment(Model.self) private var model
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        let _ = model.version
+        let items = client.sectionTabs(section: section.id)
+        let here = client.tabs().first { $0.id == selected }?.label ?? "#" + client.currentName()
+        ScrollViewReader { proxy in
+            List {
+                if section.canMoveHere {
+                    Button { model.moveHere(section.id) } label: {
+                        Label("Move \(here) here", systemImage: "arrow.down.to.line")
+                            .font(.label)
+                            .foregroundStyle(theme.accent)
+                            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .modifier(SwitcherRow())
+                }
+                ForEach(items, id: \.id) { t in
+                    Button { pick(t) } label: { row(t) }
+                        .buttonStyle(.plain)
+                        .id(t.id)
+                        .modifier(SwitcherRow())
+                }
+                .onMove { from, to in
+                    var ids = items.map(\.id)
+                    ids.move(fromOffsets: from, toOffset: to)
+                    model.order(section.id, ids)
+                }
+                if items.isEmpty {
+                    Text("no channels here")
+                        .font(.small)
+                        .foregroundStyle(theme.faint)
+                        .modifier(SwitcherRow())
+                }
+            }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            // Edit mode for the drag handles; there's no delete.
+            .environment(\.editMode, .constant(.active))
+            .onAppear { proxy.scrollTo(selected, anchor: .center) }
+        }
     }
 
     private func row(_ t: ChannelTab) -> some View {
@@ -429,6 +508,17 @@ struct TabSwitcher: View {
         .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
         .background(on ? theme.chipOn : theme.chipOff, in: RoundedRectangle(cornerRadius: 10))
         .contentShape(Rectangle())
+    }
+}
+
+private struct SwitcherRow: ViewModifier {
+    @Environment(\.theme) private var theme
+
+    func body(content: Content) -> some View {
+        content
+            .listRowBackground(theme.canvas)
+            .listRowSeparator(.hidden)
+            .listRowInsets(EdgeInsets(top: 4, leading: 22, bottom: 4, trailing: 12))
     }
 }
 

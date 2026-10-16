@@ -8,6 +8,7 @@ struct ThreadView: View {
     @Environment(Model.self) private var model
     @Environment(\.theme) private var theme
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.nav) private var nav
     @State private var landed = false
     /// Where the bell key's reply is put: ScrollViewReader's scrollTo
     /// left the thread on its root.
@@ -20,19 +21,23 @@ struct ThreadView: View {
         let tl = client.thread(channel: route.channel, root: route.root)
         let label = client.tabs().first { $0.id == route.channel }?.label ?? "thread"
         VStack(spacing: 0) {
+            // Tap back; hold anywhere on it for the tab switcher. A tap
+            // gesture, not a Button: UIKit's hold cancels it cleanly.
             HStack(spacing: 10) {
-                Button { dismiss() } label: {
-                    HStack(spacing: 10) {
-                        Image(systemName: "arrow.left").font(.system(size: 16, weight: .medium))
-                        Text(label).font(.header)
-                    }
-                    .foregroundStyle(theme.muted)
+                HStack(spacing: 10) {
+                    Image(systemName: "arrow.left").font(.system(size: 16, weight: .medium))
+                    Text(label).font(.header)
                 }
+                .foregroundStyle(theme.muted)
+                .contentShape(Rectangle())
+                .onTapGesture { dismiss() }
                 Spacer()
             }
             .padding(.horizontal, 22)
             .padding(.top, 10)
             .padding(.bottom, 14)
+            .contentShape(Rectangle())
+            .gesture(Hold { _ in nav.switcher() })
             GeometryReader { geo in
             ScrollViewReader { proxy in
                 ScrollView {

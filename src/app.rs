@@ -494,24 +494,11 @@ impl App {
                 id,
                 thread,
             } => {
-                // A reply opens its thread. So does a message older than
-                // what's loaded: the thread fetch gets it by id.
                 let known = self.store.channels.get(&channel);
-                let in_timeline = |id: &String| known.is_some_and(|c| c.timeline.contains(id));
-                let thread = thread.or_else(|| {
-                    let id = id.as_ref()?;
-                    match known.and_then(|c| c.messages.get(id)) {
-                        Some(m) => m.root.clone(),
-                        None if in_timeline(id) => None,
-                        None => Some(id.clone()),
-                    }
-                });
+                let l = crate::links::land(known, id, thread);
                 let jump = Jump {
-                    selected: id.clone().filter(|i| thread.is_none() && in_timeline(i)),
-                    thread: thread.map(|r| {
-                        let pick = id.filter(|i| *i != r);
-                        (r, pick)
-                    }),
+                    selected: l.selected,
+                    thread: l.thread,
                     channel,
                 };
                 let newest = known.and_then(|c| c.timeline.last());
