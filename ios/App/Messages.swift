@@ -13,7 +13,7 @@ struct ChannelView: View {
         let tl = client.timeline(channel: channel)
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 18) {
+                LazyVStack(alignment: .leading, spacing: 22) {
                     if tl.hasMore {
                         ProgressView()
                             .frame(maxWidth: .infinity)
@@ -36,10 +36,12 @@ struct ChannelView: View {
                     }
                     Color.clear.frame(height: 1).id("end")
                 }
-                .padding(.horizontal, 18)
+                .padding(.horizontal, 22)
                 .padding(.top, 6)
             }
-            .defaultScrollAnchor(.bottom)
+            .defaultScrollAnchor(.bottom, for: .initialOffset)
+            .defaultScrollAnchor(.bottom, for: .sizeChanges)
+            .defaultScrollAnchor(.top, for: .alignment)
             .scrollDismissesKeyboard(.interactively)
             .onChange(of: tl.messages.last?.id) { _, _ in
                 withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("end", anchor: .bottom) }
@@ -81,7 +83,7 @@ struct MessageRow: View {
                 .font(.footnote.italic())
                 .foregroundStyle(theme.faint)
         } else {
-            VStack(alignment: .leading, spacing: 5) {
+            VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Text(m.authorName)
                         .font(.name)
@@ -129,18 +131,20 @@ struct MessageRow: View {
                     HStack(spacing: 6) {
                         ForEach(m.reactions, id: \.emoji) { r in
                             Text("\(r.emoji) \(r.count)")
-                                .font(.caption)
+                                .font(.subheadline)
                                 .foregroundStyle(theme.text)
-                                .padding(.horizontal, 9)
-                                .padding(.vertical, 4)
+                                .padding(.horizontal, 11)
+                                .padding(.vertical, 5)
                                 .background(r.mine ? theme.rule : theme.idle, in: Capsule())
                         }
                     }
+                    .padding(.top, 4)
                 }
                 if showReplies && m.replyCount > 0 {
                     let who = m.repliers.isEmpty ? "" : " · " + m.repliers.joined(separator: ", ")
                     Text("\(m.replyCount) \(m.replyCount == 1 ? "reply" : "replies")\(who)")
-                        .font(.caption)
+                        .font(.footnote)
+                        .padding(.top, 4)
                         .foregroundStyle(theme.muted)
                 }
             }

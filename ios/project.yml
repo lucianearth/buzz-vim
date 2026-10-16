@@ -2,7 +2,7 @@ name: BuzzVim
 options:
   bundleIdPrefix: com.lucianhymer
   deploymentTarget:
-    iOS: "17.0"
+    iOS: "18.0"
 settings:
   base:
     DEVELOPMENT_TEAM: 3FV2554F26

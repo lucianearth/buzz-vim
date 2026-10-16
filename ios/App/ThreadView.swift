@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// A thread, flat: the root, a rule, then the replies oldest first.
+/// A thread, flat: the root, then the replies oldest first.
 struct ThreadView: View {
     let client: Client
     let route: Route
@@ -16,35 +16,35 @@ struct ThreadView: View {
             HStack(spacing: 10) {
                 Button { dismiss() } label: {
                     HStack(spacing: 8) {
-                        Image(systemName: "chevron.left").font(.body.weight(.semibold))
-                        Text(label).font(.body.weight(.semibold))
+                        Image(systemName: "chevron.left").font(.title3.weight(.semibold))
+                        Text(label).font(.title3.weight(.semibold))
                     }
                     .foregroundStyle(theme.muted)
                 }
                 Spacer()
             }
-            .padding(.horizontal, 18)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 22)
+            .padding(.top, 10)
+            .padding(.bottom, 14)
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 18) {
-                        ForEach(Array(tl.messages.enumerated()), id: \.element.id) { i, m in
+                    LazyVStack(alignment: .leading, spacing: 22) {
+                        ForEach(tl.messages, id: \.id) { m in
                             MessageRow(client: client, message: m, showReplies: false)
                                 .contentShape(Rectangle())
                                 .onTapGesture(count: 2) { client.thumbsUp(target: m.id) }
-                            if i == 0 && tl.messages.count > 1 {
-                                Rectangle().fill(theme.rule).frame(height: 1)
-                            }
                         }
                         if !tl.working.isEmpty {
                             Working(names: tl.working)
                         }
                         Color.clear.frame(height: 1).id("end")
                     }
-                    .padding(.horizontal, 18)
+                    .padding(.horizontal, 22)
                     .padding(.top, 4)
                 }
-                .defaultScrollAnchor(.bottom)
+                .defaultScrollAnchor(.bottom, for: .initialOffset)
+                .defaultScrollAnchor(.bottom, for: .sizeChanges)
+                .defaultScrollAnchor(.top, for: .alignment)
                 .scrollDismissesKeyboard(.interactively)
                 .onChange(of: tl.messages.last?.id) { _, _ in
                     withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("end", anchor: .bottom) }

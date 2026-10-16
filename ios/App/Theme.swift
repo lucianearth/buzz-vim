@@ -32,13 +32,17 @@ struct Theme {
     var rule: Color { tone(.surface, 6) }
     var text: Color { tone(.text, 21) }
     var bright: Color { tone(.text, 23) }
-    var muted: Color { tone(.muted, 13) }
+    var muted: Color { tone(.muted, 15) }
     var faint: Color { tone(.muted, 8) }
     var accent: Color { tone(.accent, 22) }
     var badge: Color { tone(.accent, 18) }
     var link: Color { tone(.accent, 20) }
     var code: Color { tone(.code, 19) }
     var codeLabel: Color { tone(.code, 10) }
+    /// The selected tab: a softer pink than `accent` on dark, deep plum on light.
+    var chipOn: Color { tone(.accent, light ? 22 : 20) }
+    /// An unselected tab, a step lighter than `idle`.
+    var chipOff: Color { tone(.surface, 3) }
     /// Text on a filled accent chip.
     var onAccent: Color { tone(.surface, 1) }
     /// The "online" dot: the code hue (a green) at the muted step.
@@ -69,7 +73,7 @@ struct Themed: ViewModifier {
 }
 
 extension Font {
-    static let name = Font.subheadline.weight(.semibold)
-    static let stamp = Font.caption
+    static let name = Font.body.weight(.semibold)
+    static let stamp = Font.footnote
     static let mono = Font.system(.footnote, design: .monospaced)
 }

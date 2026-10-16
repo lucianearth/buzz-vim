@@ -76,11 +76,11 @@ struct ComposeBar: View {
                     }
                 }
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .background(theme.card, in: RoundedRectangle(cornerRadius: 20))
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+            .background(theme.card, in: RoundedRectangle(cornerRadius: 16))
         }
-        .padding(.horizontal, 12)
+        .padding(.horizontal, 16)
         .padding(.top, 4)
         .padding(.bottom, 6)
         .background(theme.canvas)
