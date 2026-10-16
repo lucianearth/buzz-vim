@@ -1,0 +1,25 @@
+[package]
+name = "buzz-vim-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "The UI-free half of buzz-vim: relay IO, the live socket, the message store, read state, sections and agent telemetry"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+bytes = "1.12.1"
+chrono = "0.4.45"
+hex = "0.4.3"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde = "1.0.229"
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+tokio = { version = "1.53.3", features = ["full"] }
+unicode-width = "0.2.2"
+nostr = { version = "0.44", features = ["nip44", "nip98"] }
+buzz-core = { git = "https://github.com/block/buzz", rev = "5397ea49e27fd56d4e0346e2120906d09ac91579" }
+buzz-sdk = { git = "https://github.com/block/buzz", rev = "5397ea49e27fd56d4e0346e2120906d09ac91579" }
+buzz-ws-client = { git = "https://github.com/block/buzz", rev = "5397ea49e27fd56d4e0346e2120906d09ac91579" }
+uuid = "1.28.0"

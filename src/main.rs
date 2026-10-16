@@ -7,22 +7,15 @@ mod app;
 mod art;
 mod clip;
 mod config;
-mod draft;
 mod garden;
 mod keys;
-mod links;
-mod live;
-mod log;
 mod media;
-mod model;
-mod readstate;
-mod relay;
-mod sections;
 mod state;
 mod sync;
-mod telemetry;
 mod theme;
 mod ui;
+
+use buzz_vim_core::{draft, links, live, log, model, readstate, relay, sections, telemetry};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

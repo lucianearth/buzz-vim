@@ -433,6 +433,7 @@ dependencies = [
  "base64 0.23.1",
  "buzz-core",
  "buzz-sdk",
+ "buzz-vim-core",
  "buzz-ws-client",
  "bytes",
  "chrono",
@@ -454,6 +455,32 @@ dependencies = [
  "unicode-width",
  "uuid",
 ]
+
+[[package]]
+name = "buzz-vim-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "buzz-core",
+ "buzz-sdk",
+ "buzz-ws-client",
+ "bytes",
+ "chrono",
+ "hex",
+ "nostr",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tokio",
+ "unicode-width",
+ "uuid",
+]
+
+[[package]]
+name = "buzz-vim-ffi"
+version = "0.1.0"
 
 [[package]]
 name = "buzz-ws-client"
