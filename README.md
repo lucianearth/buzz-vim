@@ -31,6 +31,10 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
 - `s` pick which sections become tabs, `R` reload them from the relay
 - `^v` paste an image or file from the clipboard; dropping a file does the same. Either way a box shows what it
   found and where it goes (`<relay>/upload`), and nothing uploads until you press `y`.
+- Links: click one, or press `f` and type the letter on its chip. A `buzz://` message link opens here: its
+  channel's tab, or an extra tab at the end when the channel isn't in your sections (it goes away when you
+  leave it). Links marked 🐝 (pr, issue, repo) open in Buzz Desktop, and web links in your browser.
+  `⌫` or `^o` goes back to where you were, as many steps as you followed.
 - `o` open the selected image full screen (`←` `→` page through the images, `Esc` closes), `q` quit
 
 ## Development
