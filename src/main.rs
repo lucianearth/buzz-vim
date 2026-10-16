@@ -79,6 +79,13 @@ fn main() -> Result<()> {
     // capture and bracketed paste are ours to undo, before it runs.
     let ratatui_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // The UI runs on the main thread and keeps going after a background
+        // task panics (a blocking decode comes back as an error; a spawned
+        // task just stops), so the terminal has to stay as it is.
+        if std::thread::current().name() != Some("main") {
+            log::line(format!("background panic: {info}"));
+            return;
+        }
         let _ = execute!(
             std::io::stdout(),
             PopKeyboardEnhancementFlags,
@@ -360,10 +367,15 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
                     app.store.remove_message(&id);
                     // Put the text back so nothing is lost: in its own box if that
                     // conversation is still open, otherwise in the one in front of you.
-                    let Some((channel, root, d)) = pending else {
+                    let Some((channel, root, mut d)) = pending else {
                         app.say(format!("not sent: {e}"));
                         return;
                     };
+                    // A relay that refused it would refuse the same event
+                    // again; only a send lost in transit is worth repeating.
+                    if e.to_string().starts_with("relay rejected") {
+                        d.sent_as = None;
+                    }
                     match app.draft_for(&channel, root.as_deref()) {
                         Some(slot) => {
                             slot.restore(d);
@@ -418,6 +430,11 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
             };
             app.media.images.insert(url, slot);
         }
+        Msg::Attachment { label, result } => match (result, label) {
+            (Ok(p), _) => app.attach(p),
+            (Err(e), Some(path)) => app.say(format!("can't attach {path}: {e}")),
+            (Err(e), None) => app.say(e.to_string()),
+        },
         Msg::Encoded { key, result } => {
             app.media.encoding.remove(&key);
             match result {
@@ -472,4 +489,90 @@ fn tmux_keys(on: bool) {
     let mut out = std::io::stdout();
     let _ = out.write_all(if on { b"\x1b[>4;2m" } else { b"\x1b[>4m" });
     let _ = out.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A send that fails comes back to the box with its signed event, and
+    /// sending the same text again re-publishes that event rather than a twin.
+    #[tokio::test]
+    async fn resend_after_failure_reuses_the_event() {
+        let relay = relay::Relay::new("http://127.0.0.1:1", nostr::Keys::generate(), None).unwrap();
+        let (live_tx, _live_rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut sync = sync::Sync::new(relay, live_tx, tx);
+        let mut app = App::new("me".into(), None);
+        let ch = "2130646b-d6c8-4ec3-93e3-36f77bee1a37".to_string();
+        app.tabs = vec![ch.clone()];
+        let other = "bcd11c3d-f78b-4934-8e48-c08b6baed1c5".to_string();
+        let mut restore = None;
+        let mut sent = vec![];
+        // Type, resend as is, edit the restored text and send, then send the
+        // same text somewhere else.
+        for (text, to) in [("hello", &ch), ("", &ch), (" again", &ch), ("", &other)] {
+            app.draft_mut().insert(text);
+            let channel = to.clone();
+            sync.run(
+                &mut app,
+                Action::Send {
+                    channel,
+                    root: None,
+                    parent: None,
+                },
+            );
+            let msg = rx.recv().await.unwrap();
+            let sync::Msg::Sent { id, result } = &msg else {
+                panic!("expected a send result");
+            };
+            assert!(result.is_err());
+            sent.push(id.clone());
+            handle(&mut app, &mut sync, msg, &mut restore);
+            assert!(!app.draft_ref().is_empty());
+        }
+        // Unchanged text: the same event. Edited text, or another channel:
+        // a new one.
+        assert_eq!(sent[0], sent[1]);
+        assert_ne!(sent[1], sent[2]);
+        assert_ne!(sent[2], sent[3]);
+    }
+
+    /// A dropped file is read off the UI loop, then offered for upload.
+    #[tokio::test]
+    async fn dropped_files_are_read_in_the_background() {
+        let dir = std::env::temp_dir().join(format!("bv-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("shot.png");
+        std::fs::write(&f, b"\x89PNG\r\n\x1a\nrest").unwrap();
+        let relay = relay::Relay::new("http://127.0.0.1:1", nostr::Keys::generate(), None).unwrap();
+        let (live_tx, _live_rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut sync = sync::Sync::new(relay, live_tx, tx);
+        let mut app = App::new("me".into(), None);
+        app.on_term(crossterm::event::Event::Paste(f.display().to_string()));
+        assert!(app.pending.is_none());
+        for a in std::mem::take(&mut app.actions) {
+            sync.run(&mut app, a);
+        }
+        let msg = rx.recv().await.unwrap();
+        handle(&mut app, &mut sync, msg, &mut None);
+        assert_eq!(
+            app.pending.as_ref().map(|p| p.mime.as_str()),
+            Some("image/png")
+        );
+        assert_eq!(app.mode, keys::Mode::Confirm);
+        // Finishing while a popup is up leaves the popup alone.
+        app.pending = None;
+        app.mode = keys::Mode::Sections;
+        app.on_term(crossterm::event::Event::Paste(f.display().to_string()));
+        for a in std::mem::take(&mut app.actions) {
+            sync.run(&mut app, a);
+        }
+        let msg = rx.recv().await.unwrap();
+        handle(&mut app, &mut sync, msg, &mut None);
+        assert!(app.pending.is_none());
+        assert_eq!(app.mode, keys::Mode::Sections);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

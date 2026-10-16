@@ -11,6 +11,18 @@ pub struct Draft {
     /// (label as typed, pubkey). Kept only while the label is still in the text.
     pub mentions: Vec<(String, String)>,
     pub attachments: Vec<BlobDescriptor>,
+    /// After a send that failed in transit: where it went (channel, thread
+    /// root), its content, and the event signed for it. The relay may have
+    /// got it anyway, so sending the same content to the same place again
+    /// re-publishes that event (same id) instead of posting a twin.
+    pub sent_as: Option<SentAs>,
+}
+
+pub struct SentAs {
+    pub channel: String,
+    pub root: Option<String>,
+    pub content: String,
+    pub event: Box<nostr::Event>,
 }
 
 impl Draft {
