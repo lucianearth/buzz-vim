@@ -29,8 +29,8 @@ extension EnvironmentValues {
 
 /// Tabs across the top, one channel per page: swipe sideways between them,
 /// tap a message for its thread, pull the header down for the agents,
-/// hold a tab for the switcher (every tab in tall rows, drag handles to
-/// reorder, a Sections button), hold the status line for sections.
+/// hold a tab to drag it (the row unfolds into a column), hold the status
+/// line for sections.
 struct Home: View {
     let client: Client
     @Environment(Model.self) private var model
@@ -43,7 +43,7 @@ struct Home: View {
     @State private var fallback = false
     @State private var showAgents = false
     @State private var showSections = false
-    @State private var switcher = false
+    @State private var lift: Lift?
 
     var body: some View {
         let _ = model.version
@@ -51,7 +51,7 @@ struct Home: View {
         NavigationStack(path: $path) {
             VStack(spacing: 0) {
                 Header(client: client, tabs: tabs, selected: $selected,
-                       showAgents: $showAgents, showSections: $showSections, switcher: $switcher)
+                       showAgents: $showAgents, showSections: $showSections, lift: $lift)
                 if tabs.isEmpty {
                     Spacer()
                     Text(client.ready() ? "no channels yet" : "loading channels…")
@@ -89,13 +89,12 @@ struct Home: View {
             }
         }
         .overlay {
-            if switcher {
-                TabSwitcher(client: client, tabs: tabs, selected: $selected,
-                            shown: $switcher, showSections: $showSections)
+            if lift != nil {
+                TabColumn(lift: $lift, tabs: tabs)
                     .transition(.opacity)
             }
         }
-        .sensoryFeedback(.impact, trigger: switcher) { _, now in now }
+        .sensoryFeedback(.impact, trigger: lift?.held)
         .environment(\.nav, Nav(step: step, nextUnread: nextUnread))
         .onAppear { settle(tabs) }
         .onChange(of: tabs.map(\.id)) { _, _ in settle(client.tabs()) }
@@ -196,9 +195,11 @@ struct Header: View {
     @Binding var selected: String?
     @Binding var showAgents: Bool
     @Binding var showSections: Bool
-    @Binding var switcher: Bool
+    @Binding var lift: Lift?
     @Environment(Model.self) private var model
     @Environment(\.theme) private var theme
+    /// A reorder that ends dragging down mustn't also open the agents.
+    @State private var droppedAt = Date.distantPast
     /// Each tab's place in the row, to tell which one a hold landed on.
     @State private var chipFrames: [String: CGRect] = [:]
 
@@ -222,10 +223,11 @@ struct Header: View {
                     }
                     .padding(.horizontal, 22)
                     .coordinateSpace(.named("tabrow"))
-                    // Hold a tab: the switcher opens. One UIKit long press for
-                    // the row; it fails if the finger moves early, so the
-                    // scroll view keeps swipes.
-                    .gesture(Hold(began: pickUp))
+                    // Hold a tab: its section unfolds into a column to slide
+                    // it up or down in. One UIKit long press for the whole
+                    // row (one per tab missed some tabs); it fails if the
+                    // finger moves early, so the scroll view keeps swipes.
+                    .gesture(Hold(began: pickUp, moved: moved, ended: drop))
                 }
                 .onChange(of: selected) { _, now in
                     withAnimation { proxy.scrollTo(now, anchor: .center) }
@@ -243,19 +245,39 @@ struct Header: View {
         .contentShape(Rectangle())
         // Simultaneous: as `.gesture` it took sideways swipes from the tab row.
         .simultaneousGesture(DragGesture(minimumDistance: 24).onEnded { g in
-            if !switcher,
+            if lift == nil, Date().timeIntervalSince(droppedAt) > 0.5,
                g.translation.height > 50 && abs(g.translation.width) < g.translation.height {
                 showAgents = true
             }
         })
     }
 
-    private func pickUp(_ at: CGPoint) {
-        guard tabs.contains(where: { chipFrames[$0.id]?.contains(at) == true }) else {
+    private func pickUp(_ at: CGPoint, _ y: CGFloat) {
+        guard let t = tabs.first(where: { chipFrames[$0.id]?.contains(at) == true }) else {
             holdLog.info("hold missed at \(at.x), \(at.y); \(chipFrames.count) frames")
             return
         }
-        withAnimation(.easeOut(duration: 0.15)) { switcher = true }
+        holdLog.info("hold on \(t.id, privacy: .public) at \(at.x), \(at.y)")
+        let ids = tabs.filter { $0.section == t.section }.map(\.id)
+        withAnimation(.easeOut(duration: 0.15)) {
+            lift = Lift(section: t.section, ids: ids, held: t.id, y: y, startY: y)
+        }
+    }
+
+    /// Hold still and nothing moves; once the finger goes up or down, the
+    /// tab goes to the row under it.
+    private func moved(_ y: CGFloat) {
+        lift?.y = y
+        if let l = lift, abs(y - l.startY) > 10 { lift?.moved = true }
+    }
+
+    /// Let go: save the new order and fold the column away.
+    private func drop() {
+        guard let l = lift else { return }
+        holdLog.info("drop \(l.held, privacy: .public) \(l.start) -> \(l.target)")
+        if l.order != l.ids { model.order(l.section, l.order) }
+        droppedAt = Date()
+        withAnimation(.easeOut(duration: 0.2)) { lift = nil }
     }
 
     private var status: some View {
@@ -319,11 +341,14 @@ struct Header: View {
     }
 }
 
-/// Hold 0.3 s; `began` gets the point in the view the hold is on.
+/// Hold 0.3 s, then report where the finger is (global y) until it lifts.
+/// `began` also gets the point in the view the hold is on.
 /// UIKit's long press fails as soon as the finger moves early, which hands
-/// the touch to the scroll view; a SwiftUI long press kept it.
+/// the touch to the scroll view; a SwiftUI long press + drag kept it.
 struct Hold: UIGestureRecognizerRepresentable {
-    let began: (CGPoint) -> Void
+    let began: (CGPoint, CGFloat) -> Void
+    let moved: (CGFloat) -> Void
+    let ended: () -> Void
 
     func makeUIGestureRecognizer(context: Context) -> UILongPressGestureRecognizer {
         let g = UILongPressGestureRecognizer()
@@ -332,104 +357,98 @@ struct Hold: UIGestureRecognizerRepresentable {
     }
 
     func handleUIGestureRecognizerAction(_ g: UILongPressGestureRecognizer, context: Context) {
-        if g.state == .began { began(context.converter.location(in: .local)) }
+        let y = context.converter.location(in: .global).y
+        if g.state != .changed {
+            holdLog.info("hold state \(g.state.rawValue) y=\(y)")
+        }
+        switch g.state {
+        case .began: began(context.converter.location(in: .local), y)
+        case .changed: moved(y)
+        case .ended, .cancelled, .failed: ended()
+        default: break
+        }
     }
 }
 
-/// Every tab in tall rows, by section: tap one to go there, drag a handle
-/// to reorder it within its section. It flips down from the tab row and
-/// stays until a tab, Sections or Close.
-struct TabSwitcher: View {
-    let client: Client
+/// A held tab and its section's tabs, while it's being dragged.
+struct Lift {
+    let section: String
+    /// The section's tabs as they were when the hold started.
+    let ids: [String]
+    let held: String
+    /// The finger, on screen, and whether it has moved up or down yet.
+    var y: CGFloat
+    let startY: CGFloat
+    var moved = false
+    /// Where the column's first row starts on screen, and one row's height.
+    var top: CGFloat = 0
+    var rowH: CGFloat = 56
+
+    var start: Int { ids.firstIndex(of: held) ?? 0 }
+    /// The row under the finger.
+    var target: Int {
+        guard moved else { return start }
+        return min(max(Int(((y - top) / rowH).rounded(.down)), 0), ids.count - 1)
+    }
+    /// The held row, centred on the finger but kept inside the column.
+    var heldY: CGFloat {
+        min(max(y - top - rowH / 2, 0), CGFloat(ids.count - 1) * rowH)
+    }
+    var order: [String] {
+        var o = ids.filter { $0 != held }
+        o.insert(held, at: target)
+        return o
+    }
+}
+
+/// The section the held tab is in, unfolded into tall rows. The held one
+/// sits under the finger; the rest make room as it passes.
+struct TabColumn: View {
+    @Binding var lift: Lift?
     let tabs: [ChannelTab]
-    @Binding var selected: String?
-    @Binding var shown: Bool
-    @Binding var showSections: Bool
-    @Environment(Model.self) private var model
     @Environment(\.theme) private var theme
     @State private var open = false
 
     var body: some View {
-        let names = Dictionary(client.sections().map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
-        VStack(spacing: 0) {
-            ScrollViewReader { proxy in
-                List {
-                    ForEach(groups, id: \.0) { section, items in
-                        Section {
-                            ForEach(items, id: \.id) { t in
-                                Button { pick(t.id) } label: { row(t) }
-                                    .buttonStyle(.plain)
-                                    .id(t.id)
-                                    .listRowBackground(theme.canvas)
-                                    .listRowSeparator(.hidden)
-                                    .listRowInsets(EdgeInsets(top: 4, leading: 22, bottom: 4, trailing: 12))
-                            }
-                            .onMove { from, to in
-                                var ids = items.map(\.id)
-                                ids.move(fromOffsets: from, toOffset: to)
-                                model.order(section, ids)
-                            }
-                        } header: {
-                            Text(names[section] ?? section)
-                                .font(.small)
-                                .foregroundStyle(theme.faint)
+        GeometryReader { geo in
+            if let l = lift {
+                let byId = Dictionary(tabs.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+                ZStack(alignment: .top) {
+                    theme.canvas.opacity(0.97).ignoresSafeArea()
+                    ForEach(Array(l.order.enumerated()), id: \.element) { i, id in
+                        if let t = byId[id] {
+                            let held = id == l.held
+                            let slot = held ? l.heldY : CGFloat(i) * l.rowH
+                            row(t, held: held)
+                                .frame(height: l.rowH - 8)
+                                .padding(.horizontal, 22)
+                                // Unfold: each row drops down from the tab row
+                                // and flips open, one just after another.
+                                .rotation3DEffect(.degrees(open ? 0 : -80), axis: (1, 0, 0),
+                                                  anchor: .top, perspective: 0.6)
+                                .offset(y: 16 + (open || held ? slot : 0))
+                                .opacity(open ? 1 : 0)
+                                .animation(.spring(duration: 0.35).delay(Double(i) * 0.02), value: open)
+                                .animation(held ? nil : .snappy(duration: 0.2), value: l.target)
+                                .zIndex(held ? 1 : 0)
                         }
                     }
                 }
-                .listStyle(.plain)
-                .scrollContentBackground(.hidden)
-                // Edit mode for the drag handles; there's no delete.
-                .environment(\.editMode, .constant(.active))
-                .onAppear { proxy.scrollTo(selected, anchor: .center) }
-            }
-            HStack {
-                Button("Sections") {
-                    close()
-                    showSections = true
+                .onAppear {
+                    lift?.rowH = min(64, max(36, (geo.size.height - 32) / CGFloat(max(l.ids.count, 1))))
+                    lift?.top = geo.frame(in: .global).minY + 16
+                    open = true
                 }
-                Spacer()
-                Button("Close") { close() }
-            }
-            .font(.label)
-            .foregroundStyle(theme.accent)
-            .padding(.horizontal, 22)
-            .padding(.vertical, 14)
-        }
-        .background(theme.canvas.ignoresSafeArea())
-        // Flip down from the tab row.
-        .rotation3DEffect(.degrees(open ? 0 : -70), axis: (1, 0, 0), anchor: .top, perspective: 0.6)
-        .opacity(open ? 1 : 0)
-        .onAppear { withAnimation(.spring(duration: 0.35)) { open = true } }
-    }
-
-    /// Sections in tab order, each with its tabs.
-    private var groups: [(String, [ChannelTab])] {
-        var out: [(String, [ChannelTab])] = []
-        for t in tabs {
-            if let i = out.firstIndex(where: { $0.0 == t.section }) {
-                out[i].1.append(t)
-            } else {
-                out.append((t.section, [t]))
+                .sensoryFeedback(.selection, trigger: l.target)
             }
         }
-        return out
     }
 
-    private func pick(_ id: String) {
-        selected = id
-        close()
-    }
-
-    private func close() {
-        withAnimation(.easeOut(duration: 0.2)) { shown = false }
-    }
-
-    private func row(_ t: ChannelTab) -> some View {
-        let on = t.id == selected
+    private func row(_ t: ChannelTab, held: Bool) -> some View {
         let name = t.label.hasPrefix("#") ? String(t.label.dropFirst()) : t.label
         return HStack(spacing: 8) {
             Text(name)
-                .font(on ? .chipOn : .chip)
+                .font(held ? .chipOn : .chip)
                 .lineLimit(1)
             Spacer()
             if t.mentions > 0 {
@@ -443,11 +462,12 @@ struct TabSwitcher: View {
                 Circle().fill(theme.badge).frame(width: 6, height: 6)
             }
         }
-        .foregroundStyle(on ? theme.onAccent : theme.muted)
+        .foregroundStyle(held ? theme.onAccent : theme.muted)
         .padding(.horizontal, 16)
-        .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
-        .background(on ? theme.chipOn : theme.chipOff, in: RoundedRectangle(cornerRadius: 10))
-        .contentShape(Rectangle())
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .background(held ? theme.chipOn : theme.chipOff, in: RoundedRectangle(cornerRadius: 10))
+        .scaleEffect(held ? 1.03 : 1)
+        .shadow(color: .black.opacity(held ? 0.35 : 0), radius: 10, y: 4)
     }
 }
 
