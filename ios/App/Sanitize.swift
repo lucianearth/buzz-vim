@@ -6,21 +6,31 @@ import UIKit
 /// segment or chunk the relay doesn't allow is dropped. Ported from Buzz's
 /// own iOS app (mobile/ios/Runner/MediaSanitizer.swift).
 enum Sanitize {
+    /// The relay refuses images over 25 megapixels (buzz-media
+    /// validation.rs MAX_PIXELS); a little under, for rounding.
+    static let maxPixels: CGFloat = 24_000_000
+
     /// PNG stays PNG (screenshots keep their sharp edges); anything else
-    /// becomes JPEG. GIF and WebP lose animation.
+    /// becomes JPEG. GIF and WebP lose animation. A bigger image than the
+    /// relay takes (a 48 MP photo) is scaled down to fit.
     static func image(_ img: UIImage, png: Bool) -> Data? {
         guard img.size.width > 0, img.size.height > 0 else { return nil }
+        // Drawn in pixels, at scale 1, so the pixel count is what we set.
+        let pixels = CGSize(width: img.size.width * img.scale, height: img.size.height * img.scale)
+        let shrink = min(1, (maxPixels / (pixels.width * pixels.height)).squareRoot())
+        let size = CGSize(width: max(1, (pixels.width * shrink).rounded(.down)),
+                          height: max(1, (pixels.height * shrink).rounded(.down)))
         let format = UIGraphicsImageRendererFormat()
-        format.scale = img.scale
+        format.scale = 1
         // JPEG has no transparency: clear areas go white, not black.
         format.opaque = !png
         format.preferredRange = .standard
-        let flat = UIGraphicsImageRenderer(size: img.size, format: format).image { ctx in
+        let flat = UIGraphicsImageRenderer(size: size, format: format).image { ctx in
             if !png {
                 UIColor.white.setFill()
-                ctx.fill(CGRect(origin: .zero, size: img.size))
+                ctx.fill(CGRect(origin: .zero, size: size))
             }
-            img.draw(in: CGRect(origin: .zero, size: img.size))
+            img.draw(in: CGRect(origin: .zero, size: size))
         }
         if png {
             return flat.pngData().flatMap(scrubPng)
