@@ -170,6 +170,26 @@ pub fn open(url: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Open several files at once. On a Mac one `open` call puts them in one
+/// Preview window, where the arrow keys page through them.
+pub fn open_files(paths: &[std::path::PathBuf]) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    if std::env::consts::OS != "macos" {
+        for p in paths {
+            open(&p.to_string_lossy())?;
+        }
+        return Ok(());
+    }
+    let mut child = Command::new("open")
+        .args(paths)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
 /// The program and leading args that open a URL on `os`; the URL goes last,
 /// as its own argument.
 fn opener(os: &str) -> (&'static str, &'static [&'static str]) {

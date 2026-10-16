@@ -23,6 +23,19 @@ pub struct Media {
     /// (url, cols, rows) -> encoded protocol, ready to draw
     pub encoded: HashMap<(String, u16, u16), Protocol>,
     pub encoding: std::collections::HashSet<(String, u16, u16)>,
+    /// Downloaded files, so `O` doesn't fetch them again.
+    pub bytes: HashMap<String, Arc<Vec<u8>>>,
+    /// url -> (bytes so far, total if known) while it downloads
+    pub progress: HashMap<String, (u64, Option<u64>)>,
+}
+
+/// "1.2 / 2.7 MB" for the viewer's loading line.
+pub fn progress_label(got: u64, total: Option<u64>) -> String {
+    let mb = |n: u64| format!("{:.1}", n as f64 / 1_000_000.0);
+    match total {
+        Some(t) => format!("{} / {} MB", mb(got), mb(t)),
+        None => format!("{} MB", mb(got)),
+    }
 }
 
 /// Pick the image protocol. `BUZZ_VIM_IMAGES=iterm2|kitty|sixel|halfblocks|off`

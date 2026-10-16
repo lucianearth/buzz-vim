@@ -53,6 +53,17 @@ pub enum Msg {
         url: String,
         result: anyhow::Result<image::DynamicImage>,
     },
+    /// An image download moved along: (bytes so far, total if known).
+    Progress {
+        url: String,
+        got: u64,
+        total: Option<u64>,
+    },
+    /// An image file arrived, before it is decoded.
+    Bytes {
+        url: String,
+        bytes: Arc<Vec<u8>>,
+    },
     Encoded {
         key: (String, u16, u16),
         result: anyhow::Result<ratatui_image::protocol::Protocol>,
@@ -78,6 +89,9 @@ pub struct Sync {
     started: u64,
     /// Tabs whose unread messages we've looked up since startup.
     unread_checked: HashSet<String>,
+    /// Image downloads at a time. The viewer queues the picture on screen
+    /// first, so it isn't stuck behind the rest of the thread.
+    image_slots: Arc<tokio::sync::Semaphore>,
 }
 
 pub fn now() -> u64 {
@@ -98,6 +112,7 @@ impl Sync {
             loading_older: HashSet::new(),
             started: now(),
             unread_checked: HashSet::new(),
+            image_slots: Arc::new(tokio::sync::Semaphore::new(4)),
         }
     }
 
@@ -482,7 +497,7 @@ impl Sync {
             }
             Action::LoadImage(url) => self.load_image(app, url),
             Action::OpenThread { channel, root } => self.open_thread(&channel, &root),
-            Action::OpenImage(url) => self.open_image(app, url),
+            Action::OpenImages(urls) => self.open_images(app, urls),
             Action::OpenUrl(url) => {
                 if let Err(e) = crate::links::open(&url) {
                     app.say(format!("couldn't open {url}: {e}"));
@@ -643,30 +658,79 @@ impl Sync {
         self.spawn(async move { Msg::Did(r.publish(&ev).await.map(|_| label.to_string())) });
     }
 
-    /// Save an image to a temp file and hand it to the OS (Preview on a Mac).
-    fn open_image(&mut self, app: &mut App, url: String) {
-        if !self.relay.is_ours(&url) {
-            if let Err(e) = crate::links::open(&url) {
-                app.say(format!("couldn't open {url}: {e}"));
+    /// Save images to temp files and hand them to the OS in one go, so a
+    /// Mac shows them in one Preview window. Reuses what the viewer already
+    /// downloaded.
+    fn open_images(&mut self, app: &mut App, urls: Vec<String>) {
+        let (ours, theirs): (Vec<_>, Vec<_>) =
+            urls.into_iter().partition(|u| self.relay.is_ours(u));
+        for u in theirs {
+            if let Err(e) = crate::links::open(&u) {
+                app.say(format!("couldn't open {u}: {e}"));
             }
+        }
+        if ours.is_empty() {
             return;
         }
-        app.say("opening image…");
+        let n = ours.len();
+        app.say(if n == 1 {
+            "opening image…".to_string()
+        } else {
+            format!("opening {n} images…")
+        });
+        let have: Vec<Option<Arc<Vec<u8>>>> = ours
+            .iter()
+            .map(|u| app.media.bytes.get(u).cloned())
+            .collect();
         let r = self.relay.clone();
         self.spawn(async move {
             let res = async {
-                let bytes = r.download(&url).await?;
-                let name = url.rsplit('/').next().unwrap_or("image");
-                let ext = image::guess_format(&bytes)
-                    .ok()
-                    .and_then(|f| f.extensions_str().first().copied())
-                    .unwrap_or("png");
-                let dir = std::env::temp_dir().join("buzz-vim");
+                let files = futures::future::join_all(ours.iter().zip(have).map(|(u, b)| {
+                    let r = r.clone();
+                    async move {
+                        match b {
+                            Some(b) => Ok(b),
+                            None => r.download(u).await.map(Arc::new),
+                        }
+                    }
+                }))
+                .await;
+                // A fresh folder each time, numbered in thread order, so
+                // Preview's sidebar reads top to bottom like the thread.
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis());
+                let dir = std::env::temp_dir()
+                    .join("buzz-vim")
+                    .join(stamp.to_string());
                 std::fs::create_dir_all(&dir)?;
-                let path = dir.join(format!("{}.{ext}", name.split('.').next().unwrap_or(name)));
-                std::fs::write(&path, bytes)?;
-                crate::links::open(&path.to_string_lossy())?;
-                Ok(format!("opened {}", path.display()))
+                let mut paths = vec![];
+                let mut failed = 0;
+                for (i, (url, bytes)) in ours.iter().zip(files).enumerate() {
+                    let Ok(bytes) = bytes else {
+                        failed += 1;
+                        continue;
+                    };
+                    let name = url.rsplit('/').next().unwrap_or("image");
+                    let stem = name.split('.').next().unwrap_or(name);
+                    let short = &stem[stem.len().saturating_sub(8)..];
+                    let ext = image::guess_format(&bytes)
+                        .ok()
+                        .and_then(|f| f.extensions_str().first().copied())
+                        .unwrap_or("png");
+                    let path = dir.join(format!("{:02}-{short}.{ext}", i + 1));
+                    std::fs::write(&path, &*bytes)?;
+                    paths.push(path);
+                }
+                if paths.is_empty() {
+                    anyhow::bail!("couldn't download any of them");
+                }
+                crate::links::open_files(&paths)?;
+                Ok(match (paths.len(), failed) {
+                    (1, 0) => format!("opened {}", paths[0].display()),
+                    (k, 0) => format!("opened {k} images in Preview"),
+                    (k, f) => format!("opened {k} images in Preview; {f} didn't download"),
+                })
             }
             .await;
             Msg::Did(res)
@@ -688,9 +752,31 @@ impl Sync {
             .images
             .insert(url.clone(), crate::media::Slot::Loading);
         let r = self.relay.clone();
+        let tx = self.tx.clone();
+        let slots = Arc::clone(&self.image_slots);
         self.spawn(async move {
             let result = async {
-                let bytes = r.download(&url).await?;
+                let _slot = slots.acquire_owned().await?;
+                // Report every 128 KB or so; each one redraws the viewer.
+                let mut shown = 0;
+                let bytes = r
+                    .download_progress(&url, |got, total| {
+                        if got >= shown + (128 << 10) || Some(got) == total {
+                            shown = got;
+                            let _ = tx.send(Msg::Progress {
+                                url: url.clone(),
+                                got,
+                                total,
+                            });
+                        }
+                    })
+                    .await?;
+                drop(_slot);
+                let bytes = Arc::new(bytes);
+                let _ = tx.send(Msg::Bytes {
+                    url: url.clone(),
+                    bytes: Arc::clone(&bytes),
+                });
                 tokio::task::spawn_blocking(move || crate::media::decode(&bytes)).await?
             }
             .await;

@@ -1702,8 +1702,13 @@ fn draw_viewer(f: &mut Frame, app: &mut App, area: Rect) {
         }
         _ => {
             app.actions.push(crate::app::Action::EncodeImage(key));
+            // Bytes so far, so slow and stuck look different.
+            let got = match app.media.progress.get(&url) {
+                Some(&(got, total)) => format!(" {}", crate::media::progress_label(got, total)),
+                None => String::new(),
+            };
             Line::styled(
-                format!("loading {}", art::flight(app.tick, 10)),
+                format!("loading{got} {}", art::flight(app.tick, 10)),
                 theme::muted(),
             )
         }
@@ -2515,6 +2520,28 @@ mod tests {
             "{s}"
         );
         assert!(s.contains("esc") && !s.contains("loading"), "{s}");
+    }
+
+    #[test]
+    fn viewer_shows_download_progress() {
+        let mut app = App::new("00".repeat(32), None);
+        app.mode = crate::keys::Mode::Viewer;
+        app.viewer = Some("https://x/a.png".into());
+        app.viewer_list = vec!["https://x/a.png".into()];
+        app.media
+            .images
+            .insert("https://x/a.png".into(), Slot::Loading);
+        app.media
+            .progress
+            .insert("https://x/a.png".into(), (1_200_000, Some(2_700_000)));
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let s: String = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .map(|p| buf[p].symbol().to_string())
+            .collect();
+        assert!(s.contains("loading 1.2 / 2.7 MB"), "{s}");
     }
 
     #[test]

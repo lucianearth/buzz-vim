@@ -93,8 +93,9 @@ pub enum Action {
     },
     /// Hand a URL to the OS (browser, Buzz Desktop).
     OpenUrl(String),
-    /// Download an image and open it in the OS viewer (Preview).
-    OpenImage(String),
+    /// Download images and open them in the OS viewer (Preview), all in
+    /// one window.
+    OpenImages(Vec<String>),
     SaveState,
     Quit,
 }
@@ -1172,11 +1173,11 @@ impl App {
         }
     }
 
-    /// Full-screen image viewer. Opens on the selected message's image (or
-    /// the nearest one above it) and pages through every image in the pane.
-    fn open_viewer(&mut self) {
+    /// Every image in the focused pane, oldest first, and where the
+    /// cursor's message is in that list (its image, or the nearest above).
+    fn pane_images(&self) -> (Vec<String>, Option<usize>) {
         let Some(id) = self.cursor_message() else {
-            return;
+            return (vec![], None);
         };
         let ids = if self.focus == Pane::Thread {
             self.thread_ids()
@@ -1204,30 +1205,51 @@ impl App {
                 };
             }
         }
-        match start {
-            Some(i) => {
+        (list, start)
+    }
+
+    /// Full-screen image viewer. Opens on the selected message's image (or
+    /// the nearest one above it) and pages through every image in the pane.
+    fn open_viewer(&mut self) {
+        match self.pane_images() {
+            (list, Some(i)) => {
                 self.viewer_list = list;
                 self.mode = Mode::Viewer;
+                // The one on screen and its neighbours queue first, then the
+                // rest, so paging never waits.
                 self.show_image(i);
+                for u in self.viewer_list.clone() {
+                    self.actions.push(Action::LoadImage(u));
+                }
             }
-            None => self.say("no images here"),
+            _ => self.say("no images here"),
         }
     }
 
-    /// `O`: the image on screen in the viewer, or the selected message's,
-    /// in the OS's own viewer (Preview), which zooms.
+    /// `O`: in a thread, every image in it, in one Preview window. In the
+    /// channel, the image on screen in the viewer, or the selected
+    /// message's images.
     fn open_in_os(&mut self) {
-        let url = self.viewer.clone().or_else(|| {
-            let id = self.cursor_message()?;
-            let (_, m) = self.store.find_message(&id)?;
-            m.media
-                .iter()
-                .find(|x| x.mime.starts_with("image/"))
-                .map(|x| x.url.clone())
-        });
-        match url {
-            Some(u) => self.actions.push(Action::OpenImage(u)),
-            None => self.say("no image on this message"),
+        let urls = if self.focus == Pane::Thread {
+            self.pane_images().0
+        } else if let Some(u) = self.viewer.clone() {
+            vec![u]
+        } else {
+            self.cursor_message()
+                .and_then(|id| self.store.find_message(&id))
+                .map(|(_, m)| {
+                    m.media
+                        .iter()
+                        .filter(|x| x.mime.starts_with("image/"))
+                        .map(|x| x.url.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        if urls.is_empty() {
+            self.say("no images here");
+        } else {
+            self.actions.push(Action::OpenImages(urls));
         }
     }
 
@@ -1627,6 +1649,70 @@ mod tests {
         app.tabs = vec!["c1".into()];
         app.on_key(KeyEvent::from(KeyCode::Char('l')));
         assert_eq!(app.thread, Some(("c1".into(), root.id.to_hex())));
+    }
+
+    #[test]
+    fn viewer_queues_the_thread_and_o_opens_all_of_it() {
+        let mut app = App::new("me".into(), None);
+        app.tabs = vec!["ch".into()];
+        let msg = |id: &str, at: u64, root: Option<&str>, imgs: &[&str]| crate::model::Message {
+            id: id.into(),
+            author: "me".into(),
+            created_at: at,
+            content: String::new(),
+            edited: false,
+            deleted: false,
+            root: root.map(str::to_string),
+            mentions: vec![],
+            media: imgs
+                .iter()
+                .map(|u| crate::model::Media {
+                    url: u.to_string(),
+                    mime: "image/png".into(),
+                    dim: None,
+                })
+                .collect(),
+            system: false,
+        };
+        let ch = app.store.channel_mut("ch");
+        ch.messages.insert("t".into(), msg("t", 5, None, &["top"]));
+        ch.messages.insert("r".into(), msg("r", 10, None, &["a"]));
+        ch.messages
+            .insert("r1".into(), msg("r1", 20, Some("r"), &["b", "c"]));
+        ch.messages
+            .insert("r2".into(), msg("r2", 30, Some("r"), &["d"]));
+        ch.timeline = vec!["t".into(), "r".into()];
+        ch.replies
+            .insert("r".into(), vec!["r1".into(), "r2".into()]);
+        app.thread = Some(("ch".into(), "r".into()));
+        app.focus = Pane::Thread;
+        app.thread_selected = Some("r1".into());
+        app.on_key(KeyEvent::from(KeyCode::Char('o')));
+        let loads: Vec<&str> = app
+            .actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::LoadImage(u) => Some(u.as_str()),
+                _ => None,
+            })
+            .collect();
+        // The one on screen and its neighbours first, then the whole thread.
+        assert_eq!(&loads[..3], ["b", "a", "c"]);
+        assert!(["a", "b", "c", "d"].iter().all(|u| loads.contains(u)));
+        assert!(!loads.contains(&"top"));
+        app.actions.clear();
+        // O in a thread: every image in it, in thread order.
+        app.on_key(KeyEvent::from(KeyCode::Char('O')));
+        assert!(
+            matches!(app.actions.last(), Some(Action::OpenImages(u)) if u == &["a", "b", "c", "d"])
+        );
+        // In the channel: just the selected message's.
+        app.mode = Mode::Normal;
+        app.viewer = None;
+        app.focus = Pane::Timeline;
+        app.selected.insert("ch".into(), "t".into());
+        app.on_key(KeyEvent::from(KeyCode::Char('O')));
+        assert!(matches!(app.actions.last(), Some(Action::OpenImages(u)) if u == &["top"]));
     }
 
     #[test]

@@ -276,8 +276,18 @@ impl Relay {
 
     /// Authenticated BUD-01 GET of a media URL on this relay.
     pub async fn download(&self, url: &str) -> Result<Vec<u8>> {
+        self.download_progress(url, |_, _| {}).await
+    }
+
+    /// `download`, calling `progress(bytes so far, total if known)` as
+    /// chunks arrive.
+    pub async fn download_progress(
+        &self,
+        url: &str,
+        mut progress: impl FnMut(u64, Option<u64>),
+    ) -> Result<Vec<u8>> {
         let auth = self.blossom_auth("get", None, url)?;
-        let r = self
+        let mut r = self
             .authed(self.http.get(url))
             .timeout(Duration::from_secs(120))
             .header("Authorization", auth)
@@ -287,7 +297,13 @@ impl Relay {
         if !s.is_success() {
             bail!("download failed ({s})");
         }
-        Ok(r.bytes().await?.to_vec())
+        let total = r.content_length();
+        let mut out = Vec::with_capacity(total.unwrap_or(0).min(64 << 20) as usize);
+        while let Some(chunk) = r.chunk().await? {
+            out.extend_from_slice(&chunk);
+            progress(out.len() as u64, total);
+        }
+        Ok(out)
     }
 
     /// Archived identities (NIP-IA): the `p` tags of the newest kind 13535

@@ -39,7 +39,7 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("+", "👍", false),
             ("s", "sections", false),
             ("o", "image", true),
-            ("O", "image in Preview", false),
+            ("O", "images in Preview (a thread: all of them)", false),
             ("f", "follow link", true),
             ("⌫ ^o", "back to where a link took you from", false),
             ("[ ]", "narrower / wider (or drag the right edge)", false),
@@ -83,7 +83,7 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
         Mode::Viewer => &[
             ("← →", "prev / next image", true),
             ("esc q o", "close", true),
-            ("O", "open in Preview (zoom)", true),
+            ("O", "Preview (a thread: all of them, one window)", true),
         ],
         Mode::Help => &[("esc ?", "close", true)],
         Mode::Hint => &[
