@@ -350,13 +350,13 @@ struct Hold: UIGestureRecognizerRepresentable {
     let moved: (CGFloat) -> Void
     let ended: () -> Void
 
-    func makeUIGestureRecognizer(context: Context) -> UILongPressGestureRecognizer {
-        let g = UILongPressGestureRecognizer()
+    func makeUIGestureRecognizer(context: Context) -> HoldRecognizer {
+        let g = HoldRecognizer()
         g.minimumPressDuration = 0.3
         return g
     }
 
-    func handleUIGestureRecognizerAction(_ g: UILongPressGestureRecognizer, context: Context) {
+    func handleUIGestureRecognizerAction(_ g: HoldRecognizer, context: Context) {
         let y = context.converter.location(in: .global).y
         if g.state != .changed {
             holdLog.info("hold state \(g.state.rawValue) y=\(y)")
@@ -367,6 +367,26 @@ struct Hold: UIGestureRecognizerRepresentable {
         case .ended, .cancelled, .failed: ended()
         default: break
         }
+    }
+}
+
+/// The long press, logging what reaches it, to find why some holds never
+/// begin on the sim.
+final class HoldRecognizer: UILongPressGestureRecognizer {
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        let p = touches.first?.location(in: view)
+        holdLog.info("touch began at \(p?.x ?? -1), \(p?.y ?? -1) state \(self.state.rawValue)")
+        super.touchesBegan(touches, with: event)
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        holdLog.info("touch cancelled state \(self.state.rawValue)")
+        super.touchesCancelled(touches, with: event)
+    }
+
+    override func reset() {
+        holdLog.info("reset from state \(self.state.rawValue)")
+        super.reset()
     }
 }
 
