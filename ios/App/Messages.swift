@@ -7,6 +7,7 @@ struct ChannelView: View {
     let openThread: (String) -> Void
     @Environment(Model.self) private var model
     @Environment(\.theme) private var theme
+    @State private var edges = Edges()
 
     var body: some View {
         let _ = model.version
@@ -17,6 +18,7 @@ struct ChannelView: View {
                 // drawn, and bottom-anchored that guess showed as a screen of
                 // empty space under the last message until the rows measured.
                 VStack(alignment: .leading, spacing: 22) {
+                    Color.clear.frame(height: 0).id("top")
                     if tl.hasMore {
                         ProgressView()
                             .frame(maxWidth: .infinity)
@@ -48,13 +50,16 @@ struct ChannelView: View {
             .defaultScrollAnchor(.bottom)
             .defaultScrollAnchor(.bottom, for: .sizeChanges)
             .scrollDismissesKeyboard(.interactively)
+            .onScrollGeometryChange(for: Edges.self, of: Edges.init) { _, now in edges = now }
             .onChange(of: tl.messages.last?.id) { _, _ in
                 withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("end", anchor: .bottom) }
             }
-            // Older messages came in above: keep the row that was on top
-            // there, instead of landing on the oldest one loaded.
+            // Older messages came in above while you were up there: keep
+            // the row that was on top, instead of landing on the oldest one
+            // loaded. At the bottom (a page loading as the channel opens)
+            // the bottom anchor keeps you where you were.
             .onChange(of: tl.messages.first?.id) { old, _ in
-                guard let old, tl.messages.contains(where: { $0.id == old }) else { return }
+                guard !edges.bottom, let old, tl.messages.contains(where: { $0.id == old }) else { return }
                 var t = Transaction()
                 t.disablesAnimations = true
                 withTransaction(t) { proxy.scrollTo(old, anchor: .top) }
@@ -62,6 +67,13 @@ struct ChannelView: View {
             // The bell key landed here: that message at the top.
             .onChange(of: model.scrollTarget?.id) { _, _ in scrollToTarget(proxy) }
             .onAppear { scrollToTarget(proxy) }
+            .overlay(alignment: .bottomTrailing) {
+                EdgeButtons(edges: edges) { top in
+                    withAnimation(.easeOut(duration: 0.25)) {
+                        proxy.scrollTo(top ? "top" : "end", anchor: top ? .top : .bottom)
+                    }
+                }
+            }
             .safeAreaInset(edge: .bottom) {
                 ComposeBar(client: client, channel: channel, root: nil, hint: "write…")
             }
@@ -75,6 +87,50 @@ struct ChannelView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(t.id, anchor: .top) }
         }
+    }
+}
+
+/// Is the list at its top, at its bottom? Near enough counts.
+struct Edges: Equatable {
+    var top = true
+    var bottom = true
+
+    init() {}
+
+    init(_ g: ScrollGeometry) {
+        let y = g.contentOffset.y
+        top = y + g.contentInsets.top <= 80
+        bottom = y + g.containerSize.height - g.contentInsets.bottom >= g.contentSize.height - 80
+    }
+}
+
+/// Round ↑ and ↓ at the side of a list, each while you are away from that
+/// end. The status-bar tap can't do it: there is a list per tab.
+struct EdgeButtons: View {
+    let edges: Edges
+    let go: (_ top: Bool) -> Void
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        VStack(spacing: 10) {
+            if !edges.top { button("arrow.up") { go(true) } }
+            if !edges.bottom { button("arrow.down") { go(false) } }
+        }
+        .padding(.trailing, 14)
+        .padding(.bottom, 10)
+        .animation(.easeOut(duration: 0.15), value: edges)
+    }
+
+    private func button(_ symbol: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(theme.text)
+                .frame(width: 38, height: 38)
+                .background(theme.idle, in: Circle())
+                .overlay(Circle().stroke(theme.rule, lineWidth: 1))
+        }
+        .transition(.opacity)
     }
 }
 
