@@ -122,10 +122,16 @@ impl Message {
             edited: false,
             deleted: false,
             root,
+            // A notified mention carries both a `p` and a `mention` tag.
             mentions: tags(ev, "p")
                 .chain(tags(ev, "mention"))
                 .filter_map(|t| t.get(1).cloned())
-                .collect(),
+                .fold(vec![], |mut out, pk| {
+                    if !out.contains(&pk) {
+                        out.push(pk);
+                    }
+                    out
+                }),
             media,
             system: ev.kind.as_u16() == KIND_SYSTEM,
         }
@@ -528,6 +534,20 @@ mod tests {
             .custom_created_at(nostr::Timestamp::from(at))
             .sign_with_keys(keys)
             .unwrap()
+    }
+
+    #[test]
+    fn a_mention_with_p_and_mention_tags_counts_once() {
+        let a = Keys::generate();
+        let pk = "ab".repeat(32);
+        let m = ev(
+            &a,
+            9,
+            "hi",
+            vec![vec!["h", "c"], vec!["p", &pk], vec!["mention", &pk]],
+            1,
+        );
+        assert_eq!(Message::from_event(&m).mentions, vec![pk]);
     }
 
     #[test]
