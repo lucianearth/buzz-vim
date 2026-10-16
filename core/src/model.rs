@@ -226,27 +226,22 @@ impl Store {
     }
 
     /// The agents in `mentioned` (bot profiles, or `ours`) who aren't in
-    /// `channel` yet. They count as members from here on, so the next
-    /// message doesn't add them again. DMs keep the people they were opened
-    /// with.
-    pub fn bring_in(
-        &mut self,
+    /// `channel` yet. DMs keep the people they were opened with.
+    pub fn outsiders(
+        &self,
         channel: &str,
         mentioned: &[String],
         ours: impl Fn(&str) -> bool,
     ) -> Vec<String> {
-        let profiles = &self.profiles;
-        let is_agent = |pk: &str| profiles.get(pk).is_some_and(|p| p.is_agent) || ours(pk);
-        let Some(ch) = self.channels.get_mut(channel).filter(|c| !c.is_dm) else {
+        let Some(ch) = self.channels.get(channel).filter(|c| !c.is_dm) else {
             return vec![];
         };
-        let new: Vec<String> = mentioned
+        mentioned
             .iter()
-            .filter(|pk| !ch.members.contains(pk) && is_agent(pk))
+            .filter(|pk| !ch.members.contains(pk))
+            .filter(|pk| self.profiles.get(*pk).is_some_and(|p| p.is_agent) || ours(pk))
             .cloned()
-            .collect();
-        ch.members.extend(new.iter().cloned());
-        new
+            .collect()
     }
 
     pub fn name_of(&self, pubkey: &str) -> String {
@@ -561,18 +556,17 @@ mod tests {
     }
 
     #[test]
-    fn mentioned_agents_are_brought_in_once() {
+    fn outsiders_are_mentioned_agents_not_yet_here() {
         let mut s = Store::new("me".into());
         let ch = s.channel_mut("c");
         ch.members = vec!["me".into(), "bot1".into()];
         s.profiles.entry("bot3".into()).or_default().is_agent = true;
         let said: Vec<String> = ["bot1", "bot2", "bot3", "human"].map(String::from).to_vec();
         let agent = |pk: &str| pk == "bot1" || pk == "bot2";
-        assert_eq!(s.bring_in("c", &said, agent), vec!["bot2", "bot3"]);
-        assert!(s.bring_in("c", &said, agent).is_empty());
+        assert_eq!(s.outsiders("c", &said, agent), vec!["bot2", "bot3"]);
         s.channel_mut("d").is_dm = true;
-        assert!(s.bring_in("d", &said, agent).is_empty());
-        assert!(s.bring_in("nope", &said, agent).is_empty());
+        assert!(s.outsiders("d", &said, agent).is_empty());
+        assert!(s.outsiders("nope", &said, agent).is_empty());
     }
 
     #[test]

@@ -894,11 +894,11 @@ impl App {
             _ => self.current(),
         };
         // Our agents too: mentioning one who isn't here adds them on send.
-        let mut members: Vec<String> = ch
-            .and_then(|c| self.store.channels.get(c))
-            .map(|c| c.members.clone())
-            .unwrap_or_default();
-        members.extend(self.agents.by_pubkey.keys().cloned());
+        let ch = ch.and_then(|c| self.store.channels.get(c));
+        let mut members: Vec<String> = ch.map(|c| c.members.clone()).unwrap_or_default();
+        if ch.is_some_and(|c| !c.is_dm) {
+            members.extend(self.agents.by_pubkey.keys().cloned());
+        }
         members.sort();
         members.dedup();
         let mut out: Vec<(String, String)> = members

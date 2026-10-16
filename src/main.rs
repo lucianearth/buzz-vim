@@ -430,6 +430,19 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
             Ok(s) => app.say(s),
             Err(e) => app.say(format!("failed: {e}")),
         },
+        Msg::Added {
+            channel,
+            pubkeys,
+            result,
+        } => match result {
+            Ok(()) => {
+                let names: Vec<String> = pubkeys.iter().map(|pk| app.store.name_of(pk)).collect();
+                // No live member updates here, so count them in ourselves.
+                app.store.channel_mut(&channel).members.extend(pubkeys);
+                app.say(format!("added {} to the channel", names.join(", ")));
+            }
+            Err(e) => app.say(format!("couldn't add to the channel: {e}")),
+        },
         Msg::Uploaded(r, (channel, root)) => {
             app.uploading = false;
             match r {

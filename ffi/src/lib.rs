@@ -1719,7 +1719,7 @@ impl Engine {
         let ours = &self.agents.by_pubkey;
         let invite = self
             .store
-            .bring_in(&channel, &mentions, |pk| ours.contains_key(pk));
+            .outsiders(&channel, &mentioned, |pk| ours.contains_key(pk));
         self.publish_message(ev, channel, invite);
         Ok(id)
     }
