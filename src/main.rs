@@ -15,7 +15,9 @@ mod sync;
 mod theme;
 mod ui;
 
-use buzz_vim_core::{draft, links, live, log, model, readstate, relay, sections, telemetry};
+use buzz_vim_core::{
+    draft, links, live, log, model, readstate, relay, sections, telemetry, unread,
+};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -139,7 +141,7 @@ async fn run(
     app.last_bot = saved.last_bot.clone();
     let mut sync = Sync::new(relay, live_cmd, tx);
     if !saved.read_slot.is_empty() && !saved.read_client.is_empty() {
-        sync.read = readstate::ReadState::new(saved.read_slot.clone(), saved.read_client.clone());
+        app.read = readstate::ReadState::new(saved.read_slot.clone(), saved.read_client.clone());
     }
     sync.start();
     sync.want_profiles([app.store.me.clone()]);
@@ -225,28 +227,28 @@ async fn run(
             match a {
                 Action::Quit => quit = true,
                 Action::SaveState => {
-                    state::save(&sync.relay.base, &app.store.me, &saved_state(&app, &sync));
+                    state::save(&sync.relay.base, &app.store.me, &saved_state(&app));
                 }
                 a => sync.run(&mut app, a),
             }
         }
-        sync.check_unread(&app.tabs);
-        sync.flush_read();
+        sync.check_unread(&app.read, &app.tabs);
+        sync.flush_read(&mut app.read);
         if quit {
-            state::save(&sync.relay.base, &app.store.me, &saved_state(&app, &sync));
-            sync.flush_read_now().await;
+            state::save(&sync.relay.base, &app.store.me, &saved_state(&app));
+            sync.flush_read_now(&mut app.read).await;
             break;
         }
     }
     Ok(())
 }
 
-fn saved_state(app: &App, sync: &Sync) -> state::State {
+fn saved_state(app: &App) -> state::State {
     state::State {
         chosen: app.chosen.clone(),
         active: app.current().map(str::to_string),
-        read_slot: sync.read.slot().to_string(),
-        read_client: sync.read.client_id().to_string(),
+        read_slot: app.read.slot().to_string(),
+        read_client: app.read.client_id().to_string(),
         read_width: app.read_width,
         last_bot: app.last_bot.clone(),
     }
@@ -257,18 +259,42 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
         Msg::ReadState(r) => {
             match r {
                 Ok(evs) => {
-                    sync.apply_read(&evs);
-                    sync.read.loaded = true;
+                    // Where the open channel was read up to before this
+                    // run marked it, for the jump key.
+                    let mut before = readstate::ReadState::new(String::new(), String::new());
+                    sync.apply_read(&mut before, &evs);
+                    if let Some(c) = app.current().map(str::to_string) {
+                        if let Some(at) = before.read_at(&c) {
+                            app.entry.insert(c, at);
+                        }
+                    }
+                    sync.apply_read(&mut app.read, &evs);
+                    app.read.loaded = true;
                 }
                 Err(e) => log::line(format!("read state load: {e}")),
             }
             // Even on failure, so unread still works from the last week.
-            sync.read.tried = true;
-            sync::prune_unread(app, &sync.read);
+            app.read.tried = true;
+            sync::prune_unread(app);
         }
         Msg::Unread { channel, events } => match events {
-            Ok(evs) => sync::fold_unread(app, &sync.read, &channel, &evs),
+            Ok(evs) => {
+                // Replies go in the store: they make "(N new)" and the jump key.
+                let mut want = vec![];
+                for ev in evs
+                    .iter()
+                    .filter(|e| model::Message::from_event(e).root.is_some())
+                {
+                    want.extend(sync::fold(app, sync, ev, false));
+                }
+                sync.want_profiles(want);
+                sync::fold_unread(app, &channel, &evs);
+            }
             Err(e) => log::line(format!("unread {channel}: {e}")),
+        },
+        Msg::Archived(r) => match r {
+            Ok(pks) => app.archived = pks.into_iter().collect(),
+            Err(e) => log::line(format!("archived: {e}")),
         },
         Msg::Channels(Ok(evs)) => {
             app.channels_loaded = true;

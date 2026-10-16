@@ -35,6 +35,12 @@ final class Model {
     /// Ids sent since launch.
     private var mine: Set<String> = []
 
+    /// A compose box (draft key) that should take the keyboard when it
+    /// shows: tab moves from the key row keep you typing.
+    var focusKey: String?
+    /// A message to scroll to the top of its channel: (channel, id).
+    var scrollTarget: (channel: String, id: String)?
+
     static let defaultRelay = "wss://buzz.gitcoin.co"
 
     var relayHost: String {

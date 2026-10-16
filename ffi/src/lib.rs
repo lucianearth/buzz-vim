@@ -20,6 +20,7 @@ use buzz_vim_core::readstate::{self, ReadState};
 use buzz_vim_core::relay::{BlobDescriptor, Relay};
 use buzz_vim_core::sections::{self, Lanes, Section};
 use buzz_vim_core::telemetry::Agents;
+use buzz_vim_core::unread::{self, Next};
 use nostr::nips::nip44;
 use nostr::{Event, EventId, Keys, Tag};
 use serde_json::{Value, json};
@@ -165,6 +166,17 @@ pub struct Timeline {
     pub has_more: bool,
     /// Agents mid-turn here right now.
     pub working: Vec<String>,
+    /// The message with the newest activity ("" if none): in a channel the
+    /// one whose own time or latest reply is newest, in a thread the last.
+    pub latest: String,
+}
+
+/// Where the jump key lands: a top-level message, or a reply (`root` set)
+/// whose thread opens with it at the top.
+#[derive(uniffi::Record, Clone)]
+pub struct Jump {
+    pub root: Option<String>,
+    pub id: String,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -284,6 +296,7 @@ enum Msg {
         older: bool,
     },
     Events(anyhow::Result<Vec<Event>>),
+    Archived(anyhow::Result<Vec<String>>),
     Unread {
         channel: String,
         events: anyhow::Result<Vec<Event>>,
@@ -323,9 +336,13 @@ struct Engine {
     loading_older: HashSet<String>,
     unread_checked: HashSet<String>,
     started: u64,
-    /// Channel read positions from before this session marked anything:
-    /// replies after it count as new until their thread is opened.
-    floor: HashMap<String, u64>,
+    /// channel -> where it was read up to when it last came on screen:
+    /// newer top-level messages are what the jump key visits.
+    entry: HashMap<String, u64>,
+    /// Top-level messages the jump key has already been to.
+    visited: HashSet<String>,
+    /// Identities the relay has archived: left out of @ completion.
+    archived: HashSet<String>,
     /// Our sends the relay hasn't confirmed: id -> event.
     sending: HashMap<String, Event>,
     failed: HashMap<String, Event>,
@@ -411,7 +428,9 @@ impl Client {
             loading_older: HashSet::new(),
             unread_checked: HashSet::new(),
             started: now(),
-            floor: HashMap::new(),
+            entry: HashMap::new(),
+            visited: HashSet::new(),
+            archived: HashSet::new(),
             sending: HashMap::new(),
             failed: HashMap::new(),
             notices: vec![],
@@ -511,8 +530,17 @@ impl Client {
     /// The channel now on screen (or none): loads it and marks it read.
     pub fn open_channel(&self, channel: Option<String>) {
         let mut e = self.engine.lock().unwrap();
+        let fresh = e.current != channel;
         e.current = channel.clone();
         if let Some(id) = channel {
+            // Coming onto it: remember where it was read up to first. Until
+            // the startup load is in that is unknown; the load fills it in.
+            if fresh && e.read.tried {
+                match e.read.read_at(&id) {
+                    Some(at) => e.entry.insert(id.clone(), at),
+                    None => e.entry.remove(&id),
+                };
+            }
             e.mark_read(&id);
             e.open(&id);
         }
@@ -555,6 +583,7 @@ impl Client {
                 loaded: false,
                 has_more: false,
                 working: vec![],
+                latest: String::new(),
             };
         };
         Timeline {
@@ -568,20 +597,48 @@ impl Client {
             loaded: ch.loaded,
             has_more: matches!(e.cursors.get(&channel), Some(Some(_))) && !ch.exhausted,
             working: e.agents.working(&e.store, &channel, None),
+            latest: unread::latest(ch).unwrap_or_default(),
         }
     }
 
     /// A thread on screen: loads it and marks its replies seen.
     pub fn open_thread(&self, channel: String, root: String) {
         let mut e = self.engine.lock().unwrap();
-        e.read.mark(&format!("thread:{root}"), now());
+        e.read.mark(&unread::thread_key(&root), now());
         e.thread(&channel, &root);
     }
 
     /// Leaving a thread: what arrived while it was open is seen too.
     pub fn close_thread(&self, root: String) {
         let mut e = self.engine.lock().unwrap();
-        e.read.mark(&format!("thread:{root}"), now());
+        e.read.mark(&unread::thread_key(&root), now());
+    }
+
+    /// The jump key in `channel`: the oldest unread thing there, or none
+    /// (then the app moves on to the next tab with something unread). A
+    /// top-level message counts as visited once returned; a reply's thread
+    /// is marked read when the app opens it.
+    pub fn next_unread(&self, channel: String) -> Option<Jump> {
+        let mut e = self.engine.lock().unwrap();
+        let ch = e.store.channels.get(&channel)?;
+        let next = unread::next_unread(
+            ch,
+            &e.store.me,
+            &e.read,
+            e.entry.get(&channel).copied(),
+            &e.visited,
+            now(),
+        )?;
+        Some(match next {
+            Next::Message(id) => {
+                e.visited.insert(id.clone());
+                Jump { root: None, id }
+            }
+            Next::Reply { root, id } => Jump {
+                root: Some(root),
+                id,
+            },
+        })
     }
 
     /// The root first, then its replies, oldest first.
@@ -593,6 +650,7 @@ impl Client {
                 loaded: false,
                 has_more: false,
                 working: vec![],
+                latest: String::new(),
             };
         };
         let mut messages: Vec<Message> = ch
@@ -611,6 +669,7 @@ impl Client {
         }
         Timeline {
             loaded: !messages.is_empty(),
+            latest: messages.last().map(|m| m.id.clone()).unwrap_or_default(),
             messages,
             has_more: false,
             working: e.agents.working(&e.store, &channel, Some(&root)),
@@ -729,7 +788,7 @@ impl Client {
         keys.extend(e.agents.by_pubkey.keys().cloned());
         keys.sort();
         keys.dedup();
-        keys.retain(|k| *k != e.store.me);
+        keys.retain(|k| *k != e.store.me && !e.archived.contains(k));
         let mut out: Vec<Person> = keys.iter().map(|k| e.person(k)).collect();
         out.retain(|p| !p.name.is_empty());
         out.sort_by_key(|p| (!p.is_agent, p.name.to_lowercase()));
@@ -940,6 +999,8 @@ impl Engine {
                     .await,
             )
         });
+        let r = self.relay.clone();
+        self.spawn(async move { Msg::Archived(r.archived().await) });
     }
 
     fn load_channels(&self) {
@@ -1168,20 +1229,10 @@ impl Engine {
     }
 
     fn mark_read(&mut self, channel: &str) {
-        self.set_floor(channel);
         self.read.mark(channel, now());
         if let Some(ch) = self.store.channels.get_mut(channel) {
             ch.unread.clear();
             ch.mentioned.clear();
-        }
-    }
-
-    /// Remember where `channel` was read up to before we touch it. Only
-    /// once the startup read state is in; before that it is unknown.
-    fn set_floor(&mut self, channel: &str) {
-        if self.read.tried && !self.floor.contains_key(channel) {
-            let at = self.read.read_at(channel).unwrap_or(self.started);
-            self.floor.insert(channel.to_string(), at);
         }
     }
 
@@ -1221,15 +1272,14 @@ impl Engine {
             if !self.unread_checked.insert(id.clone()) {
                 continue;
             }
-            let since = self
-                .read
-                .read_at(id)
-                .map_or(now().saturating_sub(7 * 86_400), |t| t + 1);
+            // A week back: what's after the read position is unread, and
+            // the replies feed "(N new)" and the jump key.
+            let since = now().saturating_sub(unread::HORIZON);
             let r = self.relay.clone();
             let channel = id.clone();
             self.spawn(async move {
                 let f = json!({"kinds": model::UNREAD_KINDS, "#h": [channel], "since": since,
-                    "limit": 100});
+                    "limit": 500});
                 Msg::Unread {
                     events: r.query(&[f]).await,
                     channel,
@@ -1252,21 +1302,39 @@ impl Engine {
         match msg {
             Msg::ReadState(r) => {
                 if let Ok(evs) = r {
+                    // Where the open channel was read up to before this
+                    // run marked it, for the jump key.
+                    let mut before = ReadState::new(String::new(), String::new());
                     for ev in &evs {
+                        before.apply(&self.relay.keys, ev);
                         self.read.apply(&self.relay.keys, ev);
+                    }
+                    if let Some(c) = self.current.clone() {
+                        if let Some(at) = before.read_at(&c) {
+                            self.entry.insert(c, at);
+                        }
                     }
                     self.read.loaded = true;
                 }
                 // Even on failure, so unread still works from the last week.
                 self.read.tried = true;
                 self.prune_unread();
-                let ids: Vec<String> = self.store.channels.keys().cloned().collect();
-                for id in ids {
-                    self.set_floor(&id);
+            }
+            Msg::Archived(r) => {
+                if let Ok(pks) = r {
+                    self.archived = pks.into_iter().collect();
                 }
             }
             Msg::Unread { channel, events } => {
                 let Ok(evs) = events else { return };
+                let mut want = vec![];
+                for ev in evs
+                    .iter()
+                    .filter(|e| model::Message::from_event(e).root.is_some())
+                {
+                    want.extend(self.fold(ev, false));
+                }
+                self.want_profiles(want);
                 if self.visible && self.current.as_deref() == Some(channel.as_str()) {
                     return;
                 }
@@ -1294,10 +1362,6 @@ impl Engine {
                 self.channels_loaded = true;
                 for ev in &evs {
                     self.store.apply(ev);
-                }
-                let ids: Vec<String> = self.store.channels.keys().cloned().collect();
-                for id in ids {
-                    self.set_floor(&id);
                 }
                 let people: Vec<String> = self
                     .store
@@ -1516,7 +1580,6 @@ impl Engine {
                     ch.mentioned.insert(id.clone());
                 }
             } else if live_channel && active && author != self.store.me {
-                self.set_floor(&channel);
                 self.read.mark(&channel, now());
             }
             if let Some(m) = self
@@ -1703,16 +1766,8 @@ impl Engine {
             .unwrap_or_default();
         let mut repliers: Vec<Person> = vec![];
         let mut last_reply_at = ch.summary_replies.get(&m.id).map_or(0, |s| s.1);
-        let mut new_replies = 0;
+        let new_replies = unread::new_replies(ch, &m.id, me, &self.read, now()).len() as u32;
         if let Some(ids) = ch.replies.get(&m.id) {
-            let seen = [
-                self.read.read_at(&format!("thread:{}", m.id)),
-                self.floor.get(&ch.id).copied().or(Some(self.started)),
-            ]
-            .into_iter()
-            .flatten()
-            .max()
-            .unwrap_or(0);
             for id in ids.iter().rev() {
                 let Some(r) = ch.messages.get(id) else {
                     continue;
@@ -1721,15 +1776,6 @@ impl Engine {
                     continue;
                 }
                 last_reply_at = last_reply_at.max(r.created_at);
-                if r.author != *me
-                    && r.created_at > seen
-                    && self
-                        .read
-                        .read_at(&format!("msg:{id}"))
-                        .is_none_or(|t| r.created_at > t)
-                {
-                    new_replies += 1;
-                }
                 if repliers.len() < 3 && !repliers.iter().any(|p| p.pubkey == r.author) {
                     repliers.push(self.person(&r.author));
                 }
@@ -1888,7 +1934,9 @@ mod tests {
             loading_older: HashSet::new(),
             unread_checked: HashSet::new(),
             started: 0,
-            floor: HashMap::new(),
+            entry: HashMap::new(),
+            visited: HashSet::new(),
+            archived: HashSet::new(),
             sending: HashMap::new(),
             failed: HashMap::new(),
             notices: vec![],
@@ -1919,11 +1967,16 @@ mod tests {
     fn reply_line_counts_what_you_have_not_seen() {
         let mut e = engine();
         let me = e.store.me.clone();
-        e.started = 100;
+        let t = now() - 1000;
         let ch = e.store.channel_mut("c");
         for (id, author, at) in [("root", "a"), ("r1", "a"), ("r2", "b"), ("r3", me.as_str())]
             .into_iter()
-            .zip([50, 90, 150, 160])
+            .zip([
+                t - unread::HORIZON - 50,
+                t - unread::HORIZON - 10,
+                t + 150,
+                t + 160,
+            ])
             .map(|((id, au), at)| (id, au.to_string(), at))
         {
             ch.messages.insert(
@@ -1943,14 +1996,14 @@ mod tests {
             let ch = &e.store.channels["c"];
             e.view(ch, &ch.messages["root"])
         };
-        // r1 is from before this session; r3 is ours.
+        // r1 is older than a week and the thread has no read position; r3 is ours.
         let m = view(&e);
         assert_eq!(
             (m.new_replies, m.last_reply_at, m.repliers.len()),
-            (1, 160, 3)
+            (1, t + 160, 3)
         );
         assert_eq!(m.repliers[0].pubkey, me);
-        e.read.mark("thread:root", 155);
+        e.read.mark("thread:root", t + 155);
         assert_eq!(view(&e).new_replies, 0);
     }
 

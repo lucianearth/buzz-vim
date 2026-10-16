@@ -25,7 +25,7 @@ struct ChannelView: View {
                             .foregroundStyle(theme.muted)
                     }
                     ForEach(tl.messages, id: \.id) { m in
-                        MessageRow(client: client, message: m, showReplies: true)
+                        MessageRow(client: client, message: m, showReplies: true, latest: m.id == tl.latest)
                             .contentShape(Rectangle())
                             .onTapGesture(count: 2) { client.thumbsUp(target: m.id) }
                             .onTapGesture { if !m.system { openThread(m.id) } }
@@ -44,9 +44,21 @@ struct ChannelView: View {
             .onChange(of: tl.messages.last?.id) { _, _ in
                 withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("end", anchor: .bottom) }
             }
+            // The bell key landed here: that message at the top.
+            .onChange(of: model.scrollTarget?.id) { _, _ in scrollToTarget(proxy) }
+            .onAppear { scrollToTarget(proxy) }
             .safeAreaInset(edge: .bottom) {
                 ComposeBar(client: client, channel: channel, root: nil, hint: "write…")
             }
+        }
+    }
+
+    private func scrollToTarget(_ proxy: ScrollViewProxy) {
+        guard let t = model.scrollTarget, t.channel == channel else { return }
+        model.scrollTarget = nil
+        // After a tab swipe settles.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(t.id, anchor: .top) }
         }
     }
 }
@@ -70,6 +82,8 @@ struct MessageRow: View {
     let client: Client
     let message: Message
     let showReplies: Bool
+    /// The newest activity here: marked so it's easy to find.
+    var latest = false
     @Environment(\.theme) private var theme
     @Environment(Model.self) private var model
     @State private var viewer: Viewer?
@@ -91,6 +105,13 @@ struct MessageRow: View {
                         .foregroundStyle(theme.muted)
                     if m.edited {
                         Text("edited").font(.stamp).foregroundStyle(theme.faint)
+                    }
+                    if latest {
+                        HStack(spacing: 4) {
+                            Circle().fill(theme.accent).frame(width: 6, height: 6)
+                            Text("latest").font(.stamp)
+                        }
+                        .foregroundStyle(theme.accent)
                     }
                 }
                 ForEach(Array(m.segments.enumerated()), id: \.offset) { _, s in

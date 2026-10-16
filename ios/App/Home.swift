@@ -4,6 +4,8 @@ import UniformTypeIdentifiers
 struct Route: Hashable {
     let channel: String
     let root: String
+    /// A reply to open the thread on, at the top (the jump key).
+    var focus: String? = nil
 }
 
 /// Tab moves for the keyboard bar, from wherever the compose box is.
@@ -99,25 +101,52 @@ struct Home: View {
         }
     }
 
-    /// The tab `by` places along, wrapping. From a thread, back to the channel first.
+    /// The tab `by` places along, wrapping. From a thread, back to the
+    /// channel first. The keyboard stays up on the new tab.
     private func step(_ by: Int) {
         let tabs = client.tabs()
         guard !tabs.isEmpty else { return }
         let i = tabs.firstIndex { $0.id == selected } ?? 0
-        go(tabs[((i + by) % tabs.count + tabs.count) % tabs.count].id)
+        let id = tabs[((i + by) % tabs.count + tabs.count) % tabs.count].id
+        model.focusKey = id
+        go(id)
     }
 
-    /// The next tab after this one with something unread, mentions first.
+    /// The bell key: the first unread thing in this tab, oldest first (a
+    /// reply opens its thread on it). Nothing here: on to the next tab
+    /// with something unread, mentions first.
     private func nextUnread() {
+        if let s = selected, let j = client.nextUnread(channel: s) {
+            land(s, j)
+            return
+        }
         let tabs = client.tabs()
         guard !tabs.isEmpty else { return }
         let i = tabs.firstIndex { $0.id == selected } ?? -1
         let after = (1...tabs.count).map { tabs[(i + $0 + tabs.count) % tabs.count] }
             .filter { $0.id != selected }
-        if let t = after.first(where: { $0.mentions > 0 }) ?? after.first(where: { $0.unread > 0 }) {
-            go(t.id)
-        } else {
+        guard let t = after.first(where: { $0.mentions > 0 }) ?? after.first(where: { $0.unread > 0 }) else {
             model.say("nothing unread")
+            return
+        }
+        // Open it now, so Rust notes where it was read up to before the jump.
+        client.openChannel(channel: t.id)
+        go(t.id)
+        if let j = client.nextUnread(channel: t.id) {
+            land(t.id, j)
+        } else {
+            model.focusKey = t.id
+        }
+    }
+
+    private func land(_ channel: String, _ j: Jump) {
+        if let root = j.root {
+            model.focusKey = "\(channel)/\(root)"
+            path = [Route(channel: channel, root: root, focus: j.id)]
+        } else {
+            model.focusKey = channel
+            path = []
+            model.scrollTarget = (channel, j.id)
         }
     }
 

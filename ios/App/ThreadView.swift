@@ -31,9 +31,11 @@ struct ThreadView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 22) {
                         ForEach(tl.messages, id: \.id) { m in
-                            MessageRow(client: client, message: m, showReplies: false)
+                            MessageRow(client: client, message: m, showReplies: false,
+                                       latest: m.id == tl.latest)
                                 .contentShape(Rectangle())
                                 .onTapGesture(count: 2) { client.thumbsUp(target: m.id) }
+                                .id(m.id)
                         }
                         if !tl.working.isEmpty {
                             Working(names: tl.working)
@@ -48,7 +50,16 @@ struct ThreadView: View {
                 .defaultScrollAnchor(.bottom)
                 .scrollDismissesKeyboard(.interactively)
                 .onChange(of: tl.messages.last?.id) { _, _ in
+                    // Opened on a reply by the bell key: stay on it.
+                    guard route.focus == nil else { return }
                     withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("end", anchor: .bottom) }
+                }
+                .onAppear {
+                    // The bell key: the first new reply at the top.
+                    guard let f = route.focus else { return }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                        proxy.scrollTo(f, anchor: .top)
+                    }
                 }
             }
             }

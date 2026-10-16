@@ -16,6 +16,7 @@ use crate::model::{self, Applied};
 use crate::readstate::{self, ReadState};
 use crate::relay::{BlobDescriptor, Relay};
 use crate::sections::{self, Lanes};
+use crate::unread;
 
 pub enum Msg {
     Channels(anyhow::Result<Vec<Event>>),
@@ -37,6 +38,8 @@ pub enum Msg {
         channel: String,
         events: anyhow::Result<Vec<Event>>,
     },
+    /// Identities the relay has archived (NIP-IA).
+    Archived(anyhow::Result<Vec<String>>),
     Sent {
         id: String,
         result: anyhow::Result<()>,
@@ -71,7 +74,6 @@ pub struct Sync {
     subscribed: HashSet<String>,
     loading_older: HashSet<String>,
     started: u64,
-    pub read: ReadState,
     /// Tabs whose unread messages we've looked up since startup.
     unread_checked: HashSet<String>,
 }
@@ -93,7 +95,6 @@ impl Sync {
             subscribed: HashSet::new(),
             loading_older: HashSet::new(),
             started: now(),
-            read: ReadState::new(readstate::new_id(), readstate::new_id()),
             unread_checked: HashSet::new(),
         }
     }
@@ -117,6 +118,8 @@ impl Sync {
         let me = self.me();
         self.load_channels();
         self.load_lanes();
+        let r = self.relay.clone();
+        self.spawn(async move { Msg::Archived(r.archived().await) });
         let now = now();
         let sub = |id: &str, filters: Vec<Value>| Cmd::Sub {
             id: id.to_string(),
@@ -226,22 +229,17 @@ impl Sync {
     }
 
     /// Fold read-state events. Returns true if a position moved.
-    pub fn apply_read(&mut self, evs: &[Event]) -> bool {
+    pub fn apply_read(&self, read: &mut ReadState, evs: &[Event]) -> bool {
         let mut moved = false;
         for ev in evs {
-            moved |= self.read.apply(&self.relay.keys, ev);
+            moved |= read.apply(&self.relay.keys, ev);
         }
         moved
     }
 
-    /// Mark a channel read now, for Desktop and our other devices.
-    pub fn mark_read(&mut self, channel: &str) {
-        self.read.mark(channel, now());
-    }
-
     /// Publish our read-state slot once it has settled (or now, on quit).
-    pub fn flush_read(&mut self) {
-        if let Some(ev) = self.read.take_publish(&self.relay.keys, false) {
+    pub fn flush_read(&mut self, read: &mut ReadState) {
+        if let Some(ev) = read.take_publish(&self.relay.keys, false) {
             let r = self.relay.clone();
             tokio::spawn(async move {
                 if let Err(e) = r.publish(&ev).await {
@@ -251,31 +249,29 @@ impl Sync {
         }
     }
 
-    pub async fn flush_read_now(&mut self) {
-        if let Some(ev) = self.read.take_publish(&self.relay.keys, true) {
+    pub async fn flush_read_now(&mut self, read: &mut ReadState) {
+        if let Some(ev) = read.take_publish(&self.relay.keys, true) {
             let _ = tokio::time::timeout(Duration::from_secs(3), self.relay.publish(&ev)).await;
         }
     }
 
-    /// Look up what's unread in each tab we haven't checked yet: messages
-    /// and thread replies since its read position (or the last week, if it has none).
-    pub fn check_unread(&mut self, tabs: &[String]) {
-        if !self.read.tried {
+    /// Look up the last week of messages and thread replies in each tab we
+    /// haven't checked yet: what's after its read position is unread, and
+    /// the replies feed "(N new)" and the jump key.
+    pub fn check_unread(&mut self, read: &ReadState, tabs: &[String]) {
+        if !read.tried {
             return;
         }
         for id in tabs {
             if !self.unread_checked.insert(id.clone()) {
                 continue;
             }
-            let since = self
-                .read
-                .read_at(id)
-                .map_or(now().saturating_sub(7 * 86_400), |t| t + 1);
+            let since = now().saturating_sub(unread::HORIZON);
             let r = self.relay.clone();
             let channel = id.clone();
             self.spawn(async move {
                 let f = json!({"kinds": model::UNREAD_KINDS, "#h": [channel], "since": since,
-                    "limit": 100});
+                    "limit": 500});
                 Msg::Unread {
                     events: r.query(&[f]).await,
                     channel,
@@ -433,7 +429,7 @@ impl Sync {
     pub fn run(&mut self, app: &mut App, action: Action) {
         match action {
             Action::OpenChannel(id) => {
-                self.mark_read(&id);
+                app.read.mark(&id, now());
                 self.open_channel(&id);
             }
             Action::LoadOlder(id) => self.load_older(&id),
@@ -459,6 +455,7 @@ impl Sync {
             }
             Action::LoadImage(url) => self.load_image(app, url),
             Action::OpenThread { channel, root } => self.open_thread(&channel, &root),
+            Action::OpenImage(url) => self.open_image(app, url),
             Action::OpenUrl(url) => {
                 if let Err(e) = crate::links::open(&url) {
                     app.say(format!("couldn't open {url}: {e}"));
@@ -619,6 +616,36 @@ impl Sync {
         self.spawn(async move { Msg::Did(r.publish(&ev).await.map(|_| label.to_string())) });
     }
 
+    /// Save an image to a temp file and hand it to the OS (Preview on a Mac).
+    fn open_image(&mut self, app: &mut App, url: String) {
+        if !self.relay.is_ours(&url) {
+            if let Err(e) = crate::links::open(&url) {
+                app.say(format!("couldn't open {url}: {e}"));
+            }
+            return;
+        }
+        app.say("opening image…");
+        let r = self.relay.clone();
+        self.spawn(async move {
+            let res = async {
+                let bytes = r.download(&url).await?;
+                let name = url.rsplit('/').next().unwrap_or("image");
+                let ext = image::guess_format(&bytes)
+                    .ok()
+                    .and_then(|f| f.extensions_str().first().copied())
+                    .unwrap_or("png");
+                let dir = std::env::temp_dir().join("buzz-vim");
+                std::fs::create_dir_all(&dir)?;
+                let path = dir.join(format!("{}.{ext}", name.split('.').next().unwrap_or(name)));
+                std::fs::write(&path, bytes)?;
+                crate::links::open(&path.to_string_lossy())?;
+                Ok(format!("opened {}", path.display()))
+            }
+            .await;
+            Msg::Did(res)
+        });
+    }
+
     fn load_image(&mut self, app: &mut App, url: String) {
         if app.media.images.contains_key(&url) || app.picker.is_none() {
             return;
@@ -710,8 +737,8 @@ pub fn fold(app: &mut App, sync: &mut Sync, ev: &Event, live_channel: bool) -> V
             return vec![];
         }
         30078 if readstate::is_read_state(ev) => {
-            if sync.apply_read(std::slice::from_ref(ev)) {
-                prune_unread(app, &sync.read);
+            if sync.apply_read(&mut app.read, std::slice::from_ref(ev)) {
+                prune_unread(app);
             }
             return vec![];
         }
@@ -734,15 +761,34 @@ pub fn fold(app: &mut App, sync: &mut Sync, ev: &Event, live_channel: bool) -> V
         let active = app.current() == Some(channel.as_str());
         let at = ev.created_at.as_secs();
         let author = ev.pubkey.to_hex();
-        let seen = sync.read.read_at(&channel).is_some_and(|r| at <= r);
+        let seen = app.read.read_at(&channel).is_some_and(|r| at <= r);
         if live_channel && !seen && counts_unread(kind, &author, &app.store.me, active) {
-            app.store
-                .channel_mut(&channel)
-                .unread
-                .insert(id.clone(), at);
+            let me = app.store.me.clone();
+            let ch = app.store.channel_mut(&channel);
+            ch.unread.insert(id.clone(), at);
+            if ch
+                .messages
+                .get(&id)
+                .is_some_and(|m| m.mentions.contains(&me))
+            {
+                ch.mentioned.insert(id.clone());
+            }
         } else if live_channel && active && author != app.store.me {
             // You're looking at it, so it's read.
-            sync.mark_read(&channel);
+            app.read.mark(&channel, now());
+        }
+        // A reply landing in the thread on screen is seen too.
+        let root = app
+            .store
+            .channels
+            .get(&channel)
+            .and_then(|c| c.messages.get(&id))
+            .and_then(|m| m.root.clone());
+        if live_channel
+            && root.is_some()
+            && app.thread.as_ref().map(|t| (&t.0, Some(&t.1))) == Some((&channel, root.as_ref()))
+        {
+            app.mark_thread(root.as_deref().unwrap_or_default());
         }
         if let Some(m) = app
             .store
@@ -758,28 +804,34 @@ pub fn fold(app: &mut App, sync: &mut Sync, ev: &Event, live_channel: bool) -> V
 
 /// Drop unread messages at or before each channel's read position, e.g.
 /// after you read the channel in Desktop.
-pub fn prune_unread(app: &mut App, read: &ReadState) {
+pub fn prune_unread(app: &mut App) {
+    let read = &app.read;
     for (id, ch) in app.store.channels.iter_mut() {
         if let Some(r) = read.read_at(id) {
             ch.unread.retain(|_, at| *at > r);
+            let left = &ch.unread;
+            ch.mentioned.retain(|m| left.contains_key(m));
         }
     }
 }
 
 /// Unread messages from a lookup: someone else's, after the read
 /// position, in a tab you aren't looking at.
-pub fn fold_unread(app: &mut App, read: &ReadState, channel: &str, evs: &[Event]) {
+pub fn fold_unread(app: &mut App, channel: &str, evs: &[Event]) {
     if app.current() == Some(channel) {
         return;
     }
     let me = app.store.me.clone();
-    let after = read.read_at(channel).unwrap_or(0);
+    let after = app.read.read_at(channel).unwrap_or(0);
     let ch = app.store.channel_mut(channel);
     for ev in evs {
         let at = ev.created_at.as_secs();
         if model::UNREAD_KINDS.contains(&ev.kind.as_u16()) && ev.pubkey.to_hex() != me && at > after
         {
             ch.unread.insert(ev.id.to_hex(), at);
+            if ch.is_dm || model::Message::from_event(ev).mentions.contains(&me) {
+                ch.mentioned.insert(ev.id.to_hex());
+            }
         }
     }
 }

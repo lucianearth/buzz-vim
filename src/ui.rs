@@ -167,9 +167,24 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
             let ch = app.store.channels.get(id);
             let name = ch.map(channel_label).unwrap_or_else(|| "…".into());
             let unread = ch.map_or(0, |c| c.unread.len());
+            // In a DM every message is to you.
+            let mentions = ch.map_or(0, |c| {
+                if c.is_dm {
+                    c.unread.len()
+                } else {
+                    c.mentioned.len()
+                }
+            });
             // Two fixed cells after the name, unread dot then spinner, so
-            // tabs never change width as these come and go.
-            let dot = if unread > 0 { "•" } else { " " };
+            // tabs never change width as these come and go; a mention
+            // count replaces the dot.
+            let dot = if mentions > 0 {
+                format!("@{mentions}")
+            } else if unread > 0 {
+                "•".into()
+            } else {
+                " ".into()
+            };
             let spin = if app.agents.working(&app.store, id, None).is_empty() {
                 " "
             } else {
@@ -357,6 +372,7 @@ fn message_block(
     width: u16,
     selected: bool,
     show_replies: bool,
+    latest: bool,
 ) -> BlockOut {
     let mut lines = vec![];
     let mut links = vec![];
@@ -394,6 +410,9 @@ fn message_block(
     }
     if m.edited {
         head.push(Span::styled("  (edited)", theme::faint()));
+    }
+    if latest {
+        head.push(Span::styled("  ◆ latest", theme::bright()));
     }
     lines.push(Line::from(head));
     let inner = width.saturating_sub(FRAME + 2).max(10) as usize;
@@ -515,11 +534,22 @@ fn message_block(
                 .filter(|t| *t > 0)
                 .map(|t| format!("  last {who}{}", time_label(t)))
                 .unwrap_or_default();
+            let fresh =
+                crate::unread::new_replies(ch, &m.id, &app.store.me, &app.read, crate::sync::now())
+                    .len();
             lines.push(Line::from(vec![
                 bar.clone(),
                 Span::styled(
                     format!("↳ {n} {}", if n == 1 { "reply" } else { "replies" }),
                     theme::text().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    if fresh > 0 {
+                        format!(" ({fresh} new)")
+                    } else {
+                        String::new()
+                    },
+                    theme::bright().add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(when, theme::faint()),
                 Span::styled(
@@ -610,9 +640,18 @@ fn draw_blocks(
     let cur_idx = cursor.and_then(|c| blocks.iter().position(|b| b.id == c));
     // Default: newest at the bottom. With a cursor, scroll just enough.
     let mut top = total.saturating_sub(h);
+    let anchored = |i: usize| {
+        app.anchor
+            .as_ref()
+            .is_some_and(|(p, id)| *p == pane && *id == blocks[i].id)
+    };
     if let Some(i) = cur_idx {
         let a: usize = heights[..i].iter().sum();
         let b = a + heights[i];
+        if anchored(i) {
+            // The jump key's landing: this message at the top.
+            top = a.min(top);
+        }
         if b > top + h {
             top = b.saturating_sub(h);
         }
@@ -777,6 +816,7 @@ fn draw_timeline(
     }
     let cursor = app.selected.get(&id).cloned();
     let cursor_id = cursor.clone().or_else(|| ch.timeline.last().cloned());
+    let latest = crate::unread::latest(ch);
     let start = ch.timeline.len().saturating_sub(400);
     let blocks: Vec<BlockOut> = ch.timeline[start..]
         .iter()
@@ -785,7 +825,8 @@ fn draw_timeline(
             let sel = focused
                 && cursor_id.as_deref() == Some(m.id.as_str())
                 && (cursor.is_some() || app.thread.is_none());
-            message_block(app, ch, m, area.width, sel, true)
+            let lit = latest.as_deref() == Some(m.id.as_str());
+            message_block(app, ch, m, area.width, sel, true, lit)
         })
         .collect();
     draw_blocks(
@@ -834,6 +875,7 @@ fn draw_thread(
                 area.width,
                 focused && cursor_id.as_deref() == Some(m.id.as_str()),
                 false,
+                ids.last() == Some(&m.id),
             )
         })
         .collect();
@@ -1570,7 +1612,7 @@ fn draw_confirm(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    let r = centered(area, 84, 27);
+    let r = centered(area, 84, 29);
     clear(f, r);
     let block = Block::bordered()
         .border_style(theme::text())
@@ -2259,6 +2301,45 @@ mod tests {
         let buf = t.backend().buffer().clone();
         let top: String = (0..100).map(|x| buf[(x, 0)].symbol()).collect();
         assert!(top.contains("chan-4") && !top.contains('…'), "{top}");
+    }
+
+    #[test]
+    fn new_replies_latest_and_mention_counts_show() {
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let me = Keys::generate();
+        let them = Keys::generate();
+        let mut app = App::new(me.public_key().to_hex(), None);
+        let ev = |k: &Keys, content: &str, tags: Vec<Vec<&str>>| {
+            EventBuilder::new(Kind::Custom(9), content)
+                .tags(tags.into_iter().map(|t| Tag::parse(t).unwrap()))
+                .sign_with_keys(k)
+                .unwrap()
+        };
+        let root = ev(&me, "question", vec![vec!["h", "c1"]]);
+        let rid = root.id.to_hex();
+        app.store.apply(&root);
+        app.store.apply(&ev(
+            &them,
+            "answer",
+            vec![vec!["h", "c1"], vec!["e", &rid, "", "reply"]],
+        ));
+        app.tabs = vec!["c1".into(), "c2".into()];
+        let c2 = app.store.channel_mut("c2");
+        c2.name = "other".into();
+        c2.unread.insert("x".into(), 1);
+        c2.mentioned.insert("x".into());
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        assert!(
+            rows.iter().any(|r| r.contains("↳ 1 reply (1 new)")),
+            "{rows:#?}"
+        );
+        assert!(rows.iter().any(|r| r.contains("◆ latest")), "{rows:#?}");
+        assert!(rows[0].contains("other @1"), "{rows:#?}");
     }
 
     #[test]

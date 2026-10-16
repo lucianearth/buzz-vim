@@ -289,6 +289,36 @@ impl Relay {
         }
         Ok(r.bytes().await?.to_vec())
     }
+
+    /// Archived identities (NIP-IA): the `p` tags of the newest kind 13535
+    /// signed by the relay's own NIP-11 `self` key.
+    pub async fn archived(&self) -> Result<Vec<String>> {
+        let info: Value = self
+            .authed(self.http.get(&self.base))
+            .header("Accept", "application/nostr+json")
+            .send()
+            .await?
+            .json()
+            .await?;
+        let me = info
+            .get("self")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("relay info has no self key"))?
+            .to_ascii_lowercase();
+        let evs = self
+            .query(&[serde_json::json!({"kinds": [13535], "authors": [me], "limit": 1})])
+            .await?;
+        Ok(evs
+            .iter()
+            .filter(|e| e.pubkey.to_hex() == me)
+            .max_by_key(|e| e.created_at)
+            .map(|e| {
+                crate::model::tags(e, "p")
+                    .filter_map(|t| t.get(1).cloned())
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
 }
 
 fn rand_nonce() -> u128 {

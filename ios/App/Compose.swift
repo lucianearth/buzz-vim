@@ -101,6 +101,9 @@ struct ComposeBar: View {
         .padding(.bottom, 6)
         .background(theme.canvas)
         .animation(.easeOut(duration: 0.15), value: focused)
+        // Tab moves from the key row land here with the keyboard still up.
+        .onAppear { claimFocus() }
+        .onChange(of: model.focusKey) { _, _ in claimFocus() }
         .onChange(of: picked) { _, item in
             guard let item else { return }
             picked = nil
@@ -114,6 +117,13 @@ struct ComposeBar: View {
             .presentationDetents([.height(360)])
             .modifier(Themed())
         }
+    }
+
+    private func claimFocus() {
+        guard model.focusKey == key else { return }
+        model.focusKey = nil
+        // After the page swipe, so the field is on screen to take it.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { focused = true }
     }
 
     // ---------- sticky agents ----------
