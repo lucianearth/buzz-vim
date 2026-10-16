@@ -497,7 +497,7 @@ impl Sync {
             }
             Action::LoadImage(url) => self.load_image(app, url),
             Action::OpenThread { channel, root } => self.open_thread(&channel, &root),
-            Action::OpenImages(urls) => self.open_images(app, urls),
+            Action::OpenImages { urls, current } => self.open_images(app, urls, current),
             Action::OpenUrl(url) => {
                 if let Err(e) = crate::links::open(&url) {
                     app.say(format!("couldn't open {url}: {e}"));
@@ -660,8 +660,9 @@ impl Sync {
 
     /// Save images to temp files and hand them to the OS in one go, so a
     /// Mac shows them in one Preview window. Reuses what the viewer already
-    /// downloaded.
-    fn open_images(&mut self, app: &mut App, urls: Vec<String>) {
+    /// downloaded. Preview lands on `urls[current]`.
+    fn open_images(&mut self, app: &mut App, urls: Vec<String>, current: usize) {
+        let want = urls.get(current).cloned();
         let (ours, theirs): (Vec<_>, Vec<_>) =
             urls.into_iter().partition(|u| self.relay.is_ours(u));
         for u in theirs {
@@ -705,6 +706,7 @@ impl Sync {
                     .join(stamp.to_string());
                 std::fs::create_dir_all(&dir)?;
                 let mut paths = vec![];
+                let mut focus = None;
                 let mut failed = 0;
                 for (i, (url, bytes)) in ours.iter().zip(files).enumerate() {
                     let Ok(bytes) = bytes else {
@@ -720,12 +722,15 @@ impl Sync {
                         .unwrap_or("png");
                     let path = dir.join(format!("{:02}-{short}.{ext}", i + 1));
                     std::fs::write(&path, &*bytes)?;
+                    if want.as_ref() == Some(url) {
+                        focus = Some(paths.len());
+                    }
                     paths.push(path);
                 }
                 if paths.is_empty() {
                     anyhow::bail!("couldn't download any of them");
                 }
-                crate::links::open_files(&paths)?;
+                crate::links::open_files(&paths, focus)?;
                 Ok(match (paths.len(), failed) {
                     (1, 0) => format!("opened {}", paths[0].display()),
                     (k, 0) => format!("opened {k} images in Preview"),

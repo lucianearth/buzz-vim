@@ -94,8 +94,11 @@ pub enum Action {
     /// Hand a URL to the OS (browser, Buzz Desktop).
     OpenUrl(String),
     /// Download images and open them in the OS viewer (Preview), all in
-    /// one window.
-    OpenImages(Vec<String>),
+    /// one window, showing `current` first.
+    OpenImages {
+        urls: Vec<String>,
+        current: usize,
+    },
     SaveState,
     Quit,
 }
@@ -1230,8 +1233,17 @@ impl App {
     /// channel, the image on screen in the viewer, or the selected
     /// message's images.
     fn open_in_os(&mut self) {
+        let mut current = 0;
         let urls = if self.focus == Pane::Thread {
-            self.pane_images().0
+            let (list, start) = self.pane_images();
+            // The one on screen in the viewer, else the selected message's.
+            current = self
+                .viewer
+                .as_ref()
+                .and_then(|v| list.iter().position(|u| u == v))
+                .or(start)
+                .unwrap_or(0);
+            list
         } else if let Some(u) = self.viewer.clone() {
             vec![u]
         } else {
@@ -1249,7 +1261,7 @@ impl App {
         if urls.is_empty() {
             self.say("no images here");
         } else {
-            self.actions.push(Action::OpenImages(urls));
+            self.actions.push(Action::OpenImages { urls, current });
         }
     }
 
@@ -1701,18 +1713,20 @@ mod tests {
         assert!(["a", "b", "c", "d"].iter().all(|u| loads.contains(u)));
         assert!(!loads.contains(&"top"));
         app.actions.clear();
-        // O in a thread: every image in it, in thread order.
+        // O in a thread: every image in it, in thread order, opened on the
+        // one in the viewer.
         app.on_key(KeyEvent::from(KeyCode::Char('O')));
-        assert!(
-            matches!(app.actions.last(), Some(Action::OpenImages(u)) if u == &["a", "b", "c", "d"])
-        );
+        assert!(matches!(app.actions.last(),
+            Some(Action::OpenImages { urls, current: 1 }) if urls == &["a", "b", "c", "d"]));
         // In the channel: just the selected message's.
         app.mode = Mode::Normal;
         app.viewer = None;
         app.focus = Pane::Timeline;
         app.selected.insert("ch".into(), "t".into());
         app.on_key(KeyEvent::from(KeyCode::Char('O')));
-        assert!(matches!(app.actions.last(), Some(Action::OpenImages(u)) if u == &["top"]));
+        assert!(
+            matches!(app.actions.last(), Some(Action::OpenImages { urls, current: 0 }) if urls == &["top"])
+        );
     }
 
     #[test]

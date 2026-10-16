@@ -171,8 +171,9 @@ pub fn open(url: &str) -> std::io::Result<()> {
 }
 
 /// Open several files at once. On a Mac one `open` call puts them in one
-/// Preview window, where the arrow keys page through them.
-pub fn open_files(paths: &[std::path::PathBuf]) -> std::io::Result<()> {
+/// Preview window, where the arrow keys page through them; opening
+/// `paths[focus]` again once that's done makes Preview select it.
+pub fn open_files(paths: &[std::path::PathBuf], focus: Option<usize>) -> std::io::Result<()> {
     use std::process::{Command, Stdio};
     if std::env::consts::OS != "macos" {
         for p in paths {
@@ -180,13 +181,24 @@ pub fn open_files(paths: &[std::path::PathBuf]) -> std::io::Result<()> {
         }
         return Ok(());
     }
-    let mut child = Command::new("open")
-        .args(paths)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    std::thread::spawn(move || child.wait());
+    let run = |args: &[std::path::PathBuf]| {
+        Command::new("open")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    };
+    let mut child = run(paths)?;
+    let again = focus.filter(|&i| i > 0).and_then(|i| paths.get(i)).cloned();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+        if let Some(p) = again {
+            if let Ok(mut c) = run(&[p]) {
+                let _ = c.wait();
+            }
+        }
+    });
     Ok(())
 }
 
