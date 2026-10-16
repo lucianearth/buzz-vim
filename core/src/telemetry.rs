@@ -105,6 +105,18 @@ impl Agents {
         self.by_pubkey.entry(pubkey.to_string()).or_default()
     }
 
+    /// Only agents you own: anyone can send a telemetry frame.
+    pub fn is_owned(&self, pubkey: &str) -> bool {
+        self.by_pubkey.get(pubkey).is_some_and(|a| a.owned)
+    }
+
+    pub fn owned_keys(&self) -> impl Iterator<Item = &String> {
+        self.by_pubkey
+            .iter()
+            .filter(|(_, a)| a.owned)
+            .map(|(k, _)| k)
+    }
+
     /// A managed agent you own, from its kind 30177 record.
     pub fn own(&mut self, pubkey: &str, name: &str) {
         let a = self.known(pubkey);
@@ -370,6 +382,24 @@ impl Agents {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_frame_sender_is_not_ours() {
+        let mut ag = Agents::default();
+        ag.own("mine", "bot");
+        ag.frame(
+            "stranger",
+            &json!({"kind": "turn_started", "channelId": "c", "payload": {}}),
+        );
+        assert!(ag.is_owned("mine"));
+        assert!(!ag.is_owned("stranger"));
+        assert_eq!(ag.owned_keys().collect::<Vec<_>>(), vec!["mine"]);
+        let mut s = Store::new("me".into());
+        s.channel_mut("c").members = vec!["me".into()];
+        s.profiles.entry("stranger".into()).or_default().is_agent = true;
+        let said = vec!["mine".to_string(), "stranger".to_string()];
+        assert_eq!(s.outsiders("c", &said, |pk| ag.is_owned(pk)), vec!["mine"]);
+    }
 
     #[test]
     fn turn_lifecycle() {

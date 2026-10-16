@@ -831,7 +831,7 @@ impl Client {
             .get(&channel)
             .map(|c| c.members.clone())
             .unwrap_or_default();
-        keys.extend(e.agents.by_pubkey.keys().cloned());
+        keys.extend(e.agents.owned_keys().cloned());
         keys.sort();
         keys.dedup();
         keys.retain(|k| *k != e.store.me && !e.archived.contains(k));
@@ -1716,10 +1716,10 @@ impl Engine {
         let id = ev.id.to_hex();
         self.store.apply(&ev);
         // Agents it @mentions who aren't here yet join first, so they see it.
-        let ours = &self.agents.by_pubkey;
+        let ours = &self.agents;
         let invite = self
             .store
-            .outsiders(&channel, &mentioned, |pk| ours.contains_key(pk));
+            .outsiders(&channel, &mentioned, |pk| ours.is_owned(pk));
         self.publish_message(ev, channel, invite);
         Ok(id)
     }
@@ -1750,7 +1750,7 @@ impl Engine {
             .map(|c| c.members.clone())
             .unwrap_or_default()
             .into_iter()
-            .chain(self.agents.by_pubkey.keys().cloned())
+            .chain(self.agents.owned_keys().cloned())
             .filter_map(|pk| {
                 let p = self.store.profiles.get(&pk)?;
                 (!p.name.is_empty()).then(|| (p.name.clone(), pk))

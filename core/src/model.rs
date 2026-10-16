@@ -225,8 +225,9 @@ impl Store {
         }
     }
 
-    /// The agents in `mentioned` (bot profiles, or `ours`) who aren't in
-    /// `channel` yet. DMs keep the people they were opened with.
+    /// The agents in `mentioned` that are `ours` and aren't in `channel`
+    /// yet. A kind 0 bot flag is self-declared, so it doesn't count. DMs
+    /// keep the people they were opened with.
     pub fn outsiders(
         &self,
         channel: &str,
@@ -238,8 +239,7 @@ impl Store {
         };
         mentioned
             .iter()
-            .filter(|pk| !ch.members.contains(pk))
-            .filter(|pk| self.profiles.get(*pk).is_some_and(|p| p.is_agent) || ours(pk))
+            .filter(|pk| !ch.members.contains(pk) && ours(pk))
             .cloned()
             .collect()
     }
@@ -563,7 +563,7 @@ mod tests {
         s.profiles.entry("bot3".into()).or_default().is_agent = true;
         let said: Vec<String> = ["bot1", "bot2", "bot3", "human"].map(String::from).to_vec();
         let agent = |pk: &str| pk == "bot1" || pk == "bot2";
-        assert_eq!(s.outsiders("c", &said, agent), vec!["bot2", "bot3"]);
+        assert_eq!(s.outsiders("c", &said, agent), vec!["bot2"]);
         s.channel_mut("d").is_dm = true;
         assert!(s.outsiders("d", &said, agent).is_empty());
         assert!(s.outsiders("nope", &said, agent).is_empty());

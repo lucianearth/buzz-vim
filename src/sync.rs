@@ -633,10 +633,10 @@ impl Sync {
         app.pending_sends
             .insert(id.clone(), (channel.clone(), root.clone(), draft));
         // Agents it @mentions who aren't here yet join first, so they see it.
-        let ours = &app.agents.by_pubkey;
+        let ours = &app.agents;
         let invite = app
             .store
-            .outsiders(&channel, &mentions, |pk| ours.contains_key(pk));
+            .outsiders(&channel, &mentions, |pk| ours.is_owned(pk));
         let r = self.relay.clone();
         let tx = self.tx.clone();
         self.spawn(async move {

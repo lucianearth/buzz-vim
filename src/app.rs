@@ -897,7 +897,7 @@ impl App {
         let ch = ch.and_then(|c| self.store.channels.get(c));
         let mut members: Vec<String> = ch.map(|c| c.members.clone()).unwrap_or_default();
         if ch.is_some_and(|c| !c.is_dm) {
-            members.extend(self.agents.by_pubkey.keys().cloned());
+            members.extend(self.agents.owned_keys().cloned());
         }
         members.sort();
         members.dedup();
