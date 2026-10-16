@@ -293,14 +293,13 @@ fn encode(tree: serde_json::Map<String, Value>) -> Value {
     json!({"version": 1, "sections": sections, "assignments": assignments, "meta": meta})
 }
 
-/// Desktop's sections doc with `channel` moved into section `target`, or
-/// back to the unsectioned group with `None`. `head` is the newest relay
-/// doc and its `created_at`; every other register is kept as it is, so
-/// Desktop's per-field merge loses nothing.
-pub fn move_channel(
+/// Desktop's sections doc with each `(path, value)` written as a fresh
+/// register sharing one stamp (Desktop's `setRegs`). `head` is the newest
+/// relay doc and its `created_at`; every other register is kept as it is,
+/// so Desktop's per-field merge loses nothing.
+pub fn edit(
     head: Option<(&Value, u64)>,
-    channel: &str,
-    target: Option<&str>,
+    writes: &[(Vec<&str>, Value)],
     dev: &str,
     now_ms: i64,
 ) -> Value {
@@ -308,19 +307,48 @@ pub fn move_channel(
         .map(|(doc, at)| tree_of(doc, at as i64 * 1000))
         .unwrap_or_default();
     let v = now_ms.max(max_version(&Value::Object(tree.clone())) + 1);
-    let a = tree.entry("a").or_insert_with(|| json!({}));
-    if let Some(a) = a.as_object_mut() {
-        a.insert(channel.into(), json!([v, dev, target]));
+    for (path, value) in writes {
+        let Some((leaf, dirs)) = path.split_last() else {
+            continue;
+        };
+        let mut node = &mut tree;
+        for d in dirs {
+            let next = node.entry(d.to_string()).or_insert_with(|| json!({}));
+            if !next.is_object() {
+                *next = json!({});
+            }
+            node = next.as_object_mut().expect("object");
+        }
+        node.insert(leaf.to_string(), json!([v, dev, value]));
     }
     encode(tree)
 }
 
-/// Read the newest sections doc, move `channel`, publish. Returns the
-/// published event so the caller can fold it in straight away.
+/// `channel` moved into section `target`, or back to the unsectioned group with `None`.
+pub fn move_channel(
+    head: Option<(&Value, u64)>,
+    channel: &str,
+    target: Option<&str>,
+    dev: &str,
+    now_ms: i64,
+) -> Value {
+    edit(head, &[(vec!["a", channel], json!(target))], dev, now_ms)
+}
+
+/// Move `channel` and publish. Returns the published event so the caller
+/// can fold it in straight away.
 pub async fn publish_move(
     relay: &crate::relay::Relay,
     channel: &str,
     target: Option<&str>,
+) -> anyhow::Result<nostr::Event> {
+    publish_edit(relay, &[(vec!["a", channel], json!(target))]).await
+}
+
+/// Read the newest sections doc, apply `writes` (see [`edit`]), publish.
+pub async fn publish_edit(
+    relay: &crate::relay::Relay,
+    writes: &[(Vec<&str>, Value)],
 ) -> anyhow::Result<nostr::Event> {
     use nostr::nips::nip44;
     let keys = &relay.keys;
@@ -350,10 +378,9 @@ pub async fn publish_move(
         }
     }
     let now = chrono::Utc::now();
-    let next = move_channel(
+    let next = edit(
         doc.as_ref().map(|(d, at)| (d, *at)),
-        channel,
-        target,
+        writes,
         &dev_id(&me.to_hex()),
         now.timestamp_millis(),
     );
