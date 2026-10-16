@@ -293,6 +293,8 @@ struct Engine {
     conn: Conn,
     /// The channel on screen, if any: its live messages count as read.
     current: Option<String>,
+    /// False while the app is in the background: nothing counts as seen.
+    visible: bool,
     cursors: HashMap<String, Option<(u64, String)>>,
     requested_profiles: HashSet<String>,
     opened: HashSet<String>,
@@ -313,6 +315,15 @@ fn now() -> u64 {
 #[derive(uniffi::Object)]
 pub struct Client {
     engine: Arc<Mutex<Engine>>,
+    stop: Arc<tokio::sync::Notify>,
+}
+
+/// Logging out drops the client: its loop ends, which drops the engine,
+/// its keys and the live socket.
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.stop.notify_one();
+    }
 }
 
 #[uniffi::export]
@@ -366,6 +377,7 @@ impl Client {
             read: ReadState::new(read_slot, read_client),
             conn: Conn::Connecting,
             current: None,
+            visible: true,
             cursors: HashMap::new(),
             requested_profiles: HashSet::new(),
             opened: HashSet::new(),
@@ -383,8 +395,9 @@ impl Client {
             e.start();
             e.want_profiles([me]);
         }
-        RT.spawn(run(engine.clone(), rx, live_rx, listener));
-        Ok(Arc::new(Client { engine }))
+        let stop = Arc::new(tokio::sync::Notify::new());
+        RT.spawn(run(engine.clone(), rx, live_rx, listener, stop.clone()));
+        Ok(Arc::new(Client { engine, stop }))
     }
 
     pub fn me(&self) -> String {
@@ -452,6 +465,22 @@ impl Client {
             e.mark_read(&id);
             e.open(&id);
         }
+    }
+
+    /// The app went to the background (false) or came back (true). Back on
+    /// screen, the open channel counts as read again.
+    pub fn set_visible(&self, visible: bool) {
+        let mut e = self.engine.lock().unwrap();
+        e.visible = visible;
+        if let (true, Some(id)) = (visible, e.current.clone()) {
+            e.mark_read(&id);
+        }
+    }
+
+    /// Ids of our messages the relay hasn't confirmed yet (sending or failed).
+    pub fn unconfirmed(&self) -> Vec<String> {
+        let e = self.engine.lock().unwrap();
+        e.sending.keys().chain(e.failed.keys()).cloned().collect()
     }
 
     pub fn load_older(&self, channel: String) {
@@ -527,13 +556,14 @@ impl Client {
 
     /// Post `text` (and uploaded attachments) to a channel, or into the
     /// thread under `root`. Shows at once; the relay confirms later.
+    /// Returns the message id ("" when there was nothing to send).
     pub fn send(
         &self,
         channel: String,
         root: Option<String>,
         text: String,
         attachments: Vec<Attachment>,
-    ) -> Result<(), BuzzError> {
+    ) -> Result<String, BuzzError> {
         let mut e = self.engine.lock().unwrap();
         e.send(channel, root, text, &attachments)
     }
@@ -667,6 +697,7 @@ async fn run(
     mut rx: mpsc::UnboundedReceiver<Msg>,
     mut live_rx: mpsc::UnboundedReceiver<Live>,
     listener: Box<dyn Listener>,
+    stop: Arc<tokio::sync::Notify>,
 ) {
     let mut heartbeat = tokio::time::interval(Duration::from_secs(60));
     let mut channels_poll = tokio::time::interval(Duration::from_secs(300));
@@ -676,6 +707,7 @@ async fn run(
     loop {
         let mut changed = true;
         tokio::select! {
+            _ = stop.notified() => break,
             Some(msg) = rx.recv() => {
                 let mut e = engine.lock().unwrap();
                 e.handle(msg);
@@ -1089,7 +1121,7 @@ impl Engine {
             }
             Msg::Unread { channel, events } => {
                 let Ok(evs) = events else { return };
-                if self.current.as_deref() == Some(channel.as_str()) {
+                if self.visible && self.current.as_deref() == Some(channel.as_str()) {
                     return;
                 }
                 let me = self.me();
@@ -1161,7 +1193,13 @@ impl Engine {
                         }
                         self.want_profiles(want);
                     }
-                    Err(e) => self.notices.push(format!("couldn't load messages: {e}")),
+                    Err(e) => {
+                        // Opening it again retries.
+                        if !older {
+                            self.opened.remove(&channel);
+                        }
+                        self.notices.push(format!("couldn't load messages: {e}"));
+                    }
                 }
             }
             Msg::Events(Ok(evs)) => {
@@ -1279,7 +1317,7 @@ impl Engine {
         let applied = self.store.apply(ev);
         let mut want = vec![ev.pubkey.to_hex()];
         if let Applied::Message { channel, id } = applied {
-            let active = self.current.as_deref() == Some(channel.as_str());
+            let active = self.visible && self.current.as_deref() == Some(channel.as_str());
             let at = ev.created_at.as_secs();
             let author = ev.pubkey.to_hex();
             let seen = self.read.read_at(&channel).is_some_and(|r| at <= r);
@@ -1310,7 +1348,7 @@ impl Engine {
         root: Option<String>,
         text: String,
         attachments: &[Attachment],
-    ) -> Result<(), BuzzError> {
+    ) -> Result<String, BuzzError> {
         let mut content = text.trim_end().to_string();
         for a in attachments {
             let label = if a.mime.starts_with("video/") {
@@ -1322,7 +1360,7 @@ impl Engine {
         }
         let content = content.trim_start_matches('\n').to_string();
         if content.is_empty() {
-            return Ok(());
+            return Ok(String::new());
         }
         let mentioned = self.mentions_in(&channel, &content);
         let mut mentions = mentioned.clone();
@@ -1362,9 +1400,10 @@ impl Engine {
                         .filter_map(|pk| Tag::parse(["mention", pk.as_str()]).ok()),
                 );
         let ev = self.relay.sign(builder)?;
+        let id = ev.id.to_hex();
         self.store.apply(&ev);
         self.publish_message(ev);
-        Ok(())
+        Ok(id)
     }
 
     fn publish_message(&mut self, ev: Event) {
@@ -1626,6 +1665,7 @@ mod tests {
             read: ReadState::new(new_read_id(), new_read_id()),
             conn: Conn::Connecting,
             current: None,
+            visible: true,
             cursors: HashMap::new(),
             requested_profiles: HashSet::new(),
             opened: HashSet::new(),

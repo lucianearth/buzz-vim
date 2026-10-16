@@ -120,8 +120,7 @@ struct MessageRow: View {
                             Button("Send again") { client.retry(id: m.id) }
                             Button("Discard, keep the text", role: .destructive) {
                                 if let t = client.discard(id: m.id) {
-                                    UIPasteboard.general.string = t
-                                    model.say("discarded. The text is on your clipboard.")
+                                    model.takeBack(id: m.id, text: t)
                                 }
                             }
                         }

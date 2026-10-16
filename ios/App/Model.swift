@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 import Observation
 import Security
 
@@ -17,6 +18,15 @@ final class Model {
     var drafts: [String: String] = UserDefaults.standard.dictionary(forKey: "drafts") as? [String: String] ?? [:] {
         didSet { UserDefaults.standard.set(drafts, forKey: "drafts") }
     }
+
+    /// Sends the relay hasn't confirmed: message id -> [draft key, text].
+    /// What is still here at launch never confirmed, so it goes back into
+    /// its compose box rather than vanishing.
+    private var outbox: [String: [String]] = UserDefaults.standard.dictionary(forKey: "outbox") as? [String: [String]] ?? [:] {
+        didSet { UserDefaults.standard.set(outbox, forKey: "outbox") }
+    }
+    /// Ids sent since launch.
+    private var mine: Set<String> = []
 
     static let defaultRelay = "wss://buzz.gitcoin.co"
 
@@ -71,6 +81,7 @@ final class Model {
         let chosen = d.stringArray(forKey: "chosen") ?? []
         client = try Client(relayUrl: relay, secret: secret, chosen: chosen,
                             readSlot: slot, readClient: cid, authTag: authTag, listener: Poke(model: self))
+        restoreUnsent()
     }
 
     func setChosen(_ ids: [String]) {
@@ -95,9 +106,46 @@ final class Model {
 
     func bump() {
         version &+= 1
+        if let c = client, !mine.isEmpty {
+            let pending = Set(c.unconfirmed())
+            for id in mine where !pending.contains(id) {
+                mine.remove(id)
+                outbox[id] = nil
+            }
+        }
         if let n = client?.takeNotices(), let last = n.last {
             say(last)
         }
+    }
+
+    func sent(id: String, key: String, text: String) {
+        guard !id.isEmpty else { return }
+        mine.insert(id)
+        outbox[id] = [key, text]
+    }
+
+    /// A failed message taken back: its text returns to its compose box.
+    func takeBack(id: String, text: String) {
+        let key = outbox[id]?.first
+        mine.remove(id)
+        outbox[id] = nil
+        if let key {
+            drafts[key] = [drafts[key], text].compactMap { $0 }.joined(separator: "\n")
+            say("the message is back in its compose box")
+        } else {
+            UIPasteboard.general.string = text
+            say("discarded. The text is on your clipboard.")
+        }
+    }
+
+    private func restoreUnsent() {
+        let left = outbox.filter { !mine.contains($0.key) }
+        guard !left.isEmpty else { return }
+        for (id, kt) in left where kt.count == 2 {
+            drafts[kt[0]] = [drafts[kt[0]], kt[1]].compactMap { $0 }.joined(separator: "\n")
+            outbox[id] = nil
+        }
+        say("a message from last time may not have sent. It's back in its compose box.")
     }
 
     func say(_ s: String) {

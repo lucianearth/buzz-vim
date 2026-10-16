@@ -14,8 +14,12 @@ struct BuzzVimApp: App {
         }
         .onChange(of: phase) { _, now in
             switch now {
-            case .background: model.client?.flush()
-            case .active: model.client?.resume()
+            case .background:
+                model.client?.setVisible(visible: false)
+                model.client?.flush()
+            case .active:
+                model.client?.setVisible(visible: true)
+                model.client?.resume()
             default: break
             }
         }

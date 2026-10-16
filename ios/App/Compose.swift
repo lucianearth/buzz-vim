@@ -147,7 +147,8 @@ struct ComposeBar: View {
     private func send() {
         let body = text.wrappedValue
         do {
-            try client.send(channel: channel, root: root, text: body, attachments: attachments)
+            let id = try client.send(channel: channel, root: root, text: body, attachments: attachments)
+            model.sent(id: id, key: key, text: body)
             text.wrappedValue = ""
             attachments = []
         } catch let BuzzError.Failed(message) {
