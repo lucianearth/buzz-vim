@@ -1410,7 +1410,7 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 }
 
 fn draw_sections(f: &mut Frame, app: &mut App, area: Rect) {
-    let h = (app.sections.len() as u16 + 10).max(13);
+    let h = (app.sections.len() as u16 + 11).max(14);
     let r = centered(area, 60, h);
     clear(f, r);
     let block = Block::bordered()
@@ -1432,7 +1432,7 @@ fn draw_sections(f: &mut Frame, app: &mut App, area: Rect) {
     }
     // Rows left for the list after the heading and the legend. A long list
     // scrolls to keep the cursor in view.
-    let rows = (inner.height as usize).saturating_sub(7).max(1);
+    let rows = (inner.height as usize).saturating_sub(8).max(1);
     let first = app
         .picker_cursor
         .saturating_sub(rows / 2)
@@ -1487,6 +1487,7 @@ fn draw_sections(f: &mut Frame, app: &mut App, area: Rect) {
         ("j k", "move"),
         ("⏎", "switch to this section"),
         ("space", "mark [x] to show several, then ⏎"),
+        ("m", "move this channel into it"),
         ("R", "reload  ·  esc  cancel"),
     ]
     .into_iter()
