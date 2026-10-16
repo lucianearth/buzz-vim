@@ -8,6 +8,7 @@ struct ChannelView: View {
     @Environment(Model.self) private var model
     @Environment(\.theme) private var theme
     @State private var edges = Edges()
+    @State private var fling = Fling()
 
     var body: some View {
         let _ = model.version
@@ -46,6 +47,7 @@ struct ChannelView: View {
                 }
                 .padding(.horizontal, 22)
                 .padding(.top, 6)
+                .background(FlingStop(fling: fling))
             }
             .defaultScrollAnchor(.bottom)
             .defaultScrollAnchor(.bottom, for: .sizeChanges)
@@ -69,6 +71,7 @@ struct ChannelView: View {
             .onAppear { scrollToTarget(proxy) }
             .overlay(alignment: .bottomTrailing) {
                 EdgeButtons(edges: edges) { top in
+                    fling.stop()
                     withAnimation(.easeOut(duration: 0.25)) {
                         proxy.scrollTo(top ? "top" : "end", anchor: top ? .top : .bottom)
                     }
@@ -132,6 +135,42 @@ struct EdgeButtons: View {
                 .overlay(Circle().stroke(theme.rule, lineWidth: 1))
         }
         .transition(.opacity)
+    }
+}
+
+/// The list's UIScrollView, to stop a fling: while one runs, SwiftUI's
+/// scrollTo is overridden by it and the top/bottom buttons go nowhere.
+final class Fling {
+    weak var view: UIScrollView?
+
+    func stop() {
+        guard let v = view, v.isDecelerating || v.isDragging else { return }
+        v.setContentOffset(v.contentOffset, animated: false)
+    }
+}
+
+/// Put inside a ScrollView's content: finds that UIScrollView for `fling`.
+struct FlingStop: UIViewRepresentable {
+    let fling: Fling
+
+    func makeUIView(context: Context) -> UIView {
+        let v = Finder()
+        v.found = { [weak fling] in fling?.view = $0 }
+        v.isUserInteractionEnabled = false
+        return v
+    }
+
+    func updateUIView(_ v: UIView, context: Context) {}
+
+    final class Finder: UIView {
+        var found: ((UIScrollView) -> Void)?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            var s = superview
+            while let v = s, !(v is UIScrollView) { s = v.superview }
+            if let sv = s as? UIScrollView { found?(sv) }
+        }
     }
 }
 

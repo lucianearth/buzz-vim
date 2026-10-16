@@ -13,6 +13,7 @@ struct ThreadView: View {
     /// left the thread on its root.
     @State private var position = ScrollPosition(idType: String.self)
     @State private var edges = Edges()
+    @State private var fling = Fling()
 
     var body: some View {
         let _ = model.version
@@ -55,6 +56,7 @@ struct ThreadView: View {
                     .padding(.top, 4)
                     // A short thread starts under the header, not at the bottom.
                     .frame(minHeight: geo.size.height, alignment: .top)
+                    .background(FlingStop(fling: fling))
                 }
                 // Opened on a reply by the bell key: hold the top, so the
                 // keyboard coming up doesn't push the reply off screen.
@@ -65,6 +67,7 @@ struct ThreadView: View {
                 .onScrollGeometryChange(for: Edges.self, of: Edges.init) { _, now in edges = now }
                 .overlay(alignment: .bottomTrailing) {
                     EdgeButtons(edges: edges) { top in
+                        fling.stop()
                         withAnimation(.easeOut(duration: 0.25)) { position.scrollTo(edge: top ? .top : .bottom) }
                     }
                 }
