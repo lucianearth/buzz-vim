@@ -308,6 +308,7 @@ enum Msg {
         result: anyhow::Result<()>,
     },
     Moved(anyhow::Result<(Event, String)>),
+    Notice(String),
 }
 
 struct Engine {
@@ -769,7 +770,8 @@ impl Client {
     pub fn retry(&self, id: String) {
         let mut e = self.engine.lock().unwrap();
         if let Some(ev) = e.failed.remove(&id) {
-            e.publish_message(ev);
+            let channel = model::tag(&ev, "h").unwrap_or_default().to_string();
+            e.publish_message(ev, channel, vec![]);
         }
     }
 
@@ -1486,6 +1488,7 @@ impl Engine {
                 }
             }
             Msg::Events(Err(e)) => self.notices.push(format!("couldn't load: {e}")),
+            Msg::Notice(n) => self.notices.push(n),
             Msg::Sent { id, result } => {
                 let Some(ev) = self.sending.remove(&id) else {
                     return;
@@ -1712,15 +1715,26 @@ impl Engine {
         let ev = self.relay.sign(builder)?;
         let id = ev.id.to_hex();
         self.store.apply(&ev);
-        self.publish_message(ev);
+        // Agents it @mentions who aren't here yet join first, so they see it.
+        let ours = &self.agents.by_pubkey;
+        let invite = self
+            .store
+            .bring_in(&channel, &mentions, |pk| ours.contains_key(pk));
+        self.publish_message(ev, channel, invite);
         Ok(id)
     }
 
-    fn publish_message(&mut self, ev: Event) {
+    fn publish_message(&mut self, ev: Event, channel: String, invite: Vec<String>) {
         let id = ev.id.to_hex();
         self.sending.insert(id.clone(), ev.clone());
         let r = self.relay.clone();
+        let tx = self.tx.clone();
         self.spawn(async move {
+            if !invite.is_empty() {
+                if let Err(e) = r.add_members(&channel, &invite).await {
+                    let _ = tx.send(Msg::Notice(format!("couldn't add to channel: {e}")));
+                }
+            }
             let result = r.publish(&ev).await;
             Msg::Sent { id, result }
         });

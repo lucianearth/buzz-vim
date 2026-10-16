@@ -179,6 +179,21 @@ impl Relay {
         Err(last.unwrap_or_else(|| anyhow!("query failed")))
     }
 
+    /// Add each agent to the channel as a bot (NIP-29 kind 9000), one at a
+    /// time. Stops at the first the relay refuses.
+    pub async fn add_members(&self, channel: &str, pubkeys: &[String]) -> Result<()> {
+        let uuid = uuid::Uuid::parse_str(channel).context("bad channel id")?;
+        for pk in pubkeys {
+            let ev = self.sign(buzz_sdk::build_add_member(
+                uuid,
+                pk,
+                Some(buzz_sdk::MemberRole::Bot),
+            )?)?;
+            self.publish(&ev).await?;
+        }
+        Ok(())
+    }
+
     /// Submit a signed event (`POST /events`). Errors when the relay rejects it.
     pub async fn publish(&self, event: &Event) -> Result<()> {
         let url = format!("{}/events", self.base);

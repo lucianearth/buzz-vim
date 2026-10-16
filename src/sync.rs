@@ -626,8 +626,23 @@ impl Sync {
         });
         app.pending_sends
             .insert(id.clone(), (channel.clone(), root.clone(), draft));
+        // Agents it @mentions who aren't here yet join first, so they see it.
+        let ours = &app.agents.by_pubkey;
+        let invite = app
+            .store
+            .bring_in(&channel, &mentions, |pk| ours.contains_key(pk));
+        let names: Vec<String> = invite.iter().map(|pk| app.store.name_of(pk)).collect();
         let r = self.relay.clone();
+        let tx = self.tx.clone();
         self.spawn(async move {
+            if !invite.is_empty() {
+                let added = r.add_members(&channel, &invite).await;
+                let _ = tx.send(Msg::Did(
+                    added
+                        .map(|_| format!("added {} to the channel", names.join(", ")))
+                        .map_err(|e| e.context("couldn't add to the channel")),
+                ));
+            }
             let result = r.publish(&ev).await.map(|_| ());
             Msg::Sent { id, result }
         });
