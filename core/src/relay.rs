@@ -192,6 +192,11 @@ impl Relay {
             .await?;
         let s = r.status();
         let t = r.text().await.unwrap_or_default();
+        // A 5xx may have stored it anyway, so it isn't a rejection: sending
+        // the same event again is the safe retry.
+        if s.is_server_error() {
+            bail!("relay error ({s}): {t}");
+        }
         if !s.is_success() {
             bail!("relay rejected event ({s}): {t}");
         }
