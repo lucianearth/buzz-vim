@@ -602,7 +602,7 @@ fn draw_blocks(
     let cur_idx = cursor.and_then(|c| blocks.iter().position(|b| b.id == c));
     // Default: newest at the bottom. With a cursor, scroll just enough.
     let mut top = total.saturating_sub(h);
-    // The cursor has moved off the jump key's landing: stop pinning it.
+    // The cursor has moved off the bell's landing: stop pinning it.
     if app
         .anchor
         .as_ref()
@@ -619,7 +619,7 @@ fn draw_blocks(
         let a: usize = heights[..i].iter().sum();
         let b = a + heights[i];
         if anchored(i) {
-            // The jump key's landing: this message at the top.
+            // The bell's landing: this message at the top.
             top = a.min(top);
         }
         if b > top + h {

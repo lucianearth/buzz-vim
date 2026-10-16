@@ -183,15 +183,12 @@ pub struct App {
     prefill: Option<String>,
     /// Read positions shared with Desktop and our other devices.
     pub read: ReadState,
-    /// channel -> where it was read up to when you came into it: newer
-    /// top-level messages are what the jump key visits.
-    pub entry: HashMap<String, u64>,
-    /// Top-level messages the jump key has already been to.
-    pub visited: HashSet<String>,
+    /// channel -> the bell's last place there (see [`unread::bell`]).
+    pub bell: HashMap<String, (u64, Next)>,
     /// Identities the relay has archived: left out of @ completion.
     pub archived: HashSet<String>,
     /// A message to keep at the top of its pane while it is the cursor
-    /// (the jump key lands on the first unread with it at the top).
+    /// (the bell lands with it at the top).
     pub anchor: Option<(Pane, String)>,
 }
 
@@ -249,8 +246,7 @@ impl App {
             last_bot: HashMap::new(),
             prefill: None,
             read: ReadState::new(readstate::new_id(), readstate::new_id()),
-            entry: HashMap::new(),
-            visited: HashSet::new(),
+            bell: HashMap::new(),
             archived: HashSet::new(),
             anchor: None,
         }
@@ -369,11 +365,6 @@ impl App {
 
     pub fn open_current(&mut self) {
         if let Some(id) = self.current().map(str::to_string) {
-            // Before OpenChannel marks it read. Until the startup load is
-            // in, the position is unknown; that load fills it in.
-            if let Some(at) = self.read.read_at(&id).filter(|_| self.read.tried) {
-                self.entry.insert(id.clone(), at);
-            }
             let ch = self.store.channel_mut(&id);
             ch.unread.clear();
             ch.mentioned.clear();
@@ -387,51 +378,26 @@ impl App {
             .mark(&unread::thread_key(root), crate::sync::now());
     }
 
-    /// The jump key: the first unread thing in this tab, oldest first; a
-    /// reply opens its thread with that reply at the top. With nothing
-    /// unread here, on to the next tab that has some, mentions first.
-    fn next_unread(&mut self) {
-        let now = crate::sync::now();
-        let here = |app: &App| {
-            let c = app.current()?;
-            unread::next_unread(
-                app.store.channels.get(c)?,
-                &app.store.me,
-                &app.read,
-                app.entry.get(c).copied(),
-                &app.visited,
-                now,
-            )
-        };
-        if let Some(n) = here(self) {
-            self.land(n);
+    /// The bell: the newest activity in this tab, read or not; a thread
+    /// opens on its first new reply, at the top. The same place again
+    /// until something newer arrives. Never leaves the tab.
+    fn bell(&mut self) {
+        let Some(c) = self.current().map(str::to_string) else {
             return;
-        }
-        let len = self.tabs.len();
-        let order: Vec<usize> = (1..len).map(|k| (self.active + k) % len).collect();
-        let count = |i: &usize, mentions: bool| {
-            self.store.channels.get(&self.tabs[*i]).map_or(0, |c| {
-                if mentions && !c.is_dm {
-                    c.mentioned.len()
-                } else {
-                    c.unread.len()
-                }
-            })
         };
-        let pick = order
-            .iter()
-            .find(|i| count(i, true) > 0)
-            .or_else(|| order.iter().find(|i| count(i, false) > 0))
-            .copied();
-        match pick {
-            Some(i) => {
-                self.switch_tab(i);
-                if let Some(n) = here(self) {
-                    self.land(n);
-                }
-            }
-            None => self.say("nothing unread"),
-        }
+        let Some(b) = self.store.channels.get(&c).and_then(|ch| {
+            unread::bell(
+                ch,
+                &self.store.me,
+                &self.read,
+                crate::sync::now(),
+                self.bell.get(&c),
+            )
+        }) else {
+            return;
+        };
+        self.bell.insert(c, b.clone());
+        self.land(b.1);
     }
 
     fn land(&mut self, n: Next) {
@@ -441,7 +407,6 @@ impl App {
         self.peek = None;
         match n {
             Next::Message(id) => {
-                self.visited.insert(id.clone());
                 self.thread = None;
                 self.thread_selected = None;
                 self.focus = Pane::Timeline;
@@ -1173,7 +1138,7 @@ impl App {
             }
             KeyCode::Char('o') => self.open_viewer(),
             KeyCode::Char('O') => self.open_in_os(),
-            KeyCode::Char('n') => self.next_unread(),
+            KeyCode::Char('n') => self.bell(),
             KeyCode::Char('[') => self.nudge_width(-4),
             KeyCode::Char(']') => self.nudge_width(4),
             _ => {}
@@ -1788,7 +1753,7 @@ mod tests {
     }
 
     #[test]
-    fn n_walks_unread_then_moves_on_mentions_first() {
+    fn n_goes_to_the_newest_activity_and_stays() {
         let now = crate::sync::now();
         let mut app = App::new("me".into(), None);
         app.tabs = vec!["a".into(), "b".into(), "c".into()];
@@ -1810,27 +1775,23 @@ mod tests {
             }
         };
         put(&mut app, "a", "a1", now - 50, None);
-        put(&mut app, "a", "a1r", now - 40, Some("a1"));
-        put(&mut app, "a", "a2", now - 30, None);
-        app.entry.insert("a".into(), now - 45);
+        put(&mut app, "a", "a2", now - 40, None);
+        put(&mut app, "a", "a1r", now - 30, Some("a1"));
+        app.store.channel_mut("b").unread.insert("x".into(), now);
         let key = |app: &mut App| app.on_key(KeyEvent::from(KeyCode::Char('n')));
-        // The reply in a1's thread is oldest: its thread opens on it.
+        // The reply is newest: a1's thread opens on it.
         key(&mut app);
         assert_eq!(app.thread, Some(("a".into(), "a1".into())));
         assert_eq!(app.cursor_message().as_deref(), Some("a1r"));
         assert_eq!(app.anchor, Some((Pane::Thread, "a1r".into())));
-        // Then the newer top-level message.
+        // Again: same place, same tab.
+        key(&mut app);
+        assert_eq!(app.current(), Some("a"));
+        assert_eq!(app.cursor_message().as_deref(), Some("a1r"));
+        // A newer top-level post takes over.
+        put(&mut app, "a", "a3", now - 10, None);
         key(&mut app);
         assert_eq!(app.thread, None);
-        assert_eq!(app.cursor_message().as_deref(), Some("a2"));
-        // Nothing left here: the tab that mentions you comes before the one
-        // that is merely unread.
-        app.store.channel_mut("b").unread.insert("x".into(), now);
-        let c = app.store.channel_mut("c");
-        c.unread.insert("y".into(), now);
-        c.mentioned.insert("y".into());
-        key(&mut app);
-        assert_eq!(app.current(), Some("c"));
-        assert!(app.store.channels["c"].mentioned.is_empty());
+        assert_eq!(app.cursor_message().as_deref(), Some("a3"));
     }
 }

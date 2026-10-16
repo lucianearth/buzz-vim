@@ -6,14 +6,14 @@ private let holdLog = Logger(subsystem: "com.lucianhymer.buzzvim", category: "ho
 struct Route: Hashable {
     let channel: String
     let root: String
-    /// A reply to open the thread on, at the top (the jump key).
+    /// A reply to open the thread on, at the top (the bell).
     var focus: String? = nil
 }
 
 /// Tab moves for the keyboard bar, from wherever the compose box is.
 struct Nav {
     var step: (Int) -> Void = { _ in }
-    var nextUnread: () -> Void = {}
+    var bell: () -> Void = {}
 }
 
 private struct NavKey: EnvironmentKey {
@@ -96,7 +96,7 @@ struct Home: View {
             }
         }
         .sensoryFeedback(.impact, trigger: switcher) { _, now in now }
-        .environment(\.nav, Nav(step: step, nextUnread: nextUnread))
+        .environment(\.nav, Nav(step: step, bell: bell))
         .onAppear { settle(tabs) }
         .onChange(of: tabs.map(\.id)) { _, _ in settle(client.tabs()) }
         .onChange(of: selected) { _, now in
@@ -133,31 +133,12 @@ struct Home: View {
         go(id)
     }
 
-    /// The bell key: the first unread thing in this tab, oldest first (a
-    /// reply opens its thread on it). Nothing here: on to the next tab
-    /// with something unread, mentions first.
-    private func nextUnread() {
-        if let s = selected, let j = client.nextUnread(channel: s) {
-            land(s, j)
-            return
-        }
-        let tabs = client.tabs()
-        guard !tabs.isEmpty else { return }
-        let i = tabs.firstIndex { $0.id == selected } ?? -1
-        let after = (1...tabs.count).map { tabs[(i + $0 + tabs.count) % tabs.count] }
-            .filter { $0.id != selected }
-        guard let t = after.first(where: { $0.mentions > 0 }) ?? after.first(where: { $0.unread > 0 }) else {
-            model.say("nothing unread")
-            return
-        }
-        // Open it now, so Rust notes where it was read up to before the jump.
-        client.openChannel(channel: t.id)
-        go(t.id)
-        if let j = client.nextUnread(channel: t.id) {
-            land(t.id, j)
-        } else {
-            model.focusKey = t.id
-        }
+    /// The bell key: the newest activity in this tab, read or not; a
+    /// thread opens on its first new reply. The same place again until
+    /// something newer arrives. Never leaves the tab.
+    private func bell() {
+        guard let s = selected, let j = client.bell(channel: s) else { return }
+        land(s, j)
     }
 
     private func land(_ channel: String, _ j: Jump) {

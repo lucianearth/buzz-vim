@@ -173,7 +173,7 @@ pub struct Timeline {
     pub latest: String,
 }
 
-/// Where the jump key lands: a top-level message, or a reply (`root` set)
+/// Where the bell lands: a top-level message, or a reply (`root` set)
 /// whose thread opens with it at the top.
 #[derive(uniffi::Record, Clone)]
 pub struct Jump {
@@ -340,11 +340,8 @@ struct Engine {
     loading_older: HashSet<String>,
     unread_checked: HashSet<String>,
     started: u64,
-    /// channel -> where it was read up to when it last came on screen:
-    /// newer top-level messages are what the jump key visits.
-    entry: HashMap<String, u64>,
-    /// Top-level messages the jump key has already been to.
-    visited: HashSet<String>,
+    /// channel -> the bell's last place there (see [`unread::bell`]).
+    bell: HashMap<String, (u64, Next)>,
     /// Identities the relay has archived: left out of @ completion.
     archived: HashSet<String>,
     /// Our sends the relay hasn't confirmed: id -> event.
@@ -432,8 +429,7 @@ impl Client {
             loading_older: HashSet::new(),
             unread_checked: HashSet::new(),
             started: now(),
-            entry: HashMap::new(),
-            visited: HashSet::new(),
+            bell: HashMap::new(),
             archived: HashSet::new(),
             sending: HashMap::new(),
             failed: HashMap::new(),
@@ -575,17 +571,8 @@ impl Client {
     /// The channel now on screen (or none): loads it and marks it read.
     pub fn open_channel(&self, channel: Option<String>) {
         let mut e = self.engine.lock().unwrap();
-        let fresh = e.current != channel;
         e.current = channel.clone();
         if let Some(id) = channel {
-            // Coming onto it: remember where it was read up to first. Until
-            // the startup load is in that is unknown; the load fills it in.
-            if fresh && e.read.tried {
-                match e.read.read_at(&id) {
-                    Some(at) => e.entry.insert(id.clone(), at),
-                    None => e.entry.remove(&id),
-                };
-            }
             e.mark_read(&id);
             e.open(&id);
         }
@@ -659,26 +646,16 @@ impl Client {
         e.read.mark(&unread::thread_key(&root), now());
     }
 
-    /// The jump key in `channel`: the oldest unread thing there, or none
-    /// (then the app moves on to the next tab with something unread). A
-    /// top-level message counts as visited once returned; a reply's thread
-    /// is marked read when the app opens it.
-    pub fn next_unread(&self, channel: String) -> Option<Jump> {
+    /// The bell in `channel`: the newest activity there, read or not; a
+    /// thread opens on its first new reply. The same place again until
+    /// something newer arrives.
+    pub fn bell(&self, channel: String) -> Option<Jump> {
         let mut e = self.engine.lock().unwrap();
         let ch = e.store.channels.get(&channel)?;
-        let next = unread::next_unread(
-            ch,
-            &e.store.me,
-            &e.read,
-            e.entry.get(&channel).copied(),
-            &e.visited,
-            now(),
-        )?;
-        Some(match next {
-            Next::Message(id) => {
-                e.visited.insert(id.clone());
-                Jump { root: None, id }
-            }
+        let b = unread::bell(ch, &e.store.me, &e.read, now(), e.bell.get(&channel))?;
+        e.bell.insert(channel, b.clone());
+        Some(match b.1 {
+            Next::Message(id) => Jump { root: None, id },
             Next::Reply { root, id } => Jump {
                 root: Some(root),
                 id,
@@ -1319,7 +1296,7 @@ impl Engine {
                 continue;
             }
             // A week back: what's after the read position is unread, and
-            // the replies feed "(N new)" and the jump key.
+            // the replies feed "(N new)" and the bell.
             let since = now().saturating_sub(unread::HORIZON);
             let r = self.relay.clone();
             let channel = id.clone();
@@ -1348,17 +1325,8 @@ impl Engine {
         match msg {
             Msg::ReadState(r) => {
                 if let Ok(evs) = r {
-                    // Where the open channel was read up to before this
-                    // run marked it, for the jump key.
-                    let mut before = ReadState::new(String::new(), String::new());
                     for ev in &evs {
-                        before.apply(&self.relay.keys, ev);
                         self.read.apply(&self.relay.keys, ev);
-                    }
-                    if let Some(c) = self.current.clone() {
-                        if let Some(at) = before.read_at(&c) {
-                            self.entry.insert(c, at);
-                        }
                     }
                     self.read.loaded = true;
                 }
@@ -1991,8 +1959,7 @@ mod tests {
             loading_older: HashSet::new(),
             unread_checked: HashSet::new(),
             started: 0,
-            entry: HashMap::new(),
-            visited: HashSet::new(),
+            bell: HashMap::new(),
             archived: HashSet::new(),
             sending: HashMap::new(),
             failed: HashMap::new(),

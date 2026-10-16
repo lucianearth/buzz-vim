@@ -1,13 +1,11 @@
 //! What counts as new, shared by both apps: the "(N new)" on a reply line,
-//! where the jump-to-unread key goes, and the newest-activity highlight.
-
-use std::collections::HashSet;
+//! where the bell goes, and the newest-activity highlight.
 
 use crate::model::{Channel, Message};
 use crate::readstate::ReadState;
 
 /// How far back a reply counts as new when its thread has no read
-/// position anywhere. Also how far back the unread lookup reaches.
+/// position anywhere.
 pub const HORIZON: u64 = 7 * 86_400;
 
 /// The read-state context for a thread (Desktop's key).
@@ -44,63 +42,51 @@ pub fn new_replies<'a>(
         .collect()
 }
 
-/// Where the jump key goes in a channel.
+/// Where the bell goes in a channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Next {
     /// A top-level message.
     Message(String),
-    /// The first new reply in a thread.
+    /// A reply in a thread.
     Reply { root: String, id: String },
 }
 
-/// The oldest unread thing in a channel: a top-level message from someone
-/// else after `entry` (the read position when you came into the channel)
-/// that the key hasn't visited yet, or a new reply (see [`new_replies`]).
-pub fn next_unread(
+/// The bell: the newest activity in a channel, read or not. A top-level
+/// post is itself; a thread opens on its first new reply (see
+/// [`new_replies`]), or its newest once all of it is read. `last` is the
+/// previous press here: until something newer arrives, the same place
+/// (opening the thread marks it read, which would move a fresh answer).
+pub fn bell(
     ch: &Channel,
     me: &str,
     read: &ReadState,
-    entry: Option<u64>,
-    visited: &HashSet<String>,
     now: u64,
-) -> Option<Next> {
-    let after = entry.unwrap_or(now.saturating_sub(HORIZON));
-    let mut best: Option<(u64, Next)> = None;
-    let mut offer = |at: u64, n: Next| {
-        if best.as_ref().is_none_or(|(b, _)| at < *b) {
-            best = Some((at, n));
-        }
-    };
-    for id in &ch.timeline {
-        let Some(m) = ch.messages.get(id) else {
-            continue;
-        };
-        if !m.deleted
-            && !m.system
-            && m.author != me
-            && m.created_at > after
-            && !visited.contains(id)
-        {
-            offer(m.created_at, Next::Message(id.clone()));
-        }
+    last: Option<&(u64, Next)>,
+) -> Option<(u64, Next)> {
+    let (at, root) = newest(ch)?;
+    if let Some(l) = last.filter(|l| l.0 == at) {
+        return Some(l.clone());
     }
-    for root in ch.replies.keys() {
-        if let Some(r) = new_replies(ch, root, me, read, now).first() {
-            offer(
-                r.created_at,
-                Next::Reply {
-                    root: root.clone(),
-                    id: r.id.clone(),
-                },
-            );
-        }
+    let m = ch.messages.get(&root)?;
+    if at == m.created_at {
+        return Some((at, Next::Message(root)));
     }
-    best.map(|(_, n)| n)
+    let id = new_replies(ch, &root, me, read, now)
+        .first()
+        .map(|r| r.id.clone())
+        .or_else(|| ch.replies.get(&root).and_then(|r| r.last().cloned()))
+        .unwrap_or_else(|| root.clone());
+    Some((at, Next::Reply { root, id }))
 }
 
 /// The top-level message with the newest activity: its own time or its
 /// latest reply's, whichever is later.
 pub fn latest(ch: &Channel) -> Option<String> {
+    newest(ch).map(|(_, id)| id)
+}
+
+/// [`latest`] with that activity's time.
+fn newest(ch: &Channel) -> Option<(u64, String)> {
     ch.timeline
         .iter()
         .filter_map(|id| ch.messages.get(id))
@@ -115,7 +101,6 @@ pub fn latest(ch: &Channel) -> Option<String> {
             (m.created_at.max(reply).max(summary), m.id.clone())
         })
         .max()
-        .map(|(_, id)| id)
 }
 
 #[cfg(test)]
@@ -143,34 +128,47 @@ mod tests {
     }
 
     #[test]
-    fn jump_walks_oldest_first_and_threads_clear_when_read() {
+    fn bell_goes_to_the_newest_activity_and_stays_there() {
         let now = 1_000_000;
         let mut s = Store::new("me".into());
         put(&mut s, "old", "a", now - 500, None);
         put(&mut s, "t1", "me", now - 400, None);
-        put(&mut s, "t1r", "a", now - 300, Some("t1"));
+        put(&mut s, "t1a", "a", now - 300, Some("t1"));
+        put(&mut s, "t1b", "b", now - 250, Some("t1"));
         put(&mut s, "m2", "b", now - 200, None);
-        put(&mut s, "mine", "me", now - 100, None);
         let mut read = ReadState::new(new_id(), "x".into());
-        let ch = &s.channels["c"];
-        let mut visited = HashSet::new();
-        let entry = Some(now - 450);
-        let next =
-            |read: &ReadState, v: &HashSet<String>| next_unread(ch, "me", read, entry, v, now);
-        assert_eq!(
-            next(&read, &visited),
-            Some(Next::Reply {
-                root: "t1".into(),
-                id: "t1r".into()
-            })
-        );
-        assert_eq!(new_replies(ch, "t1", "me", &read, now).len(), 1);
+        read.mark(&thread_key("t1"), now - 350);
+        // A top-level post is newest: it is the place.
+        let b = bell(&s.channels["c"], "me", &read, now, None);
+        assert_eq!(b, Some((now - 200, Next::Message("m2".into()))));
+        // Still there on a second press.
+        assert_eq!(bell(&s.channels["c"], "me", &read, now, b.as_ref()), b);
+        // A reply makes the thread newest: its first unread reply.
+        put(&mut s, "t1c", "a", now - 100, Some("t1"));
+        let b = bell(&s.channels["c"], "me", &read, now, b.as_ref());
+        let first = Next::Reply {
+            root: "t1".into(),
+            id: "t1a".into(),
+        };
+        assert_eq!(b, Some((now - 100, first.clone())));
+        // Opening the thread reads it, but the bell doesn't move.
         read.mark(&thread_key("t1"), now);
-        assert!(new_replies(ch, "t1", "me", &read, now).is_empty());
-        assert_eq!(next(&read, &visited), Some(Next::Message("m2".into())));
-        visited.insert("m2".to_string());
-        assert_eq!(next(&read, &visited), None);
-        assert_eq!(latest(ch).as_deref(), Some("mine"));
+        assert_eq!(
+            bell(&s.channels["c"], "me", &read, now, b.as_ref()),
+            Some((now - 100, first))
+        );
+        // Fresh, with all of it read: the newest reply.
+        assert_eq!(
+            bell(&s.channels["c"], "me", &read, now, None),
+            Some((
+                now - 100,
+                Next::Reply {
+                    root: "t1".into(),
+                    id: "t1c".into()
+                }
+            ))
+        );
+        assert_eq!(latest(&s.channels["c"]).as_deref(), Some("t1"));
     }
 
     #[test]

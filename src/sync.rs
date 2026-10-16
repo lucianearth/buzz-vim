@@ -280,7 +280,7 @@ impl Sync {
 
     /// Look up the last week of messages and thread replies in each tab we
     /// haven't checked yet: what's after its read position is unread, and
-    /// the replies feed "(N new)" and the jump key.
+    /// the replies feed "(N new)" and the bell.
     pub fn check_unread(&mut self, read: &ReadState, tabs: &[String]) {
         if !read.tried {
             return;
