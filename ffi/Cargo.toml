@@ -1,0 +1,35 @@
+[package]
+name = "buzz-vim-ffi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "buzz-vim-core for the iPhone app, through UniFFI"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["lib", "staticlib"]
+name = "buzz_vim_ffi"
+
+# An example, not a bin: a second package with a bin breaks
+# `cargo install --git` for the terminal app.
+[[example]]
+name = "uniffi-bindgen"
+
+[dependencies]
+anyhow = "1.0.104"
+buzz-vim-core = { path = "../core" }
+buzz-ws-client = { git = "https://github.com/block/buzz", rev = "5397ea49e27fd56d4e0346e2120906d09ac91579" }
+buzz-core = { git = "https://github.com/block/buzz", rev = "5397ea49e27fd56d4e0346e2120906d09ac91579" }
+buzz-sdk = { git = "https://github.com/block/buzz", rev = "5397ea49e27fd56d4e0346e2120906d09ac91579" }
+nostr = { version = "0.44", features = ["nip44", "nip98"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+serde_json = "1.0.154"
+thiserror = "2"
+tokio = { version = "1.53.3", features = ["full"] }
+uniffi = { version = "0.32", features = ["cli", "tokio"] }
+uuid = "1.28.0"
+zeroize = "1"
+
+[dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring"] }

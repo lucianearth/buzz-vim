@@ -60,7 +60,7 @@ pub struct Media {
     pub dim: Option<(u32, u32)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Message {
     pub id: String,
     pub author: String,
@@ -122,10 +122,16 @@ impl Message {
             edited: false,
             deleted: false,
             root,
+            // A notified mention carries both a `p` and a `mention` tag.
             mentions: tags(ev, "p")
                 .chain(tags(ev, "mention"))
                 .filter_map(|t| t.get(1).cloned())
-                .collect(),
+                .fold(vec![], |mut out, pk| {
+                    if !out.contains(&pk) {
+                        out.push(pk);
+                    }
+                    out
+                }),
             media,
             system: ev.kind.as_u16() == KIND_SYSTEM,
         }
@@ -161,6 +167,8 @@ pub struct Channel {
     pub loaded: bool,
     /// Unread top-level messages: id -> created_at.
     pub unread: HashMap<String, u64>,
+    /// The unread ones that mention us.
+    pub mentioned: HashSet<String>,
     pub oldest: Option<u64>,
     pub exhausted: bool,
 }
@@ -179,6 +187,8 @@ impl Channel {
 pub struct Profile {
     pub name: String,
     pub is_agent: bool,
+    /// Avatar URL, "" when none.
+    pub picture: String,
 }
 
 #[derive(Default)]
@@ -342,6 +352,11 @@ impl Store {
                 let p = self.profiles.entry(ev.pubkey.to_hex()).or_default();
                 p.name = name;
                 p.is_agent |= is_agent;
+                p.picture = v
+                    .get("picture")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 Applied::Changed
             }
             KIND_CHANNEL_META => {
@@ -519,6 +534,20 @@ mod tests {
             .custom_created_at(nostr::Timestamp::from(at))
             .sign_with_keys(keys)
             .unwrap()
+    }
+
+    #[test]
+    fn a_mention_with_p_and_mention_tags_counts_once() {
+        let a = Keys::generate();
+        let pk = "ab".repeat(32);
+        let m = ev(
+            &a,
+            9,
+            "hi",
+            vec![vec!["h", "c"], vec!["p", &pk], vec!["mention", &pk]],
+            1,
+        );
+        assert_eq!(Message::from_event(&m).mentions, vec![pk]);
     }
 
     #[test]

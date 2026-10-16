@@ -31,6 +31,7 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
     match mode {
         Mode::Normal => &[
             ("j k ↑↓", "move", true),
+            ("n", "next unread (into threads too)", true),
             ("0-9", "tab", false),
             ("H L ⇥", "prev/next tab", false),
             ("⏎ l →", "thread", true),
@@ -38,6 +39,7 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("+", "👍", false),
             ("s", "sections", false),
             ("o", "image", true),
+            ("O", "images in Preview (a thread: all of them)", false),
             ("f", "follow link", true),
             ("⌫ ^o", "back to where a link took you from", false),
             ("[ ]", "narrower / wider (or drag the right edge)", false),
@@ -73,6 +75,7 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("j k", "move", true),
             ("space", "mark several", true),
             ("⏎", "switch", true),
+            ("m", "move this channel here", true),
             ("R", "reload from relay", true),
             ("esc", "cancel", true),
         ],
@@ -80,6 +83,7 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
         Mode::Viewer => &[
             ("← →", "prev / next image", true),
             ("esc q o", "close", true),
+            ("O", "Preview (a thread: all of them, one window)", true),
         ],
         Mode::Help => &[("esc ?", "close", true)],
         Mode::Hint => &[

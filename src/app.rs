@@ -16,8 +16,10 @@ use crate::keys::Mode;
 use crate::live::ConnState;
 use crate::media::Media;
 use crate::model::Store;
+use crate::readstate::{self, ReadState};
 use crate::sections::Section;
 use crate::telemetry::Agents;
+use crate::unread::{self, Next};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Pane {
@@ -73,6 +75,11 @@ pub enum Action {
     Upload,
     LoadOlder(String),
     ReloadSections,
+    /// Move a channel into a section (`None` = the unsectioned group).
+    MoveChannel {
+        channel: String,
+        section: Option<String>,
+    },
     LoadImage(String),
     EncodeImage((String, u16, u16)),
     /// Decode the pending upload so the confirm box can show it.
@@ -86,6 +93,12 @@ pub enum Action {
     },
     /// Hand a URL to the OS (browser, Buzz Desktop).
     OpenUrl(String),
+    /// Download images and open them in the OS viewer (Preview), all in
+    /// one window, showing `current` first.
+    OpenImages {
+        urls: Vec<String>,
+        current: usize,
+    },
     SaveState,
     Quit,
 }
@@ -168,6 +181,18 @@ pub struct App {
     pub last_bot: HashMap<String, (String, u64)>,
     /// Text put in a blank draft on entering insert; Esc drops it untouched.
     prefill: Option<String>,
+    /// Read positions shared with Desktop and our other devices.
+    pub read: ReadState,
+    /// channel -> where it was read up to when you came into it: newer
+    /// top-level messages are what the jump key visits.
+    pub entry: HashMap<String, u64>,
+    /// Top-level messages the jump key has already been to.
+    pub visited: HashSet<String>,
+    /// Identities the relay has archived: left out of @ completion.
+    pub archived: HashSet<String>,
+    /// A message to keep at the top of its pane while it is the cursor
+    /// (the jump key lands on the first unread with it at the top).
+    pub anchor: Option<(Pane, String)>,
 }
 
 impl App {
@@ -223,6 +248,11 @@ impl App {
             relay_host: String::new(),
             last_bot: HashMap::new(),
             prefill: None,
+            read: ReadState::new(readstate::new_id(), readstate::new_id()),
+            entry: HashMap::new(),
+            visited: HashSet::new(),
+            archived: HashSet::new(),
+            anchor: None,
         }
     }
 
@@ -339,8 +369,98 @@ impl App {
 
     pub fn open_current(&mut self) {
         if let Some(id) = self.current().map(str::to_string) {
-            self.store.channel_mut(&id).unread.clear();
+            // Before OpenChannel marks it read. Until the startup load is
+            // in, the position is unknown; that load fills it in.
+            if let Some(at) = self.read.read_at(&id).filter(|_| self.read.tried) {
+                self.entry.insert(id.clone(), at);
+            }
+            let ch = self.store.channel_mut(&id);
+            ch.unread.clear();
+            ch.mentioned.clear();
             self.actions.push(Action::OpenChannel(id));
+        }
+    }
+
+    /// A thread's replies are seen through now.
+    pub fn mark_thread(&mut self, root: &str) {
+        self.read
+            .mark(&unread::thread_key(root), crate::sync::now());
+    }
+
+    /// The jump key: the first unread thing in this tab, oldest first; a
+    /// reply opens its thread with that reply at the top. With nothing
+    /// unread here, on to the next tab that has some, mentions first.
+    fn next_unread(&mut self) {
+        let now = crate::sync::now();
+        let here = |app: &App| {
+            let c = app.current()?;
+            unread::next_unread(
+                app.store.channels.get(c)?,
+                &app.store.me,
+                &app.read,
+                app.entry.get(c).copied(),
+                &app.visited,
+                now,
+            )
+        };
+        if let Some(n) = here(self) {
+            self.land(n);
+            return;
+        }
+        let len = self.tabs.len();
+        let order: Vec<usize> = (1..len).map(|k| (self.active + k) % len).collect();
+        let count = |i: &usize, mentions: bool| {
+            self.store.channels.get(&self.tabs[*i]).map_or(0, |c| {
+                if mentions && !c.is_dm {
+                    c.mentioned.len()
+                } else {
+                    c.unread.len()
+                }
+            })
+        };
+        let pick = order
+            .iter()
+            .find(|i| count(i, true) > 0)
+            .or_else(|| order.iter().find(|i| count(i, false) > 0))
+            .copied();
+        match pick {
+            Some(i) => {
+                self.switch_tab(i);
+                if let Some(n) = here(self) {
+                    self.land(n);
+                }
+            }
+            None => self.say("nothing unread"),
+        }
+    }
+
+    fn land(&mut self, n: Next) {
+        let Some(c) = self.current().map(str::to_string) else {
+            return;
+        };
+        self.peek = None;
+        match n {
+            Next::Message(id) => {
+                self.visited.insert(id.clone());
+                self.thread = None;
+                self.thread_selected = None;
+                self.focus = Pane::Timeline;
+                let last = self.timeline_ids().last() == Some(&id);
+                self.set_cursor(id.clone(), last);
+                self.anchor = Some((Pane::Timeline, id));
+            }
+            Next::Reply { root, id } => {
+                self.actions.push(Action::OpenThread {
+                    channel: c.clone(),
+                    root: root.clone(),
+                });
+                self.thread = Some((c, root.clone()));
+                self.focus = Pane::Thread;
+                let last = self.thread_ids().last() == Some(&id);
+                self.set_cursor(id.clone(), last);
+                self.anchor = Some((Pane::Thread, id));
+                self.mark_thread(&root);
+            }
         }
     }
 
@@ -495,6 +615,7 @@ impl App {
                     channel: j.channel.clone(),
                     root: root.clone(),
                 });
+                self.mark_thread(&root);
                 self.thread = Some((j.channel, root));
                 self.thread_selected = pick;
                 self.focus = Pane::Thread;
@@ -648,6 +769,7 @@ impl App {
             channel: ch.clone(),
             root: root.clone(),
         });
+        self.mark_thread(&root);
         self.thread = Some((ch, root));
         self.thread_selected = None;
         self.focus = Pane::Thread;
@@ -657,6 +779,10 @@ impl App {
     }
 
     fn close_thread(&mut self) {
+        // What arrived while it was open is seen too.
+        if let Some((_, root)) = self.thread.clone() {
+            self.mark_thread(&root);
+        }
         self.thread = None;
         self.thread_selected = None;
         self.focus = Pane::Timeline;
@@ -773,7 +899,7 @@ impl App {
             .unwrap_or_default();
         let mut out: Vec<(String, String)> = members
             .iter()
-            .filter(|pk| **pk != self.store.me)
+            .filter(|pk| **pk != self.store.me && !self.archived.contains(*pk))
             .filter_map(|pk| {
                 self.store
                     .profiles
@@ -897,6 +1023,7 @@ impl App {
                 KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('k') | KeyCode::Up => {
                     self.step_viewer(-1)
                 }
+                KeyCode::Char('O') => self.open_in_os(),
                 KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('j') | KeyCode::Down => {
                     self.step_viewer(1)
                 }
@@ -1041,17 +1168,19 @@ impl App {
                 }
             }
             KeyCode::Char('o') => self.open_viewer(),
+            KeyCode::Char('O') => self.open_in_os(),
+            KeyCode::Char('n') => self.next_unread(),
             KeyCode::Char('[') => self.nudge_width(-4),
             KeyCode::Char(']') => self.nudge_width(4),
             _ => {}
         }
     }
 
-    /// Full-screen image viewer. Opens on the selected message's image (or
-    /// the nearest one above it) and pages through every image in the pane.
-    fn open_viewer(&mut self) {
+    /// Every image in the focused pane, oldest first, and where the
+    /// cursor's message is in that list (its image, or the nearest above).
+    fn pane_images(&self) -> (Vec<String>, Option<usize>) {
         let Some(id) = self.cursor_message() else {
-            return;
+            return (vec![], None);
         };
         let ids = if self.focus == Pane::Thread {
             self.thread_ids()
@@ -1079,13 +1208,60 @@ impl App {
                 };
             }
         }
-        match start {
-            Some(i) => {
+        (list, start)
+    }
+
+    /// Full-screen image viewer. Opens on the selected message's image (or
+    /// the nearest one above it) and pages through every image in the pane.
+    fn open_viewer(&mut self) {
+        match self.pane_images() {
+            (list, Some(i)) => {
                 self.viewer_list = list;
                 self.mode = Mode::Viewer;
+                // The one on screen and its neighbours queue first, then the
+                // rest, so paging never waits.
                 self.show_image(i);
+                for u in self.viewer_list.clone() {
+                    self.actions.push(Action::LoadImage(u));
+                }
             }
-            None => self.say("no images here"),
+            _ => self.say("no images here"),
+        }
+    }
+
+    /// `O`: in a thread, every image in it, in one Preview window. In the
+    /// channel, the image on screen in the viewer, or the selected
+    /// message's images.
+    fn open_in_os(&mut self) {
+        let mut current = 0;
+        let urls = if self.focus == Pane::Thread {
+            let (list, start) = self.pane_images();
+            // The one on screen in the viewer, else the selected message's.
+            current = self
+                .viewer
+                .as_ref()
+                .and_then(|v| list.iter().position(|u| u == v))
+                .or(start)
+                .unwrap_or(0);
+            list
+        } else if let Some(u) = self.viewer.clone() {
+            vec![u]
+        } else {
+            self.cursor_message()
+                .and_then(|id| self.store.find_message(&id))
+                .map(|(_, m)| {
+                    m.media
+                        .iter()
+                        .filter(|x| x.mime.starts_with("image/"))
+                        .map(|x| x.url.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        if urls.is_empty() {
+            self.say("no images here");
+        } else {
+            self.actions.push(Action::OpenImages { urls, current });
         }
     }
 
@@ -1130,9 +1306,32 @@ impl App {
             }
             KeyCode::Char(' ') | KeyCode::Char('x') => self.toggle_section(self.picker_cursor),
             KeyCode::Enter => self.apply_sections(),
+            KeyCode::Char('m') => self.move_here(),
             KeyCode::Char('R') => self.actions.push(Action::ReloadSections),
             _ => {}
         }
+    }
+
+    /// Move the current channel into the section under the cursor.
+    fn move_here(&mut self) {
+        let (Some(ch), Some(s)) = (self.current(), self.sections.get(self.picker_cursor)) else {
+            return;
+        };
+        let section = match s.id.as_str() {
+            "★" | "dms" => return self.say(format!("can't move a channel into {}", s.name)),
+            "channels" => None,
+            id => Some(id.to_string()),
+        };
+        if self.store.channels.get(ch).is_some_and(|c| c.is_dm) {
+            return self.say("DMs don't go in sections");
+        }
+        if s.channels.iter().any(|c| c == ch) {
+            return self.say(format!("already in {}", s.name));
+        }
+        self.actions.push(Action::MoveChannel {
+            channel: ch.to_string(),
+            section,
+        });
     }
 
     fn toggle_section(&mut self, i: usize) {
@@ -1295,6 +1494,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn m_moves_the_current_channel() {
+        let mut app = App::new("me".into(), None);
+        app.sections = ["a", "b", "channels"]
+            .map(|id| Section {
+                id: id.into(),
+                name: id.into(),
+                channels: vec![format!("{id}-ch")],
+            })
+            .to_vec();
+        app.chosen = vec!["a".into()];
+        app.rebuild_tabs();
+        for code in [KeyCode::Char('s'), KeyCode::Char('j'), KeyCode::Char('m')] {
+            app.on_key(KeyEvent::from(code));
+        }
+        let moved = |app: &App, want: Option<&str>| {
+            app.actions.iter().any(|a| {
+                matches!(a, Action::MoveChannel { channel, section }
+                if channel == "a-ch" && section.as_deref() == want)
+            })
+        };
+        assert!(moved(&app, Some("b")));
+        app.actions.clear();
+        for code in [KeyCode::Char('j'), KeyCode::Char('m')] {
+            app.on_key(KeyEvent::from(code));
+        }
+        assert!(moved(&app, None));
+        app.actions.clear();
+        // Its own section is a no-op.
+        for code in [KeyCode::Char('k'), KeyCode::Char('k'), KeyCode::Char('m')] {
+            app.on_key(KeyEvent::from(code));
+        }
+        assert!(app.actions.is_empty());
+    }
+
+    #[test]
     fn enter_switches_section() {
         let mut app = App::new("me".into(), None);
         app.sections = ["a", "b"]
@@ -1430,6 +1664,72 @@ mod tests {
     }
 
     #[test]
+    fn viewer_queues_the_thread_and_o_opens_all_of_it() {
+        let mut app = App::new("me".into(), None);
+        app.tabs = vec!["ch".into()];
+        let msg = |id: &str, at: u64, root: Option<&str>, imgs: &[&str]| crate::model::Message {
+            id: id.into(),
+            author: "me".into(),
+            created_at: at,
+            content: String::new(),
+            edited: false,
+            deleted: false,
+            root: root.map(str::to_string),
+            mentions: vec![],
+            media: imgs
+                .iter()
+                .map(|u| crate::model::Media {
+                    url: u.to_string(),
+                    mime: "image/png".into(),
+                    dim: None,
+                })
+                .collect(),
+            system: false,
+        };
+        let ch = app.store.channel_mut("ch");
+        ch.messages.insert("t".into(), msg("t", 5, None, &["top"]));
+        ch.messages.insert("r".into(), msg("r", 10, None, &["a"]));
+        ch.messages
+            .insert("r1".into(), msg("r1", 20, Some("r"), &["b", "c"]));
+        ch.messages
+            .insert("r2".into(), msg("r2", 30, Some("r"), &["d"]));
+        ch.timeline = vec!["t".into(), "r".into()];
+        ch.replies
+            .insert("r".into(), vec!["r1".into(), "r2".into()]);
+        app.thread = Some(("ch".into(), "r".into()));
+        app.focus = Pane::Thread;
+        app.thread_selected = Some("r1".into());
+        app.on_key(KeyEvent::from(KeyCode::Char('o')));
+        let loads: Vec<&str> = app
+            .actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::LoadImage(u) => Some(u.as_str()),
+                _ => None,
+            })
+            .collect();
+        // The one on screen and its neighbours first, then the whole thread.
+        assert_eq!(&loads[..3], ["b", "a", "c"]);
+        assert!(["a", "b", "c", "d"].iter().all(|u| loads.contains(u)));
+        assert!(!loads.contains(&"top"));
+        app.actions.clear();
+        // O in a thread: every image in it, in thread order, opened on the
+        // one in the viewer.
+        app.on_key(KeyEvent::from(KeyCode::Char('O')));
+        assert!(matches!(app.actions.last(),
+            Some(Action::OpenImages { urls, current: 1 }) if urls == &["a", "b", "c", "d"]));
+        // In the channel: just the selected message's.
+        app.mode = Mode::Normal;
+        app.viewer = None;
+        app.focus = Pane::Timeline;
+        app.selected.insert("ch".into(), "t".into());
+        app.on_key(KeyEvent::from(KeyCode::Char('O')));
+        assert!(
+            matches!(app.actions.last(), Some(Action::OpenImages { urls, current: 0 }) if urls == &["top"])
+        );
+    }
+
+    #[test]
     fn blank_insert_starts_with_last_bot() {
         let mut app = App::new("me".into(), None);
         app.tabs = vec!["ch".into()];
@@ -1481,5 +1781,52 @@ mod tests {
         key(&mut app, KeyCode::Esc);
         key(&mut app, KeyCode::Char('i'));
         assert_eq!(app.draft.text, "@judgebot x");
+    }
+
+    #[test]
+    fn n_walks_unread_then_moves_on_mentions_first() {
+        let now = crate::sync::now();
+        let mut app = App::new("me".into(), None);
+        app.tabs = vec!["a".into(), "b".into(), "c".into()];
+        let put = |app: &mut App, ch: &str, id: &str, at: u64, root: Option<&str>| {
+            let c = app.store.channel_mut(ch);
+            c.messages.insert(
+                id.into(),
+                crate::model::Message {
+                    id: id.into(),
+                    author: "them".into(),
+                    created_at: at,
+                    root: root.map(str::to_string),
+                    ..Default::default()
+                },
+            );
+            match root {
+                Some(r) => c.replies.entry(r.into()).or_default().push(id.into()),
+                None => c.timeline.push(id.into()),
+            }
+        };
+        put(&mut app, "a", "a1", now - 50, None);
+        put(&mut app, "a", "a1r", now - 40, Some("a1"));
+        put(&mut app, "a", "a2", now - 30, None);
+        app.entry.insert("a".into(), now - 45);
+        let key = |app: &mut App| app.on_key(KeyEvent::from(KeyCode::Char('n')));
+        // The reply in a1's thread is oldest: its thread opens on it.
+        key(&mut app);
+        assert_eq!(app.thread, Some(("a".into(), "a1".into())));
+        assert_eq!(app.cursor_message().as_deref(), Some("a1r"));
+        assert_eq!(app.anchor, Some((Pane::Thread, "a1r".into())));
+        // Then the newer top-level message.
+        key(&mut app);
+        assert_eq!(app.thread, None);
+        assert_eq!(app.cursor_message().as_deref(), Some("a2"));
+        // Nothing left here: the tab that mentions you comes before the one
+        // that is merely unread.
+        app.store.channel_mut("b").unread.insert("x".into(), now);
+        let c = app.store.channel_mut("c");
+        c.unread.insert("y".into(), now);
+        c.mentioned.insert("y".into());
+        key(&mut app);
+        assert_eq!(app.current(), Some("c"));
+        assert!(app.store.channels["c"].mentioned.is_empty());
     }
 }

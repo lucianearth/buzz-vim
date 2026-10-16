@@ -125,14 +125,20 @@ impl ReadState {
             return None;
         }
         self.pending = None;
+        self.prune(unix_now());
         let blob = json!({"v": 1, "client_id": self.client_id, "contexts": self.mine});
-        let content = nip44::encrypt(
+        let content = match nip44::encrypt(
             keys.secret_key(),
             &keys.public_key(),
             blob.to_string(),
             nip44::Version::V2,
-        )
-        .ok()?;
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                crate::log::line(format!("read-state not published: {e}"));
+                return None;
+            }
+        };
         EventBuilder::new(Kind::Custom(30078), content)
             .tags([
                 Tag::parse(["d", &format!("{D_PREFIX}{}", self.slot)]).ok()?,
@@ -141,6 +147,22 @@ impl ReadState {
             .sign_with_keys(keys)
             .ok()
     }
+}
+
+impl ReadState {
+    /// Thread marks only matter inside the unread horizon, and NIP-44 caps
+    /// the slot near 64 KB, so older ones are dropped from what we publish.
+    fn prune(&mut self, now: u64) {
+        let cutoff = now.saturating_sub(crate::unread::HORIZON);
+        self.mine
+            .retain(|k, &mut at| !k.starts_with("thread:") || at >= cutoff);
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn model_d(ev: &Event) -> Option<&str> {
@@ -223,6 +245,26 @@ mod tests {
         assert_eq!(other.read_at("c2"), Some(80));
         assert_eq!(other.read_at("c1"), Some(90));
         assert!(rs.take_publish(&keys, true).is_none());
+    }
+
+    #[test]
+    fn old_thread_marks_are_pruned_so_the_slot_still_publishes() {
+        let keys = Keys::generate();
+        let mut rs = ReadState::new(new_id(), "me".into());
+        rs.loaded = true;
+        let now = unix_now();
+        let old = now - crate::unread::HORIZON - 60;
+        for i in 0..3000 {
+            rs.mark(&crate::unread::thread_key(&format!("{i:064x}")), old);
+        }
+        rs.mark(&crate::unread::thread_key("fresh"), now);
+        rs.mark("chan", old);
+        let ev = rs.take_publish(&keys, true).expect("slot publishes");
+        let mut other = ReadState::new(new_id(), "x".into());
+        other.apply(&keys, &ev);
+        assert_eq!(other.read_at("thread:fresh"), Some(now));
+        assert_eq!(other.read_at("chan"), Some(old));
+        assert_eq!(other.read_at(&format!("thread:{:064x}", 7)), None);
     }
 
     #[test]

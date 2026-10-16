@@ -19,6 +19,7 @@ pub const ALLOWED_MIMES: &[&str] = &[
     "image/webp",
     "video/mp4",
 ];
+/// Also the most a download reads, so one oversized "image" can't eat memory.
 pub const MAX_IMAGE_BYTES: usize = 50 * 1024 * 1024;
 pub const MAX_VIDEO_BYTES: usize = 500 * 1024 * 1024;
 
@@ -192,6 +193,11 @@ impl Relay {
             .await?;
         let s = r.status();
         let t = r.text().await.unwrap_or_default();
+        // A 5xx may have stored it anyway, so it isn't a rejection: sending
+        // the same event again is the safe retry.
+        if s.is_server_error() {
+            bail!("relay error ({s}): {t}");
+        }
         if !s.is_success() {
             bail!("relay rejected event ({s}): {t}");
         }
@@ -271,8 +277,18 @@ impl Relay {
 
     /// Authenticated BUD-01 GET of a media URL on this relay.
     pub async fn download(&self, url: &str) -> Result<Vec<u8>> {
+        self.download_progress(url, |_, _| {}).await
+    }
+
+    /// `download`, calling `progress(bytes so far, total if known)` as
+    /// chunks arrive.
+    pub async fn download_progress(
+        &self,
+        url: &str,
+        mut progress: impl FnMut(u64, Option<u64>),
+    ) -> Result<Vec<u8>> {
         let auth = self.blossom_auth("get", None, url)?;
-        let r = self
+        let mut r = self
             .authed(self.http.get(url))
             .timeout(Duration::from_secs(120))
             .header("Authorization", auth)
@@ -282,7 +298,49 @@ impl Relay {
         if !s.is_success() {
             bail!("download failed ({s})");
         }
-        Ok(r.bytes().await?.to_vec())
+        let total = r.content_length();
+        if total.is_some_and(|t| t > MAX_IMAGE_BYTES as u64) {
+            bail!("too large to download");
+        }
+        let mut out = Vec::with_capacity(total.unwrap_or(0) as usize);
+        while let Some(chunk) = r.chunk().await? {
+            if out.len() as u64 + chunk.len() as u64 > MAX_IMAGE_BYTES as u64 {
+                bail!("too large to download");
+            }
+            out.extend_from_slice(&chunk);
+            progress(out.len() as u64, total);
+        }
+        Ok(out)
+    }
+
+    /// Archived identities (NIP-IA): the `p` tags of the newest kind 13535
+    /// signed by the relay's own NIP-11 `self` key.
+    pub async fn archived(&self) -> Result<Vec<String>> {
+        let info: Value = self
+            .authed(self.http.get(&self.base))
+            .header("Accept", "application/nostr+json")
+            .send()
+            .await?
+            .json()
+            .await?;
+        let me = info
+            .get("self")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("relay info has no self key"))?
+            .to_ascii_lowercase();
+        let evs = self
+            .query(&[serde_json::json!({"kinds": [13535], "authors": [me], "limit": 1})])
+            .await?;
+        Ok(evs
+            .iter()
+            .filter(|e| e.pubkey.to_hex() == me)
+            .max_by_key(|e| e.created_at)
+            .map(|e| {
+                crate::model::tags(e, "p")
+                    .filter_map(|t| t.get(1).cloned())
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 }
 
@@ -329,5 +387,38 @@ mod tests {
             base
         ));
         assert!(!super::same_origin("http://buzz.gitcoin.co/a.png", base));
+    }
+
+    /// A body with no length that runs past the cap stops at the cap.
+    #[tokio::test]
+    async fn download_stops_past_the_cap() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut req = [0u8; 4096];
+            let _ = s.read(&mut req).await;
+            s.write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let chunk = vec![0u8; 1 << 20];
+            for _ in 0..(super::MAX_IMAGE_BYTES >> 20) + 2 {
+                if s.write_all(&chunk).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let r = super::Relay::new(
+            &format!("http://127.0.0.1:{port}"),
+            nostr::Keys::generate(),
+            None,
+        )
+        .unwrap();
+        let err = r
+            .download(&format!("http://127.0.0.1:{port}/x.png"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
     }
 }

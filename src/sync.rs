@@ -16,6 +16,7 @@ use crate::model::{self, Applied};
 use crate::readstate::{self, ReadState};
 use crate::relay::{BlobDescriptor, Relay};
 use crate::sections::{self, Lanes};
+use crate::unread;
 
 pub enum Msg {
     Channels(anyhow::Result<Vec<Event>>),
@@ -37,16 +38,31 @@ pub enum Msg {
         channel: String,
         events: anyhow::Result<Vec<Event>>,
     },
+    /// Identities the relay has archived (NIP-IA).
+    Archived(anyhow::Result<Vec<String>>),
     Sent {
         id: String,
         result: anyhow::Result<()>,
     },
     Did(anyhow::Result<String>),
+    /// Our sections doc after a move, and the status line to show.
+    Moved(anyhow::Result<(Event, String)>),
     /// The upload, and the (channel, thread root) it was meant for.
     Uploaded(anyhow::Result<BlobDescriptor>, (String, Option<String>)),
     Image {
         url: String,
         result: anyhow::Result<image::DynamicImage>,
+    },
+    /// An image download moved along: (bytes so far, total if known).
+    Progress {
+        url: String,
+        got: u64,
+        total: Option<u64>,
+    },
+    /// An image file arrived, before it is decoded.
+    Bytes {
+        url: String,
+        bytes: Arc<Vec<u8>>,
     },
     Encoded {
         key: (String, u16, u16),
@@ -71,9 +87,11 @@ pub struct Sync {
     subscribed: HashSet<String>,
     loading_older: HashSet<String>,
     started: u64,
-    pub read: ReadState,
     /// Tabs whose unread messages we've looked up since startup.
     unread_checked: HashSet<String>,
+    /// Image downloads at a time. The viewer queues the picture on screen
+    /// first, so it isn't stuck behind the rest of the thread.
+    image_slots: Arc<tokio::sync::Semaphore>,
 }
 
 pub fn now() -> u64 {
@@ -93,8 +111,8 @@ impl Sync {
             subscribed: HashSet::new(),
             loading_older: HashSet::new(),
             started: now(),
-            read: ReadState::new(readstate::new_id(), readstate::new_id()),
             unread_checked: HashSet::new(),
+            image_slots: Arc::new(tokio::sync::Semaphore::new(4)),
         }
     }
 
@@ -117,6 +135,8 @@ impl Sync {
         let me = self.me();
         self.load_channels();
         self.load_lanes();
+        let r = self.relay.clone();
+        self.spawn(async move { Msg::Archived(r.archived().await) });
         let now = now();
         let sub = |id: &str, filters: Vec<Value>| Cmd::Sub {
             id: id.to_string(),
@@ -226,22 +246,17 @@ impl Sync {
     }
 
     /// Fold read-state events. Returns true if a position moved.
-    pub fn apply_read(&mut self, evs: &[Event]) -> bool {
+    pub fn apply_read(&self, read: &mut ReadState, evs: &[Event]) -> bool {
         let mut moved = false;
         for ev in evs {
-            moved |= self.read.apply(&self.relay.keys, ev);
+            moved |= read.apply(&self.relay.keys, ev);
         }
         moved
     }
 
-    /// Mark a channel read now, for Desktop and our other devices.
-    pub fn mark_read(&mut self, channel: &str) {
-        self.read.mark(channel, now());
-    }
-
     /// Publish our read-state slot once it has settled (or now, on quit).
-    pub fn flush_read(&mut self) {
-        if let Some(ev) = self.read.take_publish(&self.relay.keys, false) {
+    pub fn flush_read(&mut self, read: &mut ReadState) {
+        if let Some(ev) = read.take_publish(&self.relay.keys, false) {
             let r = self.relay.clone();
             tokio::spawn(async move {
                 if let Err(e) = r.publish(&ev).await {
@@ -251,31 +266,29 @@ impl Sync {
         }
     }
 
-    pub async fn flush_read_now(&mut self) {
-        if let Some(ev) = self.read.take_publish(&self.relay.keys, true) {
+    pub async fn flush_read_now(&mut self, read: &mut ReadState) {
+        if let Some(ev) = read.take_publish(&self.relay.keys, true) {
             let _ = tokio::time::timeout(Duration::from_secs(3), self.relay.publish(&ev)).await;
         }
     }
 
-    /// Look up what's unread in each tab we haven't checked yet: messages
-    /// and thread replies since its read position (or the last week, if it has none).
-    pub fn check_unread(&mut self, tabs: &[String]) {
-        if !self.read.tried {
+    /// Look up the last week of messages and thread replies in each tab we
+    /// haven't checked yet: what's after its read position is unread, and
+    /// the replies feed "(N new)" and the jump key.
+    pub fn check_unread(&mut self, read: &ReadState, tabs: &[String]) {
+        if !read.tried {
             return;
         }
         for id in tabs {
             if !self.unread_checked.insert(id.clone()) {
                 continue;
             }
-            let since = self
-                .read
-                .read_at(id)
-                .map_or(now().saturating_sub(7 * 86_400), |t| t + 1);
+            let since = now().saturating_sub(unread::HORIZON);
             let r = self.relay.clone();
             let channel = id.clone();
             self.spawn(async move {
                 let f = json!({"kinds": model::UNREAD_KINDS, "#h": [channel], "since": since,
-                    "limit": 100});
+                    "limit": 500});
                 Msg::Unread {
                     events: r.query(&[f]).await,
                     channel,
@@ -433,7 +446,7 @@ impl Sync {
     pub fn run(&mut self, app: &mut App, action: Action) {
         match action {
             Action::OpenChannel(id) => {
-                self.mark_read(&id);
+                app.read.mark(&id, now());
                 self.open_channel(&id);
             }
             Action::LoadOlder(id) => self.load_older(&id),
@@ -441,6 +454,31 @@ impl Sync {
                 app.say("reloading sections…");
                 self.load_channels();
                 self.load_lanes();
+            }
+            Action::MoveChannel { channel, section } => {
+                let name = |id: &str| {
+                    app.sections
+                        .iter()
+                        .find(|s| s.id == id)
+                        .map_or(id.to_string(), |s| s.name.clone())
+                };
+                let label = format!(
+                    "moved #{} to {}",
+                    app.store
+                        .channels
+                        .get(&channel)
+                        .map_or("?", |c| c.name.as_str()),
+                    name(section.as_deref().unwrap_or("channels"))
+                );
+                app.say("moving…");
+                let r = self.relay.clone();
+                self.spawn(async move {
+                    Msg::Moved(
+                        sections::publish_move(&r, &channel, section.as_deref())
+                            .await
+                            .map(|ev| (ev, label)),
+                    )
+                });
             }
             Action::Send {
                 channel,
@@ -459,6 +497,7 @@ impl Sync {
             }
             Action::LoadImage(url) => self.load_image(app, url),
             Action::OpenThread { channel, root } => self.open_thread(&channel, &root),
+            Action::OpenImages { urls, current } => self.open_images(app, urls, current),
             Action::OpenUrl(url) => {
                 if let Err(e) = crate::links::open(&url) {
                     app.say(format!("couldn't open {url}: {e}"));
@@ -619,6 +658,125 @@ impl Sync {
         self.spawn(async move { Msg::Did(r.publish(&ev).await.map(|_| label.to_string())) });
     }
 
+    /// Save images to temp files and hand them to the OS in one go, so a
+    /// Mac shows them in one Preview window. Reuses what the viewer already
+    /// downloaded. Preview lands on `urls[current]`.
+    fn open_images(&mut self, app: &mut App, urls: Vec<String>, current: usize) {
+        let want = urls.get(current).cloned();
+        let (ours, theirs): (Vec<_>, Vec<_>) =
+            urls.into_iter().partition(|u| self.relay.is_ours(u));
+        for u in theirs {
+            if let Err(e) = crate::links::open(&u) {
+                app.say(format!("couldn't open {u}: {e}"));
+            }
+        }
+        if ours.is_empty() {
+            return;
+        }
+        let n = ours.len();
+        app.say(if n == 1 {
+            "opening image…".to_string()
+        } else {
+            format!("opening {n} images…")
+        });
+        let have: Vec<Option<Arc<Vec<u8>>>> = ours
+            .iter()
+            .map(|u| app.media.bytes.get(u).cloned())
+            .collect();
+        let r = self.relay.clone();
+        let slots = Arc::clone(&self.image_slots);
+        self.spawn(async move {
+            let res = async {
+                let files = futures::future::join_all(ours.iter().zip(have).map(|(u, b)| {
+                    let r = r.clone();
+                    let slots = Arc::clone(&slots);
+                    async move {
+                        match b {
+                            Some(b) => Ok(b),
+                            None => {
+                                let _slot = slots.acquire_owned().await?;
+                                r.download(u).await.map(Arc::new)
+                            }
+                        }
+                    }
+                }))
+                .await;
+                // A fresh folder each time, numbered in thread order, so
+                // Preview's sidebar reads top to bottom like the thread.
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis());
+                // Private to this user (DM and private-channel images).
+                // Folders over a day old go, so they don't pile up; newer
+                // ones may still be open in Preview.
+                // The user's own cache folder, not a shared /tmp another
+                // user could have made first.
+                let base = dirs::cache_dir()
+                    .unwrap_or_else(std::env::temp_dir)
+                    .join("buzz-vim-images");
+                let day = std::time::Duration::from_secs(24 * 3600);
+                for e in std::fs::read_dir(&base).into_iter().flatten().flatten() {
+                    let old = e
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > day);
+                    if old {
+                        let _ = std::fs::remove_dir_all(e.path());
+                    }
+                }
+                let dir = base.join(stamp.to_string());
+                let mut b = std::fs::DirBuilder::new();
+                b.recursive(true);
+                #[cfg(unix)]
+                std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+                b.create(&dir)?;
+                let mut paths = vec![];
+                let mut focus = None;
+                let mut failed = 0;
+                for (i, (url, bytes)) in ours.iter().zip(files).enumerate() {
+                    let Ok(bytes) = bytes else {
+                        failed += 1;
+                        continue;
+                    };
+                    let name = url.rsplit('/').next().unwrap_or("image");
+                    let stem = name.split('.').next().unwrap_or(name);
+                    let short: String = stem
+                        .chars()
+                        .filter(char::is_ascii_alphanumeric)
+                        .rev()
+                        .take(8)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    let ext = image::guess_format(&bytes)
+                        .ok()
+                        .and_then(|f| f.extensions_str().first().copied())
+                        .unwrap_or("png");
+                    let path = dir.join(format!("{:02}-{short}.{ext}", i + 1));
+                    std::fs::write(&path, &*bytes)?;
+                    if want.as_ref() == Some(url) {
+                        focus = Some(paths.len());
+                    }
+                    paths.push(path);
+                }
+                if paths.is_empty() {
+                    anyhow::bail!("couldn't download any of them");
+                }
+                crate::links::open_files(&paths, focus)?;
+                Ok(match (paths.len(), failed) {
+                    (1, 0) => format!("opened {}", paths[0].display()),
+                    (k, 0) => format!("opened {k} images in Preview"),
+                    (k, f) => format!("opened {k} images in Preview; {f} didn't download"),
+                })
+            }
+            .await;
+            Msg::Did(res)
+        });
+    }
+
     fn load_image(&mut self, app: &mut App, url: String) {
         if app.media.images.contains_key(&url) || app.picker.is_none() {
             return;
@@ -634,9 +792,31 @@ impl Sync {
             .images
             .insert(url.clone(), crate::media::Slot::Loading);
         let r = self.relay.clone();
+        let tx = self.tx.clone();
+        let slots = Arc::clone(&self.image_slots);
         self.spawn(async move {
             let result = async {
-                let bytes = r.download(&url).await?;
+                let _slot = slots.acquire_owned().await?;
+                // Report every 128 KB or so; each one redraws the viewer.
+                let mut shown = 0;
+                let bytes = r
+                    .download_progress(&url, |got, total| {
+                        if got >= shown + (128 << 10) || Some(got) == total {
+                            shown = got;
+                            let _ = tx.send(Msg::Progress {
+                                url: url.clone(),
+                                got,
+                                total,
+                            });
+                        }
+                    })
+                    .await?;
+                drop(_slot);
+                let bytes = Arc::new(bytes);
+                let _ = tx.send(Msg::Bytes {
+                    url: url.clone(),
+                    bytes: Arc::clone(&bytes),
+                });
                 tokio::task::spawn_blocking(move || crate::media::decode(&bytes)).await?
             }
             .await;
@@ -710,8 +890,8 @@ pub fn fold(app: &mut App, sync: &mut Sync, ev: &Event, live_channel: bool) -> V
             return vec![];
         }
         30078 if readstate::is_read_state(ev) => {
-            if sync.apply_read(std::slice::from_ref(ev)) {
-                prune_unread(app, &sync.read);
+            if sync.apply_read(&mut app.read, std::slice::from_ref(ev)) {
+                prune_unread(app);
             }
             return vec![];
         }
@@ -734,15 +914,34 @@ pub fn fold(app: &mut App, sync: &mut Sync, ev: &Event, live_channel: bool) -> V
         let active = app.current() == Some(channel.as_str());
         let at = ev.created_at.as_secs();
         let author = ev.pubkey.to_hex();
-        let seen = sync.read.read_at(&channel).is_some_and(|r| at <= r);
+        let seen = app.read.read_at(&channel).is_some_and(|r| at <= r);
         if live_channel && !seen && counts_unread(kind, &author, &app.store.me, active) {
-            app.store
-                .channel_mut(&channel)
-                .unread
-                .insert(id.clone(), at);
+            let me = app.store.me.clone();
+            let ch = app.store.channel_mut(&channel);
+            ch.unread.insert(id.clone(), at);
+            if ch
+                .messages
+                .get(&id)
+                .is_some_and(|m| m.mentions.contains(&me))
+            {
+                ch.mentioned.insert(id.clone());
+            }
         } else if live_channel && active && author != app.store.me {
             // You're looking at it, so it's read.
-            sync.mark_read(&channel);
+            app.read.mark(&channel, now());
+        }
+        // A reply landing in the thread on screen is seen too.
+        let root = app
+            .store
+            .channels
+            .get(&channel)
+            .and_then(|c| c.messages.get(&id))
+            .and_then(|m| m.root.clone());
+        if live_channel
+            && root.is_some()
+            && app.thread.as_ref().map(|t| (&t.0, Some(&t.1))) == Some((&channel, root.as_ref()))
+        {
+            app.mark_thread(root.as_deref().unwrap_or_default());
         }
         if let Some(m) = app
             .store
@@ -758,28 +957,34 @@ pub fn fold(app: &mut App, sync: &mut Sync, ev: &Event, live_channel: bool) -> V
 
 /// Drop unread messages at or before each channel's read position, e.g.
 /// after you read the channel in Desktop.
-pub fn prune_unread(app: &mut App, read: &ReadState) {
+pub fn prune_unread(app: &mut App) {
+    let read = &app.read;
     for (id, ch) in app.store.channels.iter_mut() {
         if let Some(r) = read.read_at(id) {
             ch.unread.retain(|_, at| *at > r);
+            let left = &ch.unread;
+            ch.mentioned.retain(|m| left.contains_key(m));
         }
     }
 }
 
 /// Unread messages from a lookup: someone else's, after the read
 /// position, in a tab you aren't looking at.
-pub fn fold_unread(app: &mut App, read: &ReadState, channel: &str, evs: &[Event]) {
+pub fn fold_unread(app: &mut App, channel: &str, evs: &[Event]) {
     if app.current() == Some(channel) {
         return;
     }
     let me = app.store.me.clone();
-    let after = read.read_at(channel).unwrap_or(0);
+    let after = app.read.read_at(channel).unwrap_or(0);
     let ch = app.store.channel_mut(channel);
     for ev in evs {
         let at = ev.created_at.as_secs();
         if model::UNREAD_KINDS.contains(&ev.kind.as_u16()) && ev.pubkey.to_hex() != me && at > after
         {
             ch.unread.insert(ev.id.to_hex(), at);
+            if ch.is_dm || model::Message::from_event(ev).mentions.contains(&me) {
+                ch.mentioned.insert(ev.id.to_hex());
+            }
         }
     }
 }

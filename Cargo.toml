@@ -7,7 +7,12 @@ description = "A keyboard-first, vim-style terminal client for Buzz"
 repository = "https://github.com/lucianearth/buzz-vim"
 license = "MIT"
 
+[workspace]
+members = [".", "core", "ffi"]
+default-members = [".", "core", "ffi"]
+
 [dependencies]
+buzz-vim-core = { path = "core" }
 anyhow = "1.0.104"
 arboard = "3.7.0"
 base64 = "0.23.1"

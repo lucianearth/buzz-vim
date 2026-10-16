@@ -46,6 +46,7 @@ pub struct Agents {
 }
 
 pub struct Row {
+    pub pubkey: String,
     pub name: String,
     pub busy: bool,
     pub online: bool,
@@ -337,6 +338,7 @@ impl Agents {
                     .and_then(|c| a.activity.get(c));
                 let (recent, thought) = act.map_or((&[][..], ""), |x| (&x.recent[..], &x.thought));
                 Some(Row {
+                    pubkey: pk.clone(),
                     name: a.display_name(pk, store),
                     busy,
                     online: true,

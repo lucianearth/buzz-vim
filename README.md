@@ -28,7 +28,8 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
 - `⏎` or `l` open a thread, `r` reply in it, `+` 👍 the selected message; `h`, `←` or `Esc` goes back
 - `a` the agents screen: who is working, where, and their last tool calls. The header shows who is working
   from anywhere, and a thread shows `taskbot thinking` while an agent answers in it
-- `s` pick which sections become tabs, `R` reload them from the relay
+- `s` pick which sections become tabs (`m` there moves the current channel into the section under the cursor, the same
+  move Desktop makes), `R` reload them from the relay
 - `^v` paste an image or file from the clipboard; dropping a file does the same. Either way a box shows what it
   found and where it goes (`<relay>/upload`), and nothing uploads until you press `y`.
 - Links: click one, or press `f` and type the letter on its chip. A `buzz://` message link opens here: its
