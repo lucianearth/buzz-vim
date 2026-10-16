@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
+use buzz_vim_core::links;
 use buzz_vim_core::live::{self, Cmd, ConnState, Live};
 use buzz_vim_core::model::{self, Applied, Store};
 use buzz_vim_core::palette::{self, Role};
@@ -116,6 +117,8 @@ pub struct Media {
     pub mime: String,
     pub width: u32,
     pub height: u32,
+    /// The uploader's file name, when it gave one.
+    pub name: Option<String>,
 }
 
 #[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq)]
@@ -446,6 +449,12 @@ impl Client {
         let stop = Arc::new(tokio::sync::Notify::new());
         RT.spawn(run(engine.clone(), rx, live_rx, listener, stop.clone()));
         Ok(Arc::new(Client { engine, stop }))
+    }
+
+    /// A link to a file on our relay: tapping it downloads with our auth
+    /// (`save_file`) instead of opening a browser that has none.
+    pub fn is_file(&self, url: String) -> bool {
+        self.engine.lock().unwrap().relay.is_file(&url)
     }
 
     pub fn me(&self) -> String {
@@ -872,6 +881,23 @@ impl Client {
             return Err(BuzzError::Failed("external image".into()));
         }
         Ok(relay.download(&url).await?)
+    }
+
+    /// Download a file on our relay into `dir` under the name it was sent
+    /// with, for the share sheet. Returns its path.
+    pub async fn save_file(&self, url: String, dir: String) -> Result<String, BuzzError> {
+        let (relay, name) = {
+            let e = self.engine.lock().unwrap();
+            (e.relay.clone(), e.store.media_name(&url))
+        };
+        if !relay.is_file(&url) {
+            return Err(BuzzError::Failed("not a file on this relay".into()));
+        }
+        let dir = std::path::Path::new(&dir);
+        std::fs::create_dir_all(dir).map_err(|e| BuzzError::Failed(e.to_string()))?;
+        let path = links::free_path(dir, &links::file_name(&url, name.as_deref()));
+        relay.download_to(&url, &path).await?;
+        Ok(path.to_string_lossy().into_owned())
     }
 }
 
@@ -1867,6 +1893,7 @@ impl Engine {
                     mime: x.mime.clone(),
                     width: x.dim.map_or(0, |d| d.0),
                     height: x.dim.map_or(0, |d| d.1),
+                    name: x.name.clone(),
                 })
                 .collect(),
             reactions,

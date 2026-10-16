@@ -76,7 +76,7 @@ struct ComposeBar: View {
                     }
                 }
                 ComposeField(text: text, focused: $focused, lines: 6) { data, type in
-                    pending = PendingUpload.make(data, type)
+                    Task { prepare(await PendingUpload.make(data, type)) }
                 }
                 .overlay(alignment: .topLeading) {
                     if text.wrappedValue.isEmpty {
@@ -113,7 +113,7 @@ struct ComposeBar: View {
         .onChange(of: picked) { _, item in
             guard let item else { return }
             picked = nil
-            Task { pending = await PendingUpload.load(item) }
+            Task { prepare(await PendingUpload.load(item)) }
         }
         .sheet(item: $pending) { p in
             UploadSheet(upload: p, host: model.relayHost) { yes in
@@ -258,6 +258,15 @@ struct ComposeBar: View {
         }
     }
 
+    /// Ask about a prepared image, or say why there's nothing to ask about.
+    private func prepare(_ p: PendingUpload?) {
+        if let p {
+            pending = p
+        } else {
+            model.say("couldn't read that image")
+        }
+    }
+
     private func upload(_ p: PendingUpload) {
         uploading = true
         Task {
@@ -285,12 +294,17 @@ struct PendingUpload: Identifiable {
 
     static func load(_ item: PhotosPickerItem) async -> PendingUpload? {
         guard let raw = try? await item.loadTransferable(type: Data.self) else { return nil }
-        return make(raw, item.supportedContentTypes.first)
+        return await make(raw, item.supportedContentTypes.first)
     }
 
     /// The relay takes no metadata at all, so every image is redrawn and
     /// re-encoded clean (see Sanitize): PNG stays PNG, the rest go as JPEG.
-    static func make(_ raw: Data, _ type: UTType?) -> PendingUpload? {
+    /// Off the main thread: a 48 MP photo takes a moment to redraw.
+    static func make(_ raw: Data, _ type: UTType?) async -> PendingUpload? {
+        await Task.detached(priority: .userInitiated) { build(raw, type) }.value
+    }
+
+    private static func build(_ raw: Data, _ type: UTType?) -> PendingUpload? {
         guard let img = UIImage(data: raw) else { return nil }
         let png = type?.conforms(to: .png) ?? false
         guard let data = Sanitize.image(img, png: png) else { return nil }

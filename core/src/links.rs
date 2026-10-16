@@ -170,6 +170,62 @@ pub fn open(url: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// A safe file name to save `url` as: the uploader's name if there is
+/// one, else the URL's last segment. Never a path, never hidden.
+pub fn file_name(url: &str, given: Option<&str>) -> String {
+    let tail = url.split(['?', '#']).next().unwrap_or(url);
+    let tail = tail.rsplit('/').next().unwrap_or("");
+    let clean = |s: &str| {
+        let s = s.rsplit(['/', '\\']).next().unwrap_or("");
+        let s: String = s.chars().filter(|c| !c.is_control()).collect();
+        s.trim().trim_start_matches('.').to_string()
+    };
+    [given.map(clean), Some(clean(tail))]
+        .into_iter()
+        .flatten()
+        .find(|s| !s.is_empty())
+        .unwrap_or_else(|| "download".into())
+}
+
+/// `name` in `dir`, or `name (1)`, `name (2)`… if that's taken, the way a
+/// browser saves downloads.
+pub fn free_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
+        _ => (name, String::new()),
+    };
+    (0..)
+        .map(|i| match i {
+            0 => dir.join(name),
+            i => dir.join(format!("{stem} ({i}){ext}")),
+        })
+        .find(|p| !p.exists())
+        .expect("some name is free")
+}
+
+/// Show a downloaded file in the file manager (Finder selects it) rather
+/// than opening it: a file someone sent could be a script.
+pub fn reveal(path: &std::path::Path) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    let mut cmd = if std::env::consts::OS == "macos" {
+        let mut c = Command::new("open");
+        c.arg("-R").arg(path);
+        c
+    } else {
+        let (prog, args) = opener(std::env::consts::OS);
+        let mut c = Command::new(prog);
+        c.args(args).arg(path.parent().unwrap_or(path));
+        c
+    };
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
 /// Open several files at once. On a Mac one `open` call puts them in one
 /// Preview window, where the arrow keys page through them; opening
 /// `paths[focus]` again once that's done makes Preview select it.
@@ -230,6 +286,29 @@ pub fn hint_labels(n: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_names_are_names_not_paths() {
+        let u = "https://buzz.gitcoin.co/media/abc123.bin";
+        assert_eq!(file_name(u, Some("gate.log")), "gate.log");
+        assert_eq!(file_name(u, None), "abc123.bin");
+        assert_eq!(file_name(u, Some("../../etc/passwd")), "passwd");
+        assert_eq!(file_name(u, Some("a\\..\\.bashrc")), "bashrc");
+        assert_eq!(file_name(u, Some("")), "abc123.bin");
+        assert_eq!(file_name("https://x/y/?a=b", Some("..")), "download");
+    }
+
+    #[test]
+    fn free_paths_number_like_a_browser() {
+        let dir = std::env::temp_dir().join(format!("bv-free-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(free_path(&dir, "a.log"), dir.join("a.log"));
+        std::fs::write(dir.join("a.log"), "").unwrap();
+        assert_eq!(free_path(&dir, "a.log"), dir.join("a (1).log"));
+        std::fs::write(dir.join("Makefile"), "").unwrap();
+        assert_eq!(free_path(&dir, "Makefile"), dir.join("Makefile (1)"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn targets() {

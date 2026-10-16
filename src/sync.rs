@@ -520,6 +520,7 @@ impl Sync {
             Action::LoadImage(url) => self.load_image(app, url),
             Action::OpenThread { channel, root } => self.open_thread(&channel, &root),
             Action::OpenImages { urls, current } => self.open_images(app, urls, current),
+            Action::OpenUrl(url) if self.relay.is_file(&url) => self.save_file(app, url),
             Action::OpenUrl(url) => {
                 if let Err(e) = crate::links::open(&url) {
                     app.say(format!("couldn't open {url}: {e}"));
@@ -692,6 +693,32 @@ impl Sync {
         };
         let r = self.relay.clone();
         self.spawn(async move { Msg::Did(r.publish(&ev).await.map(|_| label.to_string())) });
+    }
+
+    /// A file on our relay needs our auth, which a browser doesn't have:
+    /// download it into Downloads under the name it was sent with, and
+    /// show it there.
+    fn save_file(&mut self, app: &mut App, url: String) {
+        let name = crate::links::file_name(&url, app.store.media_name(&url).as_deref());
+        app.say(format!("downloading {name}…"));
+        let r = self.relay.clone();
+        self.spawn(async move {
+            let res = async {
+                let dir = dirs::download_dir()
+                    .or_else(dirs::home_dir)
+                    .ok_or_else(|| anyhow::anyhow!("no Downloads folder"))?;
+                let path = crate::links::free_path(&dir, &name);
+                let n = r.download_to(&url, &path).await?;
+                crate::links::reveal(&path)?;
+                anyhow::Ok(format!(
+                    "saved {} ({})",
+                    path.display(),
+                    crate::clip::human_size(n as usize)
+                ))
+            }
+            .await;
+            Msg::Did(res)
+        });
     }
 
     /// Save images to temp files and hand them to the OS in one go, so a

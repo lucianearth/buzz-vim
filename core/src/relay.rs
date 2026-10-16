@@ -252,6 +252,12 @@ impl Relay {
         same_origin(url, &self.base)
     }
 
+    /// A file in our relay's media store: a link to it needs our auth, so
+    /// we download it ourselves instead of handing it to a browser.
+    pub fn is_file(&self, url: &str) -> bool {
+        self.is_ours(url) && reqwest::Url::parse(url).is_ok_and(|u| u.path().starts_with("/media/"))
+    }
+
     /// BUD-02 upload. Caller has already checked type and size.
     pub async fn upload(&self, bytes: Vec<u8>, mime: &str) -> Result<BlobDescriptor> {
         let sha = hex::encode(Sha256::digest(&bytes));
@@ -326,6 +332,40 @@ impl Relay {
             progress(out.len() as u64, total);
         }
         Ok(out)
+    }
+
+    /// Authenticated GET of any file on this relay, streamed into `path`
+    /// (no size cap: it goes to disk, not memory). A failed download
+    /// leaves nothing behind.
+    pub async fn download_to(&self, url: &str, path: &std::path::Path) -> Result<u64> {
+        use tokio::io::AsyncWriteExt;
+        let auth = self.blossom_auth("get", None, url)?;
+        let mut r = self
+            .authed(self.http.get(url))
+            // Files can be big videos; the client's 30 s is for small calls.
+            .timeout(Duration::from_secs(600))
+            .header("Authorization", auth)
+            .send()
+            .await?;
+        let s = r.status();
+        if !s.is_success() {
+            bail!("download failed ({s})");
+        }
+        let res = async {
+            let mut f = tokio::fs::File::create(path).await?;
+            let mut n = 0u64;
+            while let Some(chunk) = r.chunk().await? {
+                f.write_all(&chunk).await?;
+                n += chunk.len() as u64;
+            }
+            f.flush().await?;
+            anyhow::Ok(n)
+        }
+        .await;
+        if res.is_err() {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+        res
     }
 
     /// Archived identities (NIP-IA): the `p` tags of the newest kind 13535

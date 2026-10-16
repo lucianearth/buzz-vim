@@ -1740,6 +1740,7 @@ mod tests {
                     url: u.to_string(),
                     mime: "image/png".into(),
                     dim: None,
+                    name: None,
                 })
                 .collect(),
             system: false,
