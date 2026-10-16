@@ -59,5 +59,9 @@ struct ThreadView: View {
             ComposeBar(client: client, channel: route.channel, root: route.root, hint: "reply…")
         }
         .onAppear { client.openThread(channel: route.channel, root: route.root) }
+        .onDisappear {
+            client.closeThread(root: route.root)
+            model.bump()
+        }
     }
 }

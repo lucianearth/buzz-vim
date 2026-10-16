@@ -6,6 +6,23 @@ struct Route: Hashable {
     let root: String
 }
 
+/// Tab moves for the keyboard bar, from wherever the compose box is.
+struct Nav {
+    var step: (Int) -> Void = { _ in }
+    var nextUnread: () -> Void = {}
+}
+
+private struct NavKey: EnvironmentKey {
+    static let defaultValue = Nav()
+}
+
+extension EnvironmentValues {
+    var nav: Nav {
+        get { self[NavKey.self] }
+        set { self[NavKey.self] = newValue }
+    }
+}
+
 /// Tabs across the top, one channel per page: swipe sideways between them,
 /// tap a message for its thread, pull the header down for the agents,
 /// hold a tab to drag it, hold the status line for sections.
@@ -56,6 +73,7 @@ struct Home: View {
                 ThreadView(client: client, route: r)
             }
         }
+        .environment(\.nav, Nav(step: step, nextUnread: nextUnread))
         .onAppear { settle(tabs) }
         .onChange(of: tabs.map(\.id)) { _, _ in settle(client.tabs()) }
         .onChange(of: selected) { _, now in
@@ -79,6 +97,33 @@ struct Home: View {
                 .presentationDragIndicator(.visible)
                 .modifier(Themed())
         }
+    }
+
+    /// The tab `by` places along, wrapping. From a thread, back to the channel first.
+    private func step(_ by: Int) {
+        let tabs = client.tabs()
+        guard !tabs.isEmpty else { return }
+        let i = tabs.firstIndex { $0.id == selected } ?? 0
+        go(tabs[((i + by) % tabs.count + tabs.count) % tabs.count].id)
+    }
+
+    /// The next tab after this one with something unread, mentions first.
+    private func nextUnread() {
+        let tabs = client.tabs()
+        guard !tabs.isEmpty else { return }
+        let i = tabs.firstIndex { $0.id == selected } ?? -1
+        let after = (1...tabs.count).map { tabs[(i + $0 + tabs.count) % tabs.count] }
+            .filter { $0.id != selected }
+        if let t = after.first(where: { $0.mentions > 0 }) ?? after.first(where: { $0.unread > 0 }) {
+            go(t.id)
+        } else {
+            model.say("nothing unread")
+        }
+    }
+
+    private func go(_ id: String) {
+        path = []
+        withAnimation(.easeOut(duration: 0.2)) { selected = id }
     }
 
     /// Keep the selection on a tab that exists, and tell Rust what's open.
@@ -192,7 +237,14 @@ struct Header: View {
             Text(name)
                 .font(on ? .chipOn : .chip)
                 .lineLimit(1)
-            if t.unread > 0 && !on {
+            if t.mentions > 0 && !on {
+                Text("\(t.mentions)")
+                    .font(.tiny)
+                    .foregroundStyle(theme.onAccent)
+                    .padding(.horizontal, 5)
+                    .frame(minWidth: 17, minHeight: 17)
+                    .background(theme.badge, in: Capsule())
+            } else if t.unread > 0 && !on {
                 Circle().fill(theme.badge).frame(width: 6, height: 6)
             }
         }

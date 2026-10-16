@@ -19,6 +19,13 @@ final class Model {
         didSet { UserDefaults.standard.set(drafts, forKey: "drafts") }
     }
 
+    /// Sticky agents by conversation (same keys as drafts): pubkeys every
+    /// send there goes to until you take them off. Mentioning an agent adds
+    /// it. No entry yet means a thread starts with its root's agents.
+    var sticky: [String: [String]] = UserDefaults.standard.dictionary(forKey: "sticky") as? [String: [String]] ?? [:] {
+        didSet { UserDefaults.standard.set(sticky, forKey: "sticky") }
+    }
+
     /// Sends the relay hasn't confirmed: message id -> [draft key, text].
     /// What is still here at launch never confirmed, so it goes back into
     /// its compose box rather than vanishing.
@@ -71,6 +78,7 @@ final class Model {
         UserDefaults.standard.removeObject(forKey: "chosen")
         UserDefaults.standard.removeObject(forKey: "tabOrder")
         drafts = [:]
+        sticky = [:]
     }
 
     private func start(relay: String, secret: String, authTag: String? = nil) throws {

@@ -77,6 +77,8 @@ pub struct ChannelTab {
     /// `#name` for channels, `@name` for DMs.
     pub label: String,
     pub unread: u32,
+    /// Unread messages that mention us (every unread one, in a DM).
+    pub mentions: u32,
     pub is_dm: bool,
     /// The section this tab came from; tabs reorder within their section.
     pub section: String,
@@ -134,12 +136,25 @@ pub struct Message {
     pub media: Vec<Media>,
     pub reactions: Vec<Reaction>,
     pub reply_count: u32,
-    /// Who replied, newest first, at most three names.
-    pub repliers: Vec<String>,
+    /// Who replied, newest first, at most three.
+    pub repliers: Vec<Person>,
+    /// When the last reply landed, 0 if unknown.
+    pub last_reply_at: u64,
+    /// Replies from others you haven't seen in the thread.
+    pub new_replies: u32,
     pub edited: bool,
     pub deleted: bool,
     pub system: bool,
     pub state: SendState,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct Person {
+    pub pubkey: String,
+    pub name: String,
+    /// Avatar URL, "" when none.
+    pub picture: String,
+    pub is_agent: bool,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -308,6 +323,9 @@ struct Engine {
     loading_older: HashSet<String>,
     unread_checked: HashSet<String>,
     started: u64,
+    /// Channel read positions from before this session marked anything:
+    /// replies after it count as new until their thread is opened.
+    floor: HashMap<String, u64>,
     /// Our sends the relay hasn't confirmed: id -> event.
     sending: HashMap<String, Event>,
     failed: HashMap<String, Event>,
@@ -393,6 +411,7 @@ impl Client {
             loading_older: HashSet::new(),
             unread_checked: HashSet::new(),
             started: now(),
+            floor: HashMap::new(),
             sending: HashMap::new(),
             failed: HashMap::new(),
             notices: vec![],
@@ -437,6 +456,13 @@ impl Client {
                     id: id.clone(),
                     label: e.label(id),
                     unread: ch.map_or(0, |c| c.unread.len() as u32),
+                    mentions: ch.map_or(0, |c| {
+                        (if c.is_dm {
+                            c.unread.len()
+                        } else {
+                            c.mentioned.len()
+                        }) as u32
+                    }),
                     is_dm: ch.is_some_and(|c| c.is_dm),
                     section: e.tab_section.get(id).cloned().unwrap_or_default(),
                 }
@@ -545,9 +571,17 @@ impl Client {
         }
     }
 
+    /// A thread on screen: loads it and marks its replies seen.
     pub fn open_thread(&self, channel: String, root: String) {
-        let e = self.engine.lock().unwrap();
+        let mut e = self.engine.lock().unwrap();
+        e.read.mark(&format!("thread:{root}"), now());
         e.thread(&channel, &root);
+    }
+
+    /// Leaving a thread: what arrived while it was open is seen too.
+    pub fn close_thread(&self, root: String) {
+        let mut e = self.engine.lock().unwrap();
+        e.read.mark(&format!("thread:{root}"), now());
     }
 
     /// The root first, then its replies, oldest first.
@@ -592,9 +626,40 @@ impl Client {
         root: Option<String>,
         text: String,
         attachments: Vec<Attachment>,
+        to: Vec<String>,
     ) -> Result<String, BuzzError> {
         let mut e = self.engine.lock().unwrap();
-        e.send(channel, root, text, &attachments)
+        e.send(channel, root, text, &attachments, &to)
+    }
+
+    /// Agents `text` @mentions, by pubkey: they become the sticky audience.
+    pub fn mentioned_agents(&self, channel: String, text: String) -> Vec<String> {
+        let e = self.engine.lock().unwrap();
+        e.mentions_in(&channel, &text)
+            .into_iter()
+            .filter(|pk| e.is_agent(pk))
+            .collect()
+    }
+
+    /// Agents a thread's root addressed: a reply goes to them by default.
+    pub fn root_agents(&self, channel: String, root: String) -> Vec<String> {
+        let e = self.engine.lock().unwrap();
+        e.store
+            .channels
+            .get(&channel)
+            .and_then(|c| c.messages.get(&root))
+            .map(|m| {
+                m.mentions
+                    .iter()
+                    .filter(|pk| e.is_agent(pk))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn person(&self, pubkey: String) -> Person {
+        self.engine.lock().unwrap().person(&pubkey)
     }
 
     /// Send a failed message's event again, unchanged.
@@ -652,9 +717,8 @@ impl Client {
             .collect()
     }
 
-    /// Names of channel members, for @ completion: (name, pubkey) pairs as
-    /// "name\tpubkey".
-    pub fn people(&self, channel: String) -> Vec<String> {
+    /// Channel members and our agents for @ completion, agents first.
+    pub fn people(&self, channel: String) -> Vec<Person> {
         let e = self.engine.lock().unwrap();
         let mut keys: Vec<String> = e
             .store
@@ -662,12 +726,13 @@ impl Client {
             .get(&channel)
             .map(|c| c.members.clone())
             .unwrap_or_default();
+        keys.extend(e.agents.by_pubkey.keys().cloned());
+        keys.sort();
+        keys.dedup();
         keys.retain(|k| *k != e.store.me);
-        let mut out: Vec<String> = keys
-            .iter()
-            .map(|k| format!("{}\t{k}", e.store.name_of(k)))
-            .collect();
-        out.sort_by_key(|s| s.to_lowercase());
+        let mut out: Vec<Person> = keys.iter().map(|k| e.person(k)).collect();
+        out.retain(|p| !p.name.is_empty());
+        out.sort_by_key(|p| (!p.is_agent, p.name.to_lowercase()));
         out
     }
 
@@ -1103,9 +1168,39 @@ impl Engine {
     }
 
     fn mark_read(&mut self, channel: &str) {
+        self.set_floor(channel);
         self.read.mark(channel, now());
         if let Some(ch) = self.store.channels.get_mut(channel) {
             ch.unread.clear();
+            ch.mentioned.clear();
+        }
+    }
+
+    /// Remember where `channel` was read up to before we touch it. Only
+    /// once the startup read state is in; before that it is unknown.
+    fn set_floor(&mut self, channel: &str) {
+        if self.read.tried && !self.floor.contains_key(channel) {
+            let at = self.read.read_at(channel).unwrap_or(self.started);
+            self.floor.insert(channel.to_string(), at);
+        }
+    }
+
+    fn is_agent(&self, pk: &str) -> bool {
+        self.store.profiles.get(pk).is_some_and(|p| p.is_agent)
+            || self.agents.by_pubkey.contains_key(pk)
+    }
+
+    fn person(&self, pk: &str) -> Person {
+        Person {
+            pubkey: pk.to_string(),
+            name: self.store.name_of(pk),
+            picture: self
+                .store
+                .profiles
+                .get(pk)
+                .map(|p| p.picture.clone())
+                .unwrap_or_default(),
+            is_agent: self.is_agent(pk),
         }
     }
 
@@ -1147,6 +1242,8 @@ impl Engine {
         for (id, ch) in self.store.channels.iter_mut() {
             if let Some(r) = self.read.read_at(id) {
                 ch.unread.retain(|_, at| *at > r);
+                let left = &ch.unread;
+                ch.mentioned.retain(|m| left.contains_key(m));
             }
         }
     }
@@ -1163,6 +1260,10 @@ impl Engine {
                 // Even on failure, so unread still works from the last week.
                 self.read.tried = true;
                 self.prune_unread();
+                let ids: Vec<String> = self.store.channels.keys().cloned().collect();
+                for id in ids {
+                    self.set_floor(&id);
+                }
             }
             Msg::Unread { channel, events } => {
                 let Ok(evs) = events else { return };
@@ -1179,6 +1280,13 @@ impl Engine {
                         && at > after
                     {
                         ch.unread.insert(ev.id.to_hex(), at);
+                        let tagged = ev
+                            .tags
+                            .iter()
+                            .any(|t| matches!(t.as_slice(), [k, v, ..] if k == "p" && *v == me));
+                        if tagged {
+                            ch.mentioned.insert(ev.id.to_hex());
+                        }
                     }
                 }
             }
@@ -1186,6 +1294,10 @@ impl Engine {
                 self.channels_loaded = true;
                 for ev in &evs {
                     self.store.apply(ev);
+                }
+                let ids: Vec<String> = self.store.channels.keys().cloned().collect();
+                for id in ids {
+                    self.set_floor(&id);
                 }
                 let people: Vec<String> = self
                     .store
@@ -1393,11 +1505,18 @@ impl Engine {
             let seen = self.read.read_at(&channel).is_some_and(|r| at <= r);
             let counts = model::UNREAD_KINDS.contains(&kind) && author != self.store.me;
             if live_channel && !seen && counts && !active {
-                self.store
-                    .channel_mut(&channel)
-                    .unread
-                    .insert(id.clone(), at);
+                let me = self.store.me.clone();
+                let ch = self.store.channel_mut(&channel);
+                ch.unread.insert(id.clone(), at);
+                if ch
+                    .messages
+                    .get(&id)
+                    .is_some_and(|m| m.mentions.contains(&me))
+                {
+                    ch.mentioned.insert(id.clone());
+                }
             } else if live_channel && active && author != self.store.me {
+                self.set_floor(&channel);
                 self.read.mark(&channel, now());
             }
             if let Some(m) = self
@@ -1418,6 +1537,7 @@ impl Engine {
         root: Option<String>,
         text: String,
         attachments: &[Attachment],
+        to: &[String],
     ) -> Result<String, BuzzError> {
         let mut content = text.trim_end().to_string();
         for a in attachments {
@@ -1434,6 +1554,13 @@ impl Engine {
         }
         let mentioned = self.mentions_in(&channel, &content);
         let mut mentions = mentioned.clone();
+        // The sticky agents: notified without an @ in the text, as Desktop
+        // sends its pinned audience.
+        for pk in to {
+            if *pk != self.store.me && !mentions.contains(pk) {
+                mentions.push(pk.clone());
+            }
+        }
         // In a DM everyone else is notified, as Desktop does.
         if let Some(ch) = self.store.channels.get(&channel).filter(|c| c.is_dm) {
             for m in &ch.members {
@@ -1574,17 +1701,37 @@ impl Engine {
                     .collect()
             })
             .unwrap_or_default();
-        let mut repliers = vec![];
+        let mut repliers: Vec<Person> = vec![];
+        let mut last_reply_at = ch.summary_replies.get(&m.id).map_or(0, |s| s.1);
+        let mut new_replies = 0;
         if let Some(ids) = ch.replies.get(&m.id) {
+            let seen = [
+                self.read.read_at(&format!("thread:{}", m.id)),
+                self.floor.get(&ch.id).copied().or(Some(self.started)),
+            ]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or(0);
             for id in ids.iter().rev() {
-                if let Some(r) = ch.messages.get(id) {
-                    let n = self.store.name_of(&r.author);
-                    if !repliers.contains(&n) {
-                        repliers.push(n);
-                    }
+                let Some(r) = ch.messages.get(id) else {
+                    continue;
+                };
+                if r.deleted {
+                    continue;
                 }
-                if repliers.len() == 3 {
-                    break;
+                last_reply_at = last_reply_at.max(r.created_at);
+                if r.author != *me
+                    && r.created_at > seen
+                    && self
+                        .read
+                        .read_at(&format!("msg:{id}"))
+                        .is_none_or(|t| r.created_at > t)
+                {
+                    new_replies += 1;
+                }
+                if repliers.len() < 3 && !repliers.iter().any(|p| p.pubkey == r.author) {
+                    repliers.push(self.person(&r.author));
                 }
             }
         }
@@ -1599,12 +1746,7 @@ impl Engine {
             id: m.id.clone(),
             author: m.author.clone(),
             author_name: self.store.name_of(&m.author),
-            is_agent: self
-                .store
-                .profiles
-                .get(&m.author)
-                .is_some_and(|p| p.is_agent)
-                || self.agents.by_pubkey.contains_key(&m.author),
+            is_agent: self.is_agent(&m.author),
             at: m.created_at,
             segments: segments(body.trim_end()),
             mention_names: m
@@ -1627,6 +1769,8 @@ impl Engine {
             reactions,
             reply_count: ch.reply_count(&m.id) as u32,
             repliers,
+            last_reply_at,
+            new_replies,
             edited: m.edited,
             deleted: m.deleted,
             system: m.system,
@@ -1744,6 +1888,7 @@ mod tests {
             loading_older: HashSet::new(),
             unread_checked: HashSet::new(),
             started: 0,
+            floor: HashMap::new(),
             sending: HashMap::new(),
             failed: HashMap::new(),
             notices: vec![],
@@ -1761,12 +1906,52 @@ mod tests {
                 model::Profile {
                     name: name.into(),
                     is_agent: false,
+                    ..Default::default()
                 },
             );
         }
         assert_eq!(e.mentions_in("c", "hi @Ann Lee"), vec!["b".to_string()]);
         assert_eq!(e.mentions_in("c", "hi @Ann"), vec!["a".to_string()]);
         assert!(e.mentions_in("c", "hi Ann").is_empty());
+    }
+
+    #[test]
+    fn reply_line_counts_what_you_have_not_seen() {
+        let mut e = engine();
+        let me = e.store.me.clone();
+        e.started = 100;
+        let ch = e.store.channel_mut("c");
+        for (id, author, at) in [("root", "a"), ("r1", "a"), ("r2", "b"), ("r3", me.as_str())]
+            .into_iter()
+            .zip([50, 90, 150, 160])
+            .map(|((id, au), at)| (id, au.to_string(), at))
+        {
+            ch.messages.insert(
+                id.into(),
+                model::Message {
+                    id: id.into(),
+                    author,
+                    created_at: at,
+                    root: (id != "root").then(|| "root".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        ch.replies
+            .insert("root".into(), vec!["r1".into(), "r2".into(), "r3".into()]);
+        let view = |e: &Engine| {
+            let ch = &e.store.channels["c"];
+            e.view(ch, &ch.messages["root"])
+        };
+        // r1 is from before this session; r3 is ours.
+        let m = view(&e);
+        assert_eq!(
+            (m.new_replies, m.last_reply_at, m.repliers.len()),
+            (1, 160, 3)
+        );
+        assert_eq!(m.repliers[0].pubkey, me);
+        e.read.mark("thread:root", 155);
+        assert_eq!(view(&e).new_replies, 0);
     }
 
     #[test]

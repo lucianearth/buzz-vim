@@ -140,11 +140,8 @@ struct MessageRow: View {
                     .padding(.top, 4)
                 }
                 if showReplies && m.replyCount > 0 {
-                    let who = m.repliers.isEmpty ? "" : " · " + m.repliers.joined(separator: ", ")
-                    Text("\(m.replyCount) \(m.replyCount == 1 ? "reply" : "replies")\(who)")
-                        .font(.small)
+                    ReplyLine(client: client, message: m)
                         .padding(.top, 4)
-                        .foregroundStyle(theme.muted)
                 }
             }
             .opacity(m.state == .sending ? 0.55 : 1)
@@ -160,6 +157,70 @@ struct MessageRow: View {
             return nil
         }.joined(separator: " ")
         return "\(m.authorName) " + t.trimmingCharacters(in: CharacterSet(charactersIn: "_"))
+    }
+}
+
+/// Under a message with replies: who replied, how many, how many you
+/// haven't seen, and how long ago the last one came. Tapping the message
+/// opens the thread.
+struct ReplyLine: View {
+    let client: Client
+    let message: Message
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        let m = message
+        HStack(spacing: 8) {
+            HStack(spacing: -6) {
+                ForEach(m.repliers.reversed(), id: \.pubkey) { p in
+                    Avatar(client: client, person: p, size: 22)
+                }
+            }
+            (Text("\(m.replyCount) \(m.replyCount == 1 ? "reply" : "replies")")
+                .foregroundStyle(m.newReplies > 0 ? theme.text : theme.muted)
+             + Text(m.newReplies > 0 ? " (\(m.newReplies) new)" : "")
+                .foregroundStyle(theme.badge)
+             + Text(m.lastReplyAt > 0 ? " · " + ago(m.lastReplyAt) : "")
+                .foregroundStyle(theme.faint))
+                .font(.small)
+                .lineLimit(1)
+        }
+    }
+}
+
+/// A round face: their picture, or their initial in their color.
+struct Avatar: View {
+    let client: Client
+    let person: Person
+    let size: CGFloat
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        Group {
+            if person.picture.isEmpty {
+                Text(person.name.prefix(1).uppercased())
+                    .font(.system(size: size * 0.5, weight: .semibold))
+                    .foregroundStyle(theme.onAccent)
+                    .frame(width: size, height: size)
+                    .background(theme.ink(person.name))
+            } else {
+                RelayImage(client: client, url: person.picture, width: 1, height: 1, fill: true)
+                    .frame(width: size, height: size)
+            }
+        }
+        .clipShape(Circle())
+        .overlay(Circle().stroke(theme.canvas, lineWidth: 2))
+    }
+}
+
+/// "just now", "5m ago", "3h ago", "2d ago".
+func ago(_ at: UInt64) -> String {
+    let s = max(0, Int(Date().timeIntervalSince1970) - Int(at))
+    switch s {
+    case ..<60: return "just now"
+    case ..<3600: return "\(s / 60)m ago"
+    case ..<86_400: return "\(s / 3600)h ago"
+    default: return "\(s / 86_400)d ago"
     }
 }
 

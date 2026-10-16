@@ -2110,6 +2110,7 @@ mod tests {
                 crate::model::Profile {
                     name: name.into(),
                     is_agent: name != "lucian",
+                    ..Default::default()
                 },
             );
         }

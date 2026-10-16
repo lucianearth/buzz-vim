@@ -5,7 +5,9 @@ import UniformTypeIdentifiers
 
 /// One thin bar at the bottom. It grows as you type; the paperclip and the
 /// send arrow show once you are writing. A photo uploads only after you say
-/// yes on the sheet.
+/// yes on the sheet. Agents you @mention stay on as chips and every send
+/// here goes to them until you tap one off. While typing, a row of keys
+/// sits on the keyboard: @, #, code fence, tab moves, hide.
 struct ComposeBar: View {
     let client: Client
     let channel: String
@@ -13,6 +15,7 @@ struct ComposeBar: View {
     let hint: String
     @Environment(Model.self) private var model
     @Environment(\.theme) private var theme
+    @Environment(\.nav) private var nav
     @FocusState private var focused: Bool
     @State private var attachments: [Attachment] = []
     @State private var picked: PhotosPickerItem?
@@ -30,9 +33,18 @@ struct ComposeBar: View {
         !text.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty
     }
 
+    /// The sticky agents here. A thread nobody has changed yet starts with
+    /// the agents its root addressed, as Desktop does.
+    private var audience: [String] {
+        model.sticky[key] ?? root.map { client.rootAgents(channel: channel, root: $0) } ?? []
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             suggestions
+            if !audience.isEmpty {
+                chips
+            }
             if !attachments.isEmpty || uploading {
                 HStack(spacing: 6) {
                     ForEach(attachments, id: \.url) { a in
@@ -80,6 +92,9 @@ struct ComposeBar: View {
             .padding(.vertical, 16)
             .background(theme.card, in: RoundedRectangle(cornerRadius: 14))
             .overlay(RoundedRectangle(cornerRadius: 14).stroke(theme.rule, lineWidth: 1))
+            if focused {
+                keys
+            }
         }
         .padding(.horizontal, 16)
         .padding(.top, 4)
@@ -101,34 +116,96 @@ struct ComposeBar: View {
         }
     }
 
-    // ---------- @ completion ----------
+    // ---------- sticky agents ----------
 
-    private var query: String? {
-        guard let last = text.wrappedValue.split(separator: " ", omittingEmptySubsequences: false).last,
-              last.hasPrefix("@") else { return nil }
-        return String(last.dropFirst()).lowercased()
+    private var chips: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                Text("to").font(.small).foregroundStyle(theme.muted)
+                ForEach(audience, id: \.self) { pk in
+                    let name = client.person(pubkey: pk).name
+                    HStack(spacing: 4) {
+                        Text("@" + name).font(.small).foregroundStyle(theme.ink(name))
+                        Image(systemName: "xmark").font(.tiny).foregroundStyle(theme.muted)
+                    }
+                    .padding(.horizontal, 9).padding(.vertical, 5)
+                    .background(theme.idle, in: Capsule())
+                    .onTapGesture { model.sticky[key] = audience.filter { $0 != pk } }
+                }
+            }
+            .padding(.horizontal, 6)
+        }
+    }
+
+    // ---------- the keys on the keyboard ----------
+
+    private var keys: some View {
+        HStack(spacing: 0) {
+            keyButton("at") { insert("@") }
+            keyButton("number") { insert("#") }
+            keyButton("chevron.left.forwardslash.chevron.right") { fence() }
+            Spacer(minLength: 4)
+            keyButton("chevron.left") { nav.step(-1) }
+            keyButton("chevron.right") { nav.step(1) }
+            keyButton("bell.badge") { nav.nextUnread() }
+            keyButton("keyboard.chevron.compact.down") { focused = false }
+        }
+        .padding(.horizontal, 4)
+    }
+
+    private func keyButton(_ symbol: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 17))
+                .foregroundStyle(theme.muted)
+                .frame(width: 42, height: 34)
+                .contentShape(Rectangle())
+        }
+    }
+
+    /// Add `s` at the end, after a space if it would join the last word.
+    private func insert(_ s: String) {
+        var t = text.wrappedValue
+        if let last = t.last, !last.isWhitespace { t += " " }
+        text.wrappedValue = t + s
+    }
+
+    /// A fence line: the first opens a code block, the next closes it.
+    private func fence() {
+        var t = text.wrappedValue
+        if let last = t.last, last != "\n" { t += "\n" }
+        text.wrappedValue = t + "```\n"
+    }
+
+    // ---------- @ and # completion ----------
+
+    /// The word being typed: from the last space or newline to the end.
+    private var word: (range: Range<String.Index>, text: String)? {
+        let t = text.wrappedValue
+        let start = t.lastIndex { $0 == " " || $0 == "\n" }.map { t.index(after: $0) } ?? t.startIndex
+        guard start < t.endIndex else { return nil }
+        return (start..<t.endIndex, String(t[start...]))
     }
 
     @ViewBuilder
     private var suggestions: some View {
-        if focused, let q = query {
-            let people = client.people(channel: channel)
-                .compactMap { line -> String? in
-                    let name = line.split(separator: "\t").first.map(String.init) ?? ""
-                    return name.lowercased().hasPrefix(q) ? name : nil
-                }
-                .prefix(4)
-            if !people.isEmpty {
+        if focused, let w = word?.text, let first = w.first, first == "@" || first == "#" {
+            let q = String(w.dropFirst()).lowercased()
+            let names: [String] = first == "@"
+                ? client.people(channel: channel).map(\.name).filter { $0.lowercased().hasPrefix(q) }
+                : client.tabs().filter { !$0.isDm }.map { String($0.label.dropFirst()) }
+                    .filter { $0.lowercased().hasPrefix(q) }
+            if !names.isEmpty {
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(people), id: \.self) { name in
-                        Text("@" + name)
+                    ForEach(names.prefix(5), id: \.self) { name in
+                        Text(String(first) + name)
                             .font(.text)
-                            .foregroundStyle(theme.ink(name))
+                            .foregroundStyle(first == "@" ? theme.ink(name) : theme.text)
                             .padding(.vertical, 8)
                             .padding(.horizontal, 14)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .contentShape(Rectangle())
-                            .onTapGesture { complete(name) }
+                            .onTapGesture { complete(String(first) + name) }
                     }
                 }
                 .background(theme.card, in: RoundedRectangle(cornerRadius: 14))
@@ -136,20 +213,23 @@ struct ComposeBar: View {
         }
     }
 
-    private func complete(_ name: String) {
-        var words = text.wrappedValue.split(separator: " ", omittingEmptySubsequences: false).map(String.init)
-        words.removeLast()
-        words.append("@" + name + " ")
-        text.wrappedValue = words.joined(separator: " ")
+    private func complete(_ token: String) {
+        guard let w = word else { return }
+        var t = text.wrappedValue
+        t.replaceSubrange(w.range, with: token + " ")
+        text.wrappedValue = t
     }
 
     // ---------- send ----------
 
     private func send() {
         let body = text.wrappedValue
+        let to = audience
         do {
-            let id = try client.send(channel: channel, root: root, text: body, attachments: attachments)
+            let id = try client.send(channel: channel, root: root, text: body, attachments: attachments, to: to)
             model.sent(id: id, key: key, text: body)
+            let added = client.mentionedAgents(channel: channel, text: body).filter { !to.contains($0) }
+            model.sticky[key] = to + added
             text.wrappedValue = ""
             attachments = []
         } catch let BuzzError.Failed(message) {

@@ -60,7 +60,7 @@ pub struct Media {
     pub dim: Option<(u32, u32)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Message {
     pub id: String,
     pub author: String,
@@ -161,6 +161,8 @@ pub struct Channel {
     pub loaded: bool,
     /// Unread top-level messages: id -> created_at.
     pub unread: HashMap<String, u64>,
+    /// The unread ones that mention us.
+    pub mentioned: HashSet<String>,
     pub oldest: Option<u64>,
     pub exhausted: bool,
 }
@@ -179,6 +181,8 @@ impl Channel {
 pub struct Profile {
     pub name: String,
     pub is_agent: bool,
+    /// Avatar URL, "" when none.
+    pub picture: String,
 }
 
 #[derive(Default)]
@@ -342,6 +346,11 @@ impl Store {
                 let p = self.profiles.entry(ev.pubkey.to_hex()).or_default();
                 p.name = name;
                 p.is_agent |= is_agent;
+                p.picture = v
+                    .get("picture")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 Applied::Changed
             }
             KIND_CHANNEL_META => {
