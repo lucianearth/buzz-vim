@@ -14,8 +14,6 @@ struct Route: Hashable {
 struct Nav {
     var step: (Int) -> Void = { _ in }
     var bell: () -> Void = {}
-    /// Open the tab switcher (holding the thread header).
-    var switcher: () -> Void = {}
 }
 
 private struct NavKey: EnvironmentKey {
@@ -32,7 +30,7 @@ extension EnvironmentValues {
 /// Tabs across the top, one channel per page: swipe sideways between them,
 /// tap a message for its thread (it opens in the tab, which remembers it;
 /// swipes still change tabs), pull the header down for the agents,
-/// hold a tab, the status line or a thread's header for the switcher
+/// hold a tab or the status line for the switcher
 /// (a page of tall rows per section, drag handles to reorder).
 struct Home: View {
     let client: Client
@@ -86,14 +84,14 @@ struct Home: View {
         .overlay {
             if switcher {
                 TabSwitcher(client: client, selected: selected, shown: $switcher,
-                            page: tabs.first { $0.id == selected }?.section
+                            page: tabs.first { $0.id == selected }?.section.nilIfEmpty
                                 ?? client.sections().first(where: \.chosen)?.id,
                             pick: pick)
                     .transition(.opacity)
             }
         }
         .sensoryFeedback(.impact, trigger: switcher) { _, now in now }
-        .environment(\.nav, Nav(step: step, bell: bell, switcher: openSwitcher))
+        .environment(\.nav, Nav(step: step, bell: bell))
         .onAppear {
             model.follow = follow
             settle(tabs)
@@ -205,6 +203,9 @@ struct Home: View {
 
     /// Open a thread in a tab, or close it (nil), and remember it.
     private func show(_ channel: String, _ r: Route?) {
+        // The page underneath stays in the window: its box mustn't keep
+        // the keyboard. A bell landing claims it back after.
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
         withAnimation(.easeOut(duration: 0.2)) { threads[channel] = r }
         UserDefaults.standard.set(threads.mapValues(\.root), forKey: "threads")
     }
@@ -406,6 +407,12 @@ struct TabSwitcher: View {
             .padding(.horizontal, 22)
             .padding(.top, 14)
             .padding(.bottom, 6)
+            if sections.isEmpty {
+                Text(client.ready() ? "no sections" : "loading sections…")
+                    .font(.small)
+                    .foregroundStyle(theme.muted)
+                    .frame(maxHeight: .infinity)
+            }
             ScrollView(.horizontal) {
                 LazyHStack(spacing: 0) {
                     ForEach(sections, id: \.id) { s in
@@ -555,4 +562,8 @@ struct Pulse: View {
             .animation(on ? .easeInOut(duration: 0.9).repeatForever(autoreverses: true) : .default, value: big)
             .onAppear { big = true }
     }
+}
+
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
 }
