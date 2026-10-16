@@ -21,7 +21,7 @@ struct ChannelView: View {
                     }
                     if !tl.loaded {
                         Text("loading…")
-                            .font(.footnote)
+                            .font(.small)
                             .foregroundStyle(theme.muted)
                     }
                     ForEach(tl.messages, id: \.id) { m in
@@ -60,7 +60,7 @@ struct Working: View {
         HStack(spacing: 7) {
             Pulse(color: theme.live, on: true)
             Text(names.joined(separator: ", ") + " thinking…")
-                .font(.footnote.italic())
+                .font(.small)
                 .foregroundStyle(theme.muted)
         }
     }
@@ -78,11 +78,11 @@ struct MessageRow: View {
         let m = message
         if m.system {
             Text(plainSystem(m))
-                .font(.footnote.italic())
+                .font(.small)
                 .foregroundStyle(theme.faint)
         } else {
             VStack(alignment: .leading, spacing: 4) {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                HStack(alignment: .firstTextBaseline, spacing: 12) {
                     Text(m.authorName)
                         .font(.name)
                         .foregroundStyle(theme.ink(m.author))
@@ -97,7 +97,7 @@ struct MessageRow: View {
                     switch s {
                     case let .text(text):
                         Text(rich(text, mentions: m.mentionNames, theme: theme))
-                            .font(.body)
+                            .font(.text)
                             .lineSpacing(3)
                             .fixedSize(horizontal: false, vertical: true)
                     case let .code(lang, body):
@@ -113,7 +113,7 @@ struct MessageRow: View {
                 }
                 if m.state == .failed {
                     Text("not sent · tap to send again")
-                        .font(.caption)
+                        .font(.small)
                         .foregroundStyle(theme.badge)
                         .onTapGesture { client.retry(id: m.id) }
                         .contextMenu {
@@ -129,11 +129,12 @@ struct MessageRow: View {
                     HStack(spacing: 6) {
                         ForEach(m.reactions, id: \.emoji) { r in
                             Text("\(r.emoji) \(r.count)")
-                                .font(.subheadline)
+                                .font(.text)
                                 .foregroundStyle(theme.text)
                                 .padding(.horizontal, 11)
-                                .padding(.vertical, 5)
-                                .background(r.mine ? theme.rule : theme.idle, in: Capsule())
+                                .padding(.vertical, 6)
+                                .background(r.mine ? theme.idle : theme.card, in: RoundedRectangle(cornerRadius: 10))
+                                .overlay(RoundedRectangle(cornerRadius: 10).stroke(theme.rule, lineWidth: 1))
                         }
                     }
                     .padding(.top, 4)
@@ -141,7 +142,7 @@ struct MessageRow: View {
                 if showReplies && m.replyCount > 0 {
                     let who = m.repliers.isEmpty ? "" : " · " + m.repliers.joined(separator: ", ")
                     Text("\(m.replyCount) \(m.replyCount == 1 ? "reply" : "replies")\(who)")
-                        .font(.footnote)
+                        .font(.small)
                         .padding(.top, 4)
                         .foregroundStyle(theme.muted)
                 }
@@ -168,9 +169,10 @@ struct CodeBlock: View {
     @Environment(\.theme) private var theme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 2) {
             if !lang.isEmpty {
-                Text(lang).font(.caption2.monospaced()).foregroundStyle(theme.codeLabel)
+                Text(lang).font(.tiny).foregroundStyle(theme.codeLabel)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
             }
             ScrollView(.horizontal, showsIndicators: false) {
                 Text(code)
@@ -182,7 +184,8 @@ struct CodeBlock: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(theme.card, in: RoundedRectangle(cornerRadius: 10))
+        .background(theme.codeBg, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(theme.rule, lineWidth: 1))
     }
 }
 
@@ -236,7 +239,7 @@ func rich(_ src: String, mentions: [String], theme: Theme) -> AttributedString {
         while let r = plain.range(of: "@" + name, range: from..<plain.endIndex) {
             if let s = span(r) {
                 a[s].foregroundColor = theme.accent
-                a[s].font = Font.body.weight(.semibold)
+                a[s].font = Font.textBold
             }
             from = r.upperBound
         }

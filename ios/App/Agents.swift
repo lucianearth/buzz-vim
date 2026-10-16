@@ -13,13 +13,13 @@ struct AgentsView: View {
             LazyVStack(alignment: .leading, spacing: 0) {
                 if agents.isEmpty {
                     Text("none of your agents are online")
-                        .font(.body)
+                        .font(.text)
                         .foregroundStyle(theme.muted)
                         .padding(.top, 30)
                 }
                 ForEach(Array(agents.enumerated()), id: \.element.pubkey) { i, a in
                     if i > 0 {
-                        Rectangle().fill(theme.rule).frame(height: 1).padding(.vertical, 14)
+                        Rectangle().fill(theme.rule).frame(height: 1).padding(.vertical, 20)
                     }
                     row(a)
                 }
@@ -28,32 +28,47 @@ struct AgentsView: View {
             .padding(.top, 26)
             .padding(.bottom, 20)
         }
-        .background(theme.canvas)
+        .background(theme.sheet)
     }
 
     private func row(_ a: Agent) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 4) {
             Text(a.name)
-                .font(.title3.weight(.semibold))
+                .font(.heading)
                 .foregroundStyle(theme.ink(a.pubkey))
-            HStack(spacing: 6) {
-                Pulse(color: a.busy ? theme.live : theme.faint, on: a.busy)
+            HStack(spacing: 7) {
+                if a.busy { Pulse(color: theme.live, on: true) }
                 Text(status(a))
-                    .font(.footnote)
+                    .font(.text)
                     .foregroundStyle(theme.muted)
             }
-            ForEach(Array(a.recent.suffix(3).enumerated()), id: \.offset) { _, step in
-                Text(step)
-                    .font(.mono)
-                    .foregroundStyle(theme.faint)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+            let steps = a.recent.suffix(3)
+            if !steps.isEmpty || !a.thought.isEmpty {
+                Rectangle().fill(theme.rule).frame(height: 1).padding(.vertical, 8)
+            }
+            // "bash  cargo test": the tool in muted, what it ran in code green.
+            ForEach(Array(steps.enumerated()), id: \.offset) { _, step in
+                let parts = step.split(separator: " ", maxSplits: 1).map(String.init)
+                HStack(alignment: .firstTextBaseline, spacing: 12) {
+                    Text(parts.first ?? "")
+                        .foregroundStyle(theme.muted)
+                        .frame(minWidth: 44, alignment: .leading)
+                    if parts.count > 1 {
+                        Text(parts[1]).foregroundStyle(theme.code)
+                    }
+                }
+                .font(.mono)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .padding(.leading, 14)
             }
             if !a.thought.isEmpty {
                 Text(a.thought)
-                    .font(.footnote.italic())
+                    .font(.small)
                     .foregroundStyle(theme.muted)
                     .lineLimit(2)
+                    .padding(.leading, 14)
+                    .padding(.top, 2)
             }
         }
     }

@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct Route: Hashable {
     let channel: String
@@ -6,7 +7,8 @@ struct Route: Hashable {
 }
 
 /// Tabs across the top, one channel per page: swipe sideways between them,
-/// tap a message for its thread, pull the header down for the agents.
+/// tap a message for its thread, pull the header down for the agents,
+/// hold a tab to drag it, hold the status line for sections.
 struct Home: View {
     let client: Client
     @Environment(Model.self) private var model
@@ -30,7 +32,7 @@ struct Home: View {
                 if tabs.isEmpty {
                     Spacer()
                     Text(client.ready() ? "no channels yet" : "loading channels…")
-                        .font(.footnote)
+                        .font(.small)
                         .foregroundStyle(theme.muted)
                     Spacer()
                 } else {
@@ -98,13 +100,16 @@ struct Header: View {
     @Binding var selected: String?
     @Binding var showAgents: Bool
     @Binding var showSections: Bool
+    @Environment(Model.self) private var model
     @Environment(\.theme) private var theme
+    @State private var dragging: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             status
                 .padding(.horizontal, 22)
                 .onTapGesture { showAgents = true }
+                .onLongPressGesture { showSections = true }
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
@@ -112,6 +117,13 @@ struct Header: View {
                             chip(t)
                                 .id(t.id)
                                 .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { selected = t.id } }
+                                // Hold a tab and drag it to reorder its section.
+                                .onDrag {
+                                    dragging = t.id
+                                    return NSItemProvider(object: t.id as NSString)
+                                }
+                                .onDrop(of: [.text], delegate: TabDrop(target: t.id, tabs: tabs,
+                                                                       dragging: $dragging, model: model))
                         }
                     }
                     .padding(.horizontal, 22)
@@ -125,9 +137,6 @@ struct Header: View {
                     DispatchQueue.main.async { proxy.scrollTo(selected, anchor: .center) }
                 }
             }
-            .simultaneousGesture(LongPressGesture(minimumDuration: 0.5).onEnded { _ in
-                showSections = true
-            })
             dots
         }
         .padding(.top, 16)
@@ -158,7 +167,7 @@ struct Header: View {
         return HStack(spacing: 7) {
             Pulse(color: dot, on: !working.isEmpty)
             Text(text)
-                .font(.subheadline)
+                .font(.text)
                 .foregroundStyle(theme.muted)
                 .lineLimit(1)
         }
@@ -181,7 +190,7 @@ struct Header: View {
         let name = t.label.hasPrefix("#") ? String(t.label.dropFirst()) : t.label
         return HStack(spacing: 5) {
             Text(name)
-                .font(.subheadline.weight(on ? .semibold : .regular))
+                .font(on ? .chipOn : .chip)
                 .lineLimit(1)
             if t.unread > 0 && !on {
                 Circle().fill(theme.badge).frame(width: 6, height: 6)
@@ -191,6 +200,26 @@ struct Header: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 11)
         .background(on ? theme.chipOn : theme.chipOff, in: RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+/// Tabs shuffle as a dragged tab passes over them; the order saves as it goes.
+struct TabDrop: DropDelegate {
+    let target: String
+    let tabs: [ChannelTab]
+    @Binding var dragging: String?
+    let model: Model
+
+    func dropEntered(info: DropInfo) {
+        guard let id = dragging else { return }
+        withAnimation(.easeOut(duration: 0.15)) { model.move(id, to: target, in: tabs) }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+
+    func performDrop(info: DropInfo) -> Bool {
+        dragging = nil
+        return true
     }
 }
 

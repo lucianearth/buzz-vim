@@ -26,10 +26,15 @@ struct Theme {
         cached("ink-\(key)-\(level)-\(light)") { BuzzVim.ink(key: key, level: level, light: light) }
     }
 
-    var canvas: Color { tone(.surface, 0) }
-    var card: Color { tone(.surface, 2) }
-    var idle: Color { tone(.surface, 4) }
-    var rule: Color { tone(.surface, 6) }
+    // Dark surfaces follow the original dark mock: a blue charcoal rather
+    // than the terminal's near-black, so sheets and cards read as layers.
+    var canvas: Color { light ? tone(.surface, 0) : hex(0x0F1419) }
+    var card: Color { light ? tone(.surface, 2) : hex(0x181C26) }
+    var sheet: Color { light ? tone(.surface, 0) : hex(0x121721) }
+    var idle: Color { light ? tone(.surface, 4) : hex(0x262B34) }
+    var rule: Color { light ? tone(.surface, 6) : hex(0x2C313A) }
+    /// Code blocks sit a step darker than the canvas, inside a rule.
+    var codeBg: Color { light ? tone(.surface, 2) : hex(0x0A0E14) }
     var text: Color { tone(.text, 21) }
     var bright: Color { tone(.text, 23) }
     var muted: Color { tone(.muted, 15) }
@@ -39,14 +44,19 @@ struct Theme {
     var link: Color { tone(.accent, 20) }
     var code: Color { tone(.code, 19) }
     var codeLabel: Color { tone(.code, 10) }
-    /// The selected tab: a softer pink than `accent` on dark, deep plum on light.
-    var chipOn: Color { tone(.accent, light ? 22 : 20) }
-    /// An unselected tab, a step lighter than `idle`.
-    var chipOff: Color { tone(.surface, 3) }
+    /// The selected tab: the mock's light pink on dark, deep plum on light.
+    var chipOn: Color { light ? tone(.accent, 22) : hex(0xEFBCF8) }
+    /// An unselected tab.
+    var chipOff: Color { light ? tone(.surface, 3) : hex(0x22262E) }
     /// Text on a filled accent chip.
-    var onAccent: Color { tone(.surface, 1) }
+    var onAccent: Color { light ? tone(.surface, 1) : hex(0x1A1320) }
     /// The "online" dot: the code hue (a green) at the muted step.
     var live: Color { tone(.code, 14) }
+
+    private func hex(_ v: UInt32) -> Color {
+        Color(.sRGB, red: Double(v >> 16 & 0xFF) / 255, green: Double(v >> 8 & 0xFF) / 255,
+              blue: Double(v & 0xFF) / 255, opacity: 1)
+    }
 }
 
 private struct ThemeKey: EnvironmentKey {
@@ -72,8 +82,27 @@ struct Themed: ViewModifier {
     }
 }
 
+/// Fira Mono for everything you read, Fira Sans for names, tabs and
+/// buttons, as in the dark mock. Sizes follow Dynamic Type.
 extension Font {
-    static let name = Font.body.weight(.semibold)
-    static let stamp = Font.footnote
-    static let mono = Font.system(.footnote, design: .monospaced)
+    private static func fira(_ face: String, _ size: CGFloat, _ style: Font.TextStyle) -> Font {
+        .custom(face, size: size, relativeTo: style)
+    }
+
+    /// Message text and the compose box.
+    static let text = fira("FiraMono-Regular", 15, .subheadline)
+    static let textBold = fira("FiraMono-Bold", 15, .subheadline)
+    /// Times, reply counts, hints, status lines.
+    static let small = fira("FiraMono-Regular", 13, .footnote)
+    static let stamp = small
+    /// Code blocks and tool calls.
+    static let mono = fira("FiraMono-Regular", 14, .footnote)
+    static let tiny = fira("FiraMono-Regular", 11, .caption2)
+    static let name = fira("FiraSans-SemiBold", 18, .body)
+    static let chip = fira("FiraSans-Regular", 15, .subheadline)
+    static let chipOn = fira("FiraSans-Medium", 15, .subheadline)
+    static let label = fira("FiraSans-Regular", 17, .body)
+    static let button = fira("FiraSans-SemiBold", 17, .body)
+    static let header = fira("FiraMono-Regular", 17, .body)
+    static let heading = fira("FiraSans-Bold", 21, .title3)
 }

@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Which of Desktop's sidebar sections become tabs. Long-press the tabs.
+/// Which of Desktop's sidebar sections become tabs. Long-press the status line above the tabs.
 struct SectionsView: View {
     let client: Client
     @Environment(Model.self) private var model
@@ -12,13 +12,13 @@ struct SectionsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 Text("tabs come from these sections")
-                    .font(.subheadline)
+                    .font(.small)
                     .foregroundStyle(theme.muted)
                     .padding(.bottom, 12)
                 ForEach(sections, id: \.id) { s in
                     HStack {
-                        Text(s.name).font(.body).foregroundStyle(theme.text)
-                        Text("\(s.channels)").font(.footnote).foregroundStyle(theme.faint)
+                        Text(s.name).font(.label).foregroundStyle(theme.text)
+                        Text("\(s.channels)").font(.small).foregroundStyle(theme.faint)
                         Spacer()
                         Image(systemName: s.chosen ? "checkmark.circle.fill" : "circle")
                             .foregroundStyle(s.chosen ? theme.accent : theme.faint)
@@ -30,11 +30,11 @@ struct SectionsView: View {
                 }
                 HStack {
                     Text("signed in as \(client.myName())")
-                        .font(.subheadline)
+                        .font(.small)
                         .foregroundStyle(theme.muted)
                     Spacer()
                     Button("Log out") { model.logout() }
-                        .font(.subheadline)
+                        .font(.small)
                         .foregroundStyle(theme.badge)
                 }
                 .padding(.top, 28)
@@ -42,7 +42,7 @@ struct SectionsView: View {
             .padding(.horizontal, 22)
             .padding(.top, 26)
         }
-        .background(theme.canvas)
+        .background(theme.sheet)
     }
 
     private func toggle(_ s: SectionInfo, in all: [SectionInfo]) {

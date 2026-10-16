@@ -37,9 +37,9 @@ struct ComposeBar: View {
                 HStack(spacing: 6) {
                     ForEach(attachments, id: \.url) { a in
                         HStack(spacing: 4) {
-                            Image(systemName: "photo").font(.caption)
-                            Text("image").font(.caption)
-                            Image(systemName: "xmark").font(.caption2)
+                            Image(systemName: "photo").font(.small)
+                            Text("image").font(.small)
+                            Image(systemName: "xmark").font(.tiny)
                         }
                         .foregroundStyle(theme.text)
                         .padding(.horizontal, 9).padding(.vertical, 5)
@@ -48,7 +48,7 @@ struct ComposeBar: View {
                     }
                     if uploading {
                         ProgressView().controlSize(.small)
-                        Text("uploading…").font(.caption).foregroundStyle(theme.muted)
+                        Text("uploading…").font(.small).foregroundStyle(theme.muted)
                     }
                 }
                 .padding(.horizontal, 6)
@@ -57,7 +57,7 @@ struct ComposeBar: View {
                 if focused || canSend {
                     PhotosPicker(selection: $picked, matching: .images) {
                         Image(systemName: "paperclip")
-                            .font(.body)
+                            .font(.text)
                             .foregroundStyle(theme.muted)
                             .padding(.bottom, 3)
                     }
@@ -65,7 +65,7 @@ struct ComposeBar: View {
                 TextField(hint, text: text, axis: .vertical)
                     .lineLimit(1...6)
                     .focused($focused)
-                    .font(.body)
+                    .font(.text)
                     .foregroundStyle(theme.text)
                     .tint(theme.accent)
                 if canSend {
@@ -77,8 +77,9 @@ struct ComposeBar: View {
                 }
             }
             .padding(.horizontal, 16)
-            .padding(.vertical, 17)
-            .background(theme.card, in: RoundedRectangle(cornerRadius: 16))
+            .padding(.vertical, 16)
+            .background(theme.card, in: RoundedRectangle(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14).stroke(theme.rule, lineWidth: 1))
         }
         .padding(.horizontal, 16)
         .padding(.top, 4)
@@ -121,7 +122,7 @@ struct ComposeBar: View {
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(Array(people), id: \.self) { name in
                         Text("@" + name)
-                            .font(.subheadline)
+                            .font(.text)
                             .foregroundStyle(theme.ink(name))
                             .padding(.vertical, 8)
                             .padding(.horizontal, 14)
@@ -217,16 +218,16 @@ struct UploadSheet: View {
                 }
                 VStack(alignment: .leading, spacing: 4) {
                     Text("\(upload.name) · \(ByteCountFormatter.string(fromByteCount: Int64(upload.data.count), countStyle: .file))")
-                        .font(.subheadline.weight(.semibold))
+                        .font(.button)
                         .foregroundStyle(theme.text)
                     Text("uploads to \(host.replacingOccurrences(of: "https://", with: ""))/upload")
-                        .font(.footnote)
+                        .font(.small)
                         .foregroundStyle(theme.muted)
                 }
             }
             Button { done(true) } label: {
                 Text("Upload")
-                    .font(.body.weight(.semibold))
+                    .font(.button)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 14)
                     .foregroundStyle(theme.onAccent)
@@ -234,19 +235,19 @@ struct UploadSheet: View {
             }
             Button { done(false) } label: {
                 Text("Cancel")
-                    .font(.body)
+                    .font(.label)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 14)
                     .foregroundStyle(theme.text)
                     .background(theme.idle, in: RoundedRectangle(cornerRadius: 14))
             }
             Text("Nothing uploads until you say yes.")
-                .font(.footnote)
+                .font(.small)
                 .foregroundStyle(theme.muted)
                 .frame(maxWidth: .infinity)
         }
         .padding(22)
         .frame(maxHeight: .infinity, alignment: .top)
-        .background(theme.card)
+        .background(theme.sheet)
     }
 }

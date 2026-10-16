@@ -78,6 +78,8 @@ pub struct ChannelTab {
     pub label: String,
     pub unread: u32,
     pub is_dm: bool,
+    /// The section this tab came from; tabs reorder within their section.
+    pub section: String,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -286,6 +288,10 @@ struct Engine {
     sections: Vec<Section>,
     chosen: Vec<String>,
     tabs: Vec<String>,
+    /// tab -> the section it came from ("" for the all-channels fallback).
+    tab_section: HashMap<String, String>,
+    /// Section -> the user's own tab order, set by dragging tabs.
+    order: HashMap<String, Vec<String>>,
     channels_loaded: bool,
     sections_loaded: bool,
     agents: Agents,
@@ -371,6 +377,8 @@ impl Client {
             sections: vec![],
             chosen,
             tabs: vec![],
+            tab_section: HashMap::new(),
+            order: HashMap::new(),
             channels_loaded: false,
             sections_loaded: false,
             agents: Agents::default(),
@@ -430,6 +438,7 @@ impl Client {
                     label: e.label(id),
                     unread: ch.map_or(0, |c| c.unread.len() as u32),
                     is_dm: ch.is_some_and(|c| c.is_dm),
+                    section: e.tab_section.get(id).cloned().unwrap_or_default(),
                 }
             })
             .collect()
@@ -457,6 +466,22 @@ impl Client {
         e.rebuild_tabs();
     }
 
+    /// A section's tab order, as dragged. Channels it doesn't list (new
+    /// ones) follow in sidebar order. Save it and pass it back next launch.
+    pub fn set_order(&self, section: String, ids: Vec<String>) {
+        let mut e = self.engine.lock().unwrap();
+        e.order.insert(section, ids);
+        e.rebuild_tabs();
+    }
+
+    /// Fetch channels and sections again: new channels appear, archived
+    /// ones drop. Live updates do this too; this covers what they miss.
+    pub fn refresh(&self) {
+        let e = self.engine.lock().unwrap();
+        e.load_channels();
+        e.load_lanes();
+    }
+
     /// The channel now on screen (or none): loads it and marks it read.
     pub fn open_channel(&self, channel: Option<String>) {
         let mut e = self.engine.lock().unwrap();
@@ -474,6 +499,10 @@ impl Client {
         e.visible = visible;
         if let (true, Some(id)) = (visible, e.current.clone()) {
             e.mark_read(&id);
+        }
+        if visible {
+            e.load_channels();
+            e.load_lanes();
         }
     }
 
@@ -818,6 +847,15 @@ impl Engine {
             "readstate",
             vec![json!({"kinds": [30078], "authors": [me], "#t": ["read-state"], "since": now, "limit": 0})],
         );
+        // Channel renames and archiving, and channels we're added to.
+        self.sub(
+            "channels",
+            vec![json!({"kinds": [39000], "since": now, "limit": 0})],
+        );
+        self.sub(
+            "joined",
+            vec![json!({"kinds": [39002], "#p": [me], "since": now, "limit": 0})],
+        );
         self.sub(
             "membership",
             vec![json!({"kinds": [44100, 44101], "#p": [me], "since": now, "limit": 50})],
@@ -924,6 +962,7 @@ impl Engine {
     /// section when nothing is chosen; every channel when that is empty.
     fn rebuild_tabs(&mut self) {
         let mut tabs: Vec<String> = vec![];
+        let mut tab_section = HashMap::new();
         let chosen: Vec<&Section> = if self.chosen.is_empty() {
             self.sections.iter().take(1).collect()
         } else {
@@ -933,9 +972,14 @@ impl Engine {
                 .collect()
         };
         for s in chosen {
-            for c in &s.channels {
+            let mut chans: Vec<&String> = s.channels.iter().collect();
+            if let Some(o) = self.order.get(&s.id) {
+                chans.sort_by_key(|c| o.iter().position(|x| x == *c).unwrap_or(usize::MAX));
+            }
+            for c in chans {
                 if !tabs.contains(c) && self.store.channels.get(c).is_none_or(|ch| !ch.archived) {
                     tabs.push(c.clone());
+                    tab_section.insert(c.clone(), s.id.clone());
                 }
             }
         }
@@ -950,6 +994,7 @@ impl Engine {
             tabs = all.into_iter().map(|c| c.id.clone()).collect();
         }
         self.tabs = tabs;
+        self.tab_section = tab_section;
         for t in self.tabs.clone() {
             self.subscribe_channel(&t);
         }
@@ -1312,6 +1357,31 @@ impl Engine {
                 self.load_channels();
                 return vec![];
             }
+            39000 => {
+                // Only channels we know: the relay sends every channel's.
+                let known =
+                    model::tag(ev, "d").is_some_and(|d| self.store.channels.contains_key(d));
+                if known {
+                    self.store.apply(ev);
+                    self.refresh_sections();
+                }
+                return vec![];
+            }
+            39002 => {
+                let d = model::tag(ev, "d").unwrap_or_default();
+                if self
+                    .store
+                    .channels
+                    .get(d)
+                    .is_some_and(|c| c.is_member && !c.name.is_empty())
+                {
+                    self.store.apply(ev);
+                } else {
+                    // New to us: fetch its name and the rest.
+                    self.load_channels();
+                }
+                return vec![];
+            }
             _ => {}
         }
         let applied = self.store.apply(ev);
@@ -1643,14 +1713,13 @@ mod tests {
         assert_eq!((light.r, light.g, light.b), (0xf8, 0xfa, 0xff));
     }
 
-    #[test]
-    fn mentions_need_the_whole_name() {
+    fn engine() -> Engine {
         let keys = Keys::generate();
         let _g = RT.enter();
         let relay = Relay::new("wss://example.invalid", keys.clone(), None).unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let (live, _lrx) = mpsc::unbounded_channel();
-        let mut e = Engine {
+        Engine {
             relay,
             live,
             tx,
@@ -1659,6 +1728,8 @@ mod tests {
             sections: vec![],
             chosen: vec![],
             tabs: vec![],
+            tab_section: HashMap::new(),
+            order: HashMap::new(),
             channels_loaded: false,
             sections_loaded: false,
             agents: Agents::default(),
@@ -1676,7 +1747,12 @@ mod tests {
             sending: HashMap::new(),
             failed: HashMap::new(),
             notices: vec![],
-        };
+        }
+    }
+
+    #[test]
+    fn mentions_need_the_whole_name() {
+        let mut e = engine();
         let ch = e.store.channel_mut("c");
         ch.members = vec!["a".into(), "b".into()];
         for (pk, name) in [("a", "Ann"), ("b", "Ann Lee")] {
@@ -1691,5 +1767,26 @@ mod tests {
         assert_eq!(e.mentions_in("c", "hi @Ann Lee"), vec!["b".to_string()]);
         assert_eq!(e.mentions_in("c", "hi @Ann"), vec!["a".to_string()]);
         assert!(e.mentions_in("c", "hi Ann").is_empty());
+    }
+
+    #[test]
+    fn dragged_order_holds_and_new_channels_follow() {
+        let mut e = engine();
+        for (id, name) in [("a", "alpha"), ("b", "beta"), ("c", "gamma"), ("x", "old")] {
+            let ch = e.store.channel_mut(id);
+            ch.name = name.into();
+            ch.is_member = true;
+        }
+        e.store.channel_mut("x").archived = true;
+        e.sections = vec![Section {
+            id: "s".into(),
+            name: "S".into(),
+            channels: vec!["a".into(), "b".into(), "c".into(), "x".into()],
+        }];
+        e.chosen = vec!["s".into()];
+        e.order.insert("s".into(), vec!["c".into(), "a".into()]);
+        e.rebuild_tabs();
+        assert_eq!(e.tabs, vec!["c", "a", "b"]);
+        assert_eq!(e.tab_section["b"], "s");
     }
 }

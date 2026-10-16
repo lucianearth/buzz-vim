@@ -15,9 +15,9 @@ struct ThreadView: View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
                 Button { dismiss() } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "chevron.left").font(.title3.weight(.semibold))
-                        Text(label).font(.title3.weight(.semibold))
+                    HStack(spacing: 10) {
+                        Image(systemName: "arrow.left").font(.system(size: 16, weight: .medium))
+                        Text(label).font(.header)
                     }
                     .foregroundStyle(theme.muted)
                 }

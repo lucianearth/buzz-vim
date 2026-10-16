@@ -14,12 +14,12 @@ struct PairView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             Text("Pair with Desktop")
-                .font(.title2.weight(.semibold))
+                .font(.heading)
                 .foregroundStyle(theme.bright)
             switch flow.step {
             case nil:
                 Text("In Buzz Desktop: Settings → Mobile → Pair your mobile app. Point the camera at the code.")
-                    .font(.footnote)
+                    .font(.small)
                     .foregroundStyle(theme.muted)
                 if DataScannerViewController.isSupported {
                     QRScanner { flow.start($0, model: model) }
@@ -42,10 +42,10 @@ struct PairView: View {
                 waiting("connecting to Desktop…")
             case let .compare(code, desktopSaidYes):
                 Text("Does Desktop show this code?")
-                    .font(.body)
+                    .font(.text)
                     .foregroundStyle(theme.text)
                 Text(spaced(code))
-                    .font(.system(size: 44, weight: .semibold, design: .monospaced))
+                    .font(.custom("FiraMono-Medium", size: 44))
                     .foregroundStyle(theme.accent)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 12)
@@ -53,7 +53,7 @@ struct PairView: View {
                     big("Yes, it matches", filled: true) { flow.pairing?.answer(same: true) }
                 } else {
                     Text("Confirm on Desktop first, then here.")
-                        .font(.footnote)
+                        .font(.small)
                         .foregroundStyle(theme.muted)
                 }
                 big("No", filled: false) {
@@ -69,28 +69,28 @@ struct PairView: View {
                     }
             case let .failed(message):
                 Text(message)
-                    .font(.body)
+                    .font(.text)
                     .foregroundStyle(theme.badge)
                 big("Try again", filled: true) { flow.reset() }
             }
             Spacer()
         }
         .padding(24)
-        .background(theme.canvas)
+        .background(theme.sheet)
         .onDisappear { flow.pairing?.cancel() }
     }
 
     private func waiting(_ s: String) -> some View {
         HStack(spacing: 10) {
             ProgressView()
-            Text(s).font(.footnote).foregroundStyle(theme.muted)
+            Text(s).font(.small).foregroundStyle(theme.muted)
         }
     }
 
     private func big(_ title: String, filled: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
-                .font(.body.weight(filled ? .semibold : .regular))
+                .font(filled ? .button : .label)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 14)
                 .foregroundStyle(filled ? theme.onAccent : theme.text)

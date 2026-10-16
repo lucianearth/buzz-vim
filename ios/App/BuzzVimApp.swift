@@ -40,7 +40,7 @@ struct Root: View {
             }
             if let n = model.notice {
                 Text(n)
-                    .font(.footnote)
+                    .font(.small)
                     .foregroundStyle(theme.text)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 8)

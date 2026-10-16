@@ -31,6 +31,7 @@ targets:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen: {}
+        UIAppFonts: [FiraMono-Regular.ttf, FiraMono-Medium.ttf, FiraMono-Bold.ttf, FiraSans-Regular.ttf, FiraSans-Medium.ttf, FiraSans-SemiBold.ttf, FiraSans-Bold.ttf]
         ITSAppUsesNonExemptEncryption: false
         NSCameraUsageDescription: Scan the pairing code Buzz Desktop shows, to log in.
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]

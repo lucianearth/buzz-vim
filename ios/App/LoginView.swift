@@ -12,22 +12,22 @@ struct LoginView: View {
         VStack(alignment: .leading, spacing: 18) {
             Spacer()
             Text("buzz")
-                .font(.system(size: 40, weight: .bold, design: .monospaced))
+                .font(.custom("FiraMono-Bold", size: 40))
                 .foregroundStyle(theme.accent)
             Button { pairing = true } label: {
                 Text("Pair with Desktop")
-                    .font(.body.weight(.semibold))
+                    .font(.button)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 14)
                     .foregroundStyle(theme.onAccent)
                     .background(theme.accent, in: RoundedRectangle(cornerRadius: 14))
             }
             Text("Desktop shows a code; scan it, check the six digits match, done.")
-                .font(.footnote)
+                .font(.small)
                 .foregroundStyle(theme.muted)
             if withKey {
                 Text("Your private key is in Buzz Desktop under Settings → Profile → Private key. It stays in this phone's Keychain.")
-                    .font(.footnote)
+                    .font(.small)
                     .foregroundStyle(theme.muted)
                 field("relay", text: $relay, secure: false)
                 field("nsec1…", text: $secret, secure: true)
@@ -35,7 +35,7 @@ struct LoginView: View {
                     model.login(relay: relay, secret: secret)
                 } label: {
                     Text("Log in")
-                        .font(.body)
+                        .font(.label)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 14)
                         .foregroundStyle(theme.text)
@@ -45,11 +45,11 @@ struct LoginView: View {
                 .opacity(secret.isEmpty ? 0.5 : 1)
             } else {
                 Button("Use a private key instead") { withKey = true }
-                    .font(.footnote)
+                    .font(.small)
                     .foregroundStyle(theme.muted)
             }
             if let e = model.loginError {
-                Text(e).font(.footnote).foregroundStyle(theme.badge)
+                Text(e).font(.small).foregroundStyle(theme.badge)
             }
             Spacer()
             Spacer()
