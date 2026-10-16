@@ -124,6 +124,22 @@ impl Agents {
         a.name = name.to_string();
     }
 
+    /// A kind 30177 record (d = agent pubkey). Only ones `me` signed count:
+    /// anyone can publish a 30177, and thread fetches don't filter authors.
+    /// Returns the agent's pubkey.
+    pub fn own_record(&mut self, me: &str, ev: &nostr::Event) -> Option<String> {
+        if ev.pubkey.to_hex() != me {
+            return None;
+        }
+        let pk = crate::model::tag(ev, "d").filter(|d| d.len() == 64)?;
+        let name = serde_json::from_str::<Value>(&ev.content)
+            .ok()
+            .and_then(|v| v.get("name")?.as_str().map(str::to_string))
+            .unwrap_or_default();
+        self.own(pk, &name);
+        Some(pk.to_string())
+    }
+
     /// One decrypted frame from `agent`. Batches are unwrapped.
     pub fn frame(&mut self, agent: &str, frame: &Value) {
         if frame.get("kind").and_then(Value::as_str) == Some("batch") {
@@ -399,6 +415,31 @@ mod tests {
         s.profiles.entry("stranger".into()).or_default().is_agent = true;
         let said = vec!["mine".to_string(), "stranger".to_string()];
         assert_eq!(s.outsiders("c", &said, |pk| ag.is_owned(pk)), vec!["mine"]);
+    }
+
+    #[test]
+    fn only_my_30177_makes_an_agent_mine() {
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let me = Keys::generate();
+        let stranger = Keys::generate();
+        let record = |by: &Keys, agent: &Keys| {
+            EventBuilder::new(Kind::Custom(30177), r#"{"name":"bot"}"#)
+                .tags([Tag::parse(["d", &agent.public_key().to_hex()]).unwrap()])
+                .sign_with_keys(by)
+                .unwrap()
+        };
+        let mut ag = Agents::default();
+        let me_hex = me.public_key().to_hex();
+        assert_eq!(ag.own_record(&me_hex, &record(&stranger, &stranger)), None);
+        assert!(!ag.is_owned(&stranger.public_key().to_hex()));
+        let mine = Keys::generate();
+        let pk = mine.public_key().to_hex();
+        assert_eq!(
+            ag.own_record(&me_hex, &record(&me, &mine)),
+            Some(pk.clone())
+        );
+        assert!(ag.is_owned(&pk));
+        assert_eq!(ag.by_pubkey[&pk].name, "bot");
     }
 
     #[test]

@@ -1556,15 +1556,8 @@ impl Engine {
                 return vec![];
             }
             30177 => {
-                if let Some(pk) = model::tag(ev, "d").filter(|d| d.len() == 64) {
-                    let name = serde_json::from_str::<Value>(&ev.content)
-                        .ok()
-                        .and_then(|v| v.get("name")?.as_str().map(str::to_string))
-                        .unwrap_or_default();
-                    self.agents.own(pk, &name);
-                    return vec![pk.to_string()];
-                }
-                return vec![];
+                let me = self.store.me.clone();
+                return self.agents.own_record(&me, ev).into_iter().collect();
             }
             20001 => {
                 self.agents.presence(&ev.pubkey.to_hex(), &ev.content);

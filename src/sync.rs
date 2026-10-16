@@ -894,16 +894,9 @@ pub fn fold(app: &mut App, sync: &mut Sync, ev: &Event, live_channel: bool) -> V
             return vec![];
         }
         30177 => {
-            // Managed agent you own: d = agent pubkey.
-            if let Some(pk) = model::tag(ev, "d").filter(|d| d.len() == 64) {
-                let name = serde_json::from_str::<serde_json::Value>(&ev.content)
-                    .ok()
-                    .and_then(|v| v.get("name")?.as_str().map(str::to_string))
-                    .unwrap_or_default();
-                app.agents.own(pk, &name);
-                return vec![pk.to_string()];
-            }
-            return vec![];
+            // Managed agent you own: d = agent pubkey, signed by you.
+            let me = app.store.me.clone();
+            return app.agents.own_record(&me, ev).into_iter().collect();
         }
         20001 => {
             app.agents.presence(&ev.pubkey.to_hex(), &ev.content);
