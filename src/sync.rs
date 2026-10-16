@@ -454,6 +454,11 @@ impl Sync {
             }
             Action::LoadImage(url) => self.load_image(app, url),
             Action::OpenThread { channel, root } => self.open_thread(&channel, &root),
+            Action::OpenUrl(url) => {
+                if let Err(e) = crate::links::open(&url) {
+                    app.say(format!("couldn't open {url}: {e}"));
+                }
+            }
             Action::PreviewPending => {
                 let Some(p) = &app.pending else { return };
                 if !p.mime.starts_with("image/") || app.picker.is_none() {

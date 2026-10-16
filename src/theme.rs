@@ -243,6 +243,11 @@ pub fn chip(hue: f32) -> Style {
         .bg(ink(hue, 17))
         .add_modifier(Modifier::BOLD)
 }
+pub fn link() -> Style {
+    Style::new()
+        .fg(tone(Role::Accent, 20))
+        .add_modifier(Modifier::UNDERLINED)
+}
 pub fn code() -> Style {
     Style::new().fg(tone(Role::Code, 19)).bg(gray(2))
 }

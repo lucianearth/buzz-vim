@@ -37,6 +37,24 @@ pub enum Hit {
     Handle,
 }
 
+/// A piece of a link on screen, from the last draw.
+#[derive(Clone, Debug)]
+pub struct LinkHit {
+    pub rect: Rect,
+    pub url: String,
+    /// (message id, link number in it): the pieces of one wrapped link share it.
+    pub key: (String, usize),
+}
+
+/// Where a link took you from, for Backspace / ^o.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Jump {
+    pub channel: String,
+    pub selected: Option<String>,
+    /// Open thread root and the reply picked in it.
+    pub thread: Option<(String, Option<String>)>,
+}
+
 /// Things the user asked for that need the network. `main` executes them.
 pub enum Action {
     OpenChannel(String),
@@ -59,6 +77,8 @@ pub enum Action {
         channel: String,
         root: String,
     },
+    /// Hand a URL to the OS (browser, Buzz Desktop).
+    OpenUrl(String),
     SaveState,
     Quit,
 }
@@ -106,6 +126,14 @@ pub struct App {
     /// Every image in the pane the viewer was opened from, oldest first.
     pub viewer_list: Vec<String>,
     pub hits: Vec<(Rect, Hit)>,
+    pub links: Vec<LinkHit>,
+    /// Hint letters typed so far in `f` mode.
+    pub hint_typed: String,
+    /// A channel outside the chosen sections that a link opened, shown as
+    /// one extra tab at the end until you leave it.
+    pub extra: Option<String>,
+    /// Where links took you from, newest last.
+    pub jumps: Vec<Jump>,
     /// Timeline/thread page height from the last draw, for ^d/^u.
     pub page: usize,
     /// Line offset into a message taller than the pane: (message id, lines
@@ -171,6 +199,10 @@ impl App {
             viewer: None,
             viewer_list: vec![],
             hits: vec![],
+            links: vec![],
+            hint_typed: String::new(),
+            extra: None,
+            jumps: vec![],
             page: 20,
             peek: None,
             tall: None,
@@ -286,6 +318,11 @@ impl App {
             all.sort_by_key(|c| (c.is_dm, c.name.to_lowercase()));
             tabs = all.into_iter().map(|c| c.id.clone()).collect();
         }
+        match &self.extra {
+            Some(x) if tabs.contains(x) => self.extra = None,
+            Some(x) => tabs.push(x.clone()),
+            None => {}
+        }
         self.tabs = tabs;
         self.active = keep
             .and_then(|k| self.tabs.iter().position(|t| *t == k))
@@ -305,8 +342,156 @@ impl App {
             self.active = i;
             self.thread = None;
             self.focus = Pane::Timeline;
+            self.drop_extra();
             self.open_current();
             self.actions.push(Action::SaveState);
+        }
+    }
+
+    /// The extra tab goes away once you are on another one.
+    fn drop_extra(&mut self) {
+        let Some(x) = self.extra.clone() else { return };
+        if self.current() == Some(x.as_str()) {
+            return;
+        }
+        self.extra = None;
+        if let Some(i) = self.tabs.iter().position(|t| *t == x) {
+            self.tabs.remove(i);
+            if self.active > i {
+                self.active -= 1;
+            }
+        }
+    }
+
+    // ---------- links ----------
+
+    /// Each link on screen once, at its first piece, in screen order.
+    pub fn link_starts(&self) -> Vec<(Rect, String)> {
+        let mut seen = HashSet::new();
+        self.links
+            .iter()
+            .filter(|l| seen.insert(l.key.clone()))
+            .map(|l| (l.rect, l.url.clone()))
+            .collect()
+    }
+
+    fn here(&self) -> Option<Jump> {
+        Some(Jump {
+            channel: self.current()?.to_string(),
+            selected: self.current().and_then(|c| self.selected.get(c).cloned()),
+            thread: self
+                .thread
+                .as_ref()
+                .map(|(_, r)| (r.clone(), self.thread_selected.clone())),
+        })
+    }
+
+    pub fn follow(&mut self, url: &str) {
+        use crate::links::Target;
+        match crate::links::target(url) {
+            Target::Message {
+                channel,
+                id,
+                thread,
+            } => {
+                // A reply opens its thread. So does a message older than
+                // what's loaded: the thread fetch gets it by id.
+                let known = self.store.channels.get(&channel);
+                let in_timeline = |id: &String| known.is_some_and(|c| c.timeline.contains(id));
+                let thread = thread.or_else(|| {
+                    let id = id.as_ref()?;
+                    match known.and_then(|c| c.messages.get(id)) {
+                        Some(m) => m.root.clone(),
+                        None if in_timeline(id) => None,
+                        None => Some(id.clone()),
+                    }
+                });
+                let jump = Jump {
+                    selected: id.clone().filter(|i| thread.is_none() && in_timeline(i)),
+                    thread: thread.map(|r| {
+                        let pick = id.filter(|i| *i != r);
+                        (r, pick)
+                    }),
+                    channel,
+                };
+                if let Some(h) = self.here() {
+                    self.jumps.push(h);
+                }
+                self.goto(jump);
+            }
+            Target::Desktop => {
+                self.actions.push(Action::OpenUrl(url.to_string()));
+                self.say("🐝 opening in Buzz Desktop");
+            }
+            Target::Web => {
+                self.actions.push(Action::OpenUrl(url.to_string()));
+                self.say(format!("opening {url}"));
+            }
+        }
+    }
+
+    fn back(&mut self) {
+        match self.jumps.pop() {
+            Some(j) => self.goto(j),
+            None => self.say("nowhere to go back to"),
+        }
+    }
+
+    fn goto(&mut self, j: Jump) {
+        let i = match self.tabs.iter().position(|t| *t == j.channel) {
+            Some(i) => i,
+            None => {
+                if let Some(x) = self.extra.take() {
+                    self.tabs.retain(|t| *t != x);
+                }
+                self.extra = Some(j.channel.clone());
+                self.tabs.push(j.channel.clone());
+                self.tabs.len() - 1
+            }
+        };
+        let left = self.active != i;
+        self.active = i;
+        self.drop_extra();
+        if left {
+            self.open_current();
+        }
+        match j.selected {
+            Some(s) => self.selected.insert(j.channel.clone(), s),
+            None => self.selected.remove(&j.channel),
+        };
+        self.peek = None;
+        match j.thread {
+            Some((root, pick)) => {
+                self.actions.push(Action::OpenThread {
+                    channel: j.channel.clone(),
+                    root: root.clone(),
+                });
+                self.thread = Some((j.channel, root));
+                self.thread_selected = pick;
+                self.focus = Pane::Thread;
+            }
+            None => {
+                self.thread = None;
+                self.thread_selected = None;
+                self.focus = Pane::Timeline;
+            }
+        }
+        self.actions.push(Action::SaveState);
+    }
+
+    fn key_hint(&mut self, k: KeyEvent) {
+        let KeyCode::Char(c) = k.code else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        self.hint_typed.push(c);
+        let starts = self.link_starts();
+        let labels = crate::links::hint_labels(starts.len());
+        if let Some(i) = labels.iter().position(|l| *l == self.hint_typed) {
+            self.mode = Mode::Normal;
+            self.follow(&starts[i].1.clone());
+        } else if !labels.iter().any(|l| l.starts_with(&self.hint_typed)) {
+            self.mode = Mode::Normal;
         }
     }
 
@@ -674,6 +859,7 @@ impl App {
                 }
                 _ => {}
             },
+            Mode::Hint => self.key_hint(k),
             Mode::Help => {
                 if matches!(
                     k.code,
@@ -801,6 +987,16 @@ impl App {
             }
             KeyCode::Char('R') => self.actions.push(Action::ReloadSections),
             KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('o') if ctrl => self.back(),
+            KeyCode::Backspace => self.back(),
+            KeyCode::Char('f') => {
+                if self.links.is_empty() {
+                    self.say("no links on screen");
+                } else {
+                    self.hint_typed.clear();
+                    self.mode = Mode::Hint;
+                }
+            }
             KeyCode::Char('o') => self.open_viewer(),
             KeyCode::Char('[') => self.nudge_width(-4),
             KeyCode::Char(']') => self.nudge_width(4),
@@ -921,6 +1117,7 @@ impl App {
             .map(|s| s.id.clone())
             .collect();
         self.mode = Mode::Normal;
+        self.extra = None;
         self.rebuild_tabs();
         self.actions.push(Action::SaveState);
     }
@@ -938,6 +1135,16 @@ impl App {
     /// terminal later keeps filling it.
     fn set_width(&mut self, w: u16) {
         self.read_width = (w < self.body_max).then_some(w.max(Self::MIN_WIDTH));
+    }
+
+    fn link_at(&self, col: u16, row: u16) -> Option<String> {
+        self.links
+            .iter()
+            .find(|l| {
+                let r = l.rect;
+                col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+            })
+            .map(|l| l.url.clone())
     }
 
     fn on_mouse(&mut self, m: MouseEvent) {
@@ -989,6 +1196,15 @@ impl App {
                     self.focus = *pane;
                 }
                 self.move_cursor(d);
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if matches!(self.mode, Mode::Normal | Mode::Insert | Mode::Hint)
+                    && self.link_at(m.column, m.row).is_some() =>
+            {
+                self.mode = Mode::Normal;
+                if let Some(url) = self.link_at(m.column, m.row) {
+                    self.follow(&url);
+                }
             }
             MouseEventKind::Down(MouseButton::Left) => match hit {
                 Some(Hit::Tab(i)) => self.switch_tab(i),
@@ -1061,6 +1277,39 @@ mod tests {
             app.on_key(KeyEvent::from(code));
         }
         assert_eq!(app.chosen, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn links_jump_and_come_back() {
+        let mut app = App::new("me".into(), None);
+        app.tabs = vec!["a".into(), "b".into()];
+        app.store.channel_mut("a").timeline = vec!["m1".into()];
+        // Into a channel outside the tabs: an extra tab, then back.
+        app.follow("buzz://message?channel=x&id=r1");
+        assert_eq!(app.tabs, vec!["a", "b", "x"]);
+        assert_eq!(app.current(), Some("x"));
+        // Not loaded, so it opens as a thread to fetch it.
+        assert_eq!(app.thread, Some(("x".into(), "r1".into())));
+        app.on_key(KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(app.tabs, vec!["a", "b"]);
+        assert_eq!(app.current(), Some("a"));
+        assert_eq!(app.thread, None);
+        // A loaded top-level message is picked in the timeline; ^o goes back.
+        app.on_key(KeyEvent::from(KeyCode::Char('1')));
+        app.follow("buzz://message?channel=a&id=m1");
+        assert_eq!(
+            (app.current(), app.selected.get("a")),
+            (Some("a"), Some(&"m1".to_string()))
+        );
+        app.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert_eq!(app.current(), Some("b"));
+        // Leaving the extra tab drops it.
+        app.follow("buzz://channel/x");
+        app.on_key(KeyEvent::from(KeyCode::Char('0')));
+        assert_eq!(app.tabs, vec!["a", "b"]);
+        // Desktop and web links go to the OS.
+        app.follow("buzz://pr?id=1");
+        assert!(matches!(app.actions.last(), Some(Action::OpenUrl(u)) if u == "buzz://pr?id=1"));
     }
 
     #[test]

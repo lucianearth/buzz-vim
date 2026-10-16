@@ -9,6 +9,7 @@ pub enum Mode {
     Confirm,
     Viewer,
     Help,
+    Hint,
 }
 
 impl Mode {
@@ -20,6 +21,7 @@ impl Mode {
             Mode::Confirm => "UPLOAD?",
             Mode::Viewer => "IMAGE",
             Mode::Help => "HELP",
+            Mode::Hint => "LINK",
         }
     }
 }
@@ -36,6 +38,8 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("+", "👍", false),
             ("s", "sections", false),
             ("o", "image", true),
+            ("f", "follow link", true),
+            ("⌫ ^o", "back to where a link took you from", false),
             ("[ ]", "narrower / wider (or drag the right edge)", false),
             ("a", "agents", true),
             ("?", "help", true),
@@ -78,5 +82,9 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("esc q o", "close", true),
         ],
         Mode::Help => &[("esc ?", "close", true)],
+        Mode::Hint => &[
+            ("letters", "follow that link", true),
+            ("esc", "cancel", true),
+        ],
     }
 }

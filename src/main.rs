@@ -10,6 +10,7 @@ mod config;
 mod draft;
 mod garden;
 mod keys;
+mod links;
 mod live;
 mod log;
 mod media;

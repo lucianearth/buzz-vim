@@ -25,6 +25,7 @@ const THUMB_MAX_ROWS: u16 = 12;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.hits.clear();
+    app.links.clear();
     app.empty_prev = app.empty.take();
     let area = f.area();
     f.render_widget(Block::new().style(Style::new().bg(theme::gray(0))), area);
@@ -67,7 +68,23 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Confirm => draw_confirm(f, app, area),
         Mode::Help => draw_help(f, area),
         Mode::Viewer => draw_viewer(f, app, area),
+        Mode::Hint => draw_hints(f, app),
         _ => {}
+    }
+}
+
+/// `f`: a letter chip over the start of every link on screen.
+fn draw_hints(f: &mut Frame, app: &App) {
+    let starts = app.link_starts();
+    for ((rect, _), label) in starts.iter().zip(crate::links::hint_labels(starts.len())) {
+        if !label.starts_with(&app.hint_typed) {
+            continue;
+        }
+        let w = (label.width() as u16).min(f.area().right().saturating_sub(rect.x));
+        f.render_widget(
+            Paragraph::new(Span::styled(label, theme::key())),
+            Rect { width: w, ..*rect },
+        );
     }
 }
 
@@ -292,6 +309,9 @@ struct BlockOut {
     lines: Vec<Line<'static>>,
     /// (row offset inside block, rows, url, cols)
     image: Option<(u16, u16, String, u16)>,
+    /// (row, column inside the block, width, link number, url): each piece
+    /// of each link.
+    links: Vec<(u16, u16, u16, usize, String)>,
 }
 
 fn time_label(at: u64) -> String {
@@ -339,6 +359,7 @@ fn message_block(
     show_replies: bool,
 ) -> BlockOut {
     let mut lines = vec![];
+    let mut links = vec![];
     let bar = if selected {
         Span::styled("▌", theme::bright())
     } else {
@@ -402,7 +423,25 @@ fn message_block(
             .collect::<Vec<_>>()
             .join("\n");
         let body = if m.system { system_text(&body) } else { body };
-        for l in render_markdown(body.trim_end(), inner, &mention_names) {
+        let name = |c: &str| {
+            app.store
+                .channels
+                .get(c)
+                .filter(|c| !c.name.is_empty())
+                .map(|c| c.name.clone())
+        };
+        let r = render_markdown_links(body.trim_end(), inner, &mention_names, &name);
+        let top = lines.len();
+        for (row, col, w, k) in r.at {
+            links.push((
+                (top + row) as u16,
+                FRAME + col as u16,
+                w as u16,
+                k,
+                r.urls[k].clone(),
+            ));
+        }
+        for l in r.lines {
             let mut spans = vec![bar.clone(), Span::raw("  ")];
             spans.extend(l.spans);
             lines.push(Line::from(spans));
@@ -497,6 +536,7 @@ fn message_block(
         id: m.id.clone(),
         lines: out,
         image,
+        links,
     }
 }
 
@@ -624,6 +664,22 @@ fn draw_blocks(
         let lines: Vec<Line> = b.lines.into_iter().skip(skip).take(visible).collect();
         f.render_widget(Paragraph::new(lines), rect);
         app.hits.push((rect, Hit::Message(pane, b.id.clone())));
+        for (r, c, w, k, url) in b.links {
+            let r = r as usize;
+            if r < skip || r >= skip + visible || c >= area.width {
+                continue;
+            }
+            app.links.push(crate::app::LinkHit {
+                rect: Rect {
+                    x: area.x + c,
+                    y: row + (r - skip) as u16,
+                    width: w.min(area.width - c),
+                    height: 1,
+                },
+                url,
+                key: (b.id.clone(), k),
+            });
+        }
         if let Some((off, rows, url, cols)) = b.image {
             let off = off as usize;
             // Only draw a picture when it is fully on screen.
@@ -1563,9 +1619,34 @@ fn system_text(raw: &str) -> String {
     }
 }
 
-/// Just enough markdown for chat: code fences, `inline code`, **bold**,
-/// _italic_, and @mentions. Wraps to `width` columns.
+/// A span and the link it belongs to, if any.
+type Tagged = (Span<'static>, Option<usize>);
+
+/// Rendered message text and where its links landed.
+#[derive(Default)]
+pub struct Rendered {
+    pub lines: Vec<Line<'static>>,
+    pub urls: Vec<String>,
+    /// (row, column, width, index into `urls`), one per piece of a link, so
+    /// a link wrapped over two lines has two.
+    pub at: Vec<(usize, usize, usize, usize)>,
+}
+
+#[cfg(test)]
 pub fn render_markdown(src: &str, width: usize, mentions: &[String]) -> Vec<Line<'static>> {
+    render_markdown_links(src, width, mentions, &|_| None).lines
+}
+
+/// Just enough markdown for chat: code fences, `inline code`, **bold**,
+/// _italic_, @mentions and links. Wraps to `width` columns. `channel_name`
+/// names the channels bare `buzz://` links point at.
+pub fn render_markdown_links(
+    src: &str,
+    width: usize,
+    mentions: &[String],
+    channel_name: &dyn Fn(&str) -> Option<String>,
+) -> Rendered {
+    let mut r = Rendered::default();
     let mut out = vec![];
     let mut in_fence = false;
     let code_line = |out: &mut Vec<Line<'static>>, raw: &str| {
@@ -1614,7 +1695,7 @@ pub fn render_markdown(src: &str, width: usize, mentions: &[String]) -> Vec<Line
                 ("", raw)
             };
         let heading = raw.starts_with('#');
-        let spans = inline(body, mentions, heading);
+        let spans = inline(body, mentions, heading, &mut r.urls, channel_name);
         for (i, l) in wrap_spans(spans, width.saturating_sub(prefix.width()))
             .into_iter()
             .enumerate()
@@ -1627,14 +1708,29 @@ pub fn render_markdown(src: &str, width: usize, mentions: &[String]) -> Vec<Line
                 },
                 theme::muted(),
             )];
-            s.extend(l);
+            let mut col = prefix.width();
+            for (span, link) in l {
+                let w = span.content.width();
+                if let Some(k) = link {
+                    r.at.push((out.len(), col, w, k));
+                }
+                col += w;
+                s.push(span);
+            }
             out.push(Line::from(s));
         }
     }
-    out
+    r.lines = out;
+    r
 }
 
-fn inline(s: &str, mentions: &[String], heading: bool) -> Vec<Span<'static>> {
+fn inline(
+    s: &str,
+    mentions: &[String],
+    heading: bool,
+    urls: &mut Vec<String>,
+    channel_name: &dyn Fn(&str) -> Option<String>,
+) -> Vec<Tagged> {
     let base = if heading {
         theme::bright()
     } else {
@@ -1643,9 +1739,9 @@ fn inline(s: &str, mentions: &[String], heading: bool) -> Vec<Span<'static>> {
     let mut out = vec![];
     let mut buf = String::new();
     let mut rest = s;
-    let flush = |buf: &mut String, out: &mut Vec<Span<'static>>| {
+    let flush = |buf: &mut String, out: &mut Vec<Tagged>| {
         if !buf.is_empty() {
-            out.push(Span::styled(std::mem::take(buf), base));
+            out.push((Span::styled(std::mem::take(buf), base), None));
         }
     };
     while let Some(c) = rest.chars().next() {
@@ -1665,7 +1761,7 @@ fn inline(s: &str, mentions: &[String], heading: bool) -> Vec<Span<'static>> {
                     Some(c) if !c.trim().is_empty() => c.to_string(),
                     _ => code,
                 };
-                out.push(Span::styled(code, theme::code()));
+                out.push((Span::styled(code, theme::code()), None));
                 rest = &rest[end + n..];
                 continue;
             }
@@ -1676,10 +1772,13 @@ fn inline(s: &str, mentions: &[String], heading: bool) -> Vec<Span<'static>> {
         if rest.starts_with("**") {
             if let Some(end) = rest[2..].find("**") {
                 flush(&mut buf, &mut out);
-                out.push(Span::styled(
-                    rest[2..2 + end].to_string(),
-                    base.add_modifier(Modifier::BOLD)
-                        .fg(theme::tone(theme::Role::Text, 23)),
+                out.push((
+                    Span::styled(
+                        rest[2..2 + end].to_string(),
+                        base.add_modifier(Modifier::BOLD)
+                            .fg(theme::tone(theme::Role::Text, 23)),
+                    ),
+                    None,
                 ));
                 rest = &rest[end + 4..];
                 continue;
@@ -1692,11 +1791,38 @@ fn inline(s: &str, mentions: &[String], heading: bool) -> Vec<Span<'static>> {
                 .max_by_key(|m| m.len())
             {
                 flush(&mut buf, &mut out);
-                out.push(Span::styled(
-                    m.clone(),
-                    theme::mention().fg(theme::ink(theme::hue(&m[1..]), 18)),
+                out.push((
+                    Span::styled(
+                        m.clone(),
+                        theme::mention().fg(theme::ink(theme::hue(&m[1..]), 18)),
+                    ),
+                    None,
                 ));
                 rest = &rest[m.len()..];
+                continue;
+            }
+        }
+        // A link starts at a word boundary.
+        let boundary = !buf
+            .chars()
+            .last()
+            .is_some_and(|p| p.is_alphanumeric() || p == '/');
+        if matches!(c, '[' | 'h' | 'b') && boundary {
+            if let Some(found) = crate::links::at(rest) {
+                flush(&mut buf, &mut out);
+                let text = if found.text == found.url {
+                    crate::links::label(&found.url, channel_name).unwrap_or(found.text)
+                } else {
+                    found.text
+                };
+                let desktop = crate::links::target(&found.url) == crate::links::Target::Desktop;
+                out.push((Span::styled(text, theme::link()), Some(urls.len())));
+                // The bee says Buzz Desktop opens this one.
+                if desktop {
+                    out.push((Span::styled(" 🐝", base), None));
+                }
+                urls.push(found.url);
+                rest = &rest[found.end..];
                 continue;
             }
         }
@@ -1733,11 +1859,11 @@ fn wrap_plain(s: &str, width: usize) -> Vec<String> {
 }
 
 /// Word-wrap styled spans.
-fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>> {
+fn wrap_spans(spans: Vec<Tagged>, width: usize) -> Vec<Vec<Tagged>> {
     let width = width.max(4);
-    let mut lines: Vec<Vec<Span<'static>>> = vec![vec![]];
+    let mut lines: Vec<Vec<Tagged>> = vec![vec![]];
     let mut w = 0usize;
-    for span in spans {
+    for (span, link) in spans {
         let style = span.style;
         // Split into words keeping the spaces attached.
         let text = span.content.to_string();
@@ -1754,7 +1880,7 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>
                     }
                     w = chunk.width();
                     if let Some(l) = lines.last_mut() {
-                        l.push(Span::styled(chunk, style))
+                        l.push((Span::styled(chunk, style), link))
                     }
                 }
                 continue;
@@ -1766,7 +1892,7 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>
             };
             w += word.width();
             if let Some(l) = lines.last_mut() {
-                l.push(Span::styled(word, style))
+                l.push((Span::styled(word, style), link))
             }
         }
     }
@@ -2317,6 +2443,35 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn links_are_found_through_wrapping() {
+        let name = |c: &str| (c == "c1").then(|| "general".to_string());
+        let r = render_markdown_links(
+            "- see https://example.com/a/long/path and buzz://pr?id=1 or buzz://message?channel=c1&id=m",
+            20,
+            &[],
+            &name,
+        );
+        assert_eq!(r.urls.len(), 3);
+        let rows = text(&r.lines);
+        // Every recorded piece covers exactly the text it claims.
+        for &(row, col, w, k) in &r.at {
+            let mut at = 0;
+            let cells: String = rows[row]
+                .chars()
+                .filter(|c| {
+                    at += c.width().unwrap_or(0);
+                    at > col && at <= col + w
+                })
+                .collect();
+            assert!(!cells.trim().is_empty(), "link {k} at {row}:{col} is blank");
+        }
+        assert!(rows.iter().any(|l| l.contains("pr 🐝")), "{rows:?}");
+        assert!(rows.iter().any(|l| l.contains("#general")), "{rows:?}");
+        // The long URL wrapped, and both halves point at it.
+        assert!(r.at.iter().filter(|a| a.3 == 0).count() >= 2);
     }
 
     #[test]
