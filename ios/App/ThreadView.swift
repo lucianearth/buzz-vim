@@ -1,3 +1,4 @@
+import OSLog
 import SwiftUI
 
 /// A thread, flat: the root, then the replies oldest first.
@@ -8,6 +9,9 @@ struct ThreadView: View {
     @Environment(\.theme) private var theme
     @Environment(\.dismiss) private var dismiss
     @State private var landed = false
+    /// Where the bell key's reply is put: ScrollViewReader's scrollTo
+    /// left the thread on its root.
+    @State private var position = ScrollPosition(idType: String.self)
 
     var body: some View {
         let _ = model.version
@@ -44,6 +48,7 @@ struct ThreadView: View {
                         // Room below, so a reply near the end can still sit at the top.
                         Color.clear.frame(height: route.focus == nil ? 1 : geo.size.height).id("end")
                     }
+                    .scrollTargetLayout()
                     .padding(.horizontal, 22)
                     .padding(.top, 4)
                     // A short thread starts under the header, not at the bottom.
@@ -52,6 +57,7 @@ struct ThreadView: View {
                 // Opened on a reply by the bell key: hold the top, so the
                 // keyboard coming up doesn't push the reply off screen.
                 .defaultScrollAnchor(route.focus == nil ? .bottom : .top)
+                .scrollPosition($position, anchor: .top)
                 .scrollDismissesKeyboard(.interactively)
                 .onChange(of: tl.messages.last?.id) { _, _ in
                     // Opened on a reply by the bell key: stay on it.
@@ -60,8 +66,8 @@ struct ThreadView: View {
                 }
                 // The bell key: the first new reply at the top, once it has
                 // loaded, and again after the push and keyboard settle.
-                .onAppear { land(proxy, tl) }
-                .onChange(of: tl.messages.count) { _, _ in land(proxy, tl) }
+                .onAppear { land(tl) }
+                .onChange(of: tl.messages.count) { _, _ in land(tl) }
             }
             }
         }
@@ -77,12 +83,14 @@ struct ThreadView: View {
         }
     }
 
-    private func land(_ proxy: ScrollViewProxy, _ tl: Timeline) {
+    private func land(_ tl: Timeline) {
         guard !landed, let f = route.focus, tl.messages.contains(where: { $0.id == f }) else { return }
         landed = true
-        proxy.scrollTo(f, anchor: .top)
-        for delay in [0.35, 0.7] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { proxy.scrollTo(f, anchor: .top) }
+        let i = tl.messages.firstIndex { $0.id == f } ?? -1
+        Logger(subsystem: "com.lucianhymer.buzzvim", category: "bell")
+            .info("thread \(route.root, privacy: .public): reply \(f, privacy: .public) at \(i) of \(tl.messages.count)")
+        for delay in [0.05, 0.35, 0.7] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { position.scrollTo(id: f, anchor: .top) }
         }
     }
 }
