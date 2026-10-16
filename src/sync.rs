@@ -45,6 +45,12 @@ pub enum Msg {
         result: anyhow::Result<()>,
     },
     Did(anyhow::Result<String>),
+    /// Agents a message @mentioned, added to its channel.
+    Added {
+        channel: String,
+        pubkeys: Vec<String>,
+        result: anyhow::Result<()>,
+    },
     /// Our sections doc after a move, and the status line to show.
     Moved(anyhow::Result<(Event, String)>),
     /// The upload, and the (channel, thread root) it was meant for.
@@ -626,8 +632,22 @@ impl Sync {
         });
         app.pending_sends
             .insert(id.clone(), (channel.clone(), root.clone(), draft));
+        // Agents it @mentions who aren't here yet join first, so they see it.
+        let ours = &app.agents;
+        let invite = app
+            .store
+            .outsiders(&channel, &mentions, |pk| ours.is_owned(pk));
         let r = self.relay.clone();
+        let tx = self.tx.clone();
         self.spawn(async move {
+            if !invite.is_empty() {
+                let result = r.add_members(&channel, &invite).await;
+                let _ = tx.send(Msg::Added {
+                    channel,
+                    pubkeys: invite,
+                    result,
+                });
+            }
             let result = r.publish(&ev).await.map(|_| ());
             Msg::Sent { id, result }
         });
@@ -874,16 +894,9 @@ pub fn fold(app: &mut App, sync: &mut Sync, ev: &Event, live_channel: bool) -> V
             return vec![];
         }
         30177 => {
-            // Managed agent you own: d = agent pubkey.
-            if let Some(pk) = model::tag(ev, "d").filter(|d| d.len() == 64) {
-                let name = serde_json::from_str::<serde_json::Value>(&ev.content)
-                    .ok()
-                    .and_then(|v| v.get("name")?.as_str().map(str::to_string))
-                    .unwrap_or_default();
-                app.agents.own(pk, &name);
-                return vec![pk.to_string()];
-            }
-            return vec![];
+            // Managed agent you own: d = agent pubkey, signed by you.
+            let me = app.store.me.clone();
+            return app.agents.own_record(&me, ev).into_iter().collect();
         }
         20001 => {
             app.agents.presence(&ev.pubkey.to_hex(), &ev.content);

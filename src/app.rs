@@ -893,10 +893,14 @@ impl App {
             (Some((c, _)), Pane::Thread) => Some(c.as_str()),
             _ => self.current(),
         };
-        let members: Vec<String> = ch
-            .and_then(|c| self.store.channels.get(c))
-            .map(|c| c.members.clone())
-            .unwrap_or_default();
+        // Our agents too: mentioning one who isn't here adds them on send.
+        let ch = ch.and_then(|c| self.store.channels.get(c));
+        let mut members: Vec<String> = ch.map(|c| c.members.clone()).unwrap_or_default();
+        if ch.is_some_and(|c| !c.is_dm) {
+            members.extend(self.agents.owned_keys().cloned());
+        }
+        members.sort();
+        members.dedup();
         let mut out: Vec<(String, String)> = members
             .iter()
             .filter(|pk| **pk != self.store.me && !self.archived.contains(*pk))

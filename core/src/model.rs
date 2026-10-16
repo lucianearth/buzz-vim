@@ -225,6 +225,25 @@ impl Store {
         }
     }
 
+    /// The agents in `mentioned` that are `ours` and aren't in `channel`
+    /// yet. A kind 0 bot flag is self-declared, so it doesn't count. DMs
+    /// keep the people they were opened with.
+    pub fn outsiders(
+        &self,
+        channel: &str,
+        mentioned: &[String],
+        ours: impl Fn(&str) -> bool,
+    ) -> Vec<String> {
+        let Some(ch) = self.channels.get(channel).filter(|c| !c.is_dm) else {
+            return vec![];
+        };
+        mentioned
+            .iter()
+            .filter(|pk| !ch.members.contains(pk) && ours(pk))
+            .cloned()
+            .collect()
+    }
+
     pub fn name_of(&self, pubkey: &str) -> String {
         match self.profiles.get(pubkey) {
             Some(p) if !p.name.is_empty() => p.name.clone(),
@@ -534,6 +553,20 @@ mod tests {
             .custom_created_at(nostr::Timestamp::from(at))
             .sign_with_keys(keys)
             .unwrap()
+    }
+
+    #[test]
+    fn outsiders_are_mentioned_agents_not_yet_here() {
+        let mut s = Store::new("me".into());
+        let ch = s.channel_mut("c");
+        ch.members = vec!["me".into(), "bot1".into()];
+        s.profiles.entry("bot3".into()).or_default().is_agent = true;
+        let said: Vec<String> = ["bot1", "bot2", "bot3", "human"].map(String::from).to_vec();
+        let agent = |pk: &str| pk == "bot1" || pk == "bot2";
+        assert_eq!(s.outsiders("c", &said, agent), vec!["bot2"]);
+        s.channel_mut("d").is_dm = true;
+        assert!(s.outsiders("d", &said, agent).is_empty());
+        assert!(s.outsiders("nope", &said, agent).is_empty());
     }
 
     #[test]

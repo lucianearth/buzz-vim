@@ -105,11 +105,39 @@ impl Agents {
         self.by_pubkey.entry(pubkey.to_string()).or_default()
     }
 
+    /// Only agents you own: anyone can send a telemetry frame.
+    pub fn is_owned(&self, pubkey: &str) -> bool {
+        self.by_pubkey.get(pubkey).is_some_and(|a| a.owned)
+    }
+
+    pub fn owned_keys(&self) -> impl Iterator<Item = &String> {
+        self.by_pubkey
+            .iter()
+            .filter(|(_, a)| a.owned)
+            .map(|(k, _)| k)
+    }
+
     /// A managed agent you own, from its kind 30177 record.
     pub fn own(&mut self, pubkey: &str, name: &str) {
         let a = self.known(pubkey);
         a.owned = true;
         a.name = name.to_string();
+    }
+
+    /// A kind 30177 record (d = agent pubkey). Only ones `me` signed count:
+    /// anyone can publish a 30177, and thread fetches don't filter authors.
+    /// Returns the agent's pubkey.
+    pub fn own_record(&mut self, me: &str, ev: &nostr::Event) -> Option<String> {
+        if ev.pubkey.to_hex() != me {
+            return None;
+        }
+        let pk = crate::model::tag(ev, "d").filter(|d| d.len() == 64)?;
+        let name = serde_json::from_str::<Value>(&ev.content)
+            .ok()
+            .and_then(|v| v.get("name")?.as_str().map(str::to_string))
+            .unwrap_or_default();
+        self.own(pk, &name);
+        Some(pk.to_string())
     }
 
     /// One decrypted frame from `agent`. Batches are unwrapped.
@@ -370,6 +398,49 @@ impl Agents {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_frame_sender_is_not_ours() {
+        let mut ag = Agents::default();
+        ag.own("mine", "bot");
+        ag.frame(
+            "stranger",
+            &json!({"kind": "turn_started", "channelId": "c", "payload": {}}),
+        );
+        assert!(ag.is_owned("mine"));
+        assert!(!ag.is_owned("stranger"));
+        assert_eq!(ag.owned_keys().collect::<Vec<_>>(), vec!["mine"]);
+        let mut s = Store::new("me".into());
+        s.channel_mut("c").members = vec!["me".into()];
+        s.profiles.entry("stranger".into()).or_default().is_agent = true;
+        let said = vec!["mine".to_string(), "stranger".to_string()];
+        assert_eq!(s.outsiders("c", &said, |pk| ag.is_owned(pk)), vec!["mine"]);
+    }
+
+    #[test]
+    fn only_my_30177_makes_an_agent_mine() {
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let me = Keys::generate();
+        let stranger = Keys::generate();
+        let record = |by: &Keys, agent: &Keys| {
+            EventBuilder::new(Kind::Custom(30177), r#"{"name":"bot"}"#)
+                .tags([Tag::parse(["d", &agent.public_key().to_hex()]).unwrap()])
+                .sign_with_keys(by)
+                .unwrap()
+        };
+        let mut ag = Agents::default();
+        let me_hex = me.public_key().to_hex();
+        assert_eq!(ag.own_record(&me_hex, &record(&stranger, &stranger)), None);
+        assert!(!ag.is_owned(&stranger.public_key().to_hex()));
+        let mine = Keys::generate();
+        let pk = mine.public_key().to_hex();
+        assert_eq!(
+            ag.own_record(&me_hex, &record(&me, &mine)),
+            Some(pk.clone())
+        );
+        assert!(ag.is_owned(&pk));
+        assert_eq!(ag.by_pubkey[&pk].name, "bot");
+    }
 
     #[test]
     fn turn_lifecycle() {

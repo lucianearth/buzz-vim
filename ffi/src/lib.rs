@@ -308,6 +308,7 @@ enum Msg {
         result: anyhow::Result<()>,
     },
     Moved(anyhow::Result<(Event, String)>),
+    Notice(String),
 }
 
 struct Engine {
@@ -769,7 +770,8 @@ impl Client {
     pub fn retry(&self, id: String) {
         let mut e = self.engine.lock().unwrap();
         if let Some(ev) = e.failed.remove(&id) {
-            e.publish_message(ev);
+            let channel = model::tag(&ev, "h").unwrap_or_default().to_string();
+            e.publish_message(ev, channel, vec![]);
         }
     }
 
@@ -829,7 +831,7 @@ impl Client {
             .get(&channel)
             .map(|c| c.members.clone())
             .unwrap_or_default();
-        keys.extend(e.agents.by_pubkey.keys().cloned());
+        keys.extend(e.agents.owned_keys().cloned());
         keys.sort();
         keys.dedup();
         keys.retain(|k| *k != e.store.me && !e.archived.contains(k));
@@ -1486,6 +1488,7 @@ impl Engine {
                 }
             }
             Msg::Events(Err(e)) => self.notices.push(format!("couldn't load: {e}")),
+            Msg::Notice(n) => self.notices.push(n),
             Msg::Sent { id, result } => {
                 let Some(ev) = self.sending.remove(&id) else {
                     return;
@@ -1553,15 +1556,8 @@ impl Engine {
                 return vec![];
             }
             30177 => {
-                if let Some(pk) = model::tag(ev, "d").filter(|d| d.len() == 64) {
-                    let name = serde_json::from_str::<Value>(&ev.content)
-                        .ok()
-                        .and_then(|v| v.get("name")?.as_str().map(str::to_string))
-                        .unwrap_or_default();
-                    self.agents.own(pk, &name);
-                    return vec![pk.to_string()];
-                }
-                return vec![];
+                let me = self.store.me.clone();
+                return self.agents.own_record(&me, ev).into_iter().collect();
             }
             20001 => {
                 self.agents.presence(&ev.pubkey.to_hex(), &ev.content);
@@ -1712,15 +1708,26 @@ impl Engine {
         let ev = self.relay.sign(builder)?;
         let id = ev.id.to_hex();
         self.store.apply(&ev);
-        self.publish_message(ev);
+        // Agents it @mentions who aren't here yet join first, so they see it.
+        let ours = &self.agents;
+        let invite = self
+            .store
+            .outsiders(&channel, &mentioned, |pk| ours.is_owned(pk));
+        self.publish_message(ev, channel, invite);
         Ok(id)
     }
 
-    fn publish_message(&mut self, ev: Event) {
+    fn publish_message(&mut self, ev: Event, channel: String, invite: Vec<String>) {
         let id = ev.id.to_hex();
         self.sending.insert(id.clone(), ev.clone());
         let r = self.relay.clone();
+        let tx = self.tx.clone();
         self.spawn(async move {
+            if !invite.is_empty() {
+                if let Err(e) = r.add_members(&channel, &invite).await {
+                    let _ = tx.send(Msg::Notice(format!("couldn't add to channel: {e}")));
+                }
+            }
             let result = r.publish(&ev).await;
             Msg::Sent { id, result }
         });
@@ -1736,7 +1743,7 @@ impl Engine {
             .map(|c| c.members.clone())
             .unwrap_or_default()
             .into_iter()
-            .chain(self.agents.by_pubkey.keys().cloned())
+            .chain(self.agents.owned_keys().cloned())
             .filter_map(|pk| {
                 let p = self.store.profiles.get(&pk)?;
                 (!p.name.is_empty()).then(|| (p.name.clone(), pk))
