@@ -13,11 +13,16 @@ struct ChannelView: View {
         let tl = client.timeline(channel: channel)
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 22) {
+                // Not lazy: a LazyVStack guesses the height of rows it hasn't
+                // drawn, and bottom-anchored that guess showed as a screen of
+                // empty space under the last message until the rows measured.
+                VStack(alignment: .leading, spacing: 22) {
                     if tl.hasMore {
                         ProgressView()
                             .frame(maxWidth: .infinity)
-                            .onAppear { client.loadOlder(channel: channel) }
+                            .onScrollVisibilityChange { seen in
+                                if seen { client.loadOlder(channel: channel) }
+                            }
                     }
                     if !tl.loaded {
                         Text("loading…")
@@ -40,6 +45,7 @@ struct ChannelView: View {
                 .padding(.top, 6)
             }
             .defaultScrollAnchor(.bottom)
+            .defaultScrollAnchor(.bottom, for: .sizeChanges)
             .scrollDismissesKeyboard(.interactively)
             .onChange(of: tl.messages.last?.id) { _, _ in
                 withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("end", anchor: .bottom) }

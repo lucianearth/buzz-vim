@@ -34,7 +34,8 @@ struct ThreadView: View {
             GeometryReader { geo in
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 22) {
+                    // Not lazy, for the same reason as the channel view.
+                    VStack(alignment: .leading, spacing: 22) {
                         ForEach(tl.messages, id: \.id) { m in
                             MessageRow(client: client, message: m, showReplies: false,
                                        latest: m.id == tl.latest)
@@ -57,6 +58,7 @@ struct ThreadView: View {
                 // Opened on a reply by the bell key: hold the top, so the
                 // keyboard coming up doesn't push the reply off screen.
                 .defaultScrollAnchor(route.focus == nil ? .bottom : .top)
+                .defaultScrollAnchor(route.focus == nil ? .bottom : .top, for: .sizeChanges)
                 .scrollPosition($position, anchor: .top)
                 .scrollDismissesKeyboard(.interactively)
                 .onChange(of: tl.messages.last?.id) { _, _ in
