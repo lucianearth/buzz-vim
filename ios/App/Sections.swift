@@ -12,7 +12,7 @@ struct SectionsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 Text("tabs come from these sections")
-                    .font(.footnote)
+                    .font(.subheadline)
                     .foregroundStyle(theme.muted)
                     .padding(.bottom, 12)
                 ForEach(sections, id: \.id) { s in
@@ -30,11 +30,11 @@ struct SectionsView: View {
                 }
                 HStack {
                     Text("signed in as \(client.myName())")
-                        .font(.footnote)
+                        .font(.subheadline)
                         .foregroundStyle(theme.muted)
                     Spacer()
                     Button("Log out") { model.logout() }
-                        .font(.footnote)
+                        .font(.subheadline)
                         .foregroundStyle(theme.badge)
                 }
                 .padding(.top, 28)

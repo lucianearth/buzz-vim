@@ -13,7 +13,7 @@ struct AgentsView: View {
             LazyVStack(alignment: .leading, spacing: 0) {
                 if agents.isEmpty {
                     Text("none of your agents are online")
-                        .font(.footnote)
+                        .font(.body)
                         .foregroundStyle(theme.muted)
                         .padding(.top, 30)
                 }
