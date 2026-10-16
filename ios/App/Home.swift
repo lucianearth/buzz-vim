@@ -30,14 +30,16 @@ extension EnvironmentValues {
 }
 
 /// Tabs across the top, one channel per page: swipe sideways between them,
-/// tap a message for its thread, pull the header down for the agents,
+/// tap a message for its thread (it opens in the tab, which remembers it;
+/// swipes still change tabs), pull the header down for the agents,
 /// hold a tab, the status line or a thread's header for the switcher
 /// (a page of tall rows per section, drag handles to reorder).
 struct Home: View {
     let client: Client
     @Environment(Model.self) private var model
     @Environment(\.theme) private var theme
-    @State private var path: [Route] = []
+    /// The thread open in each tab, by channel; kept across launches.
+    @State private var threads: [String: Route] = Home.savedThreads()
     @State private var selected: String? = UserDefaults.standard.string(forKey: "active")
     /// The channel the user last chose. Survives a fallback pick while the
     /// tab list is still filling in, so a relaunch lands back on it.
@@ -49,46 +51,38 @@ struct Home: View {
     var body: some View {
         let _ = model.version
         let tabs = client.tabs()
-        NavigationStack(path: $path) {
-            VStack(spacing: 0) {
-                Header(client: client, tabs: tabs, selected: $selected,
-                       showAgents: $showAgents, switcher: $switcher, openSwitcher: openSwitcher)
-                if tabs.isEmpty {
-                    Spacer()
-                    Text(client.ready() ? "no channels yet" : "loading channels…")
-                        .font(.small)
-                        .foregroundStyle(theme.muted)
-                    Spacer()
-                } else {
-                    // A paging scroll view, not a paged TabView: the TabView
-                    // stalls halfway between pages when the selection moves
-                    // while a compose field holds the keyboard.
-                    ScrollView(.horizontal) {
-                        LazyHStack(spacing: 0) {
-                            ForEach(tabs, id: \.id) { t in
-                                ChannelView(client: client, channel: t.id) { root in
-                                    path.append(Route(channel: t.id, root: root))
-                                }
+        VStack(spacing: 0) {
+            Header(client: client, tabs: tabs, selected: $selected,
+                   showAgents: $showAgents, switcher: $switcher, openSwitcher: openSwitcher)
+            if tabs.isEmpty {
+                Spacer()
+                Text(client.ready() ? "no channels yet" : "loading channels…")
+                    .font(.small)
+                    .foregroundStyle(theme.muted)
+                Spacer()
+            } else {
+                // A paging scroll view, not a paged TabView: the TabView
+                // stalls halfway between pages when the selection moves
+                // while a compose field holds the keyboard.
+                ScrollView(.horizontal) {
+                    LazyHStack(spacing: 0) {
+                        ForEach(tabs, id: \.id) { t in
+                            page(t.id)
                                 .containerRelativeFrame([.horizontal, .vertical])
                                 .id(t.id)
-                            }
                         }
-                        .scrollTargetLayout()
                     }
-                    .scrollIndicators(.hidden)
-                    .scrollTargetBehavior(.paging)
-                    .scrollPosition(id: $selected)
-                    // Rebuild when the tab list changes, so a restored
-                    // selection lands on its page.
-                    .id(tabs.map(\.id))
+                    .scrollTargetLayout()
                 }
-            }
-            .background(theme.canvas)
-            .toolbar(.hidden, for: .navigationBar)
-            .navigationDestination(for: Route.self) { r in
-                ThreadView(client: client, route: r)
+                .scrollIndicators(.hidden)
+                .scrollTargetBehavior(.paging)
+                .scrollPosition(id: $selected)
+                // Rebuild when the tab list changes, so a restored
+                // selection lands on its page.
+                .id(tabs.map(\.id))
             }
         }
+        .background(theme.canvas)
         .overlay {
             if switcher {
                 TabSwitcher(client: client, selected: selected, shown: $switcher,
@@ -122,14 +116,14 @@ struct Home: View {
         }
     }
 
-    /// The tab `by` places along, wrapping. From a thread, back to the
-    /// channel first. The keyboard stays up on the new tab.
+    /// The tab `by` places along, wrapping, on its open thread if it has
+    /// one. The keyboard stays up on the new tab.
     private func step(_ by: Int) {
         let tabs = client.tabs()
         guard !tabs.isEmpty else { return }
         let i = tabs.firstIndex { $0.id == selected } ?? 0
         let id = tabs[((i + by) % tabs.count + tabs.count) % tabs.count].id
-        model.focusKey = id
+        model.focusKey = threads[id].map { "\(id)/\($0.root)" } ?? id
         go(id)
     }
 
@@ -144,10 +138,10 @@ struct Home: View {
     private func land(_ channel: String, _ j: Jump) {
         if let root = j.root {
             model.focusKey = "\(channel)/\(root)"
-            path = [Route(channel: channel, root: root, focus: j.id)]
+            show(channel, Route(channel: channel, root: root, focus: j.id))
         } else {
             model.focusKey = channel
-            path = []
+            show(channel, nil)
             model.scrollTarget = (channel, j.id)
         }
     }
@@ -173,27 +167,51 @@ struct Home: View {
         if let s = f.section {
             model.setChosen([s])
         } else if !client.tabs().contains(where: { $0.id == f.channel }) {
-            // In no section: a thread still opens, a channel can't.
-            guard let root = f.root else {
-                model.say("that channel isn't in your sidebar")
-                return
-            }
-            path = [Route(channel: f.channel, root: root, focus: f.id)]
+            model.say("that channel isn't in your sidebar")
             return
         }
         selected = f.channel
         if let root = f.root {
-            path = [Route(channel: f.channel, root: root, focus: f.id)]
+            show(f.channel, Route(channel: f.channel, root: root, focus: f.id))
         } else {
-            path = []
+            show(f.channel, nil)
             if let id = f.id { model.scrollTarget = (f.channel, id) }
         }
     }
 
     /// Key-row moves only, so the keyboard is up: jump, no page slide.
     private func go(_ id: String) {
-        path = []
         selected = id
+    }
+
+    /// A tab's page: its open thread over its channel. The channel stays
+    /// underneath, so going back finds it where it was.
+    private func page(_ id: String) -> some View {
+        ZStack {
+            let thread = threads[id]
+            ChannelView(client: client, channel: id) { root in
+                show(id, Route(channel: id, root: root))
+            }
+            .opacity(thread == nil ? 1 : 0)
+            .allowsHitTesting(thread == nil)
+            if let r = thread {
+                ThreadView(client: client, route: r, active: id == selected) { show(id, nil) }
+                    .id(r)
+                    .transition(.move(edge: .trailing))
+            }
+        }
+        .clipped()
+    }
+
+    /// Open a thread in a tab, or close it (nil), and remember it.
+    private func show(_ channel: String, _ r: Route?) {
+        withAnimation(.easeOut(duration: 0.2)) { threads[channel] = r }
+        UserDefaults.standard.set(threads.mapValues(\.root), forKey: "threads")
+    }
+
+    private static func savedThreads() -> [String: Route] {
+        let saved = UserDefaults.standard.dictionary(forKey: "threads") as? [String: String] ?? [:]
+        return Dictionary(uniqueKeysWithValues: saved.map { ($0, Route(channel: $0, root: $1)) })
     }
 
     /// Keep the selection on a tab that exists, and tell Rust what's open.

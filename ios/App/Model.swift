@@ -88,6 +88,7 @@ final class Model {
         Keychain.delete()
         UserDefaults.standard.removeObject(forKey: "chosen")
         UserDefaults.standard.removeObject(forKey: "tabOrder")
+        UserDefaults.standard.removeObject(forKey: "threads")
         drafts = [:]
         sticky = [:]
         // Unsent text belongs to this account; the next one mustn't get it.
