@@ -195,10 +195,6 @@ struct Header: View {
     @Binding var lift: Lift?
     @Environment(Model.self) private var model
     @Environment(\.theme) private var theme
-    /// False again if the system cancels the hold, so the column can't stick.
-    @GestureState private var holding = false
-    /// Where the tab row sits on screen: a lifted tab starts there.
-    @State private var rowY: CGFloat = 0
     /// A reorder that ends dragging down mustn't also open the agents.
     @State private var droppedAt = Date.distantPast
 
@@ -216,14 +212,12 @@ struct Header: View {
                                 .id(t.id)
                                 .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { selected = t.id } }
                                 // Hold a tab: its section unfolds into a column
-                                // to slide it up or down in.
-                                // Simultaneous, so a quick sideways swipe
-                                // still scrolls the row.
-                                .simultaneousGesture(hold(t))
+                                // to slide it up or down in. A UIKit long press,
+                                // so the row's scroll view keeps quick swipes.
+                                .gesture(Hold(began: { pickUp(t, $0) }, moved: moved, ended: drop))
                         }
                     }
                     .padding(.horizontal, 22)
-                    .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).midY } action: { rowY = $0 }
                 }
                 .scrollDisabled(lift != nil)
                 .onChange(of: selected) { _, now in
@@ -235,13 +229,13 @@ struct Header: View {
                     DispatchQueue.main.async { proxy.scrollTo(selected, anchor: .center) }
                 }
             }
-            .onChange(of: holding) { _, now in if !now { drop() } }
             dots
         }
         .padding(.top, 16)
         .padding(.bottom, 16)
         .contentShape(Rectangle())
-        .gesture(DragGesture(minimumDistance: 24).onEnded { g in
+        // Simultaneous: as `.gesture` it took sideways swipes from the tab row.
+        .simultaneousGesture(DragGesture(minimumDistance: 24).onEnded { g in
             if lift == nil, Date().timeIntervalSince(droppedAt) > 0.5,
                g.translation.height > 50 && abs(g.translation.width) < g.translation.height {
                 showAgents = true
@@ -249,28 +243,18 @@ struct Header: View {
         })
     }
 
-    private func hold(_ t: ChannelTab) -> some Gesture {
-        LongPressGesture(minimumDuration: 0.3)
-            .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .global))
-            .updating($holding) { v, state, _ in
-                if case .second(true, _) = v { state = true }
-            }
-            .onChanged { v in
-                guard case .second(true, let drag) = v else { return }
-                if lift == nil {
-                    let ids = tabs.filter { $0.section == t.section }.map(\.id)
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        lift = Lift(section: t.section, ids: ids, held: t.id, y: rowY)
-                    }
-                }
-                if let d = drag {
-                    lift?.y = d.location.y
-                    // Hold still and nothing moves; once the finger goes up
-                    // or down, the tab goes to the row under it.
-                    if abs(d.translation.height) > 10 { lift?.moved = true }
-                }
-            }
-            .onEnded { _ in drop() }
+    private func pickUp(_ t: ChannelTab, _ y: CGFloat) {
+        let ids = tabs.filter { $0.section == t.section }.map(\.id)
+        withAnimation(.easeOut(duration: 0.15)) {
+            lift = Lift(section: t.section, ids: ids, held: t.id, y: y, startY: y)
+        }
+    }
+
+    /// Hold still and nothing moves; once the finger goes up or down, the
+    /// tab goes to the row under it.
+    private func moved(_ y: CGFloat) {
+        lift?.y = y
+        if let l = lift, abs(y - l.startY) > 10 { lift?.moved = true }
     }
 
     /// Let go: save the new order and fold the column away.
@@ -342,6 +326,31 @@ struct Header: View {
     }
 }
 
+/// Hold 0.3 s, then report where the finger is (global y) until it lifts.
+/// UIKit's long press fails as soon as the finger moves early, which hands
+/// the touch to the scroll view; a SwiftUI long press + drag kept it.
+struct Hold: UIGestureRecognizerRepresentable {
+    let began: (CGFloat) -> Void
+    let moved: (CGFloat) -> Void
+    let ended: () -> Void
+
+    func makeUIGestureRecognizer(context: Context) -> UILongPressGestureRecognizer {
+        let g = UILongPressGestureRecognizer()
+        g.minimumPressDuration = 0.3
+        return g
+    }
+
+    func handleUIGestureRecognizerAction(_ g: UILongPressGestureRecognizer, context: Context) {
+        let y = context.converter.location(in: .global).y
+        switch g.state {
+        case .began: began(y)
+        case .changed: moved(y)
+        case .ended, .cancelled, .failed: ended()
+        default: break
+        }
+    }
+}
+
 /// A held tab and its section's tabs, while it's being dragged.
 struct Lift {
     let section: String
@@ -350,6 +359,7 @@ struct Lift {
     let held: String
     /// The finger, on screen, and whether it has moved up or down yet.
     var y: CGFloat
+    let startY: CGFloat
     var moved = false
     /// Where the column's first row starts on screen, and one row's height.
     var top: CGFloat = 0
