@@ -701,10 +701,28 @@ impl Sync {
                 let stamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_millis());
-                let dir = std::env::temp_dir()
-                    .join("buzz-vim")
-                    .join(stamp.to_string());
-                std::fs::create_dir_all(&dir)?;
+                // Private to this user (DM and private-channel images).
+                // Folders over a day old go, so they don't pile up; newer
+                // ones may still be open in Preview.
+                let base = std::env::temp_dir().join("buzz-vim");
+                let day = std::time::Duration::from_secs(24 * 3600);
+                for e in std::fs::read_dir(&base).into_iter().flatten().flatten() {
+                    let old = e
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > day);
+                    if old {
+                        let _ = std::fs::remove_dir_all(e.path());
+                    }
+                }
+                let dir = base.join(stamp.to_string());
+                let mut b = std::fs::DirBuilder::new();
+                b.recursive(true);
+                #[cfg(unix)]
+                std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+                b.create(&dir)?;
                 let mut paths = vec![];
                 let mut focus = None;
                 let mut failed = 0;
@@ -715,7 +733,15 @@ impl Sync {
                     };
                     let name = url.rsplit('/').next().unwrap_or("image");
                     let stem = name.split('.').next().unwrap_or(name);
-                    let short = &stem[stem.len().saturating_sub(8)..];
+                    let short: String = stem
+                        .chars()
+                        .filter(char::is_ascii_alphanumeric)
+                        .rev()
+                        .take(8)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
                     let ext = image::guess_format(&bytes)
                         .ok()
                         .and_then(|f| f.extensions_str().first().copied())

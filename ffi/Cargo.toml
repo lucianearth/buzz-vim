@@ -11,9 +11,10 @@ publish = false
 crate-type = ["lib", "staticlib"]
 name = "buzz_vim_ffi"
 
-[[bin]]
+# An example, not a bin: a second package with a bin breaks
+# `cargo install --git` for the terminal app.
+[[example]]
 name = "uniffi-bindgen"
-path = "uniffi-bindgen.rs"
 
 [dependencies]
 anyhow = "1.0.104"

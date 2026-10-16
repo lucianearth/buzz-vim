@@ -640,6 +640,14 @@ fn draw_blocks(
     let cur_idx = cursor.and_then(|c| blocks.iter().position(|b| b.id == c));
     // Default: newest at the bottom. With a cursor, scroll just enough.
     let mut top = total.saturating_sub(h);
+    // The cursor has moved off the jump key's landing: stop pinning it.
+    if app
+        .anchor
+        .as_ref()
+        .is_some_and(|(p, id)| *p == pane && Some(id.as_str()) != cursor)
+    {
+        app.anchor = None;
+    }
     let anchored = |i: usize| {
         app.anchor
             .as_ref()

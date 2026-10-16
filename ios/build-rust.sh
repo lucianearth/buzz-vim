@@ -16,7 +16,7 @@ done
 gen=ios/Generated
 rm -rf "$gen" ios/BuzzVimCore.xcframework
 mkdir -p "$gen/include"
-cargo run --locked -q -p buzz-vim-ffi --bin uniffi-bindgen -- generate \
+cargo run --locked -q -p buzz-vim-ffi --example uniffi-bindgen -- generate \
   --library "$target_dir/${targets[0]}/release/libbuzz_vim_ffi.a" \
   --language swift --out-dir "$gen"
 mv "$gen/buzz_vim_ffiFFI.h" "$gen/include/"
