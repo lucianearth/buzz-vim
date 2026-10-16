@@ -75,6 +75,11 @@ pub enum Action {
     Upload,
     LoadOlder(String),
     ReloadSections,
+    /// Move a channel into a section (`None` = the unsectioned group).
+    MoveChannel {
+        channel: String,
+        section: Option<String>,
+    },
     LoadImage(String),
     EncodeImage((String, u16, u16)),
     /// Decode the pending upload so the confirm box can show it.
@@ -1267,9 +1272,32 @@ impl App {
             }
             KeyCode::Char(' ') | KeyCode::Char('x') => self.toggle_section(self.picker_cursor),
             KeyCode::Enter => self.apply_sections(),
+            KeyCode::Char('m') => self.move_here(),
             KeyCode::Char('R') => self.actions.push(Action::ReloadSections),
             _ => {}
         }
+    }
+
+    /// Move the current channel into the section under the cursor.
+    fn move_here(&mut self) {
+        let (Some(ch), Some(s)) = (self.current(), self.sections.get(self.picker_cursor)) else {
+            return;
+        };
+        let section = match s.id.as_str() {
+            "★" | "dms" => return self.say(format!("can't move a channel into {}", s.name)),
+            "channels" => None,
+            id => Some(id.to_string()),
+        };
+        if self.store.channels.get(ch).is_some_and(|c| c.is_dm) {
+            return self.say("DMs don't go in sections");
+        }
+        if s.channels.iter().any(|c| c == ch) {
+            return self.say(format!("already in {}", s.name));
+        }
+        self.actions.push(Action::MoveChannel {
+            channel: ch.to_string(),
+            section,
+        });
     }
 
     fn toggle_section(&mut self, i: usize) {
@@ -1430,6 +1458,41 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn m_moves_the_current_channel() {
+        let mut app = App::new("me".into(), None);
+        app.sections = ["a", "b", "channels"]
+            .map(|id| Section {
+                id: id.into(),
+                name: id.into(),
+                channels: vec![format!("{id}-ch")],
+            })
+            .to_vec();
+        app.chosen = vec!["a".into()];
+        app.rebuild_tabs();
+        for code in [KeyCode::Char('s'), KeyCode::Char('j'), KeyCode::Char('m')] {
+            app.on_key(KeyEvent::from(code));
+        }
+        let moved = |app: &App, want: Option<&str>| {
+            app.actions.iter().any(|a| {
+                matches!(a, Action::MoveChannel { channel, section }
+                if channel == "a-ch" && section.as_deref() == want)
+            })
+        };
+        assert!(moved(&app, Some("b")));
+        app.actions.clear();
+        for code in [KeyCode::Char('j'), KeyCode::Char('m')] {
+            app.on_key(KeyEvent::from(code));
+        }
+        assert!(moved(&app, None));
+        app.actions.clear();
+        // Its own section is a no-op.
+        for code in [KeyCode::Char('k'), KeyCode::Char('k'), KeyCode::Char('m')] {
+            app.on_key(KeyEvent::from(code));
+        }
+        assert!(app.actions.is_empty());
+    }
 
     #[test]
     fn enter_switches_section() {

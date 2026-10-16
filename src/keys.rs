@@ -75,6 +75,7 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("j k", "move", true),
             ("space", "mark several", true),
             ("⏎", "switch", true),
+            ("m", "move this channel here", true),
             ("R", "reload from relay", true),
             ("esc", "cancel", true),
         ],

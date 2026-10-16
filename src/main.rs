@@ -318,6 +318,16 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
             app.sections_loaded = true;
             refresh_sections(app, sync, restore_active);
         }
+        Msg::Moved(Ok((ev, label))) => {
+            sync.apply_lanes(&[ev]);
+            // Stay on the channel even if it just left today's tabs.
+            if app.extra.is_none() {
+                app.extra = app.current().map(str::to_string);
+            }
+            refresh_sections(app, sync, restore_active);
+            app.say(label);
+        }
+        Msg::Moved(Err(e)) => app.say(format!("couldn't move: {e}")),
         Msg::Lanes(Err(e)) => app.say(format!("couldn't load sections: {e}")),
         Msg::Window {
             channel,

@@ -45,6 +45,8 @@ pub enum Msg {
         result: anyhow::Result<()>,
     },
     Did(anyhow::Result<String>),
+    /// Our sections doc after a move, and the status line to show.
+    Moved(anyhow::Result<(Event, String)>),
     /// The upload, and the (channel, thread root) it was meant for.
     Uploaded(anyhow::Result<BlobDescriptor>, (String, Option<String>)),
     Image {
@@ -437,6 +439,31 @@ impl Sync {
                 app.say("reloading sections…");
                 self.load_channels();
                 self.load_lanes();
+            }
+            Action::MoveChannel { channel, section } => {
+                let name = |id: &str| {
+                    app.sections
+                        .iter()
+                        .find(|s| s.id == id)
+                        .map_or(id.to_string(), |s| s.name.clone())
+                };
+                let label = format!(
+                    "moved #{} to {}",
+                    app.store
+                        .channels
+                        .get(&channel)
+                        .map_or("?", |c| c.name.as_str()),
+                    name(section.as_deref().unwrap_or("channels"))
+                );
+                app.say("moving…");
+                let r = self.relay.clone();
+                self.spawn(async move {
+                    Msg::Moved(
+                        sections::publish_move(&r, &channel, section.as_deref())
+                            .await
+                            .map(|ev| (ev, label)),
+                    )
+                });
             }
             Action::Send {
                 channel,
