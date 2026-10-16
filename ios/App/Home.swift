@@ -43,6 +43,9 @@ struct Home: View {
                         }
                     }
                     .tabViewStyle(.page(indexDisplayMode: .never))
+                    // A paged TabView whose pages change under a restored
+                    // selection can show a blank page; rebuild it instead.
+                    .id(tabs.map(\.id))
                 }
             }
             .background(theme.canvas)
@@ -98,7 +101,7 @@ struct Header: View {
     @Environment(\.theme) private var theme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 14) {
             status
                 .padding(.horizontal, 22)
                 .onTapGesture { showAgents = true }
@@ -116,14 +119,19 @@ struct Header: View {
                 .onChange(of: selected) { _, now in
                     withAnimation { proxy.scrollTo(now, anchor: .center) }
                 }
+                // On launch the restored tab may be off to the right.
+                .onAppear { proxy.scrollTo(selected, anchor: .center) }
+                .onChange(of: tabs.count) { _, _ in
+                    DispatchQueue.main.async { proxy.scrollTo(selected, anchor: .center) }
+                }
             }
             .simultaneousGesture(LongPressGesture(minimumDuration: 0.5).onEnded { _ in
                 showSections = true
             })
             dots
         }
-        .padding(.top, 8)
-        .padding(.bottom, 14)
+        .padding(.top, 16)
+        .padding(.bottom, 16)
         .contentShape(Rectangle())
         .gesture(DragGesture(minimumDistance: 24).onEnded { g in
             if g.translation.height > 50 && abs(g.translation.width) < g.translation.height {
@@ -150,7 +158,7 @@ struct Header: View {
         return HStack(spacing: 7) {
             Pulse(color: dot, on: !working.isEmpty)
             Text(text)
-                .font(.footnote)
+                .font(.subheadline)
                 .foregroundStyle(theme.muted)
                 .lineLimit(1)
         }
@@ -158,11 +166,11 @@ struct Header: View {
 
     /// Where the open tab sits in the row, like a page indicator.
     private var dots: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 8) {
             ForEach(tabs, id: \.id) { t in
                 Circle()
                     .fill(t.id == selected ? theme.chipOn : theme.rule)
-                    .frame(width: 6, height: 6)
+                    .frame(width: 7, height: 7)
             }
         }
         .frame(maxWidth: .infinity)
@@ -181,7 +189,7 @@ struct Header: View {
         }
         .foregroundStyle(on ? theme.onAccent : theme.muted)
         .padding(.horizontal, 16)
-        .padding(.vertical, 9)
+        .padding(.vertical, 11)
         .background(on ? theme.chipOn : theme.chipOff, in: RoundedRectangle(cornerRadius: 10))
     }
 }

@@ -77,7 +77,7 @@ struct ComposeBar: View {
                 }
             }
             .padding(.horizontal, 16)
-            .padding(.vertical, 14)
+            .padding(.vertical, 17)
             .background(theme.card, in: RoundedRectangle(cornerRadius: 16))
         }
         .padding(.horizontal, 16)

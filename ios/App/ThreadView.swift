@@ -26,6 +26,7 @@ struct ThreadView: View {
             .padding(.horizontal, 22)
             .padding(.top, 10)
             .padding(.bottom, 14)
+            GeometryReader { geo in
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 22) {
@@ -41,14 +42,15 @@ struct ThreadView: View {
                     }
                     .padding(.horizontal, 22)
                     .padding(.top, 4)
+                    // A short thread starts under the header, not at the bottom.
+                    .frame(minHeight: geo.size.height, alignment: .top)
                 }
-                .defaultScrollAnchor(.bottom, for: .initialOffset)
-                .defaultScrollAnchor(.bottom, for: .sizeChanges)
-                .defaultScrollAnchor(.top, for: .alignment)
+                .defaultScrollAnchor(.bottom)
                 .scrollDismissesKeyboard(.interactively)
                 .onChange(of: tl.messages.last?.id) { _, _ in
                     withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("end", anchor: .bottom) }
                 }
+            }
             }
         }
         .background(theme.canvas)
