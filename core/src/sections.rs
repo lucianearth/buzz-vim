@@ -345,12 +345,17 @@ pub async fn publish_move(
     publish_edit(relay, &[(vec!["a", channel], json!(target))]).await
 }
 
+/// One sections write at a time: two quick moves would both read the same
+/// head, and the relay keeps only one of them.
+static WRITING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Read the newest sections doc, apply `writes` (see [`edit`]), publish.
 pub async fn publish_edit(
     relay: &crate::relay::Relay,
     writes: &[(Vec<&str>, Value)],
 ) -> anyhow::Result<nostr::Event> {
     use nostr::nips::nip44;
+    let _one = WRITING.lock().await;
     let keys = &relay.keys;
     let me = keys.public_key();
     let heads = relay

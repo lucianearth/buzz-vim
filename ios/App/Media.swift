@@ -1,23 +1,60 @@
+import ImageIO
 import SwiftUI
 import UIKit
 
 /// Loads an image once and keeps it. Images on our relay go through the
-/// Rust client (it signs Blossom auth); anything else is a plain GET.
+/// Rust client (it signs Blossom auth, and stops past the upload cap);
+/// anything else is a plain GET with the same cap. Decoding is scaled down
+/// to `maxPixels` on the long side, so a huge image never decodes whole.
 actor Images {
     static let shared = Images()
-    private let cache = NSCache<NSString, UIImage>()
+    /// The relay's image upload limit (MAX_IMAGE_BYTES).
+    static let maxBytes = 50 * 1024 * 1024
+    private let cache: NSCache<NSString, UIImage> = {
+        let c = NSCache<NSString, UIImage>()
+        c.totalCostLimit = 96 * 1024 * 1024
+        return c
+    }()
 
-    func load(_ url: String, client: Client) async -> UIImage? {
-        if let hit = cache.object(forKey: url as NSString) { return hit }
+    func load(_ url: String, client: Client, maxPixels: Int = 1600) async -> UIImage? {
+        let key = "\(maxPixels) \(url)" as NSString
+        if let hit = cache.object(forKey: key) { return hit }
         var data: Data?
         if let d = try? await client.image(url: url) {
             data = d
         } else if let u = URL(string: url), u.scheme == "https" {
-            data = try? await URLSession.shared.data(from: u).0
+            data = await Self.fetch(u)
         }
-        guard let data, let img = UIImage(data: data) else { return nil }
-        cache.setObject(img, forKey: url as NSString)
+        guard let data, let img = Self.decode(data, maxPixels: maxPixels) else { return nil }
+        let cost = Int(img.size.width * img.scale * img.size.height * img.scale) * 4
+        cache.setObject(img, forKey: key, cost: cost)
         return img
+    }
+
+    private static func fetch(_ url: URL) async -> Data? {
+        guard let got = try? await URLSession.shared.bytes(from: url),
+              got.1.expectedContentLength <= maxBytes else { return nil }
+        var out = Data()
+        do {
+            for try await b in got.0 {
+                out.append(b)
+                if out.count > maxBytes { return nil }
+            }
+        } catch { return nil }
+        return out
+    }
+
+    /// A thumbnail decode: ImageIO reads only what the target size needs.
+    private static func decode(_ data: Data, maxPixels: Int) -> UIImage? {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixels,
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
+        return UIImage(cgImage: cg)
     }
 }
 
@@ -28,6 +65,8 @@ struct RelayImage: View {
     let height: UInt32
     /// Crop to fill the frame (avatars) instead of fitting inside it.
     var fill = false
+    /// Long side to decode at, in pixels.
+    var maxPixels = 1600
     @Environment(\.theme) private var theme
     @State private var image: UIImage?
     @State private var failed = false
@@ -51,7 +90,7 @@ struct RelayImage: View {
             }
         }
         .task(id: url) {
-            image = await Images.shared.load(url, client: client)
+            image = await Images.shared.load(url, client: client, maxPixels: maxPixels)
             failed = image == nil
         }
     }
@@ -123,7 +162,7 @@ struct ZoomImage: UIViewRepresentable {
         tap.numberOfTapsRequired = 2
         scroll.addGestureRecognizer(tap)
         Task { @MainActor in
-            view.image = await Images.shared.load(url, client: client)
+            view.image = await Images.shared.load(url, client: client, maxPixels: 4096)
         }
         return scroll
     }

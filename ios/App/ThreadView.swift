@@ -39,6 +39,7 @@ struct ThreadView: View {
                         ForEach(tl.messages, id: \.id) { m in
                             MessageRow(client: client, message: m, showReplies: false,
                                        latest: m.id == tl.latest)
+                                .equatable()
                                 .contentShape(Rectangle())
                                 .onTapGesture(count: 2) { client.thumbsUp(target: m.id) }
                                 .id(m.id)

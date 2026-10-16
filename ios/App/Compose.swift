@@ -1,3 +1,4 @@
+import ImageIO
 import PhotosUI
 import SwiftUI
 import UIKit
@@ -285,11 +286,26 @@ struct PendingUpload: Identifiable {
             (.png, "image/png", "png"), (.gif, "image/gif", "gif"), (.webP, "image/webp", "webp"),
             (.jpeg, "image/jpeg", "jpg"),
         ]
-        if let t = type, let k = keep.first(where: { t.conforms(to: $0.0) }) {
-            return PendingUpload(data: raw, mime: k.1, name: "photo.\(k.2)", preview: UIImage(data: raw))
+        if let t = type, let k = keep.first(where: { t.conforms(to: $0.0) }),
+           let data = withoutLocation(raw, k.0) {
+            return PendingUpload(data: data, mime: k.1, name: "photo.\(k.2)", preview: UIImage(data: data))
         }
         guard let img = UIImage(data: raw), let jpg = img.jpegData(compressionQuality: 0.85) else { return nil }
         return PendingUpload(data: jpg, mime: "image/jpeg", name: "photo.jpg", preview: img)
+    }
+
+    /// The same image without GPS in its metadata (a lossless copy). JPEG
+    /// and PNG only; GIF and WebP go as they are. Nil if ImageIO can't copy
+    /// it, and then the caller re-encodes, which drops all metadata.
+    private static func withoutLocation(_ data: Data, _ type: UTType) -> Data? {
+        guard type.conforms(to: .jpeg) || type.conforms(to: .png) else { return data }
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let out = NSMutableData()
+        guard let dst = CGImageDestinationCreateWithData(out, type.identifier as CFString, 1, nil) else { return nil }
+        let opts: [CFString: Any] = [kCGImageMetadataShouldExcludeGPS: true]
+        var err: Unmanaged<CFError>?
+        guard CGImageDestinationCopyImageSource(dst, src, opts as CFDictionary, &err) else { return nil }
+        return out as Data
     }
 }
 

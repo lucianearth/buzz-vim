@@ -31,6 +31,7 @@ struct ChannelView: View {
                     }
                     ForEach(tl.messages, id: \.id) { m in
                         MessageRow(client: client, message: m, showReplies: true, latest: m.id == tl.latest)
+                            .equatable()
                             .contentShape(Rectangle())
                             .onTapGesture(count: 2) { client.thumbsUp(target: m.id) }
                             .onTapGesture { if !m.system { openThread(m.id) } }
@@ -49,6 +50,14 @@ struct ChannelView: View {
             .scrollDismissesKeyboard(.interactively)
             .onChange(of: tl.messages.last?.id) { _, _ in
                 withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("end", anchor: .bottom) }
+            }
+            // Older messages came in above: keep the row that was on top
+            // there, instead of landing on the oldest one loaded.
+            .onChange(of: tl.messages.first?.id) { old, _ in
+                guard let old, tl.messages.contains(where: { $0.id == old }) else { return }
+                var t = Transaction()
+                t.disablesAnimations = true
+                withTransaction(t) { proxy.scrollTo(old, anchor: .top) }
             }
             // The bell key landed here: that message at the top.
             .onChange(of: model.scrollTarget?.id) { _, _ in scrollToTarget(proxy) }
@@ -84,7 +93,13 @@ struct Working: View {
     }
 }
 
-struct MessageRow: View {
+/// Equatable so a redraw of the list (the 1 s tick while an agent works)
+/// skips rows whose message hasn't changed.
+struct MessageRow: View, Equatable {
+    static func == (a: MessageRow, b: MessageRow) -> Bool {
+        a.message == b.message && a.showReplies == b.showReplies && a.latest == b.latest
+    }
+
     let client: Client
     let message: Message
     let showReplies: Bool
@@ -231,7 +246,8 @@ struct Avatar: View {
                     .frame(width: size, height: size)
                     .background(theme.ink(person.name))
             } else {
-                RelayImage(client: client, url: person.picture, width: 1, height: 1, fill: true)
+                RelayImage(client: client, url: person.picture, width: 1, height: 1, fill: true,
+                           maxPixels: Int(size * 3))
                     .frame(width: size, height: size)
             }
         }
@@ -277,19 +293,26 @@ struct CodeBlock: View {
     }
 }
 
+private func formatter(_ setup: (DateFormatter) -> Void) -> DateFormatter {
+    let f = DateFormatter()
+    setup(f)
+    return f
+}
+
+private let todayStamp = formatter { $0.timeStyle = .short }
+private let weekStamp = formatter { $0.setLocalizedDateFormatFromTemplate("EEE j:mm") }
+private let olderStamp = formatter { $0.setLocalizedDateFormatFromTemplate("MMM d") }
+
 /// "9:41" today, "Mon 9:41" this week, "Oct 3" before that.
 func stamp(_ at: UInt64) -> String {
     let d = Date(timeIntervalSince1970: TimeInterval(at))
     let cal = Calendar.current
-    let f = DateFormatter()
     if cal.isDateInToday(d) {
-        f.timeStyle = .short
+        return todayStamp.string(from: d)
     } else if let days = cal.dateComponents([.day], from: d, to: Date()).day, days < 6 {
-        f.setLocalizedDateFormatFromTemplate("EEE j:mm")
-    } else {
-        f.setLocalizedDateFormatFromTemplate("MMM d")
+        return weekStamp.string(from: d)
     }
-    return f.string(from: d)
+    return olderStamp.string(from: d)
 }
 
 private let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)

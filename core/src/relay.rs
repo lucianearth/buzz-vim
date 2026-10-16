@@ -19,6 +19,7 @@ pub const ALLOWED_MIMES: &[&str] = &[
     "image/webp",
     "video/mp4",
 ];
+/// Also the most a download reads, so one oversized "image" can't eat memory.
 pub const MAX_IMAGE_BYTES: usize = 50 * 1024 * 1024;
 pub const MAX_VIDEO_BYTES: usize = 500 * 1024 * 1024;
 
@@ -298,8 +299,14 @@ impl Relay {
             bail!("download failed ({s})");
         }
         let total = r.content_length();
-        let mut out = Vec::with_capacity(total.unwrap_or(0).min(64 << 20) as usize);
+        if total.is_some_and(|t| t > MAX_IMAGE_BYTES as u64) {
+            bail!("too large to download");
+        }
+        let mut out = Vec::with_capacity(total.unwrap_or(0) as usize);
         while let Some(chunk) = r.chunk().await? {
+            if out.len() as u64 + chunk.len() as u64 > MAX_IMAGE_BYTES as u64 {
+                bail!("too large to download");
+            }
             out.extend_from_slice(&chunk);
             progress(out.len() as u64, total);
         }
@@ -380,5 +387,38 @@ mod tests {
             base
         ));
         assert!(!super::same_origin("http://buzz.gitcoin.co/a.png", base));
+    }
+
+    /// A body with no length that runs past the cap stops at the cap.
+    #[tokio::test]
+    async fn download_stops_past_the_cap() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut req = [0u8; 4096];
+            let _ = s.read(&mut req).await;
+            s.write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let chunk = vec![0u8; 1 << 20];
+            for _ in 0..(super::MAX_IMAGE_BYTES >> 20) + 2 {
+                if s.write_all(&chunk).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let r = super::Relay::new(
+            &format!("http://127.0.0.1:{port}"),
+            nostr::Keys::generate(),
+            None,
+        )
+        .unwrap();
+        let err = r
+            .download(&format!("http://127.0.0.1:{port}/x.png"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
     }
 }

@@ -684,14 +684,19 @@ impl Sync {
             .map(|u| app.media.bytes.get(u).cloned())
             .collect();
         let r = self.relay.clone();
+        let slots = Arc::clone(&self.image_slots);
         self.spawn(async move {
             let res = async {
                 let files = futures::future::join_all(ours.iter().zip(have).map(|(u, b)| {
                     let r = r.clone();
+                    let slots = Arc::clone(&slots);
                     async move {
                         match b {
                             Some(b) => Ok(b),
-                            None => r.download(u).await.map(Arc::new),
+                            None => {
+                                let _slot = slots.acquire_owned().await?;
+                                r.download(u).await.map(Arc::new)
+                            }
                         }
                     }
                 }))
@@ -704,7 +709,11 @@ impl Sync {
                 // Private to this user (DM and private-channel images).
                 // Folders over a day old go, so they don't pile up; newer
                 // ones may still be open in Preview.
-                let base = std::env::temp_dir().join("buzz-vim");
+                // The user's own cache folder, not a shared /tmp another
+                // user could have made first.
+                let base = dirs::cache_dir()
+                    .unwrap_or_else(std::env::temp_dir)
+                    .join("buzz-vim-images");
                 let day = std::time::Duration::from_secs(24 * 3600);
                 for e in std::fs::read_dir(&base).into_iter().flatten().flatten() {
                     let old = e

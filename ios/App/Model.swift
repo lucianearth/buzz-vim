@@ -87,6 +87,9 @@ final class Model {
         UserDefaults.standard.removeObject(forKey: "tabOrder")
         drafts = [:]
         sticky = [:]
+        // Unsent text belongs to this account; the next one mustn't get it.
+        outbox = [:]
+        mine = []
     }
 
     private func start(relay: String, secret: String, authTag: String? = nil) throws {

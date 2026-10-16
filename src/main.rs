@@ -458,13 +458,13 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
                 Err(e) => media::Slot::Failed(e.to_string()),
             };
             app.media.progress.remove(&url);
-            app.media.images.insert(url, slot);
+            app.media.put_image(url, slot);
         }
         Msg::Progress { url, got, total } => {
             app.media.progress.insert(url, (got, total));
         }
         Msg::Bytes { url, bytes } => {
-            app.media.bytes.insert(url, bytes);
+            app.media.keep_bytes(url, bytes);
         }
         Msg::Attachment { label, result } => match (result, label) {
             (Ok(p), _) => app.attach(p),
