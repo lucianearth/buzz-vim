@@ -197,6 +197,10 @@ struct Header: View {
     @Environment(\.theme) private var theme
     /// False again if the system cancels the hold, so the column can't stick.
     @GestureState private var holding = false
+    /// Where the tab row sits on screen: a lifted tab starts there.
+    @State private var rowY: CGFloat = 0
+    /// A reorder that ends dragging down mustn't also open the agents.
+    @State private var droppedAt = Date.distantPast
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -213,11 +217,15 @@ struct Header: View {
                                 .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { selected = t.id } }
                                 // Hold a tab: its section unfolds into a column
                                 // to slide it up or down in.
-                                .gesture(hold(t))
+                                // Simultaneous, so a quick sideways swipe
+                                // still scrolls the row.
+                                .simultaneousGesture(hold(t))
                         }
                     }
                     .padding(.horizontal, 22)
+                    .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).midY } action: { rowY = $0 }
                 }
+                .scrollDisabled(lift != nil)
                 .onChange(of: selected) { _, now in
                     withAnimation { proxy.scrollTo(now, anchor: .center) }
                 }
@@ -234,7 +242,8 @@ struct Header: View {
         .padding(.bottom, 16)
         .contentShape(Rectangle())
         .gesture(DragGesture(minimumDistance: 24).onEnded { g in
-            if g.translation.height > 50 && abs(g.translation.width) < g.translation.height {
+            if lift == nil, Date().timeIntervalSince(droppedAt) > 0.5,
+               g.translation.height > 50 && abs(g.translation.width) < g.translation.height {
                 showAgents = true
             }
         })
@@ -251,10 +260,15 @@ struct Header: View {
                 if lift == nil {
                     let ids = tabs.filter { $0.section == t.section }.map(\.id)
                     withAnimation(.easeOut(duration: 0.15)) {
-                        lift = Lift(section: t.section, ids: ids, held: t.id)
+                        lift = Lift(section: t.section, ids: ids, held: t.id, y: rowY)
                     }
                 }
-                lift?.dy = drag?.translation.height ?? 0
+                if let d = drag {
+                    lift?.y = d.location.y
+                    // Hold still and nothing moves; once the finger goes up
+                    // or down, the tab goes to the row under it.
+                    if abs(d.translation.height) > 10 { lift?.moved = true }
+                }
             }
             .onEnded { _ in drop() }
     }
@@ -263,6 +277,7 @@ struct Header: View {
     private func drop() {
         guard let l = lift else { return }
         if l.order != l.ids { model.order(l.section, l.order) }
+        droppedAt = Date()
         withAnimation(.easeOut(duration: 0.2)) { lift = nil }
     }
 
@@ -333,12 +348,23 @@ struct Lift {
     /// The section's tabs as they were when the hold started.
     let ids: [String]
     let held: String
-    /// How far the finger has moved since, and one row's height.
-    var dy: CGFloat = 0
+    /// The finger, on screen, and whether it has moved up or down yet.
+    var y: CGFloat
+    var moved = false
+    /// Where the column's first row starts on screen, and one row's height.
+    var top: CGFloat = 0
     var rowH: CGFloat = 56
 
     var start: Int { ids.firstIndex(of: held) ?? 0 }
-    var target: Int { min(max(start + Int((dy / rowH).rounded()), 0), ids.count - 1) }
+    /// The row under the finger.
+    var target: Int {
+        guard moved else { return start }
+        return min(max(Int(((y - top) / rowH).rounded(.down)), 0), ids.count - 1)
+    }
+    /// The held row, centred on the finger but kept inside the column.
+    var heldY: CGFloat {
+        min(max(y - top - rowH / 2, 0), CGFloat(ids.count - 1) * rowH)
+    }
     var order: [String] {
         var o = ids.filter { $0 != held }
         o.insert(held, at: target)
@@ -347,7 +373,7 @@ struct Lift {
 }
 
 /// The section the held tab is in, unfolded into tall rows. The held one
-/// follows the finger; the rest make room as it passes.
+/// sits under the finger; the rest make room as it passes.
 struct TabColumn: View {
     @Binding var lift: Lift?
     let tabs: [ChannelTab]
@@ -363,9 +389,7 @@ struct TabColumn: View {
                     ForEach(Array(l.order.enumerated()), id: \.element) { i, id in
                         if let t = byId[id] {
                             let held = id == l.held
-                            let slot = held
-                                ? min(max(CGFloat(l.start) * l.rowH + l.dy, 0), CGFloat(l.ids.count - 1) * l.rowH)
-                                : CGFloat(i) * l.rowH
+                            let slot = held ? l.heldY : CGFloat(i) * l.rowH
                             row(t, held: held)
                                 .frame(height: l.rowH - 8)
                                 .padding(.horizontal, 22)
@@ -373,7 +397,7 @@ struct TabColumn: View {
                                 // and flips open, one just after another.
                                 .rotation3DEffect(.degrees(open ? 0 : -80), axis: (1, 0, 0),
                                                   anchor: .top, perspective: 0.6)
-                                .offset(y: 16 + (open ? slot : 0))
+                                .offset(y: 16 + (open || held ? slot : 0))
                                 .opacity(open ? 1 : 0)
                                 .animation(.spring(duration: 0.35).delay(Double(i) * 0.02), value: open)
                                 .animation(held ? nil : .snappy(duration: 0.2), value: l.target)
@@ -383,6 +407,7 @@ struct TabColumn: View {
                 }
                 .onAppear {
                     lift?.rowH = min(64, max(36, (geo.size.height - 32) / CGFloat(max(l.ids.count, 1))))
+                    lift?.top = geo.frame(in: .global).minY + 16
                     open = true
                 }
                 .sensoryFeedback(.selection, trigger: l.target)
