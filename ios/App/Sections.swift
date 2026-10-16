@@ -9,39 +9,52 @@ struct SectionsView: View {
     var body: some View {
         let _ = model.version
         let sections = client.sections()
-        ScrollView {
-            VStack(alignment: .leading, spacing: 0) {
-                Text("tabs come from these sections")
+        let here = "#" + client.currentName()
+        // A List, not a stack, so rows can swipe.
+        List {
+            Text("tabs come from these sections")
+                .font(.small)
+                .foregroundStyle(theme.muted)
+                .modifier(SheetRow())
+                .listRowSeparator(.hidden)
+            ForEach(sections, id: \.id) { s in
+                HStack {
+                    Text(s.name).font(.label).foregroundStyle(theme.text)
+                    Text("\(s.channels)").font(.small).foregroundStyle(theme.faint)
+                    Spacer()
+                    Image(systemName: s.chosen ? "checkmark.circle.fill" : "circle")
+                        .foregroundStyle(s.chosen ? theme.accent : theme.faint)
+                }
+                .padding(.vertical, 4)
+                .contentShape(Rectangle())
+                .onTapGesture { toggle(s, in: sections) }
+                .modifier(SheetRow())
+                // Swipe left: move the channel on screen into this section.
+                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                    if s.canMoveHere {
+                        Button("Move \(here) here") { model.moveHere(s.id) }
+                            .tint(theme.accent)
+                    }
+                }
+            }
+            HStack {
+                Text("signed in as \(client.myName())")
                     .font(.small)
                     .foregroundStyle(theme.muted)
-                    .padding(.bottom, 12)
-                ForEach(sections, id: \.id) { s in
-                    HStack {
-                        Text(s.name).font(.label).foregroundStyle(theme.text)
-                        Text("\(s.channels)").font(.small).foregroundStyle(theme.faint)
-                        Spacer()
-                        Image(systemName: s.chosen ? "checkmark.circle.fill" : "circle")
-                            .foregroundStyle(s.chosen ? theme.accent : theme.faint)
-                    }
-                    .padding(.vertical, 12)
-                    .contentShape(Rectangle())
-                    .onTapGesture { toggle(s, in: sections) }
-                    Rectangle().fill(theme.rule).frame(height: 1)
-                }
-                HStack {
-                    Text("signed in as \(client.myName())")
-                        .font(.small)
-                        .foregroundStyle(theme.muted)
-                    Spacer()
-                    Button("Log out") { model.logout() }
-                        .font(.small)
-                        .foregroundStyle(theme.badge)
-                }
-                .padding(.top, 28)
+                Spacer()
+                Button("Log out") { model.logout() }
+                    .font(.small)
+                    .foregroundStyle(theme.badge)
+                    .buttonStyle(.borderless)
             }
-            .padding(.horizontal, 22)
-            .padding(.top, 26)
+            .padding(.top, 16)
+            .modifier(SheetRow())
+            .listRowSeparator(.hidden)
         }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .environment(\.defaultMinListRowHeight, 0)
+        .padding(.top, 18)
         .background(theme.sheet)
     }
 
@@ -53,5 +66,17 @@ struct SectionsView: View {
             ids.append(s.id)
         }
         model.setChosen(ids)
+    }
+}
+
+/// A List row that looks like the rest of the sheet.
+private struct SheetRow: ViewModifier {
+    @Environment(\.theme) private var theme
+
+    func body(content: Content) -> some View {
+        content
+            .listRowBackground(theme.sheet)
+            .listRowSeparatorTint(theme.rule)
+            .listRowInsets(EdgeInsets(top: 8, leading: 22, bottom: 8, trailing: 22))
     }
 }

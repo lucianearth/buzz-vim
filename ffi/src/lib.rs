@@ -91,6 +91,8 @@ pub struct SectionInfo {
     pub name: String,
     pub channels: u32,
     pub chosen: bool,
+    /// The channel on screen can be moved into this section.
+    pub can_move_here: bool,
 }
 
 #[derive(uniffi::Enum, Clone)]
@@ -305,6 +307,7 @@ enum Msg {
         id: String,
         result: anyhow::Result<()>,
     },
+    Moved(anyhow::Result<(Event, String)>),
 }
 
 struct Engine {
@@ -450,6 +453,16 @@ impl Client {
         self.engine.lock().unwrap().store.me.clone()
     }
 
+    /// The name of the channel on screen, or "" when there is none.
+    pub fn current_name(&self) -> String {
+        let e = self.engine.lock().unwrap();
+        e.current
+            .as_ref()
+            .and_then(|c| e.store.channels.get(c))
+            .map(|c| c.name.clone())
+            .unwrap_or_default()
+    }
+
     pub fn my_name(&self) -> String {
         let e = self.engine.lock().unwrap();
         e.store.name_of(&e.store.me)
@@ -492,6 +505,10 @@ impl Client {
     pub fn sections(&self) -> Vec<SectionInfo> {
         let e = self.engine.lock().unwrap();
         let first = e.chosen.is_empty();
+        let cur = e
+            .current
+            .as_ref()
+            .filter(|c| e.store.channels.get(*c).is_some_and(|ch| !ch.is_dm));
         e.sections
             .iter()
             .enumerate()
@@ -500,6 +517,9 @@ impl Client {
                 name: s.name.clone(),
                 channels: s.channels.len() as u32,
                 chosen: e.chosen.contains(&s.id) || (first && i == 0),
+                can_move_here: cur.is_some_and(|c| {
+                    !matches!(s.id.as_str(), "★" | "dms") && !s.channels.contains(c)
+                }),
             })
             .collect()
     }
@@ -517,6 +537,30 @@ impl Client {
         let mut e = self.engine.lock().unwrap();
         e.order.insert(section, ids);
         e.rebuild_tabs();
+    }
+
+    /// Move the channel on screen into `section` ("channels" = out of its
+    /// section), in Desktop's sidebar record so Desktop sees it too.
+    pub fn move_here(&self, section: String) {
+        let e = self.engine.lock().unwrap();
+        let Some(ch) = e.current.clone() else { return };
+        let label = format!(
+            "moved #{} to {}",
+            e.store.channels.get(&ch).map_or("?", |c| c.name.as_str()),
+            e.sections
+                .iter()
+                .find(|s| s.id == section)
+                .map_or(section.as_str(), |s| s.name.as_str())
+        );
+        let target = (section != "channels").then_some(section);
+        let r = e.relay.clone();
+        e.spawn(async move {
+            Msg::Moved(
+                sections::publish_move(&r, &ch, target.as_deref())
+                    .await
+                    .map(|ev| (ev, label)),
+            )
+        });
     }
 
     /// Fetch channels and sections again: new channels appear, archived
@@ -1380,6 +1424,12 @@ impl Engine {
                 self.refresh_sections();
             }
             Msg::Lanes(Err(e)) => self.notices.push(format!("couldn't load sections: {e}")),
+            Msg::Moved(Ok((ev, label))) => {
+                self.apply_lanes(&[ev]);
+                self.refresh_sections();
+                self.notices.push(label);
+            }
+            Msg::Moved(Err(e)) => self.notices.push(format!("couldn't move: {e}")),
             Msg::Window {
                 channel,
                 events,

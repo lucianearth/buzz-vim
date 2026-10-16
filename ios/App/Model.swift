@@ -104,6 +104,12 @@ final class Model {
         restoreUnsent()
     }
 
+    /// Move the channel on screen into a section; the notice says how it went.
+    func moveHere(_ section: String) {
+        client?.moveHere(section: section)
+        say("moving…")
+    }
+
     func setChosen(_ ids: [String]) {
         UserDefaults.standard.set(ids, forKey: "chosen")
         client?.setChosen(ids: ids)
