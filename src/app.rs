@@ -414,7 +414,7 @@ impl App {
                     }),
                     channel,
                 };
-                if let Some(h) = self.here() {
+                if let Some(h) = self.here().filter(|h| *h != jump) {
                     self.jumps.push(h);
                 }
                 self.goto(jump);
@@ -438,6 +438,7 @@ impl App {
     }
 
     fn goto(&mut self, j: Jump) {
+        let left = self.current() != Some(j.channel.as_str());
         let i = match self.tabs.iter().position(|t| *t == j.channel) {
             Some(i) => i,
             None => {
@@ -449,7 +450,6 @@ impl App {
                 self.tabs.len() - 1
             }
         };
-        let left = self.active != i;
         self.active = i;
         self.drop_extra();
         if left {
@@ -1307,6 +1307,16 @@ mod tests {
         app.follow("buzz://channel/x");
         app.on_key(KeyEvent::from(KeyCode::Char('0')));
         assert_eq!(app.tabs, vec!["a", "b"]);
+        // One extra tab to another still opens the new channel.
+        app.follow("buzz://channel/x");
+        app.actions.clear();
+        app.follow("buzz://channel/y");
+        assert_eq!(app.tabs, vec!["a", "b", "y"]);
+        assert!(matches!(app.actions.first(), Some(Action::OpenChannel(c)) if c == "y"));
+        // Following a link to where you already are adds no step.
+        let n = app.jumps.len();
+        app.follow("buzz://channel/y");
+        assert_eq!(app.jumps.len(), n);
         // Desktop and web links go to the OS.
         app.follow("buzz://pr?id=1");
         assert!(matches!(app.actions.last(), Some(Action::OpenUrl(u)) if u == "buzz://pr?id=1"));

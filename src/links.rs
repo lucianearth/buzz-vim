@@ -79,7 +79,7 @@ pub fn label(url: &str, channel_name: &dyn Fn(&str) -> Option<String>) -> Option
             };
             let host = host.trim_end_matches('/');
             Some(match (get("d"), get("commit")) {
-                (Some(d), Some(c)) => format!("{d} @ {}", &c[..c.len().min(7)]),
+                (Some(d), Some(c)) => format!("{d} @ {}", c.chars().take(7).collect::<String>()),
                 (Some(d), None) => format!("{d} {host}"),
                 _ => host.to_string(),
             })
@@ -246,6 +246,11 @@ mod tests {
             Some("buzz-vim @ d5f0f35")
         );
         assert_eq!(label("buzz://pr?id=x", &name).as_deref(), Some("pr"));
+        // Untrusted text: no byte slicing through a character.
+        assert_eq!(
+            label("buzz://repo?d=x&commit=ééééé", &name).as_deref(),
+            Some("x @ ééééé")
+        );
         assert_eq!(label("https://a.com", &name), None);
     }
 
