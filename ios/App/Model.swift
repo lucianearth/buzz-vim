@@ -89,6 +89,7 @@ final class Model {
         UserDefaults.standard.removeObject(forKey: "chosen")
         UserDefaults.standard.removeObject(forKey: "tabOrder")
         UserDefaults.standard.removeObject(forKey: "threads")
+        UserDefaults.standard.removeObject(forKey: "agentContext")
         drafts = [:]
         sticky = [:]
         // Unsent text belongs to this account; the next one mustn't get it.
@@ -114,6 +115,17 @@ final class Model {
             d.removeObject(forKey: "tabOrder")
         }
         restoreUnsent()
+        if let saved = d.string(forKey: "agentContext") {
+            client?.restoreContext(json: saved)
+        }
+    }
+
+    /// Agents' last context counts, kept so the agents sheet has them
+    /// before each agent next runs.
+    func saveContext() {
+        if let json = client?.savedContext() {
+            UserDefaults.standard.set(json, forKey: "agentContext")
+        }
     }
 
     /// Move the channel on screen into a section; the notice says how it went.

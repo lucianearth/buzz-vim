@@ -139,6 +139,7 @@ async fn run(
     app.chosen = saved.chosen.clone();
     app.read_width = saved.read_width;
     app.last_bot = saved.last_bot.clone();
+    app.agents.restore_context(&saved.context);
     let mut sync = Sync::new(relay, live_cmd, tx);
     if !saved.read_slot.is_empty() && !saved.read_client.is_empty() {
         app.read = readstate::ReadState::new(saved.read_slot.clone(), saved.read_client.clone());
@@ -251,6 +252,7 @@ fn saved_state(app: &App) -> state::State {
         read_client: app.read.client_id().to_string(),
         read_width: app.read_width,
         last_bot: app.last_bot.clone(),
+        context: app.agents.saved_context(),
     }
 }
 

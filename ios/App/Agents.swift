@@ -1,10 +1,15 @@
 import SwiftUI
 
-/// Who is working, where, and their last tool calls.
+/// Who is working, where, and their last tool calls; context in the open
+/// channel, and Reset to start an agent's session there afresh.
 struct AgentsView: View {
     let client: Client
+    /// The channel on screen, and its open thread.
+    let channel: String?
+    let root: String?
     @Environment(Model.self) private var model
     @Environment(\.theme) private var theme
+    @State private var resetting: Agent?
 
     var body: some View {
         let _ = model.version
@@ -29,13 +34,43 @@ struct AgentsView: View {
             .padding(.bottom, 20)
         }
         .background(theme.sheet)
+        .confirmationDialog(
+            "Reset \(resetting?.name ?? "")'s session here?",
+            isPresented: Binding(get: { resetting != nil }, set: { if !$0 { resetting = nil } }),
+            titleVisibility: .visible
+        ) {
+            Button("Reset", role: .destructive) {
+                if let a = resetting, let ch = channel {
+                    do {
+                        try client.resetAgent(channel: ch, root: root, agent: a.pubkey)
+                        model.say("reset sent to \(a.name)")
+                    } catch {
+                        model.say("reset not sent: \(error.localizedDescription)")
+                    }
+                }
+                resetting = nil
+            }
+        }
     }
 
     private func row(_ a: Agent) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(a.name)
-                .font(.heading)
-                .foregroundStyle(theme.ink(a.pubkey))
+            HStack(alignment: .firstTextBaseline) {
+                Text(a.name)
+                    .font(.heading)
+                    .foregroundStyle(theme.ink(a.pubkey))
+                Spacer()
+                if channel != nil {
+                    Button("Reset") { resetting = a }
+                        .font(.small)
+                        .foregroundStyle(theme.muted)
+                }
+            }
+            if let c = a.context {
+                Text("context here \(c)")
+                    .font(.small)
+                    .foregroundStyle(theme.muted)
+            }
             HStack(spacing: 7) {
                 if a.busy { Pulse(color: theme.live, on: true) }
                 Text(status(a))

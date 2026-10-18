@@ -17,6 +17,9 @@ pub struct State {
     /// channel -> (bot last tagged there, unix seconds).
     #[serde(default)]
     pub last_bot: std::collections::HashMap<String, (String, u64)>,
+    /// Agents' last context counts (telemetry::Agents::saved_context).
+    #[serde(default)]
+    pub context: serde_json::Value,
 }
 
 fn path(relay: &str, me: &str) -> Option<std::path::PathBuf> {

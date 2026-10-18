@@ -17,6 +17,7 @@ struct BuzzVimApp: App {
             case .background:
                 model.client?.setVisible(visible: false)
                 model.client?.flush()
+                model.saveContext()
             case .active:
                 model.client?.setVisible(visible: true)
                 model.client?.resume()

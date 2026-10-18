@@ -210,6 +210,8 @@ pub struct Agent {
     pub recent: Vec<String>,
     pub thought: String,
     pub last_turn: Option<String>,
+    /// Tokens in its context in the open channel, e.g. "142k".
+    pub context: Option<String>,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -833,10 +835,16 @@ impl Client {
     /// Your online agents, busiest first.
     pub fn agents(&self) -> Vec<Agent> {
         let e = self.engine.lock().unwrap();
+        let ctx = |pk: &str| {
+            let a = e.agents.by_pubkey.get(pk)?;
+            let c = a.context.get(e.current.as_deref()?)?;
+            Some(buzz_vim_core::telemetry::tokens(c.used))
+        };
         e.agents
             .rows(&e.store, None)
             .into_iter()
             .map(|r| Agent {
+                context: ctx(&r.pubkey),
                 place: r
                     .channel
                     .as_deref()
@@ -852,6 +860,43 @@ impl Client {
                 last_turn: r.last_turn,
             })
             .collect()
+    }
+
+    /// Reset `agent`'s session in `channel` (the thread under `root` for
+    /// thread-scoped sessions): the owner `!rotate` buzz-acp acts on, from
+    /// you, p-tagging the agent.
+    pub fn reset_agent(
+        &self,
+        channel: String,
+        root: Option<String>,
+        agent: String,
+    ) -> Result<(), BuzzError> {
+        let mut e = self.engine.lock().unwrap();
+        e.send(
+            channel.clone(),
+            root,
+            "!rotate".into(),
+            &[],
+            std::slice::from_ref(&agent),
+        )?;
+        e.agents.rotated(&agent, &channel);
+        Ok(())
+    }
+
+    /// Agents' context counts as JSON, for the app to keep across launches.
+    pub fn saved_context(&self) -> String {
+        self.engine
+            .lock()
+            .unwrap()
+            .agents
+            .saved_context()
+            .to_string()
+    }
+
+    pub fn restore_context(&self, json: String) {
+        if let Ok(v) = serde_json::from_str(&json) {
+            self.engine.lock().unwrap().agents.restore_context(&v);
+        }
     }
 
     /// Agents mid-turn anywhere, by name.

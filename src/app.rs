@@ -72,6 +72,12 @@ pub enum Action {
     ThumbsUp {
         target: String,
     },
+    /// `!rotate` to one agent: a fresh session in that channel.
+    Reset {
+        channel: String,
+        root: Option<String>,
+        agent: String,
+    },
     Upload,
     LoadOlder(String),
     ReloadSections,
@@ -146,6 +152,10 @@ pub struct App {
     pub empty_prev: Option<(String, u64)>,
     /// The full-screen agents view (`a`).
     pub agents_view: bool,
+    /// The card picked on the agents view (j/k), for `r`.
+    pub agents_cursor: usize,
+    /// Agent (pubkey, name) waiting on the y/n before its reset.
+    pub reset_ask: Option<(String, String)>,
     pub agents: Agents,
     pub media: Media,
     pub picker: Option<Picker>,
@@ -230,6 +240,8 @@ impl App {
             empty: None,
             empty_prev: None,
             agents_view: false,
+            agents_cursor: 0,
+            reset_ask: None,
             agents: Agents::default(),
             media: Media::default(),
             picker,
@@ -287,6 +299,46 @@ impl App {
         let s = s.into();
         crate::log::line(format!("status: {s}"));
         self.status = Some((s, Instant::now()));
+    }
+
+    /// `r` on the agents view: ask before resetting the picked agent.
+    fn ask_reset(&mut self) {
+        let here = self.current().map(str::to_string);
+        if here.is_none() {
+            return;
+        }
+        let rows = self.agents.rows(&self.store, here.as_deref());
+        let Some(r) = rows.get(self.agents_cursor.min(rows.len().saturating_sub(1))) else {
+            return;
+        };
+        self.reset_ask = Some((r.pubkey.clone(), r.name.clone()));
+        self.mode = Mode::Reset;
+    }
+
+    /// Send `!rotate` from you to the agent, in this channel (in the open
+    /// thread when there is one, for thread-scoped sessions). The harness
+    /// starts that agent's next turn here with a fresh session.
+    fn reset_agent(&mut self) {
+        self.mode = Mode::Normal;
+        let Some((agent, name)) = self.reset_ask.take() else {
+            return;
+        };
+        let Some(channel) = self.current().map(str::to_string) else {
+            return;
+        };
+        let root = self
+            .thread
+            .as_ref()
+            .filter(|t| t.0 == channel)
+            .map(|t| t.1.clone());
+        self.agents.rotated(&agent, &channel);
+        self.actions.push(Action::Reset {
+            channel,
+            root,
+            agent,
+        });
+        self.actions.push(Action::SaveState);
+        self.say(format!("resetting {name}…"));
     }
 
     pub fn current(&self) -> Option<&str> {
@@ -995,6 +1047,15 @@ impl App {
                 _ => {}
             },
             Mode::Hint => self.key_hint(k),
+            Mode::Reset => match k.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.reset_agent(),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                    self.reset_ask = None;
+                    self.mode = Mode::Normal;
+                    self.say("not reset");
+                }
+                _ => {}
+            },
             Mode::Help => {
                 if matches!(
                     k.code,
@@ -1087,6 +1148,11 @@ impl App {
             }
             KeyCode::Char('d') if ctrl => self.move_cursor((self.page / 2).max(1) as isize),
             KeyCode::Char('u') if ctrl => self.move_cursor(-((self.page / 2).max(1) as isize)),
+            KeyCode::Char('j') | KeyCode::Down if self.agents_view => self.agents_cursor += 1,
+            KeyCode::Char('k') | KeyCode::Up if self.agents_view => {
+                self.agents_cursor = self.agents_cursor.saturating_sub(1)
+            }
+            KeyCode::Char('r') if self.agents_view => self.ask_reset(),
             KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
             KeyCode::Char('d') | KeyCode::PageDown => self.move_cursor(self.page.max(1) as isize),
@@ -1773,6 +1839,28 @@ mod tests {
         assert!(
             matches!(app.actions.last(), Some(Action::OpenImages { urls, current: 0 }) if urls == &["top"])
         );
+    }
+
+    #[test]
+    fn r_on_the_agents_view_asks_then_rotates_the_picked_agent() {
+        let mut app = App::new("me".into(), None);
+        app.tabs = vec!["ch".into()];
+        for (pk, name) in [("a1", "alpha"), ("b2", "beta")] {
+            app.agents.own(pk, name);
+            app.agents.presence(pk, "online");
+        }
+        app.agents_view = true;
+        app.on_key(KeyEvent::from(KeyCode::Char('j')));
+        app.on_key(KeyEvent::from(KeyCode::Char('r')));
+        assert_eq!(app.mode, Mode::Reset);
+        assert!(app.actions.is_empty());
+        app.on_key(KeyEvent::from(KeyCode::Char('n')));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.actions.is_empty());
+        app.on_key(KeyEvent::from(KeyCode::Char('r')));
+        app.on_key(KeyEvent::from(KeyCode::Char('y')));
+        assert!(matches!(app.actions.first(),
+            Some(Action::Reset { channel, root: None, agent }) if channel == "ch" && agent == "b2"));
     }
 
     #[test]
