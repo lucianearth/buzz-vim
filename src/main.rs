@@ -324,7 +324,7 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
             }
             sync.want_profiles(want);
         }
-        Msg::QuickSent { result, text } => match result {
+        Msg::QuickSent { id, result, text } => match result {
             Ok(()) => {
                 let agent = app.loop_.quick_agent.clone();
                 app.say(format!(
@@ -333,9 +333,15 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
                 ));
             }
             Err(e) => {
-                if app.quick_draft.is_empty() {
-                    app.quick_draft.insert(&text);
+                // It never landed: off the screen, and its text back in the
+                // box, after anything typed since.
+                app.store.remove_message(&id);
+                let d = &mut app.quick_draft;
+                if !d.is_empty() {
+                    d.end();
+                    d.insert("\n\n");
                 }
+                d.insert(&text);
                 app.say(format!("Q not sent: {e}. Q opens it again."));
             }
         },
@@ -634,6 +640,33 @@ mod tests {
         assert_eq!(sent[0], sent[1]);
         assert_ne!(sent[1], sent[2]);
         assert_ne!(sent[2], sent[3]);
+    }
+
+    /// A Q the relay never took leaves #quick and goes back in the box,
+    /// after anything typed since.
+    #[tokio::test]
+    async fn a_failed_q_comes_back_to_the_box() {
+        let relay = relay::Relay::new("http://127.0.0.1:1", nostr::Keys::generate(), None).unwrap();
+        let (live_tx, _live_rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut sync = sync::Sync::new(relay, live_tx, tx);
+        let mut app = App::new("me".into(), None);
+        let q = quick::CHANNEL_ID.to_string();
+        sync.run(
+            &mut app,
+            Action::SendQuick {
+                channel: q.clone(),
+                content: "[Q]\n@taskbot why?".into(),
+                agent: quick::AGENT_PUBKEY.into(),
+                text: "why?".into(),
+            },
+        );
+        assert_eq!(app.store.channels[&q].timeline.len(), 1);
+        app.quick_draft.insert("next one");
+        let msg = rx.recv().await.unwrap();
+        handle(&mut app, &mut sync, msg, &mut None);
+        assert!(app.store.channels[&q].timeline.is_empty());
+        assert_eq!(app.quick_draft.text, "next one\n\nwhy?");
     }
 
     /// A dropped file is read off the UI loop, then offered for upload.

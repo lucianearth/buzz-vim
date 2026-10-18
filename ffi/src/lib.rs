@@ -2384,6 +2384,8 @@ mod tests {
         let mut e = engine();
         let bot = Keys::generate();
         let bk = bot.public_key().to_hex();
+        // The bot is the watcher here too.
+        e.checklists.trust.watchers = vec![bk.clone()];
         let rec = |kind: u16, d: String, v: Value| {
             EventBuilder::new(Kind::Custom(kind), v.to_string())
                 .tags(

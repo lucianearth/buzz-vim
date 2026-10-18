@@ -20,7 +20,7 @@ struct File {
     /// Operator loop: who else may edit any checklist record (default lucian).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     owner: Option<String>,
-    /// The watcher's pubkeys; its state counts only from these. Unset: any.
+    /// The watcher's pubkeys; its state counts only from these (and the owner).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     watcher: Vec<String>,
     /// The Q pop-up's channel name and the agent it @mentions.
@@ -53,7 +53,10 @@ impl Default for Loop {
     fn default() -> Self {
         Loop {
             owner: crate::checklist::OWNER.to_string(),
-            watchers: vec![],
+            watchers: crate::checklist::WATCHERS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             quick_channel: crate::quick::CHANNEL.to_string(),
             quick_agent: crate::quick::AGENT.to_string(),
         }

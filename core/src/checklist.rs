@@ -23,6 +23,10 @@ pub const KINDS: &[u16] = &[KIND_ITEM, KIND_HEADER, KIND_WATCH];
 pub const TAG: &str = "buzz-checklist";
 /// lucian: accepted on every record (default, overridable).
 pub const OWNER: &str = "5c017fc7a0525e163d44fae1b4e853ad236e690c4f607fd2c603088d854bc36a";
+/// The watcher's keys, accepted on watch records by default. Empty until
+/// the watcher's identity is settled; set `watcher` in the config (or
+/// `BUZZ_VIM_WATCHER`) meanwhile. The owner's watch records always count.
+pub const WATCHERS: &[&str] = &[];
 /// What buzz-acp's notice says when it respawns a crashed agent process.
 pub const CRASH_NEEDLE: &str = "agent process crashed";
 
@@ -172,8 +176,7 @@ pub struct Watch {
 #[derive(Debug, Clone)]
 pub struct Trust {
     pub owner: String,
-    /// Keys whose watch records count. Empty: any signer (no watcher
-    /// configured yet), newest wins.
+    /// Keys whose watch records count, besides the owner's.
     pub watchers: Vec<String>,
 }
 
@@ -181,7 +184,7 @@ impl Default for Trust {
     fn default() -> Self {
         Trust {
             owner: OWNER.to_string(),
-            watchers: vec![],
+            watchers: WATCHERS.iter().map(|s| s.to_string()).collect(),
         }
     }
 }
@@ -194,6 +197,10 @@ struct Version {
     at: u64,
     id: String,
     content: Value,
+    /// The earliest (at, id) this signer claimed to be the creator, of all
+    /// its versions seen: only the newest is kept, and its time is not the
+    /// claim's.
+    first_claim: Option<(u64, String)>,
 }
 
 impl Version {
@@ -204,9 +211,16 @@ impl Version {
 }
 
 /// The version a reader takes for one `d`: the newest signed by the
-/// creator or the owner. The creator is what the owner's version says, or
-/// else the earliest version whose signer claims to be it.
-fn pick<'a>(versions: &'a [Version], owner: &str) -> Option<(&'a Version, String)> {
+/// creator or the owner. The creator is what the owner's version says;
+/// else `preferred` (the list's own creator, for items) when it claims it;
+/// else the signer with the earliest claim. Relays keep only each signer's
+/// newest version, so "earliest" is what we have seen, and a backdated
+/// claim can still win it: hence the owner and the list's creator first.
+fn pick<'a>(
+    versions: &'a [Version],
+    owner: &str,
+    preferred: Option<&str>,
+) -> Option<(&'a Version, String)> {
     let newest = |a: &&Version, b: &&Version| {
         if a.newer_than(b) {
             std::cmp::Ordering::Greater
@@ -220,11 +234,18 @@ fn pick<'a>(versions: &'a [Version], owner: &str) -> Option<(&'a Version, String
         .max_by(newest)
         .map(|v| v.creator.clone().unwrap_or_else(|| v.signer.clone()))
         .or_else(|| {
+            let p = preferred?;
             versions
                 .iter()
-                .filter(|v| v.creator.as_deref().is_none_or(|c| c == v.signer))
-                .min_by_key(|v| (v.at, v.id.clone()))
-                .map(|v| v.signer.clone())
+                .any(|v| v.signer == p && v.first_claim.is_some())
+                .then(|| p.to_string())
+        })
+        .or_else(|| {
+            versions
+                .iter()
+                .filter_map(|v| Some((v.first_claim.clone()?, &v.signer)))
+                .min()
+                .map(|(_, s)| s.clone())
         })?;
     let v = versions
         .iter()
@@ -383,12 +404,21 @@ impl Checklists {
         let Ok(content) = serde_json::from_str::<Value>(&ev.content) else {
             return false;
         };
-        let v = Version {
-            signer: ev.pubkey.to_hex(),
-            creator: tag(ev, "creator").map(str::to_string),
-            at: ev.created_at.as_secs(),
-            id: ev.id.to_hex(),
+        let signer = ev.pubkey.to_hex();
+        let creator = tag(ev, "creator").map(str::to_string);
+        let at = ev.created_at.as_secs();
+        let id = ev.id.to_hex();
+        let claim = creator
+            .as_deref()
+            .is_none_or(|c| c == signer)
+            .then(|| (at, id.clone()));
+        let mut v = Version {
+            signer,
+            creator,
+            at,
+            id,
             content,
+            first_claim: claim.clone(),
         };
         let recs = self.channels.entry(channel.to_string()).or_default();
         let slot = match kind {
@@ -396,9 +426,18 @@ impl Checklists {
             KIND_HEADER => &mut recs.header,
             _ => &mut recs.watch,
         };
-        match slot.get(&v.signer) {
-            Some(old) if !v.newer_than(old) => false,
-            _ => {
+        let earliest = |a: Option<(u64, String)>, b: Option<(u64, String)>| match (a, b) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        match slot.get_mut(&v.signer) {
+            Some(old) if !v.newer_than(old) => {
+                // Older, but its claim still counts.
+                old.first_claim = earliest(old.first_claim.take(), claim);
+                false
+            }
+            old => {
+                v.first_claim = earliest(old.and_then(|o| o.first_claim.clone()), claim);
                 slot.insert(v.signer.clone(), v);
                 true
             }
@@ -421,7 +460,7 @@ impl Checklists {
     pub fn header(&self, channel: &str) -> Option<Header> {
         let recs = self.channels.get(channel)?;
         let versions: Vec<Version> = recs.header.values().cloned().collect();
-        let (v, creator) = pick(&versions, &self.trust.owner)?;
+        let (v, creator) = pick(&versions, &self.trust.owner, None)?;
         let j: HeaderJson = serde_json::from_value(v.content.clone()).unwrap_or_default();
         Some(Header {
             title: j.title,
@@ -447,12 +486,13 @@ impl Checklists {
         let Some(recs) = self.channels.get(channel) else {
             return vec![];
         };
+        let list_creator = self.header(channel).map(|h| h.creator);
         let mut out: Vec<Item> = recs
             .items
             .iter()
             .filter_map(|(d, by)| {
                 let versions: Vec<Version> = by.values().cloned().collect();
-                let (v, creator) = pick(&versions, &self.trust.owner)?;
+                let (v, creator) = pick(&versions, &self.trust.owner, list_creator.as_deref())?;
                 let j: ItemJson = serde_json::from_value(v.content.clone()).unwrap_or_default();
                 Some(Item {
                     id: d.rsplit('/').next().unwrap_or_default().to_string(),
@@ -490,7 +530,7 @@ impl Checklists {
         let v = recs
             .watch
             .values()
-            .filter(|v| w.is_empty() || w.contains(&v.signer))
+            .filter(|v| v.signer == self.trust.owner || w.contains(&v.signer))
             .fold(None::<&Version>, |best, v| match best {
                 Some(b) if !v.newer_than(b) => Some(b),
                 _ => Some(v),
@@ -706,6 +746,70 @@ mod tests {
         assert_eq!(s.items(CH)[0].text, "late again");
     }
 
+    /// A later self-claim doesn't take an item over when the creator edits
+    /// it, and the list's creator wins a claim it shares.
+    #[test]
+    fn a_later_claim_does_not_take_an_item_over() {
+        let (owner, bot, x) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let (bk, xk) = (bot.public_key().to_hex(), x.public_key().to_hex());
+        let d = item_d("aaaa0009");
+        let mut s = store(&owner);
+        s.apply(&rec(
+            &bot,
+            KIND_ITEM,
+            &d,
+            Some(&bk),
+            10,
+            item("mine", "open", 1.0),
+        ));
+        s.apply(&rec(
+            &x,
+            KIND_ITEM,
+            &d,
+            Some(&xk),
+            20,
+            item("x's", "open", 1.0),
+        ));
+        s.apply(&rec(
+            &bot,
+            KIND_ITEM,
+            &d,
+            Some(&bk),
+            40,
+            item("mine, edited", "open", 1.0),
+        ));
+        assert_eq!(s.items(CH)[0].text, "mine, edited");
+        // Seen fresh, only the newest of each survives: the list's creator
+        // (who ran init) is preferred over an earlier-looking claim.
+        let mut s = store(&owner);
+        let hd = format!("{TAG}/header/{CH}");
+        s.apply(&rec(
+            &bot,
+            KIND_HEADER,
+            &hd,
+            Some(&bk),
+            5,
+            serde_json::json!({"title": "t"}),
+        ));
+        s.apply(&rec(
+            &x,
+            KIND_ITEM,
+            &d,
+            Some(&xk),
+            20,
+            item("x's", "open", 1.0),
+        ));
+        s.apply(&rec(
+            &bot,
+            KIND_ITEM,
+            &d,
+            Some(&bk),
+            40,
+            item("mine, edited", "open", 1.0),
+        ));
+        assert_eq!(s.items(CH)[0].text, "mine, edited");
+    }
+
     #[test]
     fn items_sort_with_standing_ones_at_the_ends() {
         let (owner, bot) = (Keys::generate(), Keys::generate());
@@ -853,9 +957,18 @@ mod tests {
         assert_eq!(sum.crashes_today, 1);
         assert!(!sum.is_empty());
         assert!(s.summary("elsewhere", today).is_empty());
-        // No watcher configured: any signer's newest counts.
+        // No watcher configured: only the owner's count.
         s.trust.watchers.clear();
-        assert_eq!(s.watch(CH).unwrap().state, WatchState::Working);
+        assert!(s.watch(CH).is_none());
+        s.apply(&rec(
+            &owner,
+            KIND_WATCH,
+            &wd,
+            None,
+            50,
+            serde_json::json!({"state": "idle"}),
+        ));
+        assert_eq!(s.watch(CH).unwrap().state, WatchState::Idle);
     }
 
     #[test]

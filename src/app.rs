@@ -1148,6 +1148,15 @@ impl App {
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && k.code == KeyCode::Char('c') {
+            // In the Q box: clear it, then close it; never quit from there.
+            if self.mode == Mode::Quick {
+                if self.quick_draft.is_empty() {
+                    self.mode = Mode::Normal;
+                } else {
+                    self.quick_draft.clear();
+                }
+                return;
+            }
             if self.mode == Mode::Insert && !self.draft_ref().is_empty() {
                 self.draft_mut().clear();
                 self.mode = Mode::Normal;
@@ -1307,7 +1316,20 @@ impl App {
                 self.agents_cursor = self.agents_cursor.saturating_sub(1)
             }
             KeyCode::Char('r') if self.agents_view => self.ask_reset(),
-            KeyCode::Char('j') | KeyCode::Down if self.checklist_view => self.checklist_cursor += 1,
+            KeyCode::Char('j') | KeyCode::Down if self.checklist_view => {
+                self.checklist_cursor = self.checklist_cursor.saturating_add(1)
+            }
+            // Thread and paging keys would act on the timeline under the
+            // pane, out of sight.
+            KeyCode::Enter
+            | KeyCode::Right
+            | KeyCode::Char('l')
+            | KeyCode::Char('r')
+            | KeyCode::Char('d')
+            | KeyCode::Char('u')
+            | KeyCode::PageDown
+            | KeyCode::PageUp
+                if self.checklist_view => {}
             KeyCode::Char('k') | KeyCode::Up if self.checklist_view => {
                 self.checklist_cursor = self.checklist_cursor.saturating_sub(1)
             }
@@ -1843,6 +1865,16 @@ mod tests {
         assert!(app.actions.iter().any(|a| matches!(a,
             Action::SendQuick { channel, agent, content, text }
             if channel == q && agent == "tb" && content == "[Q]\n@taskbot Qhow?" && text == "Qhow?")));
+        // ^c in the box clears it, then closes it; it never quits.
+        app.actions.clear();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        key(&mut app, KeyEvent::from(KeyCode::Char('Q')));
+        key(&mut app, KeyEvent::from(KeyCode::Char('x')));
+        key(&mut app, ctrl_c);
+        assert!(app.quick_draft.is_empty() && app.mode == Mode::Quick);
+        key(&mut app, ctrl_c);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(!app.actions.iter().any(|a| matches!(a, Action::Quit)));
     }
 
     #[test]

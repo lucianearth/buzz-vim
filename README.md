@@ -56,8 +56,8 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
 In `buzz-vim/config.json` (or the env var):
 
 - `owner` (`BUZZ_VIM_OWNER`): who may edit any checklist record besides its creator. Default lucian.
-- `watcher` (`BUZZ_VIM_WATCHER`, comma separated): the watcher's pubkeys; its state counts only from these.
-  Unset, the newest watch record counts whoever signed it.
+- `watcher` (`BUZZ_VIM_WATCHER`, comma separated): the watcher's pubkeys; its state counts only from these
+  (and the owner). Until it is set, the status line shows no watcher state.
 - `quick_channel` (`BUZZ_VIM_QUICK_CHANNEL`), default `quick`, and `quick_agent` (`BUZZ_VIM_QUICK_AGENT`),
   default `taskbot`: where Q posts and who it @mentions.
 

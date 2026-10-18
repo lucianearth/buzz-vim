@@ -44,7 +44,8 @@ struct LoopLine: View {
 
     private func watchText(_ w: String) -> String {
         guard let since = status.since else { return w }
-        let secs = UInt64(Date().timeIntervalSince1970) &- since
+        let now = UInt64(Date().timeIntervalSince1970)
+        let secs = since > now ? 0 : now - since
         let ago = secs < 60 ? "\(secs)s" : secs < 3600 ? "\(secs / 60)m" : "\(secs / 3600)h"
         return "\(w) \(ago)"
     }
@@ -120,9 +121,9 @@ struct ChecklistView: View {
                 Spacer(minLength: 0)
             }
             .font(.text)
-            let flags = flags(it)
-            if !flags.isEmpty {
-                Text(flags)
+            let tags = flags(it)
+            if !tags.isEmpty {
+                Text(tags)
                     .font(.small)
                     .foregroundStyle(it.missingEvidence ? theme.bright : theme.faint)
                     .padding(.leading, 24)

@@ -86,6 +86,7 @@ pub enum Msg {
     },
     /// A Q went out, or didn't: what was typed, to put back.
     QuickSent {
+        id: String,
         result: anyhow::Result<()>,
         text: String,
     },
@@ -753,9 +754,11 @@ impl Sync {
         app.store.apply(&ev);
         app.say("asking in #quick…");
         let r = self.relay.clone();
+        let id = ev.id.to_hex();
         self.spawn(async move {
             Msg::QuickSent {
                 result: r.publish(&ev).await,
+                id,
                 text,
             }
         });
