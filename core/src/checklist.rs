@@ -23,9 +23,10 @@ pub const KINDS: &[u16] = &[KIND_ITEM, KIND_HEADER, KIND_WATCH];
 pub const TAG: &str = "buzz-checklist";
 /// lucian: accepted on every record (default, overridable).
 pub const OWNER: &str = "5c017fc7a0525e163d44fae1b4e853ad236e690c4f607fd2c603088d854bc36a";
-/// The watcher's keys, accepted on watch records by default. Empty until
-/// the watcher's identity is settled; set `watcher` in the config (or
-/// `BUZZ_VIM_WATCHER`) meanwhile. The owner's watch records always count.
+/// The watcher's keys, accepted on watch records by default: the fleet-skills
+/// seat, which aei's buzz-watch and stall-judge sign with. `watcher` in the
+/// config (or `BUZZ_VIM_WATCHER`) overrides it. The owner's watch records
+/// always count.
 pub const WATCHERS: &[&str] = &["d84ddba92b7e936304ec9ea81c9b59594b9f974dd0ebeb0aa2227fe7d54d70d4"];
 /// What buzz-acp's notice says when it respawns a crashed agent process.
 pub const CRASH_NEEDLE: &str = "agent process crashed";
