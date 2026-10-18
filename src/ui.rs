@@ -125,22 +125,26 @@ fn slider(f: &mut Frame, app: &mut App, body: Rect) -> Rect {
 
 fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
     let mut x = area.x;
-    let logo = format!(
-        " {} buzz ",
-        if (app.tick / 4).is_multiple_of(2) {
-            "ʚ●"
-        } else {
-            "ɞ●"
-        }
-    );
+    // The dot breathes while anything animates and rests bright otherwise.
+    let level = if app.animating() {
+        art::breath(app.tick)
+    } else {
+        23
+    };
+    let logo = Line::from(vec![
+        Span::raw(" "),
+        Span::styled("●", Style::new().fg(theme::gray(level))),
+        Span::styled(" buzz ", theme::bright()),
+    ]);
+    let logo_w = logo.width() as u16;
     f.render_widget(
-        Paragraph::new(Span::styled(logo.clone(), theme::bright())),
+        Paragraph::new(logo),
         Rect {
-            width: logo.width() as u16,
+            width: logo_w,
             ..area
         },
     );
-    x += logo.width() as u16 + 1;
+    x += logo_w + 1;
     let msgs = app
         .current()
         .and_then(|c| app.store.channels.get(c))
