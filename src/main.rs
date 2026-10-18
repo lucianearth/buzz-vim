@@ -16,7 +16,7 @@ mod theme;
 mod ui;
 
 use buzz_vim_core::{
-    draft, links, live, log, model, readstate, relay, sections, telemetry, unread,
+    draft, links, live, log, mention, model, readstate, relay, sections, telemetry, unread,
 };
 
 use std::sync::Arc;

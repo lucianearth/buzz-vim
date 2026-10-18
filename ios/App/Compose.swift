@@ -208,10 +208,13 @@ struct ComposeBar: View {
 
     @ViewBuilder
     private var suggestions: some View {
-        if focused, let w = word?.text, let first = w.first, first == "@" || first == "#" {
-            let q = String(w.dropFirst()).lowercased()
+        if focused, let w = word, let first = w.text.first, first == "@" || first == "#" {
+            let q = String(w.text.dropFirst()).lowercased()
+            // Already named before the word being typed: not offered again.
+            let before = text.wrappedValue[..<w.range.lowerBound]
             let names: [String] = first == "@"
-                ? client.people(channel: channel).map(\.name).filter { $0.lowercased().hasPrefix(q) }
+                ? client.people(channel: channel, root: root).map(\.name)
+                    .filter { $0.lowercased().hasPrefix(q) && !before.contains("@" + $0) }
                 : client.tabs().filter { !$0.isDm }.map { String($0.label.dropFirst()) }
                     .filter { $0.lowercased().hasPrefix(q) }
             if !names.isEmpty {
@@ -367,6 +370,9 @@ struct UploadSheet: View {
 
 /// The compose box: a UITextView, because SwiftUI's TextField drops a
 /// pasted image without a word. Grows to `lines` lines, then scrolls.
+/// Scrolling stays on the whole time and the height is measured on a
+/// spare view: turning scrolling on and off as the text crossed the cap
+/// threw the box between its first and last lines on every pass.
 struct ComposeField: UIViewRepresentable {
     @Binding var text: String
     @Binding var focused: Bool
@@ -383,7 +389,7 @@ struct ComposeField: UIViewRepresentable {
         v.backgroundColor = .clear
         v.textContainerInset = .zero
         v.textContainer.lineFragmentPadding = 0
-        v.isScrollEnabled = false
+        v.showsVerticalScrollIndicator = false
         v.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         return v
     }
@@ -405,18 +411,25 @@ struct ComposeField: UIViewRepresentable {
     }
 
     func sizeThatFits(_ proposal: ProposedViewSize, uiView v: PasteTextView, context: Context) -> CGSize? {
-        let width = proposal.width.flatMap { $0.isFinite ? $0 : nil } ?? 240
-        let fit = v.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
-        let most = (v.font?.lineHeight ?? 18) * CGFloat(lines)
-        let scroll = fit.height > most + 1
-        if v.isScrollEnabled != scroll {
-            DispatchQueue.main.async {
-                v.isScrollEnabled = scroll
-                v.followCaret()
-            }
-        }
-        return CGSize(width: width, height: min(fit.height, most))
+        let width = proposal.width.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+            ?? (v.bounds.width > 0 ? v.bounds.width : 240)
+        let probe = Self.probe
+        probe.font = v.font
+        probe.attributedText = v.attributedText
+        let fit = probe.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
+        let line = v.font?.lineHeight ?? 18
+        let most = line * CGFloat(lines)
+        return CGSize(width: width, height: min(max(fit.height, line), most))
     }
+
+    /// Measures the text, so sizing never touches the live view's scroll.
+    private static let probe: UITextView = {
+        let p = UITextView()
+        p.isScrollEnabled = false
+        p.textContainerInset = .zero
+        p.textContainer.lineFragmentPadding = 0
+        return p
+    }()
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -426,7 +439,6 @@ struct ComposeField: UIViewRepresentable {
 
         func textViewDidChange(_ v: UITextView) {
             parent.text = v.text
-            (v as? PasteTextView)?.followCaret()
         }
         func textViewDidBeginEditing(_ v: UITextView) { if !parent.focused { parent.focused = true } }
         func textViewDidEndEditing(_ v: UITextView) { if parent.focused { parent.focused = false } }
@@ -437,14 +449,23 @@ struct ComposeField: UIViewRepresentable {
 final class PasteTextView: UITextView {
     var pasted: ((Data, UTType) -> Void)?
 
-    /// Keep the caret in view once the box is at its full height. Without
-    /// this, the box stopped at its last line before scrolling turned on
-    /// and new text went on below, out of sight.
+    /// After the text is set from outside (a completion, the @ key), show
+    /// the caret. Typing and dictation keep it in view on their own.
     func followCaret() {
         DispatchQueue.main.async { [weak self] in
-            guard let self, self.isScrollEnabled else { return }
+            guard let self else { return }
             self.layoutIfNeeded()
             self.scrollRangeToVisible(self.selectedRange)
+        }
+    }
+
+    /// While everything fits, sit at the top. Typing a new line scrolls
+    /// it into view a moment before the box grows to hold it; without
+    /// this the first line would stay hidden above.
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        if contentSize.height <= bounds.height + 1, contentOffset.y != 0 {
+            contentOffset = .zero
         }
     }
 

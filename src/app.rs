@@ -15,6 +15,7 @@ use crate::draft::Draft;
 use crate::keys::Mode;
 use crate::live::ConnState;
 use crate::media::Media;
+use crate::mention;
 use crate::model::Store;
 use crate::readstate::{self, ReadState};
 use crate::sections::Section;
@@ -897,36 +898,31 @@ impl App {
         self.prefill = Some(self.draft_ref().text.clone());
     }
 
-    /// Candidates for the `@query` being typed: channel members first.
+    /// Candidates for the `@query` being typed: the thread's and channel's
+    /// people first, then our agents (mentioning one who isn't here adds
+    /// them on send). Names already mentioned in the draft are left out.
     pub fn mention_candidates(&self) -> Vec<(String, String)> {
         let Some((_, q)) = self.draft_ref().mention_query() else {
             return vec![];
         };
         let q = q.to_lowercase();
-        let ch = match (&self.thread, self.focus) {
-            (Some((c, _)), Pane::Thread) => Some(c.as_str()),
-            _ => self.current(),
+        let (ch, root) = match (&self.thread, self.focus) {
+            (Some((c, r)), Pane::Thread) => (Some(c.as_str()), Some(r.as_str())),
+            _ => (self.current(), None),
         };
-        // Our agents too: mentioning one who isn't here adds them on send.
-        let ch = ch.and_then(|c| self.store.channels.get(c));
-        let mut members: Vec<String> = ch.map(|c| c.members.clone()).unwrap_or_default();
-        if ch.is_some_and(|c| !c.is_dm) {
-            members.extend(self.agents.owned_keys().cloned());
-        }
-        members.sort();
-        members.dedup();
-        let mut out: Vec<(String, String)> = members
-            .iter()
-            .filter(|pk| **pk != self.store.me && !self.archived.contains(*pk))
-            .filter_map(|pk| {
-                self.store
-                    .profiles
-                    .get(pk)
-                    .map(|p| (p.name.clone(), pk.clone()))
-            })
-            .filter(|(n, _)| !n.is_empty() && n.to_lowercase().contains(&q))
-            .collect();
-        out.sort_by_key(|(n, _)| (!n.to_lowercase().starts_with(&q), n.to_lowercase()));
+        let Some(ch) = ch else {
+            return vec![];
+        };
+        let mut skip = self.archived.clone();
+        skip.extend(self.draft_ref().mention_pubkeys());
+        let mut out: Vec<(String, String)> =
+            mention::candidates(&self.store, &self.agents, ch, root, &skip)
+                .into_iter()
+                .map(|(pk, n)| (n, pk))
+                .filter(|(n, _)| n.to_lowercase().contains(&q))
+                .collect();
+        // Stable: within prefix matches, the order above holds.
+        out.sort_by_key(|(n, _)| !n.to_lowercase().starts_with(&q));
         out.truncate(6);
         out
     }

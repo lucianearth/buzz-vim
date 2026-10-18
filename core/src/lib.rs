@@ -9,6 +9,7 @@ pub mod draft;
 pub mod links;
 pub mod live;
 pub mod log;
+pub mod mention;
 pub mod model;
 pub mod palette;
 pub mod readstate;

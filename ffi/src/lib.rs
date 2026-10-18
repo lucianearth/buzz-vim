@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use buzz_vim_core::links;
 use buzz_vim_core::live::{self, Cmd, ConnState, Live};
+use buzz_vim_core::mention;
 use buzz_vim_core::model::{self, Applied, Store};
 use buzz_vim_core::palette::{self, Role};
 use buzz_vim_core::readstate::{self, ReadState};
@@ -951,23 +952,17 @@ impl Client {
             .collect()
     }
 
-    /// Channel members and our agents for @ completion, agents first.
-    pub fn people(&self, channel: String) -> Vec<Person> {
+    /// Who an @ offers here, best guess first: the thread's people, the
+    /// channel's speakers and members, then our agents (online first).
+    pub fn people(&self, channel: String, root: Option<String>) -> Vec<Person> {
         let e = self.engine.lock().unwrap();
-        let mut keys: Vec<String> = e
-            .store
-            .channels
-            .get(&channel)
-            .map(|c| c.members.clone())
-            .unwrap_or_default();
-        keys.extend(e.agents.owned_keys().cloned());
-        keys.sort();
-        keys.dedup();
-        keys.retain(|k| *k != e.store.me && !e.archived.contains(k));
-        let mut out: Vec<Person> = keys.iter().map(|k| e.person(k)).collect();
-        out.retain(|p| !p.name.is_empty());
-        out.sort_by_key(|p| (!p.is_agent, p.name.to_lowercase()));
-        out
+        mention::candidates(&e.store, &e.agents, &channel, root.as_deref(), &e.archived)
+            .into_iter()
+            .map(|(k, name)| Person {
+                name,
+                ..e.person(&k)
+            })
+            .collect()
     }
 
     /// Short messages for the person: failures, mostly. Taking empties it.
