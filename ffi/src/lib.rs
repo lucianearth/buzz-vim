@@ -17,6 +17,7 @@ use buzz_vim_core::checklist::{self, Checklists};
 use buzz_vim_core::links;
 use buzz_vim_core::live::{self, Cmd, ConnState, Live};
 use buzz_vim_core::model::{self, Applied, Store};
+use buzz_vim_core::needs;
 use buzz_vim_core::palette::{self, Role};
 use buzz_vim_core::readstate::{self, ReadState};
 use buzz_vim_core::relay::{BlobDescriptor, Relay};
@@ -368,6 +369,38 @@ pub struct LoopStatus {
     pub done: u32,
     pub parked: u32,
     pub crashes_today: u32,
+}
+
+#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq)]
+pub enum NeedSection {
+    /// Waits on the operator.
+    Answer,
+    /// Bots mentioned him; nothing waits.
+    Fyi,
+}
+
+/// A row on tab 0, Needs you (see `buzz_vim_core::needs`).
+#[derive(uniffi::Record, Clone)]
+pub struct NeedRow {
+    /// Stable while the row stands for the same thing: notifications go by it.
+    pub key: String,
+    pub section: NeedSection,
+    /// "waiting on lucian", "stalled", "parked", "mention", "dm", "bot".
+    pub kind: String,
+    pub channel: String,
+    /// "#name", or "@name" for a DM.
+    pub channel_label: String,
+    /// Pubkey of whoever asks, "" for the watcher alone.
+    pub who: String,
+    pub who_name: String,
+    /// One line.
+    pub text: String,
+    pub at: u64,
+    /// Opens the row (`follow`): its message in its thread, else the
+    /// thread, else the channel.
+    pub link: String,
+    /// The thread a reply goes into (`send`'s root); None: the channel.
+    pub thread: Option<String>,
 }
 
 // ---------- the client ----------
@@ -834,6 +867,39 @@ impl Client {
             parked: s.parked as u32,
             crashes_today: s.crashes_today as u32,
         })
+    }
+
+    /// Tab 0: what needs an answer, then FYI, oldest first in each.
+    pub fn needs_you(&self) -> Vec<NeedRow> {
+        let e = self.engine.lock().unwrap();
+        e.needs_rows()
+            .into_iter()
+            .map(|r| NeedRow {
+                section: match r.section {
+                    needs::Section::Answer => NeedSection::Answer,
+                    needs::Section::Fyi => NeedSection::Fyi,
+                },
+                kind: r.label(),
+                channel_label: e.label(&r.channel),
+                who_name: if r.who.is_empty() {
+                    "watcher".into()
+                } else {
+                    e.store.name_of(&r.who)
+                },
+                link: r.link(),
+                key: r.key,
+                channel: r.channel,
+                who: r.who,
+                text: r.text,
+                at: r.at,
+                thread: r.thread,
+            })
+            .collect()
+    }
+
+    /// How many rows need an answer: tab 0's badge, the status line's ⚑ N.
+    pub fn needs_count(&self) -> u32 {
+        needs::answer_count(&self.engine.lock().unwrap().needs_rows()) as u32
     }
 
     /// Ids of our messages the relay hasn't confirmed yet (sending or failed).
@@ -1640,6 +1706,38 @@ impl Engine {
         }
     }
 
+    fn needs_rows(&self) -> Vec<needs::Row> {
+        let bot = |pk: &str| needs::is_bot(&self.store, &self.agents, &self.checklists, pk);
+        needs::rows(&self.store, &self.checklists, bot, now())
+    }
+
+    /// Tab 0's data across every channel we're in (see the terminal app's
+    /// `load_needs`): the last week as history, and a live tail.
+    fn load_needs(&mut self) {
+        let mine: Vec<&model::Channel> = self
+            .store
+            .channels
+            .values()
+            .filter(|c| c.is_member && !c.archived)
+            .collect();
+        let ids: Vec<String> = mine.iter().map(|c| c.id.clone()).collect();
+        let dms: Vec<String> = mine
+            .iter()
+            .filter(|c| c.is_dm)
+            .map(|c| c.id.clone())
+            .collect();
+        let op = self.checklists.trust.owner.clone();
+        let now = now();
+        let live = needs::filters(&ids, &dms, &op, now, true);
+        if live.is_empty() {
+            return;
+        }
+        self.sub("needs", live);
+        let r = self.relay.clone();
+        let history = needs::filters(&ids, &dms, &op, now, false);
+        self.spawn(async move { Msg::Events(Ok(r.query(&history).await.unwrap_or_default())) });
+    }
+
     fn is_agent(&self, pk: &str) -> bool {
         self.store.profiles.get(pk).is_some_and(|p| p.is_agent)
             || self.agents.by_pubkey.contains_key(pk)
@@ -1767,6 +1865,7 @@ impl Engine {
                     .collect();
                 self.want_profiles(people);
                 self.refresh_sections();
+                self.load_needs();
             }
             Msg::Channels(Err(e)) => self.notices.push(format!("couldn't load channels: {e}")),
             Msg::Lanes(Ok(evs)) => {
@@ -1907,7 +2006,10 @@ impl Engine {
     fn on_live(&mut self, l: Live, was_online: &mut bool) {
         match l {
             Live::Event { sub, event } => {
-                let want = self.fold(&event, sub.starts_with("ch:"));
+                // Tab 0's tail carries tabs' messages too: count them as the tab's.
+                let tab = sub == "needs"
+                    && model::tag(&event, "h").is_some_and(|h| self.subscribed.contains(h));
+                let want = self.fold(&event, sub.starts_with("ch:") || tab);
                 self.want_profiles(want);
             }
             Live::Status(s) => {
@@ -1926,6 +2028,7 @@ impl Engine {
                         if let Some(c) = self.current.clone() {
                             self.load_checklist(&c);
                         }
+                        self.load_needs();
                     }
                     *was_online = true;
                 }
@@ -2412,6 +2515,52 @@ mod tests {
 
     /// Records and crash notices folded live show up in the checklist and
     /// the status line the app reads.
+    #[test]
+    fn needs_you_rows_from_folded_events() {
+        use nostr::{EventBuilder, Kind, Timestamp};
+        let ch = "2130646b-d6c8-4ec3-93e3-36f77bee1a37";
+        let mut e = engine();
+        let (op, alice) = (Keys::generate(), Keys::generate());
+        let opk = op.public_key().to_hex();
+        e.checklists.trust.owner = opk.clone();
+        e.store.channel_mut(ch).name = "beacon".into();
+        let ask = EventBuilder::new(Kind::Custom(9), "@lucian ship it?\nmore")
+            .tags([
+                Tag::parse(["h", ch]).unwrap(),
+                Tag::parse(["p", &opk]).unwrap(),
+            ])
+            .custom_created_at(Timestamp::from(now() - 60))
+            .sign_with_keys(&alice)
+            .unwrap();
+        e.fold(&ask, true);
+        let c = Client {
+            engine: Arc::new(Mutex::new(e)),
+            stop: Arc::new(tokio::sync::Notify::new()),
+        };
+        let rows = c.needs_you();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert!(r.section == NeedSection::Answer);
+        assert_eq!(
+            (r.kind.as_str(), r.channel_label.as_str()),
+            ("mention", "#beacon")
+        );
+        assert_eq!(r.text, "@lucian ship it?");
+        assert_eq!(r.thread.as_deref(), Some(ask.id.to_hex().as_str()));
+        assert!(c.follow(r.link.clone()).is_some_and(|f| f.channel == ch));
+        assert_eq!(c.needs_count(), 1);
+        // His answer in its thread clears it.
+        let reply = EventBuilder::new(Kind::Custom(9), "yes")
+            .tags([
+                Tag::parse(["h", ch]).unwrap(),
+                Tag::parse(["e", &ask.id.to_hex(), "", "reply"]).unwrap(),
+            ])
+            .sign_with_keys(&op)
+            .unwrap();
+        c.engine.lock().unwrap().fold(&reply, true);
+        assert_eq!(c.needs_count(), 0);
+    }
+
     #[test]
     fn checklist_and_loop_status_from_live_events() {
         use nostr::{EventBuilder, Kind, Timestamp};
