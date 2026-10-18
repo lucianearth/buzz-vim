@@ -116,7 +116,8 @@ struct Home: View {
             }
         }
         .sheet(isPresented: $showAgents) {
-            AgentsView(client: client, channel: selected, root: selected.flatMap { threads[$0]?.root })
+            let here = selected == Needs.id ? nil : selected
+            AgentsView(client: client, channel: here, root: here.flatMap { threads[$0]?.root })
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
                 .modifier(Themed())
@@ -131,14 +132,16 @@ struct Home: View {
         }
     }
 
-    /// The tab `by` places along, wrapping, on its open thread if it has
-    /// one. The keyboard stays up on the new tab.
+    /// The tab `by` places along, wrapping (tab 0 included), on its open
+    /// thread if it has one. The keyboard stays up on a channel tab.
     private func step(_ by: Int) {
-        let tabs = client.tabs()
-        guard !tabs.isEmpty else { return }
-        let i = tabs.firstIndex { $0.id == selected } ?? 0
-        let id = tabs[((i + by) % tabs.count + tabs.count) % tabs.count].id
-        model.focusKey = threads[id].map { "\(id)/\($0.root)" } ?? id
+        // Tab 0 (Needs you) sits before the first channel in the ring.
+        let ring = [Needs.id] + client.tabs().map(\.id)
+        let i = ring.firstIndex { $0 == selected } ?? 0
+        let id = ring[((i + by) % ring.count + ring.count) % ring.count]
+        if id != Needs.id {
+            model.focusKey = threads[id].map { "\(id)/\($0.root)" } ?? id
+        }
         go(id)
     }
 
