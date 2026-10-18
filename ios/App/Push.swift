@@ -22,6 +22,8 @@ final class Push {
     private var token: Data?
     private var busy = false
     private var checked = Date.distantPast
+    /// Bumped on logout, so a lease already on its way isn't published after.
+    private var session = 0
 
     /// A lease the relay took is in force: tab 0 posts no local
     /// notifications then, the push covers them.
@@ -49,6 +51,7 @@ final class Push {
         let renew = state.grant == nil || state.endpoint != endpoint || state.grantExpires < now + 7 * 86_400
         guard renew || state.leased != subs || !live else { return }
         busy = true
+        let session = self.session
         Task { @MainActor in
             defer { busy = false }
             do {
@@ -56,12 +59,13 @@ final class Push {
                 if renew || state.relayPubkey != r.pubkey {
                     try await delegate(to: r, endpoint: endpoint)
                 }
-                guard let grant = state.grant else { return }
+                guard let grant = state.grant, session == self.session else { return }
                 let generation = max(state.leaseGeneration + 1, UInt64(Self.now()))
                 try await client.pushLease(relay: r, installation: state.lease, generation: generation,
                                            grant: grant, grantExpires: UInt64(state.grantExpires),
                                            subscriptions: subs)
                 state.leaseGeneration = generation
+                guard session == self.session else { return }
                 state.leased = subs
                 state.leaseExpires = min(state.grantExpires, Self.now() + Int64(r.maxTtl))
                 state.save()
@@ -76,6 +80,7 @@ final class Push {
     /// Logout: an inactive lease, then the gateway forgets the relay key.
     /// The App Attest key and installation stay for the next login.
     func stop(_ client: Client, relay: String) {
+        session += 1
         guard state.leased != nil || state.grant != nil else { return }
         let was = state
         state.leased = nil
@@ -118,13 +123,13 @@ final class Push {
         let now = Self.now()
         let d = PushDelegation(installation: installation, generation: state.generation,
                                relayPubkey: r.pubkey, notBefore: now, expiresAt: now + Self.lifetime)
-        let c = try await pushChallenge(gateway: Self.gateway)
-        let assertion = try await DCAppAttestService.shared.generateAssertion(
-            keyId, clientDataHash: pushDelegateHash(challenge: c, delegation: d))
         do {
+            let c = try await pushChallenge(gateway: Self.gateway)
+            let assertion = try await DCAppAttestService.shared.generateAssertion(
+                keyId, clientDataHash: pushDelegateHash(challenge: c, delegation: d))
             state.grant = try await pushDelegate(gateway: Self.gateway, challenge: c, delegation: d,
                                                  assertion: assertion)
-        } catch BuzzError.Gone(_) where again {
+        } catch let e where again && Self.lost(e) {
             state.installation = nil
             try await delegate(to: r, endpoint: endpoint, again: false)
             return
@@ -134,6 +139,13 @@ final class Push {
         // A delegation extends the installation to its own expiry.
         state.installationExpires = max(state.installationExpires, d.expiresAt)
         state.save()
+    }
+
+    /// The installation is no more: the gateway forgot it, or the App
+    /// Attest key went with a reinstall.
+    private static func lost(_ error: Error) -> Bool {
+        if let e = error as? BuzzError, case .Gone(_) = e { return true }
+        return (error as? DCError)?.code == .invalidKey
     }
 
     /// A new App Attest key, attested over the enrollment of `endpoint`.
