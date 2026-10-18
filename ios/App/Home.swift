@@ -27,7 +27,8 @@ extension EnvironmentValues {
     }
 }
 
-/// Tabs across the top, one channel per page: swipe sideways between them,
+/// Tabs across the top, Needs you (tab 0) first, then one channel per
+/// page: swipe sideways between them,
 /// tap a message for its thread (it opens in the tab, which remembers it;
 /// swipes still change tabs), pull the header down for the agents,
 /// hold a tab or the status line for the switcher
@@ -66,6 +67,12 @@ struct Home: View {
                 // while a compose field holds the keyboard.
                 ScrollView(.horizontal) {
                     LazyHStack(spacing: 0) {
+                        // Tab 0 first, always.
+                        NeedsView(client: client) { link in
+                            if let f = client.follow(url: link) { follow(f) }
+                        }
+                        .containerRelativeFrame([.horizontal, .vertical])
+                        .id(Needs.id)
                         ForEach(tabs, id: \.id) { t in
                             page(t.id)
                                 .containerRelativeFrame([.horizontal, .vertical])
@@ -100,7 +107,7 @@ struct Home: View {
         }
         .onChange(of: tabs.map(\.id)) { _, _ in settle(client.tabs()) }
         .onChange(of: selected) { _, now in
-            client.openChannel(channel: now)
+            client.openChannel(channel: now == Needs.id ? nil : now)
             if fallback {
                 fallback = false
             } else {
@@ -227,10 +234,11 @@ struct Home: View {
 
     /// Keep the selection on a tab that exists, and tell Rust what's open.
     private func settle(_ tabs: [ChannelTab]) {
-        if let w = wanted, w != selected, tabs.contains(where: { $0.id == w }) {
+        let here = { (id: String) in id == Needs.id || tabs.contains(where: { $0.id == id }) }
+        if let w = wanted, w != selected, here(w) {
             selected = w
-        } else if let s = selected, tabs.contains(where: { $0.id == s }) {
-            client.openChannel(channel: s)
+        } else if let s = selected, here(s) {
+            client.openChannel(channel: s == Needs.id ? nil : s)
         } else if let first = tabs.first?.id, first != selected {
             fallback = true
             selected = first
@@ -257,17 +265,30 @@ struct Header: View {
                 .padding(.horizontal, 22)
                 .onTapGesture { showAgents = true }
                 .onLongPressGesture { openSwitcher() }
-            // The operator loop's line for the open channel, when it has one.
-            if let s = selected, let loop = client.loopStatus(channel: s) {
-                LoopLine(status: loop)
+            // The operator loop's line for the open channel, when it has
+            // one; ⚑ N (tab 0's count) in every channel's.
+            let flags = client.needsCount()
+            if let s = selected, s != Needs.id, let loop = client.loopStatus(channel: s) {
+                LoopLine(status: loop, flags: flags)
                     .padding(.horizontal, 22)
                     .padding(.top, -8)
                     .contentShape(Rectangle())
                     .onTapGesture { showChecklist = true }
+            } else if let s = selected, s != Needs.id, flags > 0 {
+                Text("⚑ \(flags) need you")
+                    .font(.small)
+                    .foregroundStyle(theme.bright)
+                    .padding(.horizontal, 22)
+                    .padding(.top, -8)
+                    .contentShape(Rectangle())
+                    .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { selected = Needs.id } }
             }
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
+                        needsChip(flags)
+                            .id(Needs.id)
+                            .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { selected = Needs.id } }
                         ForEach(tabs, id: \.id) { t in
                             chip(t)
                                 .id(t.id)
@@ -342,6 +363,9 @@ struct Header: View {
     /// Where the open tab sits in the row, like a page indicator.
     private var dots: some View {
         HStack(spacing: 8) {
+            Circle()
+                .fill(selected == Needs.id ? theme.chipOn : theme.rule)
+                .frame(width: 7, height: 7)
             ForEach(tabs, id: \.id) { t in
                 Circle()
                     .fill(t.id == selected ? theme.chipOn : theme.rule)
@@ -349,6 +373,28 @@ struct Header: View {
             }
         }
         .frame(maxWidth: .infinity)
+    }
+
+    /// Tab 0's chip, its badge the count of rows that need an answer.
+    private func needsChip(_ n: UInt32) -> some View {
+        let on = selected == Needs.id
+        return HStack(spacing: 5) {
+            Text("⚑ needs you")
+                .font(on ? .chipOn : .chip)
+                .lineLimit(1)
+            if n > 0 {
+                Text("\(n)")
+                    .font(.tiny)
+                    .foregroundStyle(theme.onAccent)
+                    .padding(.horizontal, 5)
+                    .frame(minWidth: 17, minHeight: 17)
+                    .background(theme.badge, in: Capsule())
+            }
+        }
+        .foregroundStyle(on ? theme.onAccent : theme.muted)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 11)
+        .background(on ? theme.chipOn : theme.chipOff, in: RoundedRectangle(cornerRadius: 10))
     }
 
     private func chip(_ t: ChannelTab) -> some View {

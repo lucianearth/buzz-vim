@@ -61,6 +61,15 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
   `⌫` or `^o` goes back to where you were, as many steps as you followed.
 - `o` open the selected image full screen (`←` `→` page through the images, `Esc` closes), `q` quit
 
+## iPhone
+
+The iPhone app (`ios/`, on the same core through `ffi/`) has the same tab 0: a ⚑ needs you chip first in the
+tab row with the Needs-an-answer count as its badge, the same rows (tap one to open it, Reply to answer it in
+its thread), and ⚑ N on every channel's status line. It posts a local notification for each new
+Needs-an-answer row its sync sees, once per row, and only for rows that began after the phone started
+watching. That works while the app runs. Push to a closed app would need APNs, a sender and an Apple key,
+none of which exist yet.
+
 ## Operator loop settings
 
 In `buzz-vim/config.json` (or the env var):

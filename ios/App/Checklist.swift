@@ -5,6 +5,8 @@ import UIKit
 /// state, item counts, crashes today. Tap it for the checklist.
 struct LoopLine: View {
     let status: LoopStatus
+    /// Tab 0's Needs-an-answer rows, shown as ⚑ N.
+    var flags: UInt32 = 0
     @Environment(\.theme) private var theme
 
     var body: some View {
@@ -29,6 +31,9 @@ struct LoopLine: View {
             if status.crashesToday > 0 {
                 Text("✖ \(status.crashesToday) crash\(status.crashesToday == 1 ? "" : "es") today")
                     .foregroundStyle(theme.bright)
+            }
+            if flags > 0 {
+                Text("⚑ \(flags)").foregroundStyle(theme.bright)
             }
         }
         .font(.small)

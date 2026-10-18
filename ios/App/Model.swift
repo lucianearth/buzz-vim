@@ -45,6 +45,8 @@ final class Model {
     var scrollTarget: (channel: String, id: String)?
     /// Where Home goes for a tapped channel or message link.
     @ObservationIgnored var follow: (Follow) -> Void = { _ in }
+    /// Local notifications for new tab-0 rows.
+    private let notifier = Notifier()
 
     static let defaultRelay = "wss://buzz.gitcoin.co"
 
@@ -115,6 +117,8 @@ final class Model {
             d.removeObject(forKey: "tabOrder")
         }
         restoreUnsent()
+        notifier.model = self
+        notifier.authorize()
         if let saved = d.string(forKey: "agentContext") {
             client?.restoreContext(json: saved)
         }
@@ -182,6 +186,9 @@ final class Model {
         }
         if let n = client?.takeNotices(), let last = n.last {
             say(last)
+        }
+        if let c = client {
+            notifier.check(c)
         }
     }
 
