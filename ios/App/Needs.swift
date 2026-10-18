@@ -140,10 +140,10 @@ struct NeedsView: View {
 }
 
 /// Local notifications for new Needs-an-answer rows, as the app's sync
-/// sees them (while it runs: there is no server push, which would need
-/// APNs and a sender). A row notifies once, by key, and only if it began
-/// after this phone started watching, so the first launch isn't a flood.
-/// Tapping one opens its row.
+/// sees them while it runs. A row notifies once, by key, and only if it
+/// began after this phone started watching, so the first launch isn't a
+/// flood. While a push lease is live the push notifies instead (`quiet`),
+/// so nothing comes twice. Tapping one (or a push) opens its row.
 final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     weak var model: Model?
     private var seen: [String]
@@ -170,11 +170,11 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         c.requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
-    /// On every sync poke (main thread).
-    func check(_ client: Client) {
+    /// On every sync poke (main thread). `quiet`: mark rows seen, post nothing.
+    func check(_ client: Client, quiet: Bool) {
         let fresh = client.needsYou().filter { $0.section == .answer && !seenSet.contains($0.key) }
         guard !fresh.isEmpty else { return }
-        for r in fresh where r.at >= since {
+        for r in fresh where r.at >= since && !quiet {
             post(r)
         }
         seen += fresh.map(\.key)

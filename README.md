@@ -67,8 +67,15 @@ The iPhone app (`ios/`, on the same core through `ffi/`) has the same tab 0: a â
 tab row with the Needs-an-answer count as its badge, the same rows (tap one to open it, Reply to answer it in
 its thread), and âš‘ N on every channel's status line. It posts a local notification for each new
 Needs-an-answer row its sync sees, once per row, and only for rows that began after the phone started
-watching. That works while the app runs. Push to a closed app would need APNs, a sender and an Apple key,
-none of which exist yet.
+watching. That works while the app runs.
+
+Closed, it gets real pushes through upstream Buzz's push (`buzz-push-v1`): the phone enrolls its APNs token
+with the push gateway (`Push.gateway` in `ios/App/Push.swift`, App Attest), delegates to the relay's push
+key, and publishes a lease (kind 30350, encrypted to the relay) for @mentions and DMs to you, minus your own
+posts and bots' (FYI never pushes) except the watcher's. The push itself says nothing; the notification
+extension fetches the message and shows it like a tab 0 row. The lease follows your DMs and bots, renews
+while the app runs, and goes on logout. While it is live the app posts no local notifications, so nothing
+comes twice. It needs a relay that advertises `buzz-push-v1` in its NIP-11.
 
 ## Operator loop settings
 

@@ -3,6 +3,7 @@ import UIKit
 
 @main
 struct BuzzVimApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var model = Model()
     @Environment(\.scenePhase) private var phase
 
