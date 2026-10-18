@@ -211,11 +211,13 @@ struct ComposeBar: View {
             let q = String(w.text.dropFirst()).lowercased()
             // Already named before the word being typed: not offered again.
             let before = text.wrappedValue[..<w.range.lowerBound]
-            let names: [String] = first == "@"
+            var seen = Set<String>()
+            let names: [String] = (first == "@"
                 ? client.people(channel: channel, root: root).map(\.name)
-                    .filter { $0.lowercased().hasPrefix(q) && !before.contains("@" + $0) }
+                    .filter { $0.lowercased().hasPrefix(q) && !Self.named($0, in: before) }
                 : client.tabs().filter { !$0.isDm }.map { String($0.label.dropFirst()) }
-                    .filter { $0.lowercased().hasPrefix(q) }
+                    .filter { $0.lowercased().hasPrefix(q) })
+                .filter { seen.insert($0).inserted }
             if !names.isEmpty {
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(names.prefix(5), id: \.self) { name in
@@ -232,6 +234,19 @@ struct ComposeBar: View {
                 .background(theme.card, in: RoundedRectangle(cornerRadius: 14))
             }
         }
+    }
+
+    /// `@name` appears in `s` as a whole mention, not the start of a
+    /// longer name (@Al inside @Alice).
+    private static func named(_ name: String, in s: Substring) -> Bool {
+        var rest = s[...]
+        while let r = rest.range(of: "@" + name) {
+            if r.upperBound == rest.endIndex || !rest[r.upperBound].isLetter && !rest[r.upperBound].isNumber {
+                return true
+            }
+            rest = rest[r.upperBound...]
+        }
+        return false
     }
 
     private func complete(_ token: String) {
@@ -414,12 +429,15 @@ struct ComposeField: UIViewRepresentable {
         // 0 and infinite probes with the current width made the box look
         // fixed, so the row stopped stretching it to fill the bar.
         let width = proposal.width.flatMap { $0.isFinite ? $0 : nil } ?? 240
+        let line = v.font?.lineHeight ?? 18
+        let most = line * CGFloat(lines)
+        // SwiftUI's narrowest probe: laying the draft out a glyph per line
+        // only to cap it at `lines` is wasted work on every keystroke.
+        if width <= 1 { return CGSize(width: width, height: most) }
         let probe = Self.probe
         probe.font = v.font
         probe.attributedText = v.attributedText
         let fit = probe.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
-        let line = v.font?.lineHeight ?? 18
-        let most = line * CGFloat(lines)
         return CGSize(width: width, height: min(max(fit.height, line), most))
     }
 

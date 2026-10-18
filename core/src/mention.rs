@@ -1,6 +1,6 @@
 //! Who an @ offers, in the order a person most likely means them.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::model::Store;
 use crate::telemetry::Agents;
@@ -27,14 +27,22 @@ pub fn candidates(
             .flatten()
             .chain(std::iter::once(&root.to_string()))
             .filter_map(|id| c.messages.get(id))
+            .filter(|m| !m.system)
             .collect();
         msgs.sort_by_key(|m| std::cmp::Reverse(m.created_at));
         keys.extend(msgs.iter().map(|m| m.author.clone()));
     }
     if let Some(c) = ch {
-        let mut msgs: Vec<_> = c.messages.values().filter(|m| !m.system).collect();
-        msgs.sort_by_key(|m| std::cmp::Reverse(m.created_at));
-        keys.extend(msgs.iter().map(|m| m.author.clone()));
+        // Each speaker's newest message, then sort the speakers: this runs
+        // on every @ keystroke, and sorting the whole channel was too slow.
+        let mut last: HashMap<&str, u64> = HashMap::new();
+        for m in c.messages.values().filter(|m| !m.system) {
+            let at = last.entry(m.author.as_str()).or_insert(0);
+            *at = (*at).max(m.created_at);
+        }
+        let mut speakers: Vec<_> = last.into_iter().collect();
+        speakers.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
+        keys.extend(speakers.into_iter().map(|(k, _)| k.to_string()));
         keys.extend(c.members.iter().cloned());
     }
     // Agents only belong in channels: a DM is between the two of you.
