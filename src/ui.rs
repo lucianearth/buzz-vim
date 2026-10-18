@@ -125,22 +125,26 @@ fn slider(f: &mut Frame, app: &mut App, body: Rect) -> Rect {
 
 fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
     let mut x = area.x;
-    let logo = format!(
-        " {} buzz ",
-        if (app.tick / 4).is_multiple_of(2) {
-            "ʚ●"
-        } else {
-            "ɞ●"
-        }
-    );
+    // The dot breathes while anything animates and rests bright otherwise.
+    let level = if app.animating() {
+        art::breath(app.tick)
+    } else {
+        23
+    };
+    let logo = Line::from(vec![
+        Span::raw(" "),
+        Span::styled("●", Style::new().fg(theme::gray(level))),
+        Span::styled(" buzz ", theme::bright()),
+    ]);
+    let logo_w = logo.width() as u16;
     f.render_widget(
-        Paragraph::new(Span::styled(logo.clone(), theme::bright())),
+        Paragraph::new(logo),
         Rect {
-            width: logo.width() as u16,
+            width: logo_w,
             ..area
         },
     );
-    x += logo.width() as u16 + 1;
+    x += logo_w + 1;
     let msgs = app
         .current()
         .and_then(|c| app.store.channels.get(c))
@@ -961,12 +965,14 @@ fn draw_agents(f: &mut Frame, app: &mut App, area: Rect) {
         draw_empty(f, app, area, "none of your agents are online");
         return;
     }
+    app.agents_cursor = app.agents_cursor.min(rows.len() - 1);
+    let picked = app.agents_cursor;
     // Tool calls go in a right-hand column when there is room.
     let split = area.width >= 90;
     let right_w = if split { area.width / 3 } else { 0 };
     let left_w = area.width.saturating_sub(right_w + 2 + FRAME) as usize;
     let mut y = area.y + 1;
-    for r in rows {
+    for (i, r) in rows.into_iter().enumerate() {
         let edge = if r.busy {
             Span::styled("▌", theme::bright())
         } else {
@@ -991,6 +997,9 @@ fn draw_agents(f: &mut Frame, app: &mut App, area: Rect) {
             ));
         } else {
             head.push(Span::styled("[ IDLE ]", theme::faint()));
+        }
+        if i == picked {
+            head.push(Span::styled("  r reset", theme::muted()));
         }
         let mut left = vec![Line::from(head)];
         let mut place = vec![];
@@ -1059,6 +1068,9 @@ fn draw_agents(f: &mut Frame, app: &mut App, area: Rect) {
                 )
             })
             .collect();
+        if let Some(c) = &r.context {
+            right.push(Line::styled(format!("ctx {c}"), theme::muted()));
+        }
         if let Some(t) = &r.last_turn {
             right.push(Line::styled(t.clone(), theme::faint()));
         }
@@ -1074,7 +1086,7 @@ fn draw_agents(f: &mut Frame, app: &mut App, area: Rect) {
         }
         // The header row holds the head; keep the columns level.
         right.insert(0, Line::raw(""));
-        let left = frame(&r.name, left, area.width, r.busy);
+        let left = frame(&r.name, left, area.width, r.busy || i == picked);
         let h = left.len() as u16;
         if y + h > area.bottom() {
             break;
@@ -1327,7 +1339,12 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         .as_ref()
         .filter(|(_, at)| at.elapsed() < Duration::from_secs(6))
         .map(|(s, _)| s.clone());
-    if app.uploading {
+    if let (Mode::Reset, Some((_, name, _, _))) = (app.mode, &app.reset_ask) {
+        spans.push(Span::styled(
+            format!("reset {name}'s session here? "),
+            theme::bright(),
+        ));
+    } else if app.uploading {
         spans.push(Span::styled(
             format!("uploading {}", art::flight(app.tick, 8)),
             theme::bright(),
@@ -1368,14 +1385,36 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         }
         (text.width() <= room).then_some(text)
     };
-    if !app.uploading && status.is_none() {
+    // Context of the agent working here (or last to), bottom right, when
+    // it fits after the chain.
+    let usage = app
+        .current()
+        .and_then(|c| {
+            let root = app
+                .thread
+                .as_ref()
+                .filter(|t| t.0 == c)
+                .map(|t| t.1.as_str());
+            app.agents.context_here(&app.store, c, root)
+        })
+        .map(|u| format!(" {u} "))
+        .filter(|u| {
+            Line::from(spans.clone()).width()
+                + chain.as_ref().map_or(0, |c| c.width() + 1)
+                + u.width()
+                <= area.width as usize
+        });
+    let usage_w = usage.as_ref().map_or(0, |u| u.width() as u16);
+    if (!app.uploading && status.is_none()) || app.mode == Mode::Reset {
         let mut room = (area.width as usize).saturating_sub(
-            Line::from(spans.clone()).width() + chain.as_ref().map_or(0, |c| c.width() + 1),
+            Line::from(spans.clone()).width()
+                + chain.as_ref().map_or(0, |c| c.width() + 1)
+                + usage_w as usize,
         );
         for (i, (k, what, _)) in legend(app.mode).iter().filter(|l| l.2).enumerate() {
             let (key, desc) = (format!(" {k} "), format!(" {what}  "));
             let w = key.width() + desc.width();
-            if chain.is_some() && w > room {
+            if (chain.is_some() || usage.is_some()) && w > room {
                 break;
             }
             room = room.saturating_sub(w);
@@ -1384,12 +1423,22 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         }
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+    if let Some(u) = usage {
+        f.render_widget(
+            Paragraph::new(Span::styled(u, theme::muted())),
+            Rect {
+                x: area.right() - usage_w,
+                width: usage_w,
+                ..area
+            },
+        );
+    }
     if let Some(text) = chain {
         let w = text.width() as u16;
         f.render_widget(
             Paragraph::new(Span::styled(text, theme::muted())),
             Rect {
-                x: area.right() - w,
+                x: area.right() - usage_w - w,
                 width: w,
                 ..area
             },
@@ -2108,6 +2157,9 @@ mod tests {
             "a3",
             &serde_json::json!({"model": "sonnet", "turn": {"totalTokens": 5200, "costUsd": 0.18}}),
         );
+        for (pk, used) in [("a1", 141_600), ("a3", 38_000)] {
+            app.agents.frame(pk, &serde_json::json!({"kind": "acp_read", "channelId": "c1", "payload": {"params": {"update": {"sessionUpdate": "usage_update", "used": used, "size": 1000000}}}}));
+        }
         app.agents_view = true;
         let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 34)).unwrap();
         t.draw(|f| draw(f, &mut app)).unwrap();

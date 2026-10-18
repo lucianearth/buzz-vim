@@ -107,7 +107,7 @@ struct Home: View {
             }
         }
         .sheet(isPresented: $showAgents) {
-            AgentsView(client: client)
+            AgentsView(client: client, channel: selected, root: selected.flatMap { threads[$0]?.root })
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
                 .modifier(Themed())

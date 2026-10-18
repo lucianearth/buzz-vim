@@ -508,6 +508,11 @@ impl Sync {
                 parent,
             } => self.send(app, channel, root, parent),
             Action::ThumbsUp { target } => self.thumbs_up(app, target),
+            Action::Reset {
+                channel,
+                root,
+                agent,
+            } => self.reset(app, channel, root, agent),
             Action::Upload => {
                 let Some(p) = app.pending.take() else { return };
                 let Some(target) = app.draft_target() else {
@@ -668,6 +673,39 @@ impl Sync {
             let result = r.publish(&ev).await.map(|_| ());
             Msg::Sent { id, result }
         });
+    }
+
+    /// The owner `!rotate` buzz-acp acts on: kind 9 from you, p-tagging
+    /// the agent (the watcher sends the same for `!reset`).
+    fn reset(&mut self, app: &mut App, channel: String, root: Option<String>, agent: String) {
+        let thread = root
+            .as_deref()
+            .and_then(|r| EventId::from_hex(r).ok())
+            .map(|r| buzz_sdk::ThreadRef {
+                root_event_id: r,
+                parent_event_id: r,
+            });
+        let Ok(uuid) = uuid::Uuid::parse_str(&channel) else {
+            return;
+        };
+        let ev = match buzz_sdk::build_message(
+            uuid,
+            "!rotate",
+            thread.as_ref(),
+            &[agent.as_str()],
+            false,
+            &[],
+            &[],
+        )
+        .map_err(anyhow::Error::from)
+        .and_then(|b| self.relay.sign(b))
+        {
+            Ok(ev) => ev,
+            Err(e) => return app.say(format!("couldn't build the reset: {e}")),
+        };
+        app.store.apply(&ev);
+        let r = self.relay.clone();
+        self.spawn(async move { Msg::Did(r.publish(&ev).await.map(|_| "reset sent".to_string())) });
     }
 
     fn thumbs_up(&mut self, app: &mut App, target: String) {

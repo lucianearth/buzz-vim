@@ -22,6 +22,16 @@ pub struct Agent {
     /// names none) so each channel's agents screen shows only its own turns.
     pub activity: BTreeMap<String, Activity>,
     pub last_turn: Option<String>,
+    /// Tokens in the agent's context, per channel (its session there), as
+    /// the harness last reported them. Saved across restarts.
+    pub context: BTreeMap<String, Context>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Context {
+    pub used: u64,
+    /// Unix seconds of the report.
+    pub at: u64,
 }
 
 #[derive(Default)]
@@ -60,6 +70,8 @@ pub struct Row {
     pub thought: String,
     /// Busy in another channel (not the one asked about), by channel id.
     pub elsewhere: Option<String>,
+    /// Context in use in the channel asked about, e.g. "142k".
+    pub context: Option<String>,
 }
 
 /// The harness sends turn_liveness every ~10s, so a turn quiet for this
@@ -276,6 +288,19 @@ impl Agents {
                         let line = title.lines().next().unwrap_or(title).to_string();
                         push_recent(a, &here, line);
                     }
+                    // The ACP size is the model's window, not the
+                    // auto-compact cap a seat may set, so only `used` counts.
+                    "usage_update" => {
+                        if let Some(used) = update.get("used").and_then(Value::as_u64) {
+                            a.context.insert(
+                                here,
+                                Context {
+                                    used,
+                                    at: unix_now(),
+                                },
+                            );
+                        }
+                    }
                     "tool_call_update" => {
                         if update.get("status").and_then(Value::as_str) == Some("failed") {
                             push_recent(a, &here, "✗ tool failed".into());
@@ -313,6 +338,76 @@ impl Agents {
             s.push_str(&format!(" · {model}"));
         }
         self.known(agent).last_turn = Some(s);
+    }
+
+    /// You sent `agent` a `!rotate` in `channel`: its session there starts
+    /// fresh, so the old count no longer applies.
+    pub fn rotated(&mut self, agent: &str, channel: &str) {
+        self.known(agent).context.remove(channel);
+    }
+
+    /// The context of the agent that matters in `channel` (and thread
+    /// `root`): the newest live turn there, else whoever reported last.
+    /// "taskbot ctx 142k".
+    pub fn context_here(&self, store: &Store, channel: &str, root: Option<&str>) -> Option<String> {
+        let owned = || self.by_pubkey.iter().filter(|(_, a)| a.owned);
+        let busy = owned()
+            .filter_map(|(pk, a)| {
+                let t = a.live().find(|t| {
+                    t.channel.as_deref() == Some(channel)
+                        && root.is_none_or(|r| t.thread.as_deref() == Some(r))
+                })?;
+                Some((t.started, pk, a))
+            })
+            .max_by_key(|x| x.0)
+            .map(|(_, pk, a)| (pk, a));
+        let (pk, a) = busy.or_else(|| {
+            owned()
+                .filter_map(|(pk, a)| Some((a.context.get(channel)?.at, pk, a)))
+                .max_by_key(|x| x.0)
+                .map(|(_, pk, a)| (pk, a))
+        })?;
+        let c = a.context.get(channel)?;
+        Some(format!(
+            "{} ctx {}",
+            a.display_name(pk, store),
+            tokens(c.used)
+        ))
+    }
+
+    /// Every agent's saved context counts, to restore on the next start.
+    pub fn saved_context(&self) -> Value {
+        let mut out = serde_json::Map::new();
+        for (pk, a) in &self.by_pubkey {
+            if a.context.is_empty() {
+                continue;
+            }
+            let chans: serde_json::Map<String, Value> = a
+                .context
+                .iter()
+                .map(|(ch, c)| (ch.clone(), serde_json::json!([c.used, c.at])))
+                .collect();
+            out.insert(pk.clone(), Value::Object(chans));
+        }
+        Value::Object(out)
+    }
+
+    /// Counts from `saved_context`. Live reports already in win.
+    pub fn restore_context(&mut self, saved: &Value) {
+        for (pk, chans) in saved.as_object().into_iter().flatten() {
+            for (ch, v) in chans.as_object().into_iter().flatten() {
+                let (Some(used), Some(at)) = (
+                    v.get(0).and_then(Value::as_u64),
+                    v.get(1).and_then(Value::as_u64),
+                ) else {
+                    continue;
+                };
+                self.known(pk)
+                    .context
+                    .entry(ch.clone())
+                    .or_insert(Context { used, at });
+            }
+        }
     }
 
     pub fn presence(&mut self, agent: &str, status: &str) {
@@ -365,6 +460,10 @@ impl Agents {
                     .or(any.and_then(|t| t.channel.as_deref()))
                     .and_then(|c| a.activity.get(c));
                 let (recent, thought) = act.map_or((&[][..], ""), |x| (&x.recent[..], &x.thought));
+                let context = here
+                    .or(any.and_then(|t| t.channel.as_deref()))
+                    .and_then(|c| a.context.get(c))
+                    .map(|c| tokens(c.used));
                 Some(Row {
                     pubkey: pk.clone(),
                     name: a.display_name(pk, store),
@@ -380,6 +479,7 @@ impl Agents {
                     thread: turn.and_then(|t| t.thread.clone()),
                     secs: turn.map(|t| t.started.elapsed().as_secs()),
                     last_turn: a.last_turn.clone(),
+                    context,
                     thought: if busy {
                         let w: Vec<&str> = thought.split_whitespace().collect();
                         w[w.len().saturating_sub(16)..].join(" ")
@@ -391,6 +491,21 @@ impl Agents {
             .collect();
         rows.sort_by_key(|r| (!r.busy, !r.online, r.name.to_lowercase()));
         rows
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// 142000 -> "142k", 1200000 -> "1.2M".
+pub fn tokens(n: u64) -> String {
+    if n >= 999_500 {
+        format!("{:.1}M", n as f64 / 1e6)
+    } else {
+        format!("{}k", (n + 500) / 1000)
     }
 }
 
@@ -536,5 +651,44 @@ mod tests {
         assert!(ag.rows(&s, Some("c1"))[0].recent[0].starts_with("turn done"));
         assert_eq!(ag.rows(&s, Some("c2"))[0].recent[0], "step in c2");
         assert!(ag.rows(&s, Some("c3"))[0].recent.is_empty());
+    }
+
+    #[test]
+    fn context_per_channel_survives_a_restart_and_clears_on_rotate() {
+        let mut ag = Agents::default();
+        ag.own("a1", "bot");
+        ag.presence("a1", "online");
+        let s = Store::new("me".into());
+        let usage = |used: u64| json!({"kind": "acp_read", "turnId": "t1", "payload": {"params": {"update": {"sessionUpdate": "usage_update", "used": used, "size": 1000000}}}});
+        ag.frame(
+            "a1",
+            &json!({"kind": "turn_started", "turnId": "t1", "channelId": "c1", "payload": {}}),
+        );
+        ag.frame("a1", &usage(141_600));
+        assert_eq!(ag.rows(&s, Some("c1"))[0].context.as_deref(), Some("142k"));
+        assert_eq!(ag.rows(&s, Some("c2"))[0].context, None);
+        assert_eq!(
+            ag.context_here(&s, "c1", None).as_deref(),
+            Some("bot ctx 142k")
+        );
+        ag.frame("a1", &usage(1_250_000));
+        ag.frame(
+            "a1",
+            &json!({"kind": "turn_completed", "turnId": "t1", "payload": {}}),
+        );
+        // Idle now, still the last one to report here.
+        assert_eq!(
+            ag.context_here(&s, "c1", None).as_deref(),
+            Some("bot ctx 1.2M")
+        );
+        let mut back = Agents::default();
+        back.restore_context(&ag.saved_context());
+        back.own("a1", "bot");
+        assert_eq!(
+            back.context_here(&s, "c1", None).as_deref(),
+            Some("bot ctx 1.2M")
+        );
+        back.rotated("a1", "c1");
+        assert_eq!(back.context_here(&s, "c1", None), None);
     }
 }

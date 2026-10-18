@@ -11,6 +11,8 @@ pub enum Mode {
     Viewer,
     Help,
     Hint,
+    /// Asking before `!rotate`-ing an agent from the agents screen.
+    Reset,
 }
 
 impl Mode {
@@ -24,6 +26,7 @@ impl Mode {
             Mode::Viewer => "IMAGE",
             Mode::Help => "HELP",
             Mode::Hint => "LINK",
+            Mode::Reset => "RESET?",
         }
     }
 }
@@ -48,6 +51,7 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("⌫ ^o", "back to where a link took you from", false),
             ("[ ]", "narrower / wider (or drag the right edge)", false),
             ("a", "agents", true),
+            ("r", "agents screen: reset the picked agent here", false),
             ("?", "help", true),
             ("r", "reply in thread", false),
             ("h ← esc", "back (thread, agents)", false),
@@ -90,6 +94,7 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("esc", "done", true),
         ],
         Mode::Confirm => &[("y", "upload to Buzz", true), ("n esc", "cancel", true)],
+        Mode::Reset => &[("y ⏎", "reset", true), ("n esc", "cancel", true)],
         Mode::Viewer => &[
             ("← →", "prev / next image", true),
             ("esc q o", "close", true),
