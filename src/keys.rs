@@ -13,6 +13,8 @@ pub enum Mode {
     Hint,
     /// Asking before `!rotate`-ing an agent from the agents screen.
     Reset,
+    /// Asking before archiving the tab picked in the tab menu.
+    Archive,
 }
 
 impl Mode {
@@ -27,6 +29,7 @@ impl Mode {
             Mode::Help => "HELP",
             Mode::Hint => "LINK",
             Mode::Reset => "RESET?",
+            Mode::Archive => "ARCHIVE?",
         }
     }
 }
@@ -91,10 +94,12 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("j k", "pick a tab", true),
             ("J K", "move it down / up", true),
             ("⏎", "go to it", true),
+            ("a", "archive it", true),
             ("esc", "done", true),
         ],
         Mode::Confirm => &[("y", "upload to Buzz", true), ("n esc", "cancel", true)],
         Mode::Reset => &[("y ⏎", "reset", true), ("n esc", "cancel", true)],
+        Mode::Archive => &[("y ⏎", "archive", true), ("n esc", "cancel", true)],
         Mode::Viewer => &[
             ("← →", "prev / next image", true),
             ("esc q o", "close", true),

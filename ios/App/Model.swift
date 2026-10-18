@@ -140,6 +140,17 @@ final class Model {
         bump()
     }
 
+    /// Archive a channel for everyone; its tab goes at once, and the
+    /// notice says if the relay refused.
+    func archive(_ channel: String) {
+        do {
+            try client?.archiveChannel(channel: channel)
+        } catch {
+            say("not archived: \(error.localizedDescription)")
+        }
+        bump()
+    }
+
     /// Save a section's whole tab order (synced with the terminal app).
     func order(_ section: String, _ ids: [String]) {
         client?.setOrder(section: section, ids: ids)
