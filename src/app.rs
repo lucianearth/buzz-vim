@@ -154,8 +154,9 @@ pub struct App {
     pub agents_view: bool,
     /// The card picked on the agents view (j/k), for `r`.
     pub agents_cursor: usize,
-    /// Agent (pubkey, name) waiting on the y/n before its reset.
-    pub reset_ask: Option<(String, String)>,
+    /// Agent (pubkey, name) waiting on the y/n before its reset, and the
+    /// (channel, thread root) it was asked about.
+    pub reset_ask: Option<(String, String, String, Option<String>)>,
     pub agents: Agents,
     pub media: Media,
     pub picker: Option<Picker>,
@@ -303,15 +304,19 @@ impl App {
 
     /// `r` on the agents view: ask before resetting the picked agent.
     fn ask_reset(&mut self) {
-        let here = self.current().map(str::to_string);
-        if here.is_none() {
+        let Some(channel) = self.current().map(str::to_string) else {
             return;
-        }
-        let rows = self.agents.rows(&self.store, here.as_deref());
+        };
+        let rows = self.agents.rows(&self.store, Some(&channel));
         let Some(r) = rows.get(self.agents_cursor.min(rows.len().saturating_sub(1))) else {
             return;
         };
-        self.reset_ask = Some((r.pubkey.clone(), r.name.clone()));
+        let root = self
+            .thread
+            .as_ref()
+            .filter(|t| t.0 == channel)
+            .map(|t| t.1.clone());
+        self.reset_ask = Some((r.pubkey.clone(), r.name.clone(), channel, root));
         self.mode = Mode::Reset;
     }
 
@@ -320,17 +325,9 @@ impl App {
     /// starts that agent's next turn here with a fresh session.
     fn reset_agent(&mut self) {
         self.mode = Mode::Normal;
-        let Some((agent, name)) = self.reset_ask.take() else {
+        let Some((agent, name, channel, root)) = self.reset_ask.take() else {
             return;
         };
-        let Some(channel) = self.current().map(str::to_string) else {
-            return;
-        };
-        let root = self
-            .thread
-            .as_ref()
-            .filter(|t| t.0 == channel)
-            .map(|t| t.1.clone());
         self.agents.rotated(&agent, &channel);
         self.actions.push(Action::Reset {
             channel,

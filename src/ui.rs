@@ -1339,7 +1339,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         .as_ref()
         .filter(|(_, at)| at.elapsed() < Duration::from_secs(6))
         .map(|(s, _)| s.clone());
-    if let (Mode::Reset, Some((_, name))) = (app.mode, &app.reset_ask) {
+    if let (Mode::Reset, Some((_, name, _, _))) = (app.mode, &app.reset_ask) {
         spans.push(Span::styled(
             format!("reset {name}'s session here? "),
             theme::bright(),

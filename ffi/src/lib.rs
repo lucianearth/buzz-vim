@@ -872,13 +872,32 @@ impl Client {
         agent: String,
     ) -> Result<(), BuzzError> {
         let mut e = self.engine.lock().unwrap();
-        e.send(
-            channel.clone(),
-            root,
-            "!rotate".into(),
+        // Built here, not through send: in a DM that p-tags every member,
+        // and each agent tagged would rotate.
+        let thread = root
+            .as_deref()
+            .map(EventId::from_hex)
+            .transpose()
+            .map_err(|e| BuzzError::Failed(e.to_string()))?
+            .map(|r| buzz_sdk::ThreadRef {
+                root_event_id: r,
+                parent_event_id: r,
+            });
+        let uuid = uuid::Uuid::parse_str(&channel)
+            .map_err(|_| BuzzError::Failed("bad channel id".into()))?;
+        let builder = buzz_sdk::build_message(
+            uuid,
+            "!rotate",
+            thread.as_ref(),
+            &[agent.as_str()],
+            false,
             &[],
-            std::slice::from_ref(&agent),
-        )?;
+            &[],
+        )
+        .map_err(|e| BuzzError::Failed(e.to_string()))?;
+        let ev = e.relay.sign(builder)?;
+        e.store.apply(&ev);
+        e.publish_message(ev, channel.clone(), vec![]);
         e.agents.rotated(&agent, &channel);
         Ok(())
     }
