@@ -328,6 +328,11 @@ enum Msg {
     },
     Moved(anyhow::Result<(Event, String)>),
     Ordered(anyhow::Result<Event>),
+    /// The relay's answer to archiving a channel.
+    ChannelArchived {
+        channel: String,
+        result: anyhow::Result<()>,
+    },
     Notice(String),
 }
 
@@ -600,6 +605,25 @@ impl Client {
         e.lanes.order.insert(section, ids);
         e.refresh_sections();
         e.publish_order();
+    }
+
+    /// Archive a channel for everyone. Its tab goes now; it comes back
+    /// with a notice if the relay says no.
+    pub fn archive_channel(&self, channel: String) -> Result<(), BuzzError> {
+        let mut e = self.engine.lock().unwrap();
+        let uuid = uuid::Uuid::parse_str(&channel)
+            .map_err(|_| BuzzError::Failed("bad channel id".into()))?;
+        let builder =
+            buzz_sdk::build_archive(uuid).map_err(|e| BuzzError::Failed(e.to_string()))?;
+        let ev = e.relay.sign(builder)?;
+        e.store.channel_mut(&channel).archived = true;
+        e.rebuild_tabs();
+        let r = e.relay.clone();
+        e.spawn(async move {
+            let result = r.publish(&ev).await;
+            Msg::ChannelArchived { channel, result }
+        });
+        Ok(())
     }
 
     /// Move the channel on screen into `section` ("channels" = out of its
@@ -1589,6 +1613,17 @@ impl Engine {
             Msg::Moved(Err(e)) => self.notices.push(format!("couldn't move: {e}")),
             Msg::Ordered(Ok(_)) => {}
             Msg::Ordered(Err(e)) => self.notices.push(format!("tab order not saved: {e}")),
+            Msg::ChannelArchived { channel, result } => {
+                let name = self.label(&channel);
+                match result {
+                    Ok(()) => self.notices.push(format!("archived {name}")),
+                    Err(e) => {
+                        self.store.channel_mut(&channel).archived = false;
+                        self.rebuild_tabs();
+                        self.notices.push(format!("{name} not archived: {e}"));
+                    }
+                }
+            }
             Msg::Window {
                 channel,
                 events,

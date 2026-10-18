@@ -425,6 +425,20 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
             Ok(s) => app.say(s),
             Err(e) => app.say(format!("failed: {e}")),
         },
+        Msg::ChannelArchived { channel, result } => {
+            let name = app
+                .store
+                .channels
+                .get(&channel)
+                .map_or_else(String::new, |c| c.name.clone());
+            match result {
+                Ok(()) => app.say(format!("archived #{name}")),
+                Err(e) => {
+                    app.unarchive(&channel);
+                    app.say(format!("#{name} not archived: {e}"));
+                }
+            }
+        }
         Msg::Added {
             channel,
             pubkeys,

@@ -45,6 +45,11 @@ pub enum Msg {
         result: anyhow::Result<()>,
     },
     Did(anyhow::Result<String>),
+    /// The relay's answer to archiving a channel.
+    ChannelArchived {
+        channel: String,
+        result: anyhow::Result<()>,
+    },
     /// Agents a message @mentioned, added to its channel.
     Added {
         channel: String,
@@ -513,6 +518,26 @@ impl Sync {
                 root,
                 agent,
             } => self.reset(app, channel, root, agent),
+            Action::Archive(channel) => {
+                let Ok(uuid) = uuid::Uuid::parse_str(&channel) else {
+                    return app.unarchive(&channel);
+                };
+                let ev = match buzz_sdk::build_archive(uuid)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|b| self.relay.sign(b))
+                {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        app.unarchive(&channel);
+                        return app.say(format!("couldn't build the archive: {e}"));
+                    }
+                };
+                let r = self.relay.clone();
+                self.spawn(async move {
+                    let result = r.publish(&ev).await;
+                    Msg::ChannelArchived { channel, result }
+                });
+            }
             Action::Upload => {
                 let Some(p) = app.pending.take() else { return };
                 let Some(target) = app.draft_target() else {
