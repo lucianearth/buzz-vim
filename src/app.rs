@@ -10,7 +10,9 @@ use crossterm::event::{
 use ratatui::layout::Rect;
 use ratatui_image::picker::Picker;
 
+use crate::checklist::Checklists;
 use crate::clip::Pending;
+use crate::config::Loop;
 use crate::draft::Draft;
 use crate::keys::Mode;
 use crate::live::ConnState;
@@ -38,6 +40,8 @@ pub enum Hit {
     CloseThread,
     /// The reading-width slider on the body's right edge.
     Handle,
+    /// A row in the checklist pane.
+    ChecklistItem(usize),
 }
 
 /// A piece of a link on screen, from the last draw.
@@ -110,6 +114,16 @@ pub enum Action {
         urls: Vec<String>,
         current: usize,
     },
+    /// A Q: a new top-level message in #quick, @mentioning `agent`.
+    /// `text` is what was typed, back in the box if the relay refuses.
+    SendQuick {
+        channel: String,
+        content: String,
+        agent: String,
+        text: String,
+    },
+    /// Look up these people's names (the Q agent's, in #quick).
+    WantProfiles(Vec<String>),
     SaveState,
     Quit,
 }
@@ -208,6 +222,15 @@ pub struct App {
     /// A message to keep at the top of its pane while it is the cursor
     /// (the bell lands with it at the top).
     pub anchor: Option<(Pane, String)>,
+    /// The operator loop's checklist records, every channel's.
+    pub checklists: Checklists,
+    /// The checklist pane (`c`) and the item picked in it.
+    pub checklist_view: bool,
+    pub checklist_cursor: usize,
+    /// The Q box (`Q` / `^q`): its text, and whether it carries this channel.
+    pub quick_draft: Draft,
+    pub quick_include: bool,
+    pub loop_: Loop,
 }
 
 impl App {
@@ -270,6 +293,12 @@ impl App {
             bell: HashMap::new(),
             archived: HashSet::new(),
             anchor: None,
+            checklists: Checklists::default(),
+            checklist_view: false,
+            checklist_cursor: 0,
+            quick_draft: Draft::default(),
+            quick_include: false,
+            loop_: Loop::default(),
         }
     }
 
@@ -942,6 +971,121 @@ impl App {
         true
     }
 
+    // ---------- Q ----------
+
+    /// `Q` / `^q`: open the Q box; pressed again while it's open, the
+    /// current channel goes along (or comes off again).
+    fn quick(&mut self) {
+        if self.mode == Mode::Quick {
+            let here = self.current().and_then(|c| self.store.channels.get(c));
+            let quick = crate::quick::find_channel(&self.store, &self.loop_.quick_channel);
+            match here {
+                Some(h) if quick.is_some_and(|q| q.id == h.id) => {
+                    self.say("you're in the Q channel already; nothing to add")
+                }
+                Some(_) => self.quick_include = !self.quick_include,
+                None => self.say("no channel open to add"),
+            }
+            return;
+        }
+        let Some(q) = crate::quick::find_channel(&self.store, &self.loop_.quick_channel) else {
+            let msg = if self.channels_loaded {
+                format!(
+                    "no #{} channel: Q posts there, and buzz-vim doesn't make channels",
+                    self.loop_.quick_channel
+                )
+            } else {
+                "channels are still loading; try Q again in a moment".to_string()
+            };
+            return self.say(msg);
+        };
+        let members = q.members.clone();
+        self.actions.push(Action::WantProfiles(members));
+        self.quick_include = false;
+        self.mode = Mode::Quick;
+    }
+
+    fn key_quick(&mut self, k: KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = k
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT);
+        let d = &mut self.quick_draft;
+        match k.code {
+            // The text stays for next time.
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Enter if alt => d.insert("\n"),
+            KeyCode::Char('j') if ctrl => d.insert("\n"),
+            KeyCode::Enter => self.send_quick(),
+            KeyCode::Char('w') if ctrl => d.delete_word(),
+            KeyCode::Char('u') if ctrl => d.clear(),
+            KeyCode::Char('a') if ctrl => d.home(),
+            KeyCode::Char('e') if ctrl => d.end(),
+            KeyCode::Char(c) if !ctrl => d.insert(c.encode_utf8(&mut [0; 4])),
+            KeyCode::Tab => d.insert(&" ".repeat(crate::draft::TAB)),
+            KeyCode::Backspace => d.backspace(),
+            KeyCode::Delete => d.delete(),
+            KeyCode::Left => d.left(),
+            KeyCode::Right => d.right(),
+            KeyCode::Home => d.home(),
+            KeyCode::End => d.end(),
+            KeyCode::Up => {
+                d.vertical(false);
+            }
+            KeyCode::Down => {
+                d.vertical(true);
+            }
+            _ => {}
+        }
+    }
+
+    /// The Q as it will be sent, or why it can't be: (#quick id, agent
+    /// pubkey, content).
+    pub fn quick_message(&self) -> Result<(String, String, String), String> {
+        let text = self.quick_draft.text.trim();
+        if text.is_empty() {
+            return Err("type a question first".into());
+        }
+        let l = &self.loop_;
+        let q = crate::quick::find_channel(&self.store, &l.quick_channel)
+            .ok_or_else(|| format!("no #{} channel", l.quick_channel))?;
+        let agent = crate::quick::find_agent(&self.store, Some(q), &l.quick_agent)
+            .ok_or_else(|| format!("no agent named {} found to ask", l.quick_agent))?;
+        let context = if self.quick_include {
+            let here = self
+                .current()
+                .and_then(|c| self.store.channels.get(c))
+                .ok_or("no channel open to add")?;
+            let root = self
+                .thread
+                .as_ref()
+                .filter(|t| t.0 == here.id)
+                .map(|t| t.1.as_str());
+            Some(crate::quick::context_block(here, root))
+        } else {
+            None
+        };
+        let content = crate::quick::compose(&l.quick_agent, text, context.as_deref());
+        Ok((q.id.clone(), agent, content))
+    }
+
+    fn send_quick(&mut self) {
+        match self.quick_message() {
+            Ok((channel, agent, content)) => {
+                let text = std::mem::take(&mut self.quick_draft).text;
+                self.actions.push(Action::SendQuick {
+                    channel,
+                    content,
+                    agent,
+                    text,
+                });
+                self.quick_include = false;
+                self.mode = Mode::Normal;
+            }
+            Err(e) => self.say(e),
+        }
+    }
+
     // ---------- input ----------
 
     pub fn on_term(&mut self, ev: TermEvent) {
@@ -956,6 +1100,12 @@ impl App {
     }
 
     fn on_paste(&mut self, s: String) {
+        let text = s.replace("\r\n", "\n").replace('\r', "\n");
+        // The Q box takes text only, a dropped path included.
+        if self.mode == Mode::Quick {
+            self.quick_draft.insert(&text);
+            return;
+        }
         let paths = crate::clip::dropped_paths(&s);
         if let Some(p) = paths.first() {
             self.say(format!("reading {}…", p.display()));
@@ -965,8 +1115,7 @@ impl App {
         if self.mode != Mode::Insert {
             self.mode = Mode::Insert;
         }
-        self.draft_mut()
-            .insert(&s.replace("\r\n", "\n").replace('\r', "\n"));
+        self.draft_mut().insert(&text);
     }
 
     fn paste_clipboard(&mut self) {
@@ -1012,7 +1161,15 @@ impl App {
             self.paste_clipboard();
             return;
         }
+        if ctrl
+            && k.code == KeyCode::Char('q')
+            && matches!(self.mode, Mode::Normal | Mode::Insert | Mode::Quick)
+        {
+            self.quick();
+            return;
+        }
         match self.mode {
+            Mode::Quick => self.key_quick(k),
             Mode::Insert => self.key_insert(k),
             Mode::Normal => self.key_normal(k),
             Mode::Sections => self.key_sections(k),
@@ -1150,6 +1307,25 @@ impl App {
                 self.agents_cursor = self.agents_cursor.saturating_sub(1)
             }
             KeyCode::Char('r') if self.agents_view => self.ask_reset(),
+            KeyCode::Char('j') | KeyCode::Down if self.checklist_view => self.checklist_cursor += 1,
+            KeyCode::Char('k') | KeyCode::Up if self.checklist_view => {
+                self.checklist_cursor = self.checklist_cursor.saturating_sub(1)
+            }
+            KeyCode::Char('g') | KeyCode::Home if self.checklist_view => self.checklist_cursor = 0,
+            KeyCode::Char('G') | KeyCode::End if self.checklist_view => {
+                self.checklist_cursor = usize::MAX
+            }
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc | KeyCode::Char('c')
+                if self.checklist_view =>
+            {
+                self.checklist_view = false;
+            }
+            KeyCode::Char('c') => {
+                self.checklist_view = true;
+                self.agents_view = false;
+                self.checklist_cursor = 0;
+            }
+            KeyCode::Char('Q') => self.quick(),
             KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
             KeyCode::Char('d') | KeyCode::PageDown => self.move_cursor(self.page.max(1) as isize),
@@ -1171,7 +1347,10 @@ impl App {
                 }
             }
             KeyCode::Char('i') => self.enter_insert(),
-            KeyCode::Char('a') => self.agents_view = !self.agents_view,
+            KeyCode::Char('a') => {
+                self.agents_view = !self.agents_view;
+                self.checklist_view = false;
+            }
             KeyCode::Char('+') => self.thumbs_up(),
             KeyCode::Char('s') => {
                 self.picker_marks = self.chosen.iter().cloned().collect();
@@ -1589,6 +1768,8 @@ impl App {
                 Some(Hit::ConfirmYes) => self.on_key(KeyEvent::from(KeyCode::Char('y'))),
                 Some(Hit::ConfirmNo) => self.on_key(KeyEvent::from(KeyCode::Char('n'))),
                 Some(Hit::CloseThread) if self.agents_view => self.agents_view = false,
+                Some(Hit::CloseThread) if self.checklist_view => self.checklist_view = false,
+                Some(Hit::ChecklistItem(i)) => self.checklist_cursor = i,
                 Some(Hit::CloseThread) => self.close_thread(),
                 Some(Hit::Handle) | None => {}
             },
@@ -1600,6 +1781,91 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn q_asks_in_quick_and_again_adds_this_channel() {
+        let key = |app: &mut App, k: KeyEvent| app.on_key(k);
+        let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        let mut app = App::new("me".into(), None);
+        app.channels_loaded = true;
+        let here = "2130646b-d6c8-4ec3-93e3-36f77bee1a37";
+        let c = app.store.channel_mut(here);
+        c.name = "buzz-vim".into();
+        c.timeline = vec!["m1".into(), "m2".into()];
+        app.tabs = vec![here.into()];
+        // No #quick: says so, opens nothing, makes nothing.
+        key(&mut app, KeyEvent::from(KeyCode::Char('Q')));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|s| s.0.contains("no #quick"))
+        );
+        assert!(app.actions.is_empty());
+        let q = crate::quick::CHANNEL_ID;
+        let qc = app.store.channel_mut(q);
+        qc.name = "quick".into();
+        qc.members = vec!["me".into(), "tb".into()];
+        app.store.profiles.entry("tb".into()).or_default().name = "taskbot".into();
+        // First press: just the question.
+        key(&mut app, ctrl_q);
+        assert_eq!(app.mode, Mode::Quick);
+        assert!(
+            matches!(app.actions.first(), Some(Action::WantProfiles(m)) if m.contains(&"tb".to_string()))
+        );
+        app.actions.clear();
+        // Q is a letter in the box, not the key.
+        for c in "Qhow?".chars() {
+            key(&mut app, KeyEvent::from(KeyCode::Char(c)));
+        }
+        assert!(!app.quick_include);
+        key(&mut app, ctrl_q);
+        assert!(app.quick_include);
+        key(&mut app, ctrl_q);
+        assert!(!app.quick_include);
+        key(&mut app, ctrl_q);
+        let (ch, agent, content) = app.quick_message().unwrap();
+        assert_eq!((ch.as_str(), agent.as_str()), (q, "tb"));
+        assert!(
+            content.starts_with("[Q]\nContext: #buzz-vim (channel 2130646b"),
+            "{content}"
+        );
+        assert!(content.contains("m1 m2") && content.ends_with("\n\n@taskbot Qhow?"));
+        // Esc keeps the text; Enter sends it and empties the box.
+        key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+        key(&mut app, KeyEvent::from(KeyCode::Char('Q')));
+        assert_eq!(app.quick_draft.text, "Qhow?");
+        assert!(!app.quick_include);
+        key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.quick_draft.is_empty());
+        assert!(app.actions.iter().any(|a| matches!(a,
+            Action::SendQuick { channel, agent, content, text }
+            if channel == q && agent == "tb" && content == "[Q]\n@taskbot Qhow?" && text == "Qhow?")));
+    }
+
+    #[test]
+    fn c_opens_the_checklist_and_moves_in_it() {
+        let mut app = App::new("me".into(), None);
+        app.tabs = vec!["a".into()];
+        app.store.channel_mut("a").timeline = vec!["m1".into(), "m2".into()];
+        let key = |app: &mut App, c| app.on_key(KeyEvent::from(c));
+        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Char('c'));
+        assert!(app.checklist_view && !app.agents_view);
+        key(&mut app, KeyCode::Char('j'));
+        key(&mut app, KeyCode::Char('j'));
+        key(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.checklist_cursor, 1);
+        // j moved the list, not the timeline.
+        assert_eq!(app.selected.get("a"), None);
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.checklist_view);
+        key(&mut app, KeyCode::Char('c'));
+        key(&mut app, KeyCode::Char('c'));
+        assert!(!app.checklist_view);
+    }
 
     #[test]
     fn m_moves_the_current_channel() {

@@ -17,6 +17,17 @@ pub const DEFAULT_RELAY: &str = "wss://buzz.gitcoin.co";
 struct File {
     relay: Option<String>,
     nsec: Option<String>,
+    /// Operator loop: who else may edit any checklist record (default lucian).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
+    /// The watcher's pubkeys; its state counts only from these. Unset: any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    watcher: Vec<String>,
+    /// The Q pop-up's channel name and the agent it @mentions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quick_channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quick_agent: Option<String>,
 }
 
 pub struct Config {
@@ -24,6 +35,51 @@ pub struct Config {
     pub keys: Keys,
     /// NIP-OA owner delegation (`BUZZ_AUTH_TAG`), only for agent identities.
     pub auth_tag: Option<nostr::Tag>,
+    pub loop_: Loop,
+}
+
+/// Operator-loop settings: `owner`, `watcher`, `quick_channel` and
+/// `quick_agent` in config.json, or `BUZZ_VIM_OWNER`, `BUZZ_VIM_WATCHER`
+/// (comma separated), `BUZZ_VIM_QUICK_CHANNEL`, `BUZZ_VIM_QUICK_AGENT`.
+#[derive(Clone, Debug)]
+pub struct Loop {
+    pub owner: String,
+    pub watchers: Vec<String>,
+    pub quick_channel: String,
+    pub quick_agent: String,
+}
+
+impl Default for Loop {
+    fn default() -> Self {
+        Loop {
+            owner: crate::checklist::OWNER.to_string(),
+            watchers: vec![],
+            quick_channel: crate::quick::CHANNEL.to_string(),
+            quick_agent: crate::quick::AGENT.to_string(),
+        }
+    }
+}
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|s| !s.trim().is_empty())
+}
+
+fn loop_settings(file: &File) -> Loop {
+    let d = Loop::default();
+    Loop {
+        owner: env("BUZZ_VIM_OWNER")
+            .or(file.owner.clone())
+            .unwrap_or(d.owner),
+        watchers: env("BUZZ_VIM_WATCHER")
+            .map(|s| s.split(',').map(|k| k.trim().to_string()).collect())
+            .unwrap_or_else(|| file.watcher.clone()),
+        quick_channel: env("BUZZ_VIM_QUICK_CHANNEL")
+            .or(file.quick_channel.clone())
+            .unwrap_or(d.quick_channel),
+        quick_agent: env("BUZZ_VIM_QUICK_AGENT")
+            .or(file.quick_agent.clone())
+            .unwrap_or(d.quick_agent),
+    }
 }
 
 fn path() -> Result<PathBuf> {
@@ -48,6 +104,7 @@ pub fn parse_key(s: &str) -> Result<Keys> {
 
 pub fn load() -> Result<Config> {
     let file = read_file();
+    let loop_ = loop_settings(&file);
     let relay = std::env::var("BUZZ_RELAY_URL")
         .ok()
         .filter(|s| !s.is_empty())
@@ -78,6 +135,7 @@ pub fn load() -> Result<Config> {
         relay,
         keys,
         auth_tag,
+        loop_,
     })
 }
 
@@ -113,6 +171,7 @@ pub fn login() -> Result<()> {
     let body = serde_json::to_string_pretty(&File {
         relay: Some(relay),
         nsec: Some(keys.secret_key().to_bech32()?),
+        ..file
     })?;
     write_private(&p, body.as_bytes())?;
     println!(

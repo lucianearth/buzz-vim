@@ -45,6 +45,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let mut images = vec![];
     if app.agents_view {
         draw_agents(f, app, main);
+    } else if app.checklist_view {
+        draw_checklist(f, app, main);
     } else if app.thread.is_some() {
         draw_thread(f, app, main, &mut images);
     } else {
@@ -56,7 +58,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // graphics sit on top of text, and a popup can't cover them otherwise.
     let overlay = matches!(
         app.mode,
-        Mode::Sections | Mode::Order | Mode::Confirm | Mode::Help | Mode::Viewer
+        Mode::Sections | Mode::Order | Mode::Confirm | Mode::Help | Mode::Viewer | Mode::Quick
     ) || (app.mode == Mode::Insert && !app.mention_candidates().is_empty());
     for (rect, key) in images.into_iter().filter(|_| !overlay) {
         if let Some(p) = app.media.encoded.get(&key) {
@@ -70,6 +72,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Help => draw_help(f, area),
         Mode::Viewer => draw_viewer(f, app, area),
         Mode::Hint => draw_hints(f, app),
+        Mode::Quick => draw_quick(f, app, area),
         _ => {}
     }
 }
@@ -771,7 +774,9 @@ fn draw_timeline(
         return;
     };
     let focused = app.focus == Pane::Timeline;
-    // No title row: the tab says which channel, the header who's working.
+    // No title row: the tab says which channel. The row above the
+    // messages is the operator loop's status line, when there is one.
+    draw_status(f, app, Rect { height: 1, ..area }, &id, true);
     let area = Rect {
         y: area.y + 1,
         height: area.height.saturating_sub(1),
@@ -1110,6 +1115,403 @@ fn draw_agents(f: &mut Frame, app: &mut App, area: Rect) {
         }
         y += h + 1;
     }
+}
+
+// ---------- operator loop ----------
+
+fn ago(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86_400 => format!("{}h{:02}m", secs / 3600, secs % 3600 / 60),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+/// One channel's status line: mode, the watcher's state (and the ping it
+/// sent, as a link), item counts, crashes today. Nothing when the channel
+/// has no list, no watcher and no crashes.
+fn draw_status(f: &mut Frame, app: &mut App, row: Rect, channel: &str, hint: bool) {
+    let now = crate::sync::now();
+    let sum = app
+        .checklists
+        .summary(channel, crate::checklist::local_midnight(now));
+    if sum.is_empty() || row.height == 0 {
+        return;
+    }
+    let sep = || Span::styled("  ·  ", theme::faint());
+    let mut spans = vec![Span::raw(" ")];
+    match sum.mode {
+        Some(crate::checklist::Mode::Running) => {
+            spans.push(Span::styled(" RUNNING ", theme::badge()))
+        }
+        Some(m) => spans.push(Span::styled(format!("[ {} ]", m.label()), theme::muted())),
+        None => spans.push(Span::styled("no list", theme::faint())),
+    }
+    let mut link = None;
+    if let Some(w) = &sum.watch {
+        use crate::checklist::WatchState;
+        spans.push(sep());
+        let (glyph, style) = match w.state {
+            WatchState::Working => (SPIN[app.tick as usize % SPIN.len()], theme::bright()),
+            WatchState::Stalled => ("⚠", theme::bright()),
+            WatchState::WaitingOnLucian | WatchState::WaitingOnRelease => ("⚑", theme::bright()),
+            _ => ("○", theme::muted()),
+        };
+        let since = w
+            .since
+            .map(|t| format!(" {}", ago(now.saturating_sub(t))))
+            .unwrap_or_default();
+        spans.push(Span::styled(
+            format!("{glyph} {}{since}", w.state.label()),
+            style,
+        ));
+        if let Some(url) = &sum.ping_link {
+            spans.push(Span::raw("  "));
+            let x = row.x + Line::from(spans.clone()).width() as u16;
+            let label = "ping ↗";
+            link = Some((x, label.width() as u16, url.clone()));
+            spans.push(Span::styled(label, theme::key()));
+        }
+    }
+    let total = sum.open + sum.done + sum.parked;
+    if total > 0 {
+        spans.push(sep());
+        spans.push(Span::styled(format!("{} open", sum.open), theme::text()));
+        spans.push(Span::styled(
+            format!(" · {} done", sum.done),
+            theme::muted(),
+        ));
+        if sum.parked > 0 {
+            spans.push(Span::styled(
+                format!(" · {} parked", sum.parked),
+                theme::muted(),
+            ));
+        }
+    }
+    if sum.crashes_today > 0 {
+        spans.push(sep());
+        let n = sum.crashes_today;
+        spans.push(Span::styled(
+            format!("✖ {n} crash{} today", if n == 1 { "" } else { "es" }),
+            theme::bright(),
+        ));
+    }
+    if hint && total > 0 {
+        spans.push(Span::styled("    c checklist", theme::faint()));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), row);
+    if let Some((x, w, url)) = link {
+        if x + w <= row.right() {
+            app.links.push(crate::app::LinkHit {
+                rect: Rect { x, width: w, ..row },
+                url,
+                key: ("status".into(), 0),
+            });
+        }
+    }
+}
+
+/// The checklist pane (`c`): the channel's items in order, the picked
+/// one's details, evidence and parked question beside or under them.
+fn draw_checklist(f: &mut Frame, app: &mut App, area: Rect) {
+    use crate::checklist::Status;
+    let Some(channel) = app.current().map(str::to_string) else {
+        return;
+    };
+    let label = app
+        .store
+        .channels
+        .get(&channel)
+        .map(channel_label)
+        .unwrap_or_default();
+    let area = breadcrumb(f, app, area, &label, "checklist", None);
+    draw_status(f, app, Rect { height: 1, ..area }, &channel, false);
+    let area = Rect {
+        y: area.y + 2,
+        height: area.height.saturating_sub(2),
+        ..area
+    };
+    let header = app.checklists.header(&channel);
+    let items = app.checklists.items(&channel);
+    if items.is_empty() && header.is_none() {
+        draw_empty(
+            f,
+            app,
+            area,
+            "no checklist in this channel. agents start one with buzz checklist init",
+        );
+        return;
+    }
+    let mut top: Vec<Line> = vec![];
+    if let Some(h) = &header {
+        let mut l = vec![Span::styled(format!(" {}", h.title), theme::bright())];
+        let r = &h.resume;
+        let resume: Vec<&str> = [r.branch.as_str(), r.worktree.as_str(), r.worklog.as_str()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !resume.is_empty() {
+            l.push(Span::styled(
+                format!("   {}", resume.join(" · ")),
+                theme::faint(),
+            ));
+        }
+        top.push(Line::from(l));
+        top.push(Line::raw(""));
+    }
+    let top_h = top.len() as u16;
+    f.render_widget(
+        Paragraph::new(top),
+        Rect {
+            height: top_h,
+            ..area
+        },
+    );
+    let area = Rect {
+        y: area.y + top_h,
+        height: area.height.saturating_sub(top_h),
+        ..area
+    };
+    if items.is_empty() {
+        draw_empty(f, app, area, "no items yet");
+        return;
+    }
+    app.checklist_cursor = app.checklist_cursor.min(items.len() - 1);
+    let cur = app.checklist_cursor;
+    // Details beside the list when there's room, under it otherwise.
+    let wide = area.width >= 100;
+    let (list, detail) = if wide {
+        let [l, _, d] = Layout::horizontal([
+            Constraint::Percentage(48),
+            Constraint::Length(2),
+            Constraint::Min(0),
+        ])
+        .areas(area);
+        (l, d)
+    } else {
+        let rows = (items.len() as u16 + 1).min(area.height / 2).max(3);
+        let [l, d] = Layout::vertical([Constraint::Length(rows), Constraint::Min(0)]).areas(area);
+        (l, d)
+    };
+    let rows = list.height as usize;
+    let first = cur.saturating_sub(rows.saturating_sub(1));
+    let mut lines = vec![];
+    for (i, it) in items.iter().enumerate().skip(first).take(rows) {
+        let (mark, st) = match it.status {
+            Status::Open => ("○", theme::text()),
+            Status::Done => ("✓", theme::muted()),
+            Status::Parked => ("‖", theme::muted()),
+        };
+        let mut tail = String::new();
+        if it.release {
+            tail.push_str("  release");
+        }
+        if it.status == Status::Parked {
+            tail.push_str("  parked");
+        }
+        if it.missing_evidence() {
+            tail.push_str("  ⚠ no evidence");
+        }
+        let room = (list.width as usize).saturating_sub(tail.width() + 5);
+        let row_style = if i == cur { theme::tab_active() } else { st };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {mark} "), row_style),
+            Span::styled(clip(&it.text, room), row_style),
+            Span::styled(tail, if i == cur { row_style } else { theme::faint() }),
+        ]));
+        app.hits.push((
+            Rect {
+                y: list.y + (i - first) as u16,
+                height: 1,
+                ..list
+            },
+            Hit::ChecklistItem(i),
+        ));
+    }
+    f.render_widget(Paragraph::new(lines), list);
+    // The picked item.
+    let it = &items[cur];
+    let w = detail.width.saturating_sub(2) as usize;
+    let mut d: Vec<Line> = vec![];
+    if !wide {
+        d.push(Line::styled(
+            "─".repeat(detail.width as usize),
+            theme::rule(),
+        ));
+    }
+    for l in wrap_plain(&it.text, w) {
+        d.push(Line::styled(format!(" {l}"), theme::bright()));
+    }
+    let mut meta = vec![it.status.label().to_string()];
+    if it.release {
+        meta.push("release: needs lucian".into());
+    }
+    if let Some(s) = &it.standing {
+        meta.push(format!("standing ({s})"));
+    }
+    meta.push(format!("by {}", app.store.name_of(&it.creator)));
+    if it.signer != it.creator {
+        meta.push(format!("edited by {}", app.store.name_of(&it.signer)));
+    }
+    meta.push(format!(
+        "{} ago",
+        ago(crate::sync::now().saturating_sub(it.updated_at))
+    ));
+    d.push(Line::styled(
+        format!(" {}", meta.join(" · ")),
+        theme::muted(),
+    ));
+    if let Some(q) = &it.parked_question {
+        d.push(Line::raw(""));
+        for l in wrap_plain(&format!("? {q}"), w) {
+            d.push(Line::styled(format!(" {l}"), theme::bright()));
+        }
+    }
+    // Evidence: msg and url entries are links (click, or f).
+    let mut ev_links = vec![];
+    if !it.evidence.is_empty() {
+        d.push(Line::raw(""));
+        d.push(Line::styled(" evidence", theme::faint()));
+        for e in &it.evidence {
+            let link = crate::checklist::evidence_link(&channel, e);
+            let text = clip(e, w.saturating_sub(2));
+            if let Some(url) = link {
+                ev_links.push((d.len() as u16, text.width() as u16, url));
+            }
+            d.push(Line::from(vec![
+                Span::raw("   "),
+                Span::styled(text, theme::text()),
+            ]));
+        }
+    } else if it.missing_evidence() {
+        d.push(Line::styled(" ⚠ ticked without evidence", theme::bright()));
+    }
+    if !it.details.trim().is_empty() {
+        d.push(Line::raw(""));
+        for l in render_markdown_links(&it.details, w, &[], &|_| None).lines {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(l.spans);
+            d.push(Line::from(spans));
+        }
+    }
+    let h = detail.height;
+    for (row, width, url) in ev_links.into_iter().filter(|(r, _, _)| *r < h) {
+        app.links.push(crate::app::LinkHit {
+            rect: Rect {
+                x: detail.x + 3,
+                y: detail.y + row,
+                width: width.min(detail.width.saturating_sub(3)),
+                height: 1,
+            },
+            url,
+            key: (format!("ev:{}", it.id), row as usize),
+        });
+    }
+    f.render_widget(Paragraph::new(d), detail);
+}
+
+/// The Q box: a question for the agent in #quick, over everything.
+fn draw_quick(f: &mut Frame, app: &mut App, area: Rect) {
+    let w = 76.min(area.width.saturating_sub(2));
+    let cols = (w as usize).saturating_sub(4).max(4);
+    let d = &app.quick_draft;
+    let text_rows = d
+        .text
+        .split('\n')
+        .map(|l| wrap_cols(&crate::draft::expand_tabs(l), cols).len())
+        .sum::<usize>()
+        .clamp(1, 8) as u16;
+    let r = centered(area, w, text_rows + 6);
+    clear(f, r);
+    let l = &app.loop_;
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(theme::bright())
+        .title(Span::styled(
+            format!(" Q · ask {} in #{} ", l.quick_agent, l.quick_channel),
+            theme::bright(),
+        ));
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    let here = app
+        .current()
+        .and_then(|c| app.store.channels.get(c))
+        .map(channel_label)
+        .unwrap_or_default();
+    let mut lines = vec![if app.quick_include {
+        Line::from(vec![
+            Span::styled(" + ", theme::badge()),
+            Span::styled(
+                format!(
+                    " {here}: its id, link and latest {} messages",
+                    crate::quick::RECENT
+                ),
+                theme::bright(),
+            ),
+        ])
+    } else {
+        Line::styled(
+            format!(" a new thread in #{}.  ^q again: + {here}", l.quick_channel),
+            theme::faint(),
+        )
+    }];
+    lines.push(Line::raw(""));
+    let text_top = inner.y + lines.len() as u16;
+    if d.text.is_empty() {
+        lines.push(Line::styled(" type your question", theme::faint()));
+    } else {
+        for l in d.text.split('\n') {
+            for l in wrap_cols(&crate::draft::expand_tabs(l), cols) {
+                lines.push(Line::styled(format!(" {l}"), theme::text()));
+            }
+        }
+    }
+    let (cl, cc) = d.cursor_line_col();
+    let cl = d
+        .text
+        .split('\n')
+        .take(cl)
+        .map(|l| wrap_cols(&crate::draft::expand_tabs(l), cols).len())
+        .sum::<usize>()
+        + cc / cols;
+    let cc = cc % cols;
+    let skip = (cl + 1).saturating_sub(text_rows as usize);
+    let head: Vec<Line> = lines.drain(..2).collect();
+    let body: Vec<Line> = lines
+        .into_iter()
+        .skip(skip)
+        .take(text_rows as usize)
+        .collect();
+    let mut all = [head, body].concat();
+    while all.len() < 2 + text_rows as usize + 1 {
+        all.push(Line::raw(""));
+    }
+    // The footer has the long forms; here, what fits in the box.
+    let mut legend = vec![Span::raw(" ")];
+    let short = [
+        ("⏎", "send"),
+        (
+            "^q",
+            if app.quick_include {
+                "drop channel"
+            } else {
+                "+ channel"
+            },
+        ),
+        ("⇧⏎", "new line"),
+        ("esc", "close"),
+    ];
+    for (i, (k, what)) in short.into_iter().enumerate() {
+        legend.push(Span::styled(format!(" {k} "), theme::chip(theme::nth(i))));
+        legend.push(Span::styled(format!(" {what}  "), theme::muted()));
+    }
+    all.push(Line::from(legend));
+    f.render_widget(Paragraph::new(all), inner);
+    f.set_cursor_position((
+        (inner.x + 1 + cc as u16).min(inner.right().saturating_sub(1)),
+        (text_top + cl.saturating_sub(skip) as u16).min(inner.bottom().saturating_sub(1)),
+    ));
 }
 
 fn clip(s: &str, w: usize) -> String {
@@ -1689,7 +2091,16 @@ fn draw_confirm(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    let r = centered(area, 84, 29);
+    let right = [
+        Mode::Insert,
+        Mode::Sections,
+        Mode::Order,
+        Mode::Confirm,
+        Mode::Quick,
+    ];
+    let tall = (legend(Mode::Normal).len() + 2)
+        .max(right.iter().map(|m| legend(*m).len() + 2).sum::<usize>());
+    let r = centered(area, 84, tall as u16 + art::BANNER.len() as u16 + 3);
     clear(f, r);
     let block = Block::bordered()
         .border_style(theme::text())
@@ -1729,6 +2140,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
             (Mode::Sections, "sections (s)"),
             (Mode::Order, "tab order (T)"),
             (Mode::Confirm, "upload"),
+            (Mode::Quick, "Q box (Q ^q)"),
         ])),
         right,
     );
@@ -2092,6 +2504,7 @@ fn wrap_spans(spans: Vec<Tagged>, width: usize) -> Vec<Vec<Tagged>> {
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::KeyCode;
     /// `BUZZ_VIM_SHOT=dir cargo test shot_` writes cell dumps of screens
     /// that need data the relay won't give us (your agents' live frames);
     /// `tools/shot.py` turns them into PNGs.
@@ -2216,6 +2629,287 @@ mod tests {
             );
         }
         crate::theme::set_light(false);
+    }
+
+    /// A channel in the operator loop: header, items, the watcher waiting
+    /// on lucian with a ping, a crash notice, and a few messages.
+    fn loop_fixture() -> App {
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+        let ch = "2130646b-d6c8-4ec3-93e3-36f77bee1a37";
+        let (lucian, bot, watcher) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let bk = bot.public_key().to_hex();
+        let mut app = App::new(lucian.public_key().to_hex(), None);
+        app.checklists = crate::checklist::Checklists::new(crate::checklist::Trust {
+            owner: lucian.public_key().to_hex(),
+            watchers: vec![watcher.public_key().to_hex()],
+        });
+        for (k, name, agent) in [(&lucian, "lucian", false), (&bot, "taskbot", true)] {
+            app.store.profiles.insert(
+                k.public_key().to_hex(),
+                crate::model::Profile {
+                    name: name.into(),
+                    is_agent: agent,
+                    ..Default::default()
+                },
+            );
+        }
+        app.store.channel_mut(ch).name = "operator-loop".into();
+        app.store.channel_mut("c2").name = "beacon".into();
+        app.store.channel_mut(crate::quick::CHANNEL_ID).name = "quick".into();
+        app.tabs = vec![ch.into(), "c2".into()];
+        let now = crate::sync::now();
+        let rec = |k: &Keys, kind: u16, d: String, at: u64, v: serde_json::Value| {
+            EventBuilder::new(Kind::Custom(kind), v.to_string())
+                .tags(
+                    [
+                        vec!["d".to_string(), d],
+                        vec!["h".into(), ch.into()],
+                        vec!["t".into(), "buzz-checklist".into()],
+                        vec!["creator".into(), bk.clone()],
+                    ]
+                    .into_iter()
+                    .map(|t| Tag::parse(t).unwrap()),
+                )
+                .custom_created_at(Timestamp::from(at))
+                .sign_with_keys(k)
+                .unwrap()
+        };
+        app.checklists.apply(&rec(&bot, 30471, format!("buzz-checklist/header/{ch}"), now - 3000,
+            serde_json::json!({"v": 1, "title": "Operator loop: buzz-vim", "mode": "running", "go": "b756649f",
+                "resume": {"worktree": "buzz-vim-oploop", "branch": "agent/operator-loop", "worklog": "2026-10-18_OPERATOR_LOOP.md"}})));
+        let items = [
+            (
+                "a1",
+                "Reconcile the list with the conversation",
+                "done",
+                false,
+                Some("first"),
+                vec!["msg:7a1d46eb"],
+                "",
+                "",
+            ),
+            (
+                "a2",
+                "Checklist pane per channel",
+                "done",
+                false,
+                None,
+                vec!["commit:873d8c3", "url:https://buzz.gitcoin.co/pr/12"],
+                "Items in order with status, release flag and evidence; **details** on select.",
+                "",
+            ),
+            (
+                "a3",
+                "Status line per channel",
+                "open",
+                false,
+                None,
+                vec![],
+                "Mode, watcher state with the ping link, open/done counts, crashes today.",
+                "",
+            ),
+            ("a4", "Q pop-up", "open", false, None, vec![], "", ""),
+            (
+                "a5",
+                "Migrate the prod relay to the patched image",
+                "parked",
+                true,
+                None,
+                vec![],
+                "Needs the relay patch from R0.",
+                "Restart prod relay tonight or wait for the nightly?",
+            ),
+            (
+                "a6",
+                "Wrap-up: voiceover demo video + plain report",
+                "open",
+                false,
+                Some("last"),
+                vec![],
+                "",
+                "",
+            ),
+        ];
+        for (i, (id, text, status, release, standing, ev, details, q)) in
+            items.into_iter().enumerate()
+        {
+            app.checklists.apply(&rec(&bot, 30470, format!("buzz-checklist/item/{ch}/{id}"), now - 2000 + i as u64,
+                serde_json::json!({"v": 1, "text": text, "details": details, "status": status, "release": release,
+                    "order": i, "standing": standing, "evidence": ev, "parked_question": q})));
+        }
+        app.checklists.apply(&rec(
+            &watcher,
+            30472,
+            format!("buzz-checklist/watch/{ch}"),
+            now - 60,
+            serde_json::json!({"v": 1, "state": "waiting_on_lucian", "since": now - 25 * 60,
+                "thread": "5dbdf585", "ping": "c0ffee01", "nudges": 1}),
+        ));
+        let mut post = |who: &Keys, text: &str, at: u64| {
+            let ev = EventBuilder::new(Kind::Custom(9), text)
+                .tags([Tag::parse(["h", ch]).unwrap()])
+                .custom_created_at(Timestamp::from(at))
+                .sign_with_keys(who)
+                .unwrap();
+            app.store.apply(&ev);
+            app.checklists
+                .note_message(ch, &ev.id.to_hex(), at, &ev.content);
+        };
+        post(&lucian, "go: build the operator loop", now - 3000);
+        post(
+            &bot,
+            "⚠ agent process crashed (exit 137); respawned",
+            now - 1200,
+        );
+        post(
+            &bot,
+            "Parked the relay item: restart prod tonight or wait for the nightly? @lucian",
+            now - 25 * 60,
+        );
+        app.store.channel_mut(ch).loaded = true;
+        app
+    }
+
+    fn screen_text(app: &mut App, w: u16, h: u16) -> String {
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        t.draw(|f| draw(f, app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
+            .collect()
+    }
+
+    #[test]
+    fn status_line_and_checklist_pane_show_the_loop() {
+        let mut app = loop_fixture();
+        let s = screen_text(&mut app, 120, 34);
+        assert!(s.contains("RUNNING"), "{s}");
+        assert!(s.contains("waiting on lucian 25m"), "{s}");
+        assert!(
+            s.contains("ping ↗") && s.contains("3 open · 2 done · 1 parked"),
+            "{s}"
+        );
+        assert!(
+            s.contains("1 crash today") && s.contains("c checklist"),
+            "{s}"
+        );
+        // The ping is a link: f and a click find it.
+        let ping = app.links.iter().find(|l| l.key.0 == "status").unwrap();
+        assert!(
+            ping.url.ends_with("id=c0ffee01&thread=5dbdf585"),
+            "{}",
+            ping.url
+        );
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('c').into()));
+        let s = screen_text(&mut app, 120, 34);
+        assert!(
+            s.contains("›  checklist") && s.contains("Operator loop: buzz-vim"),
+            "{s}"
+        );
+        // Standing first item on top, wrap-up last, release flag shown.
+        let first = s.find("Reconcile the list").unwrap();
+        let last = s.find("Wrap-up: voiceover").unwrap();
+        assert!(first < last && s.contains("release  parked"), "{s}");
+        // Details of the picked item, its evidence linked.
+        for _ in 0..4 {
+            app.on_term(crossterm::event::Event::Key(KeyCode::Char('j').into()));
+        }
+        let s = screen_text(&mut app, 120, 34);
+        assert!(s.contains("? Restart prod relay tonight"), "{s}");
+        assert!(
+            s.contains("release: needs lucian") && s.contains("by taskbot"),
+            "{s}"
+        );
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('k').into()));
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('k').into()));
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('k').into()));
+        let s = screen_text(&mut app, 120, 34);
+        assert!(
+            s.contains("commit:873d8c3") && s.contains("details on select"),
+            "{s}"
+        );
+        assert!(
+            app.links
+                .iter()
+                .any(|l| l.url == "https://buzz.gitcoin.co/pr/12")
+        );
+        // Narrow: details under the list.
+        let s = screen_text(&mut app, 80, 34);
+        assert!(s.contains("commit:873d8c3"), "{s}");
+        // No records: no status line, and the pane says how to start one.
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('L').into()));
+        let s = screen_text(&mut app, 120, 34);
+        assert!(s.contains("no checklist in this channel"), "{s}");
+    }
+
+    #[test]
+    fn the_q_box_shows_what_it_sends() {
+        let mut app = loop_fixture();
+        app.channels_loaded = true;
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('Q').into()));
+        for c in "why is the relay item parked?".chars() {
+            app.on_term(crossterm::event::Event::Key(KeyCode::Char(c).into()));
+        }
+        let s = screen_text(&mut app, 120, 34);
+        assert!(s.contains("Q · ask taskbot in #quick"), "{s}");
+        assert!(s.contains("^q again: + #operator-loop"), "{s}");
+        app.on_term(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('q'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+        ));
+        let s = screen_text(&mut app, 120, 34);
+        assert!(
+            s.contains("#operator-loop: its id, link and latest 30 messages"),
+            "{s}"
+        );
+        app.mode = Mode::Help;
+        let s = screen_text(&mut app, 120, 40);
+        assert!(
+            s.contains("Q box (Q ^q)") && s.contains("checklist: items"),
+            "{s}"
+        );
+    }
+
+    /// The operator loop pane, status line and Q box, for README shots.
+    #[test]
+    fn shot_operator_loop() {
+        let Ok(dir) = std::env::var("BUZZ_VIM_SHOT") else {
+            return;
+        };
+        let mut app = loop_fixture();
+        app.channels_loaded = true;
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 34)).unwrap();
+        let mut shot = |app: &mut App, name: &str| {
+            t.draw(|f| draw(f, app)).unwrap();
+            dump(t.backend().buffer(), &format!("{dir}/{name}.cells"));
+        };
+        shot(&mut app, "loop-status");
+        let key = |app: &mut App, k: crossterm::event::KeyEvent| {
+            app.on_term(crossterm::event::Event::Key(k))
+        };
+        key(&mut app, KeyCode::Char('c').into());
+        key(&mut app, KeyCode::Char('j').into());
+        shot(&mut app, "loop-checklist");
+        for _ in 0..3 {
+            key(&mut app, KeyCode::Char('j').into());
+        }
+        shot(&mut app, "loop-checklist-parked");
+        key(&mut app, KeyCode::Esc.into());
+        key(&mut app, KeyCode::Char('Q').into());
+        for c in "why is the relay item parked?".chars() {
+            key(&mut app, KeyCode::Char(c).into());
+        }
+        shot(&mut app, "loop-q");
+        key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('q'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+        );
+        shot(&mut app, "loop-q-channel");
     }
 
     /// A busy channel, dark and light.

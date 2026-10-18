@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::{Action, App};
+use crate::checklist::{self, Checklists};
 use crate::live::Cmd;
 use crate::model::{self, Applied};
 use crate::readstate::{self, ReadState};
@@ -75,6 +76,18 @@ pub enum Msg {
     Encoded {
         key: (String, u16, u16),
         result: anyhow::Result<ratatui_image::protocol::Protocol>,
+    },
+    /// A channel's checklist records, and its messages since midnight
+    /// (to count crash notices).
+    Checklist {
+        channel: String,
+        records: anyhow::Result<Vec<Event>>,
+        today: anyhow::Result<Vec<Event>>,
+    },
+    /// A Q went out, or didn't: what was typed, to put back.
+    QuickSent {
+        result: anyhow::Result<()>,
+        text: String,
     },
     /// A dropped file (`label` is its path) or the clipboard, read.
     Attachment {
@@ -357,7 +370,37 @@ impl Sync {
         });
     }
 
+    /// The channel's checklist records and today's crash notices, and a
+    /// live tail of its records while it's the one on screen. Every switch
+    /// asks again, since only the current channel is tailed.
+    pub fn load_checklist(&mut self, id: &str) {
+        let _ = self.live.send(Cmd::Sub {
+            id: "checklist".into(),
+            filters: vec![
+                json!({"kinds": checklist::KINDS, "#h": [id], "since": now(), "limit": 0}),
+            ],
+        });
+        let r = self.relay.clone();
+        let channel = id.to_string();
+        let today = checklist::local_midnight(now());
+        self.spawn(async move {
+            let records = r.query(&Checklists::filters(&channel)).await;
+            let today = r
+                .query(&[
+                    json!({"kinds": model::UNREAD_KINDS, "#h": [channel], "since": today,
+                    "limit": 500}),
+                ])
+                .await;
+            Msg::Checklist {
+                channel,
+                records,
+                today,
+            }
+        });
+    }
+
     pub fn open_channel(&mut self, id: &str) {
+        self.load_checklist(id);
         self.subscribe_channel(id);
         if self.opened.insert(id.to_string()) {
             self.window(id, None);
@@ -561,6 +604,13 @@ impl Sync {
                 });
             }
             Action::EncodeImage(key) => self.encode(app, key),
+            Action::WantProfiles(pks) => self.want_profiles(pks),
+            Action::SendQuick {
+                channel,
+                content,
+                agent,
+                text,
+            } => self.send_quick(app, channel, content, agent, text),
             Action::SaveState | Action::Quit => {}
         }
     }
@@ -672,6 +722,42 @@ impl Sync {
             }
             let result = r.publish(&ev).await.map(|_| ());
             Msg::Sent { id, result }
+        });
+    }
+
+    /// A Q: a new top-level message in #quick that @mentions the agent.
+    fn send_quick(
+        &mut self,
+        app: &mut App,
+        channel: String,
+        content: String,
+        agent: String,
+        text: String,
+    ) {
+        let Ok(uuid) = uuid::Uuid::parse_str(&channel) else {
+            app.quick_draft.insert(&text);
+            return app.say("bad #quick channel id");
+        };
+        let ev =
+            match buzz_sdk::build_message(uuid, &content, None, &[agent.as_str()], false, &[], &[])
+                .map(|b| b.tags(Tag::parse(["mention", agent.as_str()]).ok()))
+                .map_err(anyhow::Error::from)
+                .and_then(|b| self.relay.sign(b))
+            {
+                Ok(ev) => ev,
+                Err(e) => {
+                    app.quick_draft.insert(&text);
+                    return app.say(format!("couldn't build the Q: {e}"));
+                }
+            };
+        app.store.apply(&ev);
+        app.say("asking in #quick…");
+        let r = self.relay.clone();
+        self.spawn(async move {
+            Msg::QuickSent {
+                result: r.publish(&ev).await,
+                text,
+            }
         });
     }
 
@@ -1000,11 +1086,17 @@ pub fn fold(app: &mut App, sync: &mut Sync, ev: &Event, live_channel: bool) -> V
             sync.load_channels();
             return vec![];
         }
+        k if checklist::KINDS.contains(&k) => {
+            app.checklists.apply(ev);
+            return vec![ev.pubkey.to_hex()];
+        }
         _ => {}
     }
     let applied = app.store.apply(ev);
     let mut want = vec![ev.pubkey.to_hex()];
     if let Applied::Message { channel, id } = applied {
+        app.checklists
+            .note_message(&channel, &id, ev.created_at.as_secs(), &ev.content);
         let active = app.current() == Some(channel.as_str());
         let at = ev.created_at.as_secs();
         let author = ev.pubkey.to_hex();

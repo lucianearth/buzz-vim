@@ -31,6 +31,16 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
 - `⏎` or `l` open a thread, `r` reply in it, `+` 👍 the selected message; `h`, `←` or `Esc` goes back
 - `a` the agents screen: who is working, where, and their last tool calls. A tab spins while an agent
   works in that channel, and a thread shows `taskbot thinking` while an agent answers in it
+- `c` the channel's checklist (the operator loop's records, kinds 30470-30472, read-only here: agents write
+  them with `buzz checklist`). Items in order with open / done / parked, the release flag and evidence, and
+  the picked item's details, evidence links and parked question beside them. Above a channel's messages a
+  status line shows its mode (ideating / running), the watcher's state (working, stalled, waiting on lucian,
+  waiting on release, with a link to its ping), open / done / parked counts and agent crashes today
+- `Q` (or `^q`, which also works while writing) asks a quick question: a box that posts a new top-level message
+  in #quick, starting with `[Q]` and @mentioning taskbot. Press `^q` again in the box to add the channel you're
+  in (its name, id, link and latest 30 messages' ids) so taskbot can read it; again takes it off. `Esc` keeps
+  the text for next time. The answer comes in that message's thread in #quick. If there is no #quick channel
+  it says so; buzz-vim never makes one
 - `s` pick which sections become tabs (`m` there moves the current channel into the section under the cursor, the same
   move Desktop makes), `R` reload them from the relay
 - `^v` paste an image or file from the clipboard; dropping a file does the same. Either way a box shows what it
@@ -40,6 +50,16 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
   leave it). Links marked 🐝 (pr, issue, repo) open in Buzz Desktop, and web links in your browser.
   `⌫` or `^o` goes back to where you were, as many steps as you followed.
 - `o` open the selected image full screen (`←` `→` page through the images, `Esc` closes), `q` quit
+
+## Operator loop settings
+
+In `buzz-vim/config.json` (or the env var):
+
+- `owner` (`BUZZ_VIM_OWNER`): who may edit any checklist record besides its creator. Default lucian.
+- `watcher` (`BUZZ_VIM_WATCHER`, comma separated): the watcher's pubkeys; its state counts only from these.
+  Unset, the newest watch record counts whoever signed it.
+- `quick_channel` (`BUZZ_VIM_QUICK_CHANNEL`), default `quick`, and `quick_agent` (`BUZZ_VIM_QUICK_AGENT`),
+  default `taskbot`: where Q posts and who it @mentions.
 
 ## Development
 

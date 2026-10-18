@@ -16,7 +16,7 @@ mod theme;
 mod ui;
 
 use buzz_vim_core::{
-    draft, links, live, log, model, readstate, relay, sections, telemetry, unread,
+    checklist, draft, links, live, log, model, quick, readstate, relay, sections, telemetry, unread,
 };
 
 use std::sync::Arc;
@@ -135,6 +135,11 @@ async fn run(
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
     let mut app = App::new(cfg.keys.public_key().to_hex(), picker);
     app.relay_host = relay.base.clone();
+    app.checklists = checklist::Checklists::new(checklist::Trust {
+        owner: cfg.loop_.owner.clone(),
+        watchers: cfg.loop_.watchers.clone(),
+    });
+    app.loop_ = cfg.loop_.clone();
     let saved = state::load(&relay.base, &app.store.me);
     app.chosen = saved.chosen.clone();
     app.read_width = saved.read_width;
@@ -193,13 +198,18 @@ async fn run(
                             sync.heartbeat();
                             if was_online {
                                 sync.refetch_open();
+                                if let Some(c) = app.current().map(str::to_string) {
+                                    sync.load_checklist(&c);
+                                }
                             }
                             was_online = true;
                         }
                     }
                     Live::Closed { sub, reason } => {
                         log::line(format!("closed {sub}: {reason}"));
-                        if !reason.is_empty() {
+                        // A relay without the checklist kinds refuses that
+                        // tail; the rest works without it, so no need to say.
+                        if !reason.is_empty() && sub != "checklist" {
                             app.say(format!("relay closed {sub}: {reason}"));
                         }
                     }
@@ -284,6 +294,50 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
                 sync::fold_unread(app, &channel, &evs);
             }
             Err(e) => log::line(format!("unread {channel}: {e}")),
+        },
+        Msg::Checklist {
+            channel,
+            records,
+            today,
+        } => {
+            let mut want = vec![];
+            match records {
+                Ok(evs) => {
+                    for ev in &evs {
+                        if app.checklists.apply(ev) {
+                            want.push(ev.pubkey.to_hex());
+                        }
+                    }
+                }
+                // Before the relay knows the kinds this is expected.
+                Err(e) => log::line(format!("checklist {channel}: {e}")),
+            }
+            match today {
+                Ok(evs) => {
+                    for ev in &evs {
+                        let id = ev.id.to_hex();
+                        let at = ev.created_at.as_secs();
+                        app.checklists.note_message(&channel, &id, at, &ev.content);
+                    }
+                }
+                Err(e) => log::line(format!("crashes {channel}: {e}")),
+            }
+            sync.want_profiles(want);
+        }
+        Msg::QuickSent { result, text } => match result {
+            Ok(()) => {
+                let agent = app.loop_.quick_agent.clone();
+                app.say(format!(
+                    "asked {agent} in #{}; the answer lands in that thread",
+                    app.loop_.quick_channel
+                ));
+            }
+            Err(e) => {
+                if app.quick_draft.is_empty() {
+                    app.quick_draft.insert(&text);
+                }
+                app.say(format!("Q not sent: {e}. Q opens it again."));
+            }
         },
         Msg::Archived(r) => match r {
             Ok(pks) => app.archived = pks.into_iter().collect(),
