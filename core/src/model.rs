@@ -256,6 +256,34 @@ impl Store {
         }
     }
 
+    /// "#name", or "@who" for a DM (the members besides us).
+    pub fn label(&self, id: &str) -> String {
+        let Some(c) = self.channels.get(id) else {
+            return format!("#{}", id.chars().take(8).collect::<String>());
+        };
+        if c.is_dm {
+            let others: Vec<String> = c
+                .members
+                .iter()
+                .filter(|m| **m != self.me)
+                .map(|m| self.name_of(m))
+                .collect();
+            if !others.is_empty() {
+                return format!("@{}", others.join(", "));
+            }
+        }
+        let n = if c.name.is_empty() {
+            c.id.chars().take(8).collect()
+        } else {
+            c.name.clone()
+        };
+        if c.is_dm {
+            format!("@{n}")
+        } else {
+            format!("#{n}")
+        }
+    }
+
     pub fn channel_mut(&mut self, id: &str) -> &mut Channel {
         self.channels
             .entry(id.to_string())
