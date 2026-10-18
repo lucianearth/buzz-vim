@@ -82,6 +82,8 @@ pub enum Action {
         root: Option<String>,
         agent: String,
     },
+    /// Archive a channel for everyone (kind 9002, `archived` true).
+    Archive(String),
     Upload,
     LoadOlder(String),
     ReloadSections,
@@ -171,6 +173,8 @@ pub struct App {
     /// Agent (pubkey, name) waiting on the y/n before its reset, and the
     /// (channel, thread root) it was asked about.
     pub reset_ask: Option<(String, String, String, Option<String>)>,
+    /// The channel `a` in the tab menu asked about archiving.
+    pub archive_ask: Option<String>,
     pub agents: Agents,
     pub media: Media,
     pub picker: Option<Picker>,
@@ -266,6 +270,7 @@ impl App {
             agents_view: false,
             agents_cursor: 0,
             reset_ask: None,
+            archive_ask: None,
             agents: Agents::default(),
             media: Media::default(),
             picker,
@@ -1219,6 +1224,15 @@ impl App {
                 }
                 _ => {}
             },
+            Mode::Archive => match k.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.archive(),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                    self.archive_ask = None;
+                    self.mode = Mode::Order;
+                    self.say("not archived");
+                }
+                _ => {}
+            },
             Mode::Help => {
                 if matches!(
                     k.code,
@@ -1572,8 +1586,40 @@ impl App {
                 self.mode = Mode::Normal;
                 self.switch_tab(self.order_cursor);
             }
+            KeyCode::Char('a') => {
+                if let Some(c) = self.tabs.get(self.order_cursor).cloned() {
+                    self.archive_ask = Some(c);
+                    self.mode = Mode::Archive;
+                }
+            }
             _ => {}
         }
+    }
+
+    /// `y` on the archive ask: the tab goes now, the relay hears after.
+    /// Back in the tab menu, on the tab that took its place.
+    fn archive(&mut self) {
+        self.mode = Mode::Order;
+        let Some(channel) = self.archive_ask.take() else {
+            return;
+        };
+        self.store.channel_mut(&channel).archived = true;
+        if self.extra.as_ref() == Some(&channel) {
+            self.extra = None;
+        }
+        if self.thread.as_ref().is_some_and(|t| t.0 == channel) {
+            self.thread = None;
+            self.focus = Pane::Timeline;
+        }
+        self.rebuild_tabs();
+        self.order_cursor = self.order_cursor.min(self.tabs.len().saturating_sub(1));
+        self.actions.push(Action::Archive(channel));
+    }
+
+    /// The relay said no: the tab comes back.
+    pub fn unarchive(&mut self, channel: &str) {
+        self.store.channel_mut(channel).archived = false;
+        self.rebuild_tabs();
     }
 
     /// The section a tab comes from: the first of today's that holds it.
@@ -2304,5 +2350,38 @@ mod tests {
         app.on_key(KeyEvent::from(KeyCode::Enter));
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(app.current(), Some("c"));
+    }
+
+    #[test]
+    fn a_in_the_tab_menu_archives_after_a_yes() {
+        let mut app = App::new("me".into(), None);
+        for id in ["a", "b", "c"] {
+            let c = app.store.channel_mut(id);
+            c.name = id.into();
+            c.is_member = true;
+        }
+        app.rebuild_tabs();
+        let key = |app: &mut App, c: char| app.on_key(KeyEvent::from(KeyCode::Char(c)));
+        key(&mut app, 'T');
+        key(&mut app, 'j');
+        // n keeps it.
+        key(&mut app, 'a');
+        assert_eq!(app.mode, Mode::Archive);
+        key(&mut app, 'n');
+        assert_eq!(app.mode, Mode::Order);
+        assert_eq!(app.tabs, vec!["a", "b", "c"]);
+        // y: gone now, the relay told, still in the menu.
+        key(&mut app, 'a');
+        key(&mut app, 'y');
+        assert_eq!(app.mode, Mode::Order);
+        assert_eq!(app.tabs, vec!["a", "c"]);
+        assert!(
+            app.actions
+                .iter()
+                .any(|a| matches!(a, Action::Archive(c) if c == "b"))
+        );
+        // The relay refusing brings it back.
+        app.unarchive("b");
+        assert_eq!(app.tabs, vec!["a", "b", "c"]);
     }
 }

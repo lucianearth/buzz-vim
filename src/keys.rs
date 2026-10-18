@@ -15,6 +15,8 @@ pub enum Mode {
     Reset,
     /// The Q box: a quick question to #quick.
     Quick,
+    /// Asking before archiving the tab picked in the tab menu.
+    Archive,
 }
 
 impl Mode {
@@ -30,6 +32,7 @@ impl Mode {
             Mode::Hint => "LINK",
             Mode::Reset => "RESET?",
             Mode::Quick => "Q",
+            Mode::Archive => "ARCHIVE?",
         }
     }
 }
@@ -100,6 +103,7 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("j k", "pick a tab", true),
             ("J K", "move it down / up", true),
             ("⏎", "go to it", true),
+            ("a", "archive it", true),
             ("esc", "done", true),
         ],
         Mode::Confirm => &[("y", "upload to Buzz", true), ("n esc", "cancel", true)],
@@ -114,6 +118,7 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("⇧⏎ ^j", "new line", true),
             ("esc", "close (keeps the text)", true),
         ],
+        Mode::Archive => &[("y ⏎", "archive", true), ("n esc", "cancel", true)],
         Mode::Viewer => &[
             ("← →", "prev / next image", true),
             ("esc q o", "close", true),

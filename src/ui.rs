@@ -58,7 +58,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // graphics sit on top of text, and a popup can't cover them otherwise.
     let overlay = matches!(
         app.mode,
-        Mode::Sections | Mode::Order | Mode::Confirm | Mode::Help | Mode::Viewer | Mode::Quick
+        Mode::Sections
+            | Mode::Order
+            | Mode::Archive
+            | Mode::Confirm
+            | Mode::Help
+            | Mode::Viewer
+            | Mode::Quick
     ) || (app.mode == Mode::Insert && !app.mention_candidates().is_empty());
     for (rect, key) in images.into_iter().filter(|_| !overlay) {
         if let Some(p) = app.media.encoded.get(&key) {
@@ -67,7 +73,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     match app.mode {
         Mode::Sections => draw_sections(f, app, area),
-        Mode::Order => draw_order(f, app, area),
+        Mode::Order | Mode::Archive => draw_order(f, app, area),
         Mode::Confirm => draw_confirm(f, app, area),
         Mode::Help => draw_help(f, area),
         Mode::Viewer => draw_viewer(f, app, area),
@@ -1746,6 +1752,16 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             format!("reset {name}'s session here? "),
             theme::bright(),
         ));
+    } else if let (Mode::Archive, Some(c)) = (app.mode, &app.archive_ask) {
+        let name = app
+            .store
+            .channels
+            .get(c)
+            .map_or_else(String::new, channel_label);
+        spans.push(Span::styled(
+            format!("archive {name} for everyone? "),
+            theme::bright(),
+        ));
     } else if app.uploading {
         spans.push(Span::styled(
             format!("uploading {}", art::flight(app.tick, 8)),
@@ -1807,7 +1823,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 <= area.width as usize
         });
     let usage_w = usage.as_ref().map_or(0, |u| u.width() as u16);
-    if (!app.uploading && status.is_none()) || app.mode == Mode::Reset {
+    if (!app.uploading && status.is_none()) || matches!(app.mode, Mode::Reset | Mode::Archive) {
         let mut room = (area.width as usize).saturating_sub(
             Line::from(spans.clone()).width()
                 + chain.as_ref().map_or(0, |c| c.width() + 1)

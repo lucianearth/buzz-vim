@@ -395,9 +395,10 @@ struct Hold: UIGestureRecognizerRepresentable {
 
 /// Every section's tabs in tall rows, a page per section. Swipe sideways
 /// to look at another section; that alone changes nothing. Tap a tab to go
-/// there (its section becomes the tab row), drag a handle to reorder. On a
-/// section the tab you're on isn't in, the top row moves it there. It
-/// flips down from the tab row and stays until a tab or Close.
+/// there (its section becomes the tab row), drag a handle to reorder, hold
+/// one to archive it. On a section the tab you're on isn't in, the top row
+/// moves it there. It flips down from the tab row and stays until a tab or
+/// Close.
 struct TabSwitcher: View {
     let client: Client
     let selected: String?
@@ -484,6 +485,8 @@ private struct SectionPage: View {
     let pick: (ChannelTab) -> Void
     @Environment(Model.self) private var model
     @Environment(\.theme) private var theme
+    /// The tab a hold asked to archive, until the confirm answers.
+    @State private var archiving: ChannelTab?
 
     var body: some View {
         let _ = model.version
@@ -507,6 +510,14 @@ private struct SectionPage: View {
                         .buttonStyle(.plain)
                         .id(t.id)
                         .modifier(SwitcherRow())
+                        // Hold a row: archive it, after a confirm. (Rows
+                        // are in drag mode and sideways swipes page the
+                        // sections, so it isn't a swipe.)
+                        .contextMenu {
+                            Button(role: .destructive) { archiving = t } label: {
+                                Label("Archive", systemImage: "archivebox")
+                            }
+                        }
                 }
                 .onMove { from, to in
                     var ids = items.map(\.id)
@@ -525,6 +536,16 @@ private struct SectionPage: View {
             // Edit mode for the drag handles; there's no delete.
             .environment(\.editMode, .constant(.active))
             .onAppear { proxy.scrollTo(selected, anchor: .center) }
+            .confirmationDialog(
+                "Archive \(archiving?.label ?? "") for everyone?",
+                isPresented: Binding(get: { archiving != nil }, set: { if !$0 { archiving = nil } }),
+                titleVisibility: .visible
+            ) {
+                Button("Archive", role: .destructive) {
+                    if let t = archiving { model.archive(t.id) }
+                    archiving = nil
+                }
+            }
         }
     }
 
