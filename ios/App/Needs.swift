@@ -7,7 +7,7 @@ enum Needs {
     static let id = "needs-you"
 }
 
-/// Tab 0's page: what needs an answer, then FYI, oldest first. Tap a row
+/// Tab 0's page: what needs an answer (oldest first), then FYI (newest first). Tap a row
 /// to open its message; Reply answers it in its thread from here.
 struct NeedsView: View {
     let client: Client
@@ -26,6 +26,13 @@ struct NeedsView: View {
         let fyi = rows.filter { $0.section == .fyi }
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
+                if let failure = Push.shared.failure {
+                    Text("push off: \(failure)")
+                        .font(.small)
+                        .foregroundStyle(theme.muted)
+                        .textSelection(.enabled)
+                        .padding(.top, 12)
+                }
                 if rows.isEmpty {
                     Text("nothing needs you")
                         .font(.small)

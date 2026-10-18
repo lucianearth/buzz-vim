@@ -137,7 +137,8 @@ pub fn filters(
     f
 }
 
-/// Every row, Needs an answer first, then FYI; oldest first in each.
+/// Every row, Needs an answer first (oldest first), then FYI (newest
+/// first, the latest `FYI_MAX` only).
 /// The operator is the checklist owner (config `owner`, default lucian).
 pub fn rows(
     store: &Store,
@@ -300,9 +301,19 @@ pub fn rows(
             });
         }
     }
-    out.sort_by(|a, b| (a.section, a.at, &a.key).cmp(&(b.section, b.at, &b.key)));
+    out.sort_by(|a, b| {
+        a.section.cmp(&b.section).then_with(|| match a.section {
+            Section::Answer => (a.at, &a.key).cmp(&(b.at, &b.key)),
+            Section::Fyi => (b.at, &b.key).cmp(&(a.at, &a.key)),
+        })
+    });
+    let answers = answer_count(&out);
+    out.truncate(answers + FYI_MAX);
     out
 }
+
+/// FYI rows kept: the newest ones.
+pub const FYI_MAX: usize = 20;
 
 /// How many rows need an answer: the "⚑ N".
 pub fn answer_count(rows: &[Row]) -> usize {
@@ -526,6 +537,26 @@ mod tests {
         let stranger = Keys::generate();
         w.post(&stranger, CH, "@lucian hi", Some(&op), None, NOW - 20);
         assert_eq!(answer_count(&w.rows()), 3);
+    }
+
+    #[test]
+    fn fyi_is_newest_first_and_capped() {
+        let mut w = World::new();
+        let (op, bot) = (w.op.clone(), w.bot.clone());
+        for i in 0..(FYI_MAX as u64 + 5) {
+            w.post(
+                &bot,
+                CH,
+                &format!("@lucian fyi {i}"),
+                Some(&op),
+                None,
+                NOW - 1000 + i,
+            );
+        }
+        let r = w.rows();
+        assert_eq!(r.len(), FYI_MAX);
+        assert_eq!(r[0].text, format!("@lucian fyi {}", FYI_MAX + 4));
+        assert!(r.windows(2).all(|p| p[0].at >= p[1].at));
     }
 
     #[test]

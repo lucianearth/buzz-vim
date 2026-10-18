@@ -24,6 +24,10 @@ final class Push {
     private var checked = Date.distantPast
     /// Bumped on logout, so a lease already on its way isn't published after.
     private var session = 0
+    /// The step a refresh is on, and the last failure with its step; tab 0
+    /// shows the failure until a refresh gets through.
+    private var step = ""
+    private(set) var failure: String?
 
     /// A lease the relay took is in force: tab 0 posts no local
     /// notifications then, the push covers them.
@@ -51,16 +55,19 @@ final class Push {
         let renew = state.grant == nil || state.endpoint != endpoint || state.grantExpires < now + 7 * 86_400
         guard renew || state.leased != subs || !live else { return }
         busy = true
+        failure = nil
         let session = self.session
         Task { @MainActor in
             defer { busy = false }
             do {
+                step = "relay"
                 let r = try await pushRelay(relayUrl: relay)
                 if renew || state.relayPubkey != r.pubkey {
                     try await delegate(to: r, endpoint: endpoint)
                 }
                 guard let grant = state.grant, session == self.session else { return }
                 let generation = max(state.leaseGeneration + 1, UInt64(Self.now()))
+                step = "lease"
                 try await client.pushLease(relay: r, installation: state.lease, generation: generation,
                                            grant: grant, grantExpires: UInt64(state.grantExpires),
                                            subscriptions: subs)
@@ -69,10 +76,12 @@ final class Push {
                 state.leased = subs
                 state.leaseExpires = min(state.grantExpires, Self.now() + Int64(r.maxTtl))
                 state.save()
+                failure = nil
             } catch {
                 // Not again for ten minutes (a relay without push, no network).
                 checked = Date().addingTimeInterval(600)
-                NSLog("push: \(error)")
+                failure = [failure, "\(step): \(error)"].compactMap { $0 }.joined(separator: "; then ")
+                NSLog("push: \(failure ?? "")")
             }
         }
     }
@@ -124,12 +133,16 @@ final class Push {
         let d = PushDelegation(installation: installation, generation: state.generation,
                                relayPubkey: r.pubkey, notBefore: now, expiresAt: now + Self.lifetime)
         do {
+            step = "delegate challenge"
             let c = try await pushChallenge(gateway: Self.gateway)
+            step = "delegate assertion"
             let assertion = try await DCAppAttestService.shared.generateAssertion(
                 keyId, clientDataHash: pushDelegateHash(challenge: c, delegation: d))
+            step = "delegate"
             state.grant = try await pushDelegate(gateway: Self.gateway, challenge: c, delegation: d,
                                                  assertion: assertion)
         } catch let e where again && Self.lost(e) {
+            failure = "\(step): \(e), enrolling again"
             state.installation = nil
             try await delegate(to: r, endpoint: endpoint, again: false)
             return
@@ -152,11 +165,15 @@ final class Push {
     @MainActor
     private func enroll(_ endpoint: String) async throws {
         let service = DCAppAttestService.shared
+        step = "enroll key"
         let keyId = try await service.generateKey()
         let expires = Self.now() + Self.lifetime
+        step = "enroll challenge"
         let c = try await pushChallenge(gateway: Self.gateway)
+        step = "enroll attest"
         let attestation = try await service.attestKey(
             keyId, clientDataHash: pushEnrollHash(challenge: c, keyId: keyId, endpoint: endpoint, expiresAt: expires))
+        step = "enroll"
         let installation = try await pushEnroll(gateway: Self.gateway, challenge: c, keyId: keyId,
                                                 attestation: attestation, endpoint: endpoint, expiresAt: expires)
         state.keyId = keyId
