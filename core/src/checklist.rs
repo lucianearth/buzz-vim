@@ -445,6 +445,11 @@ impl Checklists {
         }
     }
 
+    /// Channels we hold any records for.
+    pub fn channels(&self) -> impl Iterator<Item = &str> {
+        self.channels.keys().map(String::as_str)
+    }
+
     /// Count a message if it is a crash notice. Returns true when new.
     pub fn note_message(&mut self, channel: &str, id: &str, at: u64, content: &str) -> bool {
         if !is_crash_notice(content) {
