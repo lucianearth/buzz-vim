@@ -77,6 +77,7 @@ struct ChannelView: View {
                     }
                 }
             }
+            .overlay(alignment: .bottomLeading) { BellButton() }
             .safeAreaInset(edge: .bottom) {
                 ComposeBar(client: client, channel: channel, root: nil, hint: "write…")
             }
@@ -135,6 +136,26 @@ struct EdgeButtons: View {
                 .overlay(Circle().stroke(theme.rule, lineWidth: 1))
         }
         .transition(.opacity)
+    }
+}
+
+/// The bell, round at the bottom left of a list: the newest activity in
+/// this tab. In a thread it sits above the back arrow.
+struct BellButton: View {
+    @Environment(\.nav) private var nav
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        Button { nav.bell() } label: {
+            Image(systemName: "bell.badge")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(theme.text)
+                .frame(width: 38, height: 38)
+                .background(theme.idle, in: Circle())
+                .overlay(Circle().stroke(theme.rule, lineWidth: 1))
+        }
+        .padding(.leading, 14)
+        .padding(.bottom, 10)
     }
 }
 

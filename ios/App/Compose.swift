@@ -166,7 +166,6 @@ struct ComposeBar: View {
             Spacer(minLength: 4)
             keyButton("chevron.left") { nav.step(-1) }
             keyButton("chevron.right") { nav.step(1) }
-            keyButton("bell.badge") { nav.bell() }
             keyButton("keyboard.chevron.compact.down") { focused = false }
         }
         .padding(.horizontal, 4)

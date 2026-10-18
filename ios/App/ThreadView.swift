@@ -62,16 +62,19 @@ struct ThreadView: View {
                     }
                 }
                 .overlay(alignment: .bottomLeading) {
-                    Button(action: back) {
-                        Image(systemName: "arrow.left")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(theme.text)
-                            .frame(width: 38, height: 38)
-                            .background(theme.idle, in: Circle())
-                            .overlay(Circle().stroke(theme.rule, lineWidth: 1))
+                    VStack(alignment: .leading, spacing: 0) {
+                        BellButton()
+                        Button(action: back) {
+                            Image(systemName: "arrow.left")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(theme.text)
+                                .frame(width: 38, height: 38)
+                                .background(theme.idle, in: Circle())
+                                .overlay(Circle().stroke(theme.rule, lineWidth: 1))
+                        }
+                        .padding(.leading, 14)
+                        .padding(.bottom, 10)
                     }
-                    .padding(.leading, 14)
-                    .padding(.bottom, 10)
                 }
                 .onChange(of: tl.messages.last?.id) { _, _ in
                     // Opened on a reply by the bell key: stay on it.
