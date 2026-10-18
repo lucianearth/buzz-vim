@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
+use buzz_vim_core::checklist::{self, Checklists};
 use buzz_vim_core::links;
 use buzz_vim_core::live::{self, Cmd, ConnState, Live};
 use buzz_vim_core::model::{self, Applied, Store};
@@ -305,6 +306,70 @@ pub fn new_read_id() -> String {
     readstate::new_id()
 }
 
+// ---------- operator loop ----------
+
+#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq)]
+pub enum ItemStatus {
+    Open,
+    Done,
+    Parked,
+}
+
+/// One evidence entry; `link` when it can open (a message, a URL).
+#[derive(uniffi::Record, Clone)]
+pub struct Evidence {
+    pub text: String,
+    pub link: Option<String>,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct ChecklistItem {
+    pub id: String,
+    pub text: String,
+    /// Markdown, any length.
+    pub details: String,
+    pub status: ItemStatus,
+    /// Needs lucian to release it.
+    pub release: bool,
+    /// "first" / "last" for the two standing items.
+    pub standing: Option<String>,
+    pub evidence: Vec<Evidence>,
+    /// Done with no evidence: the spec requires some.
+    pub missing_evidence: bool,
+    pub parked_question: Option<String>,
+    pub creator: String,
+    pub updated_at: u64,
+}
+
+/// A channel's checklist, read-only (agents write it with `buzz checklist`).
+#[derive(uniffi::Record, Clone)]
+pub struct Checklist {
+    pub title: String,
+    /// "ideating" / "running", None without a header.
+    pub mode: Option<String>,
+    /// Branch, worktree and work log, joined.
+    pub resume: String,
+    pub items: Vec<ChecklistItem>,
+}
+
+/// The status line for a channel in the operator loop.
+#[derive(uniffi::Record, Clone)]
+pub struct LoopStatus {
+    pub mode: Option<String>,
+    pub running: bool,
+    /// The watcher's state ("waiting on lucian"), if it has said.
+    pub watch: Option<String>,
+    /// Stalled or waiting on lucian: worth a look.
+    pub needs_you: bool,
+    pub since: Option<u64>,
+    /// `buzz://` link to the watcher's ping.
+    pub ping_link: Option<String>,
+    pub open: u32,
+    pub done: u32,
+    pub parked: u32,
+    pub crashes_today: u32,
+}
+
 // ---------- the client ----------
 
 enum Msg {
@@ -329,6 +394,12 @@ enum Msg {
     Moved(anyhow::Result<(Event, String)>),
     Ordered(anyhow::Result<Event>),
     Notice(String),
+    /// A channel's checklist records, and its messages since midnight.
+    Checklist {
+        channel: String,
+        records: anyhow::Result<Vec<Event>>,
+        today: anyhow::Result<Vec<Event>>,
+    },
 }
 
 struct Engine {
@@ -369,6 +440,9 @@ struct Engine {
     sending: HashMap<String, Event>,
     failed: HashMap<String, Event>,
     notices: Vec<String>,
+    checklists: Checklists,
+    /// The channel whose checklist records are tailed live.
+    checklist_for: Option<String>,
 }
 
 fn now() -> u64 {
@@ -455,6 +529,8 @@ impl Client {
             sending: HashMap::new(),
             failed: HashMap::new(),
             notices: vec![],
+            checklists: Checklists::default(),
+            checklist_for: None,
         };
         let engine = Arc::new(Mutex::new(engine));
         {
@@ -638,6 +714,11 @@ impl Client {
     pub fn open_channel(&self, channel: Option<String>) {
         let mut e = self.engine.lock().unwrap();
         e.current = channel.clone();
+        if let Some(id) = &channel {
+            if e.checklist_for.as_ref() != Some(id) {
+                e.load_checklist(id);
+            }
+        }
         if let Some(id) = channel {
             e.mark_read(&id);
             e.open(&id);
@@ -656,6 +737,79 @@ impl Client {
             e.load_channels();
             e.load_lanes();
         }
+    }
+
+    /// A channel's checklist: header and items in list order.
+    pub fn checklist(&self, channel: String) -> Checklist {
+        let e = self.engine.lock().unwrap();
+        let h = e.checklists.header(&channel);
+        let items = e
+            .checklists
+            .items(&channel)
+            .into_iter()
+            .map(|i| ChecklistItem {
+                missing_evidence: i.missing_evidence(),
+                status: match i.status {
+                    checklist::Status::Open => ItemStatus::Open,
+                    checklist::Status::Done => ItemStatus::Done,
+                    checklist::Status::Parked => ItemStatus::Parked,
+                },
+                evidence: i
+                    .evidence
+                    .iter()
+                    .map(|t| Evidence {
+                        link: checklist::evidence_link(&channel, t),
+                        text: t.clone(),
+                    })
+                    .collect(),
+                creator: e.store.name_of(&i.creator),
+                id: i.id,
+                text: i.text,
+                details: i.details,
+                release: i.release,
+                standing: i.standing,
+                parked_question: i.parked_question,
+                updated_at: i.updated_at,
+            })
+            .collect();
+        Checklist {
+            title: h.as_ref().map(|h| h.title.clone()).unwrap_or_default(),
+            mode: h.as_ref().map(|h| h.mode.label().to_string()),
+            resume: h
+                .map(|h| {
+                    [h.resume.branch, h.resume.worktree, h.resume.worklog]
+                        .into_iter()
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                })
+                .unwrap_or_default(),
+            items,
+        }
+    }
+
+    /// The channel's status line, or None when it has no list, no watcher
+    /// and no crashes today.
+    pub fn loop_status(&self, channel: String) -> Option<LoopStatus> {
+        let e = self.engine.lock().unwrap();
+        let s = e
+            .checklists
+            .summary(&channel, checklist::local_midnight(now()));
+        if s.is_empty() {
+            return None;
+        }
+        Some(LoopStatus {
+            running: s.mode == Some(checklist::Mode::Running),
+            mode: s.mode.map(|m| m.label().to_string()),
+            needs_you: s.watch.as_ref().is_some_and(|w| w.state.needs_you()),
+            since: s.watch.as_ref().and_then(|w| w.since),
+            watch: s.watch.map(|w| w.state.label()),
+            ping_link: s.ping_link,
+            open: s.open as u32,
+            done: s.done as u32,
+            parked: s.parked as u32,
+            crashes_today: s.crashes_today as u32,
+        })
     }
 
     /// Ids of our messages the relay hasn't confirmed yet (sending or failed).
@@ -968,7 +1122,10 @@ impl Client {
 
     /// The app came back: reload what may have moved while iOS froze us.
     pub fn resume(&self) {
-        let e = self.engine.lock().unwrap();
+        let mut e = self.engine.lock().unwrap();
+        if let Some(c) = e.current.clone() {
+            e.load_checklist(&c);
+        }
         e.load_channels();
         let open: Vec<String> = e.opened.iter().cloned().collect();
         for id in open {
@@ -1365,6 +1522,33 @@ impl Engine {
         });
     }
 
+    /// The channel's checklist records and today's crash notices, and a
+    /// live tail of its records while it's on screen.
+    fn load_checklist(&mut self, id: &str) {
+        self.checklist_for = Some(id.to_string());
+        self.sub(
+            "checklist",
+            vec![json!({"kinds": checklist::KINDS, "#h": [id], "since": now(), "limit": 0})],
+        );
+        let r = self.relay.clone();
+        let channel = id.to_string();
+        let today = checklist::local_midnight(now());
+        self.spawn(async move {
+            let records = r.query(&Checklists::filters(&channel)).await;
+            let today = r
+                .query(&[
+                    json!({"kinds": model::UNREAD_KINDS, "#h": [channel], "since": today,
+                    "limit": 500}),
+                ])
+                .await;
+            Msg::Checklist {
+                channel,
+                records,
+                today,
+            }
+        });
+    }
+
     fn open(&mut self, id: &str) {
         self.subscribe_channel(id);
         if self.opened.insert(id.to_string()) {
@@ -1646,6 +1830,29 @@ impl Engine {
             }
             Msg::Events(Err(e)) => self.notices.push(format!("couldn't load: {e}")),
             Msg::Notice(n) => self.notices.push(n),
+            // Errors are expected while the relay lacks the kinds: no notice.
+            Msg::Checklist {
+                channel,
+                records,
+                today,
+            } => {
+                let mut want = vec![];
+                for ev in records.iter().flatten() {
+                    if self.checklists.apply(ev) {
+                        want.push(ev.pubkey.to_hex());
+                    }
+                }
+                for ev in today.iter().flatten() {
+                    let id = ev.id.to_hex();
+                    self.checklists.note_message(
+                        &channel,
+                        &id,
+                        ev.created_at.as_secs(),
+                        &ev.content,
+                    );
+                }
+                self.want_profiles(want);
+            }
             Msg::Sent { id, result } => {
                 let Some(ev) = self.sending.remove(&id) else {
                     return;
@@ -1680,6 +1887,9 @@ impl Engine {
                         // The live tail replays from `since`; open windows refetch.
                         for id in self.opened.clone() {
                             self.window(&id, None);
+                        }
+                        if let Some(c) = self.current.clone() {
+                            self.load_checklist(&c);
                         }
                     }
                     *was_online = true;
@@ -1736,6 +1946,10 @@ impl Engine {
                 self.load_channels();
                 return vec![];
             }
+            k if checklist::KINDS.contains(&k) => {
+                self.checklists.apply(ev);
+                return vec![ev.pubkey.to_hex()];
+            }
             39000 => {
                 // Only channels we know: the relay sends every channel's.
                 let known =
@@ -1766,6 +1980,8 @@ impl Engine {
         let applied = self.store.apply(ev);
         let mut want = vec![ev.pubkey.to_hex()];
         if let Applied::Message { channel, id } = applied {
+            self.checklists
+                .note_message(&channel, &id, ev.created_at.as_secs(), &ev.content);
             let active = self.visible && self.current.as_deref() == Some(channel.as_str());
             let at = ev.created_at.as_secs();
             let author = ev.pubkey.to_hex();
@@ -2154,7 +2370,80 @@ mod tests {
             sending: HashMap::new(),
             failed: HashMap::new(),
             notices: vec![],
+            checklists: Checklists::default(),
+            checklist_for: None,
         }
+    }
+
+    /// Records and crash notices folded live show up in the checklist and
+    /// the status line the app reads.
+    #[test]
+    fn checklist_and_loop_status_from_live_events() {
+        use nostr::{EventBuilder, Kind, Timestamp};
+        let ch = "2130646b-d6c8-4ec3-93e3-36f77bee1a37";
+        let mut e = engine();
+        let bot = Keys::generate();
+        let bk = bot.public_key().to_hex();
+        let rec = |kind: u16, d: String, v: Value| {
+            EventBuilder::new(Kind::Custom(kind), v.to_string())
+                .tags(
+                    [["d", d.as_str()], ["h", ch], ["creator", bk.as_str()]]
+                        .map(|t| Tag::parse(t).unwrap()),
+                )
+                .custom_created_at(Timestamp::from(now() - 10))
+                .sign_with_keys(&bot)
+                .unwrap()
+        };
+        e.fold(
+            &rec(
+                30471,
+                format!("buzz-checklist/header/{ch}"),
+                json!({"title": "loop", "mode": "running", "resume": {"branch": "agent/x"}}),
+            ),
+            true,
+        );
+        e.fold(
+            &rec(30470, format!("buzz-checklist/item/{ch}/a1"),
+                json!({"text": "ship it", "status": "done", "order": 1, "evidence": ["msg:abc", "commit:123"]})),
+            true,
+        );
+        e.fold(
+            &rec(
+                30472,
+                format!("buzz-checklist/watch/{ch}"),
+                json!({"state": "stalled", "since": now() - 60}),
+            ),
+            true,
+        );
+        let crash = EventBuilder::new(Kind::Custom(9), "agent process crashed, respawning")
+            .tags([Tag::parse(["h", ch]).unwrap()])
+            .sign_with_keys(&bot)
+            .unwrap();
+        e.fold(&crash, true);
+        let c = Client {
+            engine: Arc::new(Mutex::new(e)),
+            stop: Arc::new(tokio::sync::Notify::new()),
+        };
+        let list = c.checklist(ch.into());
+        assert_eq!(
+            (list.title.as_str(), list.mode.as_deref()),
+            ("loop", Some("running"))
+        );
+        assert_eq!(list.resume, "agent/x");
+        let it = &list.items[0];
+        assert!(it.status == ItemStatus::Done && !it.missing_evidence);
+        assert!(
+            it.evidence[0]
+                .link
+                .as_deref()
+                .is_some_and(|l| l.ends_with("id=abc"))
+        );
+        assert!(it.evidence[1].link.is_none());
+        let s = c.loop_status(ch.into()).unwrap();
+        assert!(s.running && s.needs_you);
+        assert_eq!(s.watch.as_deref(), Some("stalled"));
+        assert_eq!((s.open, s.done, s.crashes_today), (0, 1, 1));
+        assert!(c.loop_status("other".into()).is_none());
     }
 
     #[test]

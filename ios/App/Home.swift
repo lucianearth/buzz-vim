@@ -44,6 +44,7 @@ struct Home: View {
     @State private var wanted: String? = UserDefaults.standard.string(forKey: "active")
     @State private var fallback = false
     @State private var showAgents = false
+    @State private var showChecklist = false
     @State private var switcher = false
 
     var body: some View {
@@ -51,7 +52,8 @@ struct Home: View {
         let tabs = client.tabs()
         VStack(spacing: 0) {
             Header(client: client, tabs: tabs, selected: $selected,
-                   showAgents: $showAgents, switcher: $switcher, openSwitcher: openSwitcher)
+                   showAgents: $showAgents, showChecklist: $showChecklist,
+                   switcher: $switcher, openSwitcher: openSwitcher)
             if tabs.isEmpty {
                 Spacer()
                 Text(client.ready() ? "no channels yet" : "loading channels…")
@@ -111,6 +113,14 @@ struct Home: View {
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
                 .modifier(Themed())
+        }
+        .sheet(isPresented: $showChecklist) {
+            if let s = selected {
+                ChecklistView(client: client, channel: s)
+                    .presentationDetents([.medium, .large])
+                    .presentationDragIndicator(.visible)
+                    .modifier(Themed())
+            }
         }
     }
 
@@ -233,6 +243,7 @@ struct Header: View {
     let tabs: [ChannelTab]
     @Binding var selected: String?
     @Binding var showAgents: Bool
+    @Binding var showChecklist: Bool
     @Binding var switcher: Bool
     let openSwitcher: () -> Void
     @Environment(Model.self) private var model
@@ -246,6 +257,14 @@ struct Header: View {
                 .padding(.horizontal, 22)
                 .onTapGesture { showAgents = true }
                 .onLongPressGesture { openSwitcher() }
+            // The operator loop's line for the open channel, when it has one.
+            if let s = selected, let loop = client.loopStatus(channel: s) {
+                LoopLine(status: loop)
+                    .padding(.horizontal, 22)
+                    .padding(.top, -8)
+                    .contentShape(Rectangle())
+                    .onTapGesture { showChecklist = true }
+            }
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
