@@ -259,6 +259,11 @@ pub struct App {
     /// The row an inline reply (`r` on tab 0) answers, and its text.
     pub reply_to: Option<Row>,
     pub reply_draft: Draft,
+    /// Sends from the reply box, by event id, and the row each answered:
+    /// a failed one goes back into the box, not a compose box.
+    pub reply_sends: HashMap<String, Row>,
+    /// The row the last reply answered, until sync knows its event id.
+    pub reply_sent: Option<Row>,
 }
 
 impl App {
@@ -334,6 +339,8 @@ impl App {
             needs_jump: None,
             reply_to: None,
             reply_draft: Draft::default(),
+            reply_sends: HashMap::new(),
+            reply_sent: None,
         }
     }
 
@@ -647,6 +654,7 @@ impl App {
             return;
         };
         let draft = std::mem::take(&mut self.reply_draft);
+        self.reply_sent = Some(r.clone());
         let to = (!r.who.is_empty()).then_some(r.who).into_iter().collect();
         self.actions.push(Action::SendDraft {
             channel: r.channel,
@@ -1295,6 +1303,10 @@ impl App {
             self.reply_draft.insert(&text);
             return;
         }
+        // Tab 0 has no compose box: the channel under it mustn't get it.
+        if self.needs_view {
+            return self.say("to paste a reply, pick a row and press r");
+        }
         let paths = crate::clip::dropped_paths(&s);
         if let Some(p) = paths.first() {
             self.say(format!("reading {}…", p.display()));
@@ -1361,6 +1373,9 @@ impl App {
                 self.actions.push(Action::Quit);
             }
             return;
+        }
+        if ctrl && k.code == KeyCode::Char('v') && self.needs_view && self.mode == Mode::Normal {
+            return self.say("to paste a reply, pick a row and press r");
         }
         if ctrl && k.code == KeyCode::Char('v') && matches!(self.mode, Mode::Normal | Mode::Insert)
         {
@@ -1504,6 +1519,16 @@ impl App {
     fn key_normal(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if self.needs_view && !ctrl && self.key_needs(k) {
+            return;
+        }
+        // ^d ^u page tab 0's rows, not the channel under it.
+        if self.needs_view && ctrl && matches!(k.code, KeyCode::Char('d') | KeyCode::Char('u')) {
+            let step = (self.page / 2).max(1);
+            self.needs_cursor = if k.code == KeyCode::Char('d') {
+                self.needs_cursor.saturating_add(step)
+            } else {
+                self.needs_cursor.saturating_sub(step)
+            };
             return;
         }
         let n = self.tabs.len();
@@ -1988,6 +2013,11 @@ impl App {
                 } else {
                     -3
                 };
+                if self.needs_view {
+                    let c = self.needs_cursor as isize + d.signum();
+                    self.needs_cursor = c.max(0) as usize;
+                    return;
+                }
                 if self.mode == Mode::Sections {
                     self.picker_cursor = (self.picker_cursor as isize + d.signum())
                         .clamp(0, self.sections.len().saturating_sub(1) as isize)
@@ -2011,6 +2041,7 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => match hit {
                 Some(Hit::Tab(i)) => self.switch_tab(i),
                 Some(Hit::NeedsTab) => self.open_needs(),
+                Some(Hit::NeedsRow(_)) if self.mode != Mode::Normal => {}
                 Some(Hit::NeedsRow(i)) => {
                     // Click a row to pick it, again to open it.
                     if self.needs_cursor == i {
@@ -2063,6 +2094,59 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On tab 0 nothing reaches the channel underneath: paging, the wheel,
+    /// paste and ^v stay on tab 0, and row clicks count only in normal mode.
+    #[test]
+    fn tab_zero_keeps_input_off_the_hidden_channel() {
+        let mut app = App::new("me".into(), None);
+        app.tabs = vec!["a".into()];
+        app.store.channel_mut("a").timeline = vec!["m1".into(), "m2".into()];
+        app.selected.insert("a".into(), "m1".into());
+        app.on_key(KeyEvent::from(KeyCode::Char('0')));
+        assert!(app.needs_view);
+        app.page = 10;
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(app.needs_cursor, 5);
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.needs_cursor, 0);
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.needs_cursor, 1);
+        app.on_term(TermEvent::Paste("hello".into()));
+        app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(
+            app.draft.is_empty()
+                && app
+                    .actions
+                    .iter()
+                    .all(|a| !matches!(a, Action::ReadAttachment(_)))
+        );
+        assert_eq!(app.selected.get("a").map(String::as_str), Some("m1"));
+        // A row click in another mode does nothing.
+        app.hits = vec![(Rect::new(0, 3, 80, 1), Hit::NeedsRow(4))];
+        app.mode = Mode::Help;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.needs_cursor, 1);
+        app.mode = Mode::Normal;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.needs_cursor, 4);
+    }
 
     #[test]
     fn q_asks_in_quick_and_again_adds_this_channel() {

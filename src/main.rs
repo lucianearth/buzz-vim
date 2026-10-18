@@ -450,6 +450,7 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
         }
         Msg::Sent { id, result } => {
             let pending = app.pending_sends.remove(&id);
+            let reply = app.reply_sends.remove(&id);
             match result {
                 Ok(()) => {
                     app.sent_flash = Some((app.tick as usize % art::SENT.len(), Instant::now()));
@@ -466,6 +467,13 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
                     // again; only a send lost in transit is worth repeating.
                     if e.to_string().starts_with("relay rejected") {
                         d.sent_as = None;
+                    }
+                    // From tab 0's reply box: back in that box, for that row.
+                    if let Some(row) = reply {
+                        app.reply_draft.restore(d);
+                        app.reply_to = Some(row);
+                        app.say(format!("not sent: {e}. Your reply is back in its box (r)."));
+                        return;
                     }
                     match app.draft_for(&channel, root.as_deref()) {
                         Some(slot) => {
@@ -661,6 +669,46 @@ mod tests {
         assert_eq!(sent[0], sent[1]);
         assert_ne!(sent[1], sent[2]);
         assert_ne!(sent[2], sent[3]);
+    }
+
+    /// A tab-0 reply the relay never took goes back in the reply box, for
+    /// its row, and leaves the channel's compose box alone.
+    #[tokio::test]
+    async fn a_failed_inline_reply_comes_back_to_its_box() {
+        let relay = relay::Relay::new("http://127.0.0.1:1", nostr::Keys::generate(), None).unwrap();
+        let (live_tx, _live_rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut sync = sync::Sync::new(relay, live_tx, tx);
+        let mut app = App::new("me".into(), None);
+        let ch = "2130646b-d6c8-4ec3-93e3-36f77bee1a37".to_string();
+        let root = "ab".repeat(32);
+        app.tabs = vec![ch.clone()];
+        let row = needs::Row {
+            section: needs::Section::Answer,
+            reason: needs::Reason::Mention,
+            channel: ch.clone(),
+            who: String::new(),
+            text: "ship it?".into(),
+            at: 1,
+            message: Some(root.clone()),
+            thread: Some(root.clone()),
+            key: format!("msg:{root}"),
+        };
+        app.reply_to = Some(row.clone());
+        app.mode = keys::Mode::Reply;
+        app.reply_draft.insert("yes");
+        app.on_term(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Enter),
+        ));
+        assert!(app.reply_to.is_none() && app.reply_draft.is_empty());
+        for a in std::mem::take(&mut app.actions) {
+            sync.run(&mut app, a);
+        }
+        let msg = rx.recv().await.unwrap();
+        handle(&mut app, &mut sync, msg, &mut None);
+        assert_eq!(app.reply_draft.text, "yes");
+        assert_eq!(app.reply_to.as_ref().map(|r| r.key.clone()), Some(row.key));
+        assert!(app.draft.is_empty());
     }
 
     /// A Q the relay never took leaves #quick and goes back in the box,

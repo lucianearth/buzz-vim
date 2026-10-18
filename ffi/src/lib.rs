@@ -2513,8 +2513,8 @@ mod tests {
         }
     }
 
-    /// Records and crash notices folded live show up in the checklist and
-    /// the status line the app reads.
+    /// Tab 0's rows come from folded events, with what Swift shows, and a
+    /// reply in the thread clears them.
     #[test]
     fn needs_you_rows_from_folded_events() {
         use nostr::{EventBuilder, Kind, Timestamp};
@@ -2561,6 +2561,8 @@ mod tests {
         assert_eq!(c.needs_count(), 0);
     }
 
+    /// Records and crash notices folded live show up in the checklist and
+    /// the status line the app reads.
     #[test]
     fn checklist_and_loop_status_from_live_events() {
         use nostr::{EventBuilder, Kind, Timestamp};

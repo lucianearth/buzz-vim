@@ -599,7 +599,18 @@ impl Sync {
                 root,
                 draft,
                 to,
-            } => self.send(app, channel, root.clone(), root, draft, to),
+            } => {
+                let before: HashSet<String> = app.pending_sends.keys().cloned().collect();
+                self.send(app, channel, root.clone(), root, draft, to);
+                // Remember which send came from the reply box.
+                if let Some(row) = app.reply_sent.take() {
+                    for id in app.pending_sends.keys() {
+                        if !before.contains(id) {
+                            app.reply_sends.insert(id.clone(), row.clone());
+                        }
+                    }
+                }
+            }
             Action::ThumbsUp { target } => self.thumbs_up(app, target),
             Action::Reset {
                 channel,
