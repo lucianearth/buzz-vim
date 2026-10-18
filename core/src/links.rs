@@ -321,6 +321,10 @@ fn opener(os: &str) -> (&'static str, &'static [&'static str]) {
     }
 }
 
+/// A code block on screen rides along with the links under this made-up
+/// scheme, its text after it: following one copies the text.
+pub const COPY: &str = "copy:";
+
 /// Hint labels for `n` links, home row first, all the same length so none
 /// is a prefix of another.
 pub fn hint_labels(n: usize) -> Vec<String> {

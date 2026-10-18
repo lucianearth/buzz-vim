@@ -1850,6 +1850,13 @@ pub fn render_markdown_links(
     let mut r = Rendered::default();
     let mut out = vec![];
     let mut in_fence = false;
+    // The open block's first row and its raw lines, to copy with `f`.
+    let mut block: Option<(usize, Vec<&str>)> = None;
+    let copy = |r: &mut Rendered, (row, lines): (usize, Vec<&str>)| {
+        r.at.push((row, 0, 1, r.urls.len()));
+        r.urls
+            .push(format!("{}{}", crate::links::COPY, lines.join("\n")));
+    };
     let code_line = |out: &mut Vec<Line<'static>>, raw: &str| {
         let raw = crate::draft::expand_tabs(raw);
         for chunk in wrap_plain(&raw, width.saturating_sub(2)) {
@@ -1864,10 +1871,16 @@ pub fn render_markdown_links(
         if let Some(fence) = t.strip_prefix("```") {
             // ```one-liner``` on a single line.
             if !in_fence && fence.len() > 3 && fence.ends_with("```") {
-                code_line(&mut out, fence.trim_end_matches('`'));
+                let code = fence.trim_end_matches('`');
+                copy(&mut r, (out.len(), vec![code]));
+                code_line(&mut out, code);
                 continue;
             }
             in_fence = !in_fence;
+            match block.take() {
+                Some(b) => copy(&mut r, b),
+                None => block = Some((out.len(), vec![])),
+            }
             // The language tag, if any, labels the top of the block.
             if in_fence && !fence.trim().is_empty() {
                 out.push(Line::from(Span::styled(
@@ -1878,6 +1891,9 @@ pub fn render_markdown_links(
             continue;
         }
         if in_fence {
+            if let Some((_, lines)) = &mut block {
+                lines.push(raw);
+            }
             code_line(&mut out, raw);
             continue;
         }
@@ -1920,6 +1936,10 @@ pub fn render_markdown_links(
             }
             out.push(Line::from(s));
         }
+    }
+    // A fence left open runs to the end of the message.
+    if let Some(b) = block.take() {
+        copy(&mut r, b);
     }
     r.lines = out;
     r
@@ -2801,6 +2821,25 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn code_blocks_are_hinted_with_their_text() {
+        let r = render_markdown_links(
+            "see:\n```rust\nlet x = 1;\n\tlet y = 2;\n```\n```ls -la```\n```\nopen",
+            30,
+            &[],
+            &|_| None,
+        );
+        let copies: Vec<(usize, &str)> =
+            r.at.iter()
+                .map(|&(row, _, _, k)| (row, r.urls[k].strip_prefix("copy:").unwrap()))
+                .collect();
+        // Rows: "see:", the rust label, two code lines, the one-liner, "open".
+        assert_eq!(
+            copies,
+            vec![(1, "let x = 1;\n\tlet y = 2;"), (4, "ls -la"), (5, "open")]
+        );
     }
 
     #[test]

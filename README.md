@@ -39,6 +39,7 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
   channel's tab, or an extra tab at the end when the channel isn't in your sections (it goes away when you
   leave it). Links marked 🐝 (pr, issue, repo) open in Buzz Desktop, and web links in your browser.
   `⌫` or `^o` goes back to where you were, as many steps as you followed.
+  Code blocks get a chip too: picking one copies the code.
 - `o` open the selected image full screen (`←` `→` page through the images, `Esc` closes), `q` quit
 
 ## Development

@@ -107,6 +107,8 @@ pub enum Action {
     },
     /// Hand a URL to the OS (browser, Buzz Desktop).
     OpenUrl(String),
+    /// Put text on the system clipboard.
+    Copy(String),
     /// Download images and open them in the OS viewer (Preview), all in
     /// one window, showing `current` first.
     OpenImages {
@@ -543,6 +545,10 @@ impl App {
 
     pub fn follow(&mut self, url: &str) {
         use crate::links::Target;
+        if let Some(text) = url.strip_prefix(crate::links::COPY) {
+            self.actions.push(Action::Copy(text.to_string()));
+            return;
+        }
         match crate::links::target(url) {
             Target::Message {
                 channel,
@@ -1208,7 +1214,7 @@ impl App {
             KeyCode::Backspace => self.back(),
             KeyCode::Char('f') => {
                 if self.links.is_empty() {
-                    self.say("no links on screen");
+                    self.say("no links or code on screen");
                 } else {
                     self.hint_typed.clear();
                     self.mode = Mode::Hint;
@@ -1796,6 +1802,11 @@ mod tests {
         // Desktop and web links go to the OS.
         app.follow("buzz://pr?id=1");
         assert!(matches!(app.actions.last(), Some(Action::OpenUrl(u)) if u == "buzz://pr?id=1"));
+        // A code block copies its text.
+        app.follow("copy:let x = 1;\nlet y = 2;");
+        assert!(
+            matches!(app.actions.last(), Some(Action::Copy(t)) if t == "let x = 1;\nlet y = 2;")
+        );
     }
 
     #[test]
