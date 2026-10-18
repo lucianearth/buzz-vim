@@ -156,15 +156,17 @@ pub fn rows(
             }
         }
     }
-    // Answered: he posted in that thread (a DM: anywhere in it) after `at`.
+    // Answered: he posted in that thread (a DM, or a row with no thread:
+    // anywhere in the channel) after `at`.
     let answered = |channel: &str, thread: Option<&str>, at: u64| {
         let dm = store.channels.get(channel).is_some_and(|c| c.is_dm);
         said.get(channel).is_some_and(|posts| {
             posts.iter().any(|m| {
                 m.created_at > at
                     && (dm
-                        || (thread.is_some()
-                            && (m.root.as_deref() == thread || Some(m.id.as_str()) == thread)))
+                        || thread.is_none()
+                        || m.root.as_deref() == thread
+                        || Some(m.id.as_str()) == thread)
             })
         })
     };
@@ -193,8 +195,8 @@ pub fn rows(
             if let Some(p) = &w.ping {
                 pings.push(p.clone());
             }
-            flagged.push((channel.to_string(), thread.clone()));
             if !answered(channel, thread.as_deref(), anchor) {
+                flagged.push((channel.to_string(), thread.clone()));
                 let detail = if !w.reason.trim().is_empty() {
                     one_line(&w.reason)
                 } else {
@@ -218,7 +220,11 @@ pub fn rows(
                     at,
                     message: w.ping.clone(),
                     thread,
-                    key: format!("watch:{channel}:{label}:{at}"),
+                    // Stable across republishes that only bump nudges.
+                    key: format!(
+                        "watch:{channel}:{label}:{}",
+                        w.ping.clone().or(w.since.map(|t| t.to_string())).unwrap_or_default()
+                    ),
                 });
             }
         }
@@ -239,7 +245,12 @@ pub fn rows(
                 at: it.updated_at,
                 message: None,
                 thread: thread.clone(),
-                key: format!("item:{channel}:{}:{}", it.id, it.updated_at),
+                // Stable across edits that leave the question as it was.
+                key: format!(
+                    "item:{channel}:{}:{}",
+                    it.id,
+                    it.parked_question.as_deref().unwrap_or_default()
+                ),
             });
         }
     }
@@ -621,6 +632,32 @@ mod tests {
         let r = w.rows();
         // With no ask out, the agent's mention is plain FYI.
         assert_eq!(keys(&r), [(Section::Fyi, "bot".to_string())]);
+    }
+
+    #[test]
+    fn republishing_keeps_row_keys_and_threadless_rows_clear() {
+        let mut w = World::new();
+        let (op, bot) = (w.op.clone(), w.bot.clone());
+        w.record(&bot, 30470, format!("buzz-checklist/item/{CH}/a1"), NOW - 650,
+            serde_json::json!({"text": "migrate relay", "status": "parked", "parked_question": "tonight?"}));
+        let wk = w.watcher.clone();
+        let watch = |w: &mut World, at: u64| {
+            w.record(&wk, 30472, format!("buzz-checklist/watch/{CH}"), at,
+                serde_json::json!({"state": "stalled", "nudges": at}));
+        };
+        watch(&mut w, NOW - 600);
+        let before: Vec<String> = w.rows().iter().map(|r| r.key.clone()).collect();
+        assert_eq!(before.len(), 2);
+        // A nudge bump and a details edit: same asks, same keys.
+        watch(&mut w, NOW - 300);
+        w.record(&bot, 30470, format!("buzz-checklist/item/{CH}/a1"), NOW - 290,
+            serde_json::json!({"text": "migrate relay", "details": "more", "status": "parked", "parked_question": "tonight?"}));
+        let after: Vec<String> = w.rows().iter().map(|r| r.key.clone()).collect();
+        assert_eq!(before.iter().collect::<std::collections::HashSet<_>>(),
+            after.iter().collect::<std::collections::HashSet<_>>());
+        // No thread anywhere: a top-level answer in the channel clears the watch row.
+        w.post(&op, CH, "nightly", None, None, NOW - 100);
+        assert_eq!(keys(&w.rows()), [(Section::Answer, "parked".to_string())]);
     }
 
     #[test]
