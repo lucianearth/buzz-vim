@@ -24,7 +24,17 @@ Your nsec is in Buzz Desktop under Settings → Profile → Private key. `login`
 Normal mode shows the common keys in the footer. Press `?` for all of them.
 
 - `i` write, `Esc` back to normal, `⏎` send, `⇧⏎` (or `⌥⏎`, `^j`) new line
-- `j` `k` move, `0`–`9` jump to a tab, `H` `L` or `⇥` cycle tabs
+- `j` `k` move, `1`–`9` jump to a tab, `H` `L` or `⇥` cycle tabs (tab 0 included)
+- `0` is tab 0, **Needs you**, pinned first (it can't be moved, closed or archived). *Needs an answer*: channels
+  the watcher marks stalled, waiting on lucian or waiting on release (the row opens its ping), parked checklist
+  items with their question, and people's @mentions and DMs to the operator (`owner`) that he hasn't answered.
+  *FYI*: bots' @mentions of him the watcher didn't flag. One row each (channel, who, one line, age), oldest
+  first. `⏎` opens the row at its message, `r` answers it in a box that posts into that row's thread. A row
+  goes once he posts in its thread after it (in a DM: anywhere in it), or the watch state or item moves on.
+  It's all from the relay (the last week of mentions), nothing local. Bots are profiles with a NIP-OA `auth`
+  tag or a channel `bot` role, agents we see telemetry from, and the watcher
+- `!` goes to the next row that needs an answer, oldest first and round again, like `:cnext`. Every channel's
+  status line shows how many there are as `⚑ N`
 - `n` the bell: the latest message in this tab, read or not. In a thread it opens on your first unread reply
 - `<` `>` move the current tab left or right within its section; `T` opens the tab order list (`J` `K` move
   the picked tab, `a` then `y` archives it for everyone). The order is synced: dragging tabs on the phone moves them here too, and the other way round

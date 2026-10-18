@@ -16,7 +16,8 @@ mod theme;
 mod ui;
 
 use buzz_vim_core::{
-    checklist, draft, links, live, log, model, quick, readstate, relay, sections, telemetry, unread,
+    checklist, draft, links, live, log, model, needs, quick, readstate, relay, sections, telemetry,
+    unread,
 };
 
 use std::sync::Arc;
@@ -189,7 +190,11 @@ async fn run(
             Some(l) = live_rx.recv() => {
                 match l {
                     Live::Event { sub, event } => {
-                        let want = sync::fold(&mut app, &mut sync, &event, sub.starts_with("ch:"));
+                        // Tab 0's tail also carries tabs' messages; whichever
+                        // sub brings one first, it counts as a tab's.
+                        let tab = sub == "needs"
+                            && model::tag(&event, "h").is_some_and(|h| app.tabs.iter().any(|t| t == h));
+                        let want = sync::fold(&mut app, &mut sync, &event, sub.starts_with("ch:") || tab);
                         sync.want_profiles(want);
                     }
                     Live::Status(s) => {
@@ -201,6 +206,7 @@ async fn run(
                                 if let Some(c) = app.current().map(str::to_string) {
                                     sync.load_checklist(&c);
                                 }
+                                sync.load_needs(&app.store, &app.checklists.trust.owner);
                             }
                             was_online = true;
                         }
@@ -209,7 +215,7 @@ async fn run(
                         log::line(format!("closed {sub}: {reason}"));
                         // A relay without the checklist kinds refuses that
                         // tail; the rest works without it, so no need to say.
-                        if !reason.is_empty() && sub != "checklist" {
+                        if !reason.is_empty() && sub != "checklist" && sub != "needs" {
                             app.say(format!("relay closed {sub}: {reason}"));
                         }
                     }
@@ -364,6 +370,7 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
                 .collect();
             sync.want_profiles(people);
             refresh_sections(app, sync, restore_active);
+            sync.load_needs(&app.store, &app.checklists.trust.owner);
         }
         Msg::Channels(Err(e)) => app.say(format!("couldn't load channels: {e}")),
         Msg::Lanes(Ok(evs)) => {

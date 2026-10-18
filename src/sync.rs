@@ -14,6 +14,7 @@ use crate::app::{Action, App};
 use crate::checklist::{self, Checklists};
 use crate::live::Cmd;
 use crate::model::{self, Applied};
+use crate::needs;
 use crate::readstate::{self, ReadState};
 use crate::relay::{BlobDescriptor, Relay};
 use crate::sections::{self, Lanes};
@@ -405,6 +406,40 @@ impl Sync {
         });
     }
 
+    /// Tab 0's data across every channel we're in: mentions of the
+    /// operator, his own posts, DMs and checklist records, the last week
+    /// of them and a live tail. Asked again whenever channels load.
+    pub fn load_needs(&mut self, store: &model::Store, operator: &str) {
+        let mine: Vec<&model::Channel> = store
+            .channels
+            .values()
+            .filter(|c| c.is_member && !c.archived)
+            .collect();
+        let ids: Vec<String> = mine.iter().map(|c| c.id.clone()).collect();
+        let dms: Vec<String> = mine
+            .iter()
+            .filter(|c| c.is_dm)
+            .map(|c| c.id.clone())
+            .collect();
+        let now = now();
+        let live = needs::filters(&ids, &dms, operator, now, true);
+        if live.is_empty() {
+            return;
+        }
+        let _ = self.live.send(Cmd::Sub {
+            id: "needs".into(),
+            filters: live,
+        });
+        let r = self.relay.clone();
+        let history = needs::filters(&ids, &dms, operator, now, false);
+        self.spawn(async move {
+            Msg::Events(r.query(&history).await.unwrap_or_else(|e| {
+                crate::log::line(format!("needs: {e}"));
+                vec![]
+            }))
+        });
+    }
+
     pub fn open_channel(&mut self, id: &str) {
         self.load_checklist(id);
         self.subscribe_channel(id);
@@ -555,7 +590,15 @@ impl Sync {
                 channel,
                 root,
                 parent,
-            } => self.send(app, channel, root, parent),
+            } => {
+                let draft = std::mem::take(app.draft_mut());
+                self.send(app, channel, root, parent, draft)
+            }
+            Action::SendDraft {
+                channel,
+                root,
+                draft,
+            } => self.send(app, channel, root.clone(), root, draft),
             Action::ThumbsUp { target } => self.thumbs_up(app, target),
             Action::Reset {
                 channel,
@@ -647,8 +690,8 @@ impl Sync {
         channel: String,
         root: Option<String>,
         parent: Option<String>,
+        draft: crate::draft::Draft,
     ) {
-        let draft = std::mem::take(app.draft_mut());
         let mut content = draft.text.trim_end().to_string();
         for a in &draft.attachments {
             let label = if a.mime_type.starts_with("video/") {

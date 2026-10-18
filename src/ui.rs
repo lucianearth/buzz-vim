@@ -24,6 +24,7 @@ const THUMB_COLS: u16 = 36;
 const THUMB_MAX_ROWS: u16 = 12;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
+    app.needs = app.needs_rows();
     app.hits.clear();
     app.links.clear();
     app.empty_prev = app.empty.take();
@@ -43,7 +44,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // goes back up.
     let main = slider(f, app, body);
     let mut images = vec![];
-    if app.agents_view {
+    if app.needs_view {
+        draw_needs(f, app, main);
+    } else if app.agents_view {
         draw_agents(f, app, main);
     } else if app.checklist_view {
         draw_checklist(f, app, main);
@@ -65,6 +68,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             | Mode::Help
             | Mode::Viewer
             | Mode::Quick
+            | Mode::Reply
     ) || (app.mode == Mode::Insert && !app.mention_candidates().is_empty());
     for (rect, key) in images.into_iter().filter(|_| !overlay) {
         if let Some(p) = app.media.encoded.get(&key) {
@@ -79,6 +83,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Viewer => draw_viewer(f, app, area),
         Mode::Hint => draw_hints(f, app),
         Mode::Quick => draw_quick(f, app, area),
+        Mode::Reply => draw_reply(f, app, area),
         _ => {}
     }
 }
@@ -165,6 +170,30 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
     };
     // Tabs get the whole row up to the count.
     let limit = area.x + area.width.saturating_sub(right.width() as u16 + 1);
+    // Tab 0, Needs you, pinned first: it never scrolls away or closes.
+    let n = crate::needs::answer_count(&app.needs);
+    let label = if n > 0 {
+        format!(" 0 ⚑ needs you {n} ")
+    } else {
+        " 0 needs you ".to_string()
+    };
+    let w = (label.width() as u16).min(limit.saturating_sub(x));
+    let style = if app.needs_view {
+        theme::tab_active()
+    } else if n > 0 {
+        theme::tab_idle().add_modifier(Modifier::BOLD)
+    } else {
+        theme::tab_idle()
+    };
+    let r = Rect {
+        x,
+        y: area.y,
+        width: w,
+        height: 1,
+    };
+    f.render_widget(Paragraph::new(Span::styled(label, style)), r);
+    app.hits.push((r, Hit::NeedsTab));
+    x += w + 1;
     let labels: Vec<(String, usize)> = app
         .tabs
         .iter()
@@ -196,8 +225,8 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 SPIN[app.tick as usize % SPIN.len()]
             };
-            let label = if i < 10 {
-                format!(" {i} {name} {dot}{spin}")
+            let label = if i < 9 {
+                format!(" {} {name} {dot}{spin}", i + 1)
             } else {
                 format!(" {name} {dot}{spin}")
             };
@@ -243,7 +272,7 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
             break;
         }
         let hue = theme::hue(&app.tabs[i]);
-        let style = if i == app.active {
+        let style = if i == app.active && !app.needs_view {
             theme::chip(hue)
         } else if unread > 0 {
             theme::tab_idle()
@@ -1142,10 +1171,27 @@ fn draw_status(f: &mut Frame, app: &mut App, row: Rect, channel: &str, hint: boo
     let sum = app
         .checklists
         .summary(channel, crate::checklist::local_midnight(now));
-    if sum.is_empty() || row.height == 0 {
+    let flags = crate::needs::answer_count(&app.needs);
+    if row.height == 0 || (sum.is_empty() && flags == 0) {
         return;
     }
     let sep = || Span::styled("  ·  ", theme::faint());
+    // ⚑ N: what needs an answer, in every channel; `!` goes through it.
+    let flag = |spans: &mut Vec<Span<'static>>| {
+        spans.push(Span::styled(format!("⚑ {flags}"), theme::bright()));
+    };
+    if sum.is_empty() {
+        let mut spans = vec![Span::raw(" ")];
+        flag(&mut spans);
+        if hint {
+            spans.push(Span::styled(
+                "  need you · 0 to see · ! next",
+                theme::faint(),
+            ));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), row);
+        return;
+    }
     let mut spans = vec![Span::raw(" ")];
     match sum.mode {
         Some(crate::checklist::Mode::Running) => {
@@ -1202,6 +1248,10 @@ fn draw_status(f: &mut Frame, app: &mut App, row: Rect, channel: &str, hint: boo
             format!("✖ {n} crash{} today", if n == 1 { "" } else { "es" }),
             theme::bright(),
         ));
+    }
+    if flags > 0 {
+        spans.push(Span::raw("   "));
+        flag(&mut spans);
     }
     if hint && total > 0 {
         spans.push(Span::styled("    c checklist", theme::faint()));
@@ -1419,33 +1469,14 @@ fn draw_checklist(f: &mut Frame, app: &mut App, area: Rect) {
 
 /// The Q box: a question for the agent in #quick, over everything.
 fn draw_quick(f: &mut Frame, app: &mut App, area: Rect) {
-    let w = 76.min(area.width.saturating_sub(2));
-    let cols = (w as usize).saturating_sub(4).max(4);
-    let d = &app.quick_draft;
-    let text_rows = d
-        .text
-        .split('\n')
-        .map(|l| wrap_cols(&crate::draft::expand_tabs(l), cols).len())
-        .sum::<usize>()
-        .clamp(1, 8) as u16;
-    let r = centered(area, w, text_rows + 6);
-    clear(f, r);
     let l = &app.loop_;
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(theme::bright())
-        .title(Span::styled(
-            format!(" Q · ask {} in #{} ", l.quick_agent, l.quick_channel),
-            theme::bright(),
-        ));
-    let inner = block.inner(r);
-    f.render_widget(block, r);
+    let title = format!(" Q · ask {} in #{} ", l.quick_agent, l.quick_channel);
     let here = app
         .current()
         .and_then(|c| app.store.channels.get(c))
         .map(channel_label)
         .unwrap_or_default();
-    let mut lines = vec![if app.quick_include {
+    let head = if app.quick_include {
         Line::from(vec![
             Span::styled(" + ", theme::badge()),
             Span::styled(
@@ -1461,11 +1492,102 @@ fn draw_quick(f: &mut Frame, app: &mut App, area: Rect) {
             format!(" a new thread in #{}.  ^q again: + {here}", l.quick_channel),
             theme::faint(),
         )
-    }];
+    };
+    let short = [
+        ("⏎", "send"),
+        (
+            "^q",
+            if app.quick_include {
+                "drop channel"
+            } else {
+                "+ channel"
+            },
+        ),
+        ("⇧⏎", "new line"),
+        ("esc", "close"),
+    ];
+    draw_box(
+        f,
+        area,
+        title,
+        head,
+        &app.quick_draft,
+        "type your question",
+        &short,
+    );
+}
+
+/// `r` on tab 0: a reply to the picked row, into its thread.
+fn draw_reply(f: &mut Frame, app: &mut App, area: Rect) {
+    let Some(r) = app.reply_to.clone() else {
+        return;
+    };
+    let ch = app
+        .store
+        .channels
+        .get(&r.channel)
+        .map(channel_label)
+        .unwrap_or_else(|| "#…".into());
+    let title = if r.thread.is_some() {
+        format!(" reply in {ch} › thread ")
+    } else {
+        format!(" message {ch} ")
+    };
+    let who = needs_who(app, &r);
+    let head = Line::from(vec![
+        Span::styled(format!(" {who}: "), theme::muted()),
+        Span::styled(
+            clip(
+                &r.text,
+                (area.width as usize).saturating_sub(who.width() + 12),
+            ),
+            theme::text(),
+        ),
+    ]);
+    let short = [("⏎", "send"), ("⇧⏎", "new line"), ("esc", "close")];
+    draw_box(
+        f,
+        area,
+        title,
+        head,
+        &app.reply_draft,
+        "type your reply",
+        &short,
+    );
+}
+
+/// A box over everything for a short text: a line saying where it goes,
+/// the text, and its keys.
+fn draw_box(
+    f: &mut Frame,
+    area: Rect,
+    title: String,
+    head: Line<'static>,
+    d: &crate::draft::Draft,
+    placeholder: &str,
+    short: &[(&str, &str)],
+) {
+    let w = 76.min(area.width.saturating_sub(2));
+    let cols = (w as usize).saturating_sub(4).max(4);
+    let text_rows = d
+        .text
+        .split('\n')
+        .map(|l| wrap_cols(&crate::draft::expand_tabs(l), cols).len())
+        .sum::<usize>()
+        .clamp(1, 8) as u16;
+    let r = centered(area, w, text_rows + 6);
+    clear(f, r);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(theme::bright())
+        .title(Span::styled(title, theme::bright()));
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    let mut lines = vec![head];
     lines.push(Line::raw(""));
     let text_top = inner.y + lines.len() as u16;
     if d.text.is_empty() {
-        lines.push(Line::styled(" type your question", theme::faint()));
+        lines.push(Line::styled(format!(" {placeholder}"), theme::faint()));
     } else {
         for l in d.text.split('\n') {
             for l in wrap_cols(&crate::draft::expand_tabs(l), cols) {
@@ -1495,20 +1617,7 @@ fn draw_quick(f: &mut Frame, app: &mut App, area: Rect) {
     }
     // The footer has the long forms; here, what fits in the box.
     let mut legend = vec![Span::raw(" ")];
-    let short = [
-        ("⏎", "send"),
-        (
-            "^q",
-            if app.quick_include {
-                "drop channel"
-            } else {
-                "+ channel"
-            },
-        ),
-        ("⇧⏎", "new line"),
-        ("esc", "close"),
-    ];
-    for (i, (k, what)) in short.into_iter().enumerate() {
+    for (i, (k, what)) in short.iter().enumerate() {
         legend.push(Span::styled(format!(" {k} "), theme::chip(theme::nth(i))));
         legend.push(Span::styled(format!(" {what}  "), theme::muted()));
     }
@@ -1518,6 +1627,126 @@ fn draw_quick(f: &mut Frame, app: &mut App, area: Rect) {
         (inner.x + 1 + cc as u16).min(inner.right().saturating_sub(1)),
         (text_top + cl.saturating_sub(skip) as u16).min(inner.bottom().saturating_sub(1)),
     ));
+}
+
+/// Who a tab-0 row is from: their name, or the watcher's when nobody is.
+fn needs_who(app: &App, r: &crate::needs::Row) -> String {
+    if r.who.is_empty() {
+        "watcher".into()
+    } else {
+        app.store.name_of(&r.who)
+    }
+}
+
+/// Tab 0, Needs you: what waits on the operator, then FYI, oldest first.
+/// One row each: age, channel, who, one line.
+fn draw_needs(f: &mut Frame, app: &mut App, area: Rect) {
+    use crate::needs::{Reason, Section};
+    let now = crate::sync::now();
+    let rows = app.needs.clone();
+    let answer = crate::needs::answer_count(&rows);
+    let [title, rule, body] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" ⚑ needs you", theme::bright()),
+            Span::styled(
+                format!("   {answer} need an answer · {} FYI", rows.len() - answer),
+                theme::muted(),
+            ),
+            Span::styled("    ⏎ open  r reply  ! next", theme::faint()),
+        ])),
+        title,
+    );
+    f.render_widget(
+        Block::new()
+            .borders(Borders::TOP)
+            .border_style(theme::rule()),
+        rule,
+    );
+    if rows.is_empty() {
+        draw_empty(f, app, body, "nothing needs you");
+        return;
+    }
+    app.needs_cursor = app.needs_cursor.min(rows.len() - 1);
+    let cur = app.needs_cursor;
+    let width = body.width as usize;
+    // (line, row index) with the section headings in between.
+    let mut lines: Vec<(Line<'static>, Option<usize>)> = vec![];
+    let mut last = None;
+    for (i, r) in rows.iter().enumerate() {
+        if last != Some(r.section) {
+            if last.is_some() {
+                lines.push((Line::raw(""), None));
+            }
+            let (name, n) = match r.section {
+                Section::Answer => ("needs an answer", answer),
+                Section::Fyi => ("FYI", rows.len() - answer),
+            };
+            lines.push((
+                Line::styled(format!(" {name} ({n})"), theme::bright()),
+                None,
+            ));
+            last = Some(r.section);
+        }
+        let mark = match &r.reason {
+            Reason::Watch(crate::checklist::WatchState::Stalled) => "⚠",
+            Reason::Watch(_) => "⚑",
+            Reason::Parked => "‖",
+            Reason::Mention => "@",
+            Reason::Dm => "✉",
+            Reason::Bot => "·",
+        };
+        let ch = app
+            .store
+            .channels
+            .get(&r.channel)
+            .map(channel_label)
+            .unwrap_or_else(|| format!("#{}", r.channel.chars().take(8).collect::<String>()));
+        let head = format!(
+            " {mark} {:>5}  {}  {}  ",
+            ago(now.saturating_sub(r.at)),
+            pad_to(&clip(&ch, 20), 19),
+            pad_to(&clip(&needs_who(app, r), 13), 12),
+        );
+        let text = clip(&r.text, width.saturating_sub(head.width()));
+        let (hs, ts) = if i == cur {
+            (theme::tab_active(), theme::tab_active())
+        } else if r.section == Section::Answer {
+            (theme::muted(), theme::text())
+        } else {
+            (theme::faint(), theme::muted())
+        };
+        lines.push((
+            Line::from(vec![
+                Span::styled(head, hs),
+                Span::styled(pad_to(&text, width.saturating_sub(0)), ts),
+            ]),
+            Some(i),
+        ));
+    }
+    let h = body.height as usize;
+    let at = lines.iter().position(|(_, i)| *i == Some(cur)).unwrap_or(0);
+    let first = at.saturating_sub(h.saturating_sub(1));
+    let mut out = vec![];
+    for (y, (l, i)) in lines.into_iter().skip(first).take(h).enumerate() {
+        if let Some(i) = i {
+            app.hits.push((
+                Rect {
+                    y: body.y + y as u16,
+                    height: 1,
+                    ..body
+                },
+                Hit::NeedsRow(i),
+            ));
+        }
+        out.push(l);
+    }
+    f.render_widget(Paragraph::new(out), body);
 }
 
 fn clip(s: &str, w: usize) -> String {
@@ -2113,6 +2342,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Mode::Order,
         Mode::Confirm,
         Mode::Quick,
+        Mode::Reply,
     ];
     let tall = (legend(Mode::Normal).len() + 2)
         .max(right.iter().map(|m| legend(*m).len() + 2).sum::<usize>());
@@ -2157,6 +2387,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
             (Mode::Order, "tab order (T)"),
             (Mode::Confirm, "upload"),
             (Mode::Quick, "Q box (Q ^q)"),
+            (Mode::Reply, "reply (r on tab 0)"),
         ])),
         right,
     );
@@ -2858,6 +3089,142 @@ mod tests {
         assert!(s.contains("no checklist in this channel"), "{s}");
     }
 
+    /// Tab 0: what needs an answer, then FYI, oldest first; ⏎ opens a row,
+    /// r answers it in its thread (and the row goes), ! goes round them.
+    #[test]
+    fn tab_zero_lists_what_needs_you() {
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+        let ch = "2130646b-d6c8-4ec3-93e3-36f77bee1a37";
+        let mut app = loop_fixture();
+        let lucian = app.store.me.clone();
+        let (alice, judge) = (Keys::generate(), Keys::generate());
+        for (k, name, agent) in [(&alice, "alice", false), (&judge, "judgebot", true)] {
+            app.store.profiles.insert(
+                k.public_key().to_hex(),
+                crate::model::Profile {
+                    name: name.into(),
+                    is_agent: agent,
+                    ..Default::default()
+                },
+            );
+        }
+        let now = crate::sync::now();
+        let post = |app: &mut App, k: &Keys, text: &str, root: Option<&str>, at: u64| {
+            let mut tags = vec![
+                Tag::parse(["h", "c2"]).unwrap(),
+                Tag::parse(["p", &lucian]).unwrap(),
+            ];
+            if let Some(r) = root {
+                tags.push(Tag::parse(["e", r, "", "reply"]).unwrap());
+            }
+            let ev = EventBuilder::new(Kind::Custom(9), text)
+                .tags(tags)
+                .custom_created_at(Timestamp::from(at))
+                .sign_with_keys(k)
+                .unwrap();
+            app.store.apply(&ev);
+            ev.id.to_hex()
+        };
+        let ask = post(
+            &mut app,
+            &alice,
+            "@lucian can you review the beacon PR?",
+            None,
+            now - 3600,
+        );
+        post(
+            &mut app,
+            &judge,
+            "@lucian deployed beacon v2",
+            None,
+            now - 120,
+        );
+        app.store.channel_mut("c2").loaded = true;
+        // A channel with no list still shows the count.
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('2').into()));
+        let s = screen_text(&mut app, 120, 34);
+        assert!(s.contains("⚑ 3  need you · 0 to see · ! next"), "{s}");
+        assert!(s.contains("0 ⚑ needs you 3"), "{s}");
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('0').into()));
+        let s = screen_text(&mut app, 120, 34);
+        assert!(
+            s.contains("needs an answer (3)") && s.contains("FYI (1)"),
+            "{s}"
+        );
+        let at = |t: &str| s.find(t).unwrap_or_else(|| panic!("{t}: {s}"));
+        // Oldest first: alice an hour ago, the parked item, the watcher's ask.
+        assert!(at("can you review the beacon PR?") < at("Restart prod relay tonight"));
+        assert!(at("Restart prod relay tonight") < at("waiting on lucian"));
+        assert!(
+            at("waiting on lucian") < at("FYI (1)") && at("FYI (1)") < at("deployed beacon v2")
+        );
+        assert!(
+            s.contains("#beacon") && s.contains("alice") && s.contains("judgebot"),
+            "{s}"
+        );
+        // ⏎ opens alice's message.
+        app.on_term(crossterm::event::Event::Key(KeyCode::Enter.into()));
+        assert!(!app.needs_view);
+        assert_eq!(
+            (app.current(), app.selected.get("c2")),
+            (Some("c2"), Some(&ask))
+        );
+        // r on her row: a reply into her thread.
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('0').into()));
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('r').into()));
+        for c in "on it".chars() {
+            app.on_term(crossterm::event::Event::Key(KeyCode::Char(c).into()));
+        }
+        let s = screen_text(&mut app, 120, 34);
+        assert!(
+            s.contains("reply in #beacon › thread") && s.contains("alice: @lucian can you review"),
+            "{s}"
+        );
+        app.actions.clear();
+        app.on_term(crossterm::event::Event::Key(KeyCode::Enter.into()));
+        assert!(matches!(app.actions.first(),
+            Some(crate::app::Action::SendDraft { channel, root, draft })
+                if channel == "c2" && root.as_ref() == Some(&ask) && draft.text == "on it"));
+        // Once the reply is in the store, her row is gone.
+        let m = crate::model::Message {
+            id: "lucian-reply".into(),
+            author: lucian.clone(),
+            created_at: now - 1,
+            content: "on it".into(),
+            root: Some(ask.clone()),
+            ..Default::default()
+        };
+        app.store.channel_mut("c2").messages.insert(m.id.clone(), m);
+        let s = screen_text(&mut app, 120, 34);
+        assert!(
+            s.contains("needs an answer (2)") && !s.contains("can you review the beacon"),
+            "{s}"
+        );
+        // ! goes oldest first: the parked item's thread, then the ping in it.
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('!').into()));
+        assert_eq!(app.thread, Some((ch.to_string(), "5dbdf585".to_string())));
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .0
+                .starts_with("⚑ 1/2  taskbot: Restart prod relay")
+        );
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('!').into()));
+        assert_eq!(app.thread_selected.as_deref(), Some("c0ffee01"));
+        assert!(app.status.as_ref().unwrap().0.starts_with("⚑ 2/2"));
+        // H from the first channel tab comes round to tab 0.
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('1').into()));
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('H').into()));
+        assert!(app.needs_view);
+        app.mode = Mode::Help;
+        let s = screen_text(&mut app, 120, 60);
+        assert!(
+            s.contains("next ⚑, oldest first") && s.contains("reply (r on tab 0)"),
+            "{s}"
+        );
+    }
+
     #[test]
     fn the_q_box_shows_what_it_sends() {
         let mut app = loop_fixture();
@@ -3126,10 +3493,10 @@ mod tests {
             app.store.channel_mut(&format!("c{i}")).name = format!("chan-{i}");
         }
         app.tabs = (0..5).map(|i| format!("c{i}")).collect();
-        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 10)).unwrap();
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(114, 10)).unwrap();
         t.draw(|f| draw(f, &mut app)).unwrap();
         let buf = t.backend().buffer().clone();
-        let top: String = (0..100).map(|x| buf[(x, 0)].symbol()).collect();
+        let top: String = (0..114).map(|x| buf[(x, 0)].symbol()).collect();
         assert!(top.contains("chan-4") && !top.contains('…'), "{top}");
     }
 
