@@ -592,13 +592,14 @@ impl Sync {
                 parent,
             } => {
                 let draft = std::mem::take(app.draft_mut());
-                self.send(app, channel, root, parent, draft)
+                self.send(app, channel, root, parent, draft, vec![])
             }
             Action::SendDraft {
                 channel,
                 root,
                 draft,
-            } => self.send(app, channel, root.clone(), root, draft),
+                to,
+            } => self.send(app, channel, root.clone(), root, draft, to),
             Action::ThumbsUp { target } => self.thumbs_up(app, target),
             Action::Reset {
                 channel,
@@ -691,6 +692,7 @@ impl Sync {
         root: Option<String>,
         parent: Option<String>,
         draft: crate::draft::Draft,
+        to: Vec<String>,
     ) {
         let mut content = draft.text.trim_end().to_string();
         for a in &draft.attachments {
@@ -703,6 +705,11 @@ impl Sync {
         }
         let content = content.trim_start_matches('\n').to_string();
         let mut mentions = draft.mention_pubkeys();
+        for pk in to {
+            if pk != app.store.me && !mentions.contains(&pk) {
+                mentions.push(pk);
+            }
+        }
         // In a DM everyone else is notified, as Desktop does.
         if let Some(ch) = app.store.channels.get(&channel).filter(|c| c.is_dm) {
             for m in &ch.members {

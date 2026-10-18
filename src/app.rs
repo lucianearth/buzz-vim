@@ -135,6 +135,8 @@ pub enum Action {
         channel: String,
         root: Option<String>,
         draft: Draft,
+        /// Notified too, without an @ in the text: the row's asker.
+        to: Vec<String>,
     },
     /// Look up these people's names (the Q agent's, in #quick).
     WantProfiles(Vec<String>),
@@ -645,10 +647,12 @@ impl App {
             return;
         };
         let draft = std::mem::take(&mut self.reply_draft);
+        let to = (!r.who.is_empty()).then_some(r.who).into_iter().collect();
         self.actions.push(Action::SendDraft {
             channel: r.channel,
             root: r.thread,
             draft,
+            to,
         });
         self.mode = Mode::Normal;
     }

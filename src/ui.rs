@@ -3183,8 +3183,9 @@ mod tests {
         app.actions.clear();
         app.on_term(crossterm::event::Event::Key(KeyCode::Enter.into()));
         assert!(matches!(app.actions.first(),
-            Some(crate::app::Action::SendDraft { channel, root, draft })
-                if channel == "c2" && root.as_ref() == Some(&ask) && draft.text == "on it"));
+            Some(crate::app::Action::SendDraft { channel, root, draft, to })
+                if channel == "c2" && root.as_ref() == Some(&ask) && draft.text == "on it"
+                    && to == &vec![alice.public_key().to_hex()]));
         // Once the reply is in the store, her row is gone.
         let m = crate::model::Message {
             id: "lucian-reply".into(),
