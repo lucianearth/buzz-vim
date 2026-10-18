@@ -411,8 +411,10 @@ struct ComposeField: UIViewRepresentable {
     }
 
     func sizeThatFits(_ proposal: ProposedViewSize, uiView v: PasteTextView, context: Context) -> CGSize? {
-        let width = proposal.width.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
-            ?? (v.bounds.width > 0 ? v.bounds.width : 240)
+        // Never fall back to the view's own width: answering SwiftUI's
+        // 0 and infinite probes with the current width made the box look
+        // fixed, so the row stopped stretching it to fill the bar.
+        let width = proposal.width.flatMap { $0.isFinite ? $0 : nil } ?? 240
         let probe = Self.probe
         probe.font = v.font
         probe.attributedText = v.attributedText
