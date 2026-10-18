@@ -223,7 +223,10 @@ pub fn rows(
                     // Stable across republishes that only bump nudges.
                     key: format!(
                         "watch:{channel}:{label}:{}",
-                        w.ping.clone().or(w.since.map(|t| t.to_string())).unwrap_or_default()
+                        w.ping
+                            .clone()
+                            .or(w.since.map(|t| t.to_string()))
+                            .unwrap_or_default()
                     ),
                 });
             }
@@ -642,8 +645,13 @@ mod tests {
             serde_json::json!({"text": "migrate relay", "status": "parked", "parked_question": "tonight?"}));
         let wk = w.watcher.clone();
         let watch = |w: &mut World, at: u64| {
-            w.record(&wk, 30472, format!("buzz-checklist/watch/{CH}"), at,
-                serde_json::json!({"state": "stalled", "nudges": at}));
+            w.record(
+                &wk,
+                30472,
+                format!("buzz-checklist/watch/{CH}"),
+                at,
+                serde_json::json!({"state": "stalled", "nudges": at}),
+            );
         };
         watch(&mut w, NOW - 600);
         let before: Vec<String> = w.rows().iter().map(|r| r.key.clone()).collect();
@@ -653,8 +661,10 @@ mod tests {
         w.record(&bot, 30470, format!("buzz-checklist/item/{CH}/a1"), NOW - 290,
             serde_json::json!({"text": "migrate relay", "details": "more", "status": "parked", "parked_question": "tonight?"}));
         let after: Vec<String> = w.rows().iter().map(|r| r.key.clone()).collect();
-        assert_eq!(before.iter().collect::<std::collections::HashSet<_>>(),
-            after.iter().collect::<std::collections::HashSet<_>>());
+        assert_eq!(
+            before.iter().collect::<std::collections::HashSet<_>>(),
+            after.iter().collect::<std::collections::HashSet<_>>()
+        );
         // No thread anywhere: a top-level answer in the channel clears the watch row.
         w.post(&op, CH, "nightly", None, None, NOW - 100);
         assert_eq!(keys(&w.rows()), [(Section::Answer, "parked".to_string())]);
