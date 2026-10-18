@@ -30,15 +30,22 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 mod pairing;
+mod push;
 pub use pairing::{PairStep, Pairing};
+pub use push::{PushChallenge, PushDelegation, PushNote, PushRelay};
 
 uniffi::setup_scaffolding!();
 
-static RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
-    // reqwest and the websocket both link rustls with more than one crypto
-    // backend, so rustls won't pick one itself: without this every TLS
-    // connection panics inside its task and the app sits at "connecting".
+/// reqwest and the websocket both link rustls with more than one crypto
+/// backend, so rustls won't pick one itself: without this every TLS
+/// connection panics inside its task and the app sits at "connecting".
+/// The notification extension makes no `Client`, so push calls it too.
+fn tls() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+static RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tls();
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -51,6 +58,9 @@ static RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
 pub enum BuzzError {
     #[error("{0}")]
     Failed(String),
+    /// The push gateway no longer knows this installation: enroll again.
+    #[error("{0}")]
+    Gone(String),
 }
 
 impl From<anyhow::Error> for BuzzError {
