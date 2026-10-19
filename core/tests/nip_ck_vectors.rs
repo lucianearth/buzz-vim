@@ -1,5 +1,7 @@
 //! The shared NIP-CK reader vectors (rule v3), run through the production
-//! reader: `Checklists::apply`, then `driver`, `header`, `items`, `watch`.
+//! reader: `Checklists::apply`, then `driver`, `header`, `items`, `watch`,
+//! checking the selection and what is read out of it (the header's mode,
+//! each item's status). Failures name the case.
 //! The file is the one every reader repo commits, byte for byte.
 
 use buzz_vim_core::checklist::{self, Checklists, Trust};
@@ -8,7 +10,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const VECTORS: &[u8] = include_bytes!("nip-ck-vectors.json");
-const SHA256: &str = "4bcbc5970212dd47e48f89c13a1812b07efb3988606b992911b14e9b22606442";
+const SHA256: &str = "07db6f3149fd6b7bb48a48fda784466f9dbd27bf4c5a20be415c31b25bd021ba";
 
 fn vectors() -> Value {
     serde_json::from_slice(VECTORS).unwrap()
@@ -43,7 +45,7 @@ fn every_case_reads_as_expected() {
             .collect(),
     };
     let cases = v["cases"].as_array().unwrap();
-    assert_eq!(cases.len(), 31);
+    assert_eq!(cases.len(), 52);
     let mut failed = vec![];
     for case in cases {
         let mut lists = Checklists::new(trust.clone());
@@ -52,24 +54,29 @@ fn every_case_reads_as_expected() {
             lists.apply(&ev);
         }
         let d = lists.driver(channel);
-        let mut items: Vec<String> = lists
-            .items(channel)
-            .into_iter()
-            .map(|i| i.event_id)
-            .collect();
+        let shown = lists.items(channel);
+        let mut items: Vec<String> = shown.iter().map(|i| i.event_id.clone()).collect();
         items.sort();
+        let item_status: serde_json::Map<String, Value> = shown
+            .iter()
+            .map(|i| (i.event_id.clone(), json!(i.status.label())))
+            .collect();
+        let header = lists.header(channel);
         let got = json!({
             "driver": d.driver,
             "contested": d.contested,
             "contested_running": d.contested_running,
-            "header": lists.header(channel).map(|h| h.event_id),
+            "header": header.as_ref().map(|h| h.event_id.clone()),
             "items": items,
             "watch": lists.watch(channel).map(|w| w.event_id),
+            "mode": header.as_ref().map(|h| h.mode.label()),
+            "item_status": item_status,
         });
         if got != case["expect"] {
             failed.push(format!(
                 "{}: got {got}, want {}",
-                case["name"], case["expect"]
+                case["name"].as_str().unwrap_or_default(),
+                case["expect"]
             ));
         }
     }
