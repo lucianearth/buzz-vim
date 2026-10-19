@@ -107,6 +107,9 @@ pub fn one_line(s: &str) -> String {
 /// client p-tags DMs) and the checklist records. `since` = None asks for
 /// history over the horizon; Some(now) is the live tail. The relay only
 /// tails channel events for a REQ with `#h`, so the ids go in every filter.
+/// History asks for his posts and the records one channel at a time: the
+/// relay caps each filter at 1000 events, which all channels together
+/// could pass.
 pub fn filters(
     channels: &[String],
     dms: &[String],
@@ -125,12 +128,22 @@ pub fn filters(
     if chans.is_empty() {
         return vec![];
     }
+    let checklist = crate::checklist::KINDS;
+    let tag = crate::checklist::TAG;
     let mut f = vec![
         json!({"kinds": kinds, "#h": chans, "#p": [operator], "since": since, "limit": limit}),
-        json!({"kinds": kinds, "#h": chans, "authors": [operator], "since": since, "limit": limit}),
-        json!({"kinds": crate::checklist::KINDS, "#h": chans, "#t": [crate::checklist::TAG],
-            "since": if live { now } else { 0 }, "limit": limit}),
     ];
+    if live {
+        f.push(
+            json!({"kinds": kinds, "#h": chans, "authors": [operator], "since": since, "limit": 0}),
+        );
+        f.push(json!({"kinds": checklist, "#h": chans, "#t": [tag], "since": now, "limit": 0}));
+    } else {
+        for c in &chans {
+            f.push(json!({"kinds": kinds, "#h": [c], "authors": [operator], "since": since, "limit": 1000}));
+            f.push(json!({"kinds": checklist, "#h": [c], "#t": [tag], "since": 0, "limit": 500}));
+        }
+    }
     if !dms.is_empty() {
         f.push(json!({"kinds": kinds, "#h": dms, "since": since, "limit": limit}));
     }
@@ -473,14 +486,21 @@ mod tests {
     fn filters_scope_every_request_to_our_channels() {
         let chans = vec![CH.to_string(), DM.to_string()];
         let f = filters(&chans, &[DM.to_string()], "op", NOW, false);
-        assert_eq!(f.len(), 4);
+        assert_eq!(f.len(), 6);
         assert!(
             f.iter()
                 .all(|f| f["#h"].as_array().is_some_and(|h| !h.is_empty()))
         );
         assert_eq!(f[0]["#p"][0], "op");
-        assert_eq!(f[1]["authors"][0], "op");
         assert_eq!(f[0]["since"], NOW - HORIZON);
+        // History: his posts and the records one channel at a time.
+        for (i, ch) in chans.iter().enumerate() {
+            let (posts, records) = (&f[1 + 2 * i], &f[2 + 2 * i]);
+            assert_eq!(posts["authors"][0], "op");
+            assert_eq!(posts["#h"], serde_json::json!([ch]));
+            assert_eq!(records["#h"], serde_json::json!([ch]));
+            assert_eq!(records["kinds"], serde_json::json!(crate::checklist::KINDS));
+        }
         let live = filters(&chans, &[], "op", NOW, true);
         assert_eq!(
             (live.len(), &live[2]["since"], &live[2]["limit"]),
