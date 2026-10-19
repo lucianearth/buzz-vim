@@ -75,7 +75,8 @@ fn loop_settings(file: &File) -> Loop {
             .unwrap_or(d.owner),
         watchers: env("BUZZ_VIM_WATCHER")
             .map(|s| s.split(',').map(|k| k.trim().to_string()).collect())
-            .unwrap_or_else(|| file.watcher.clone()),
+            .or_else(|| (!file.watcher.is_empty()).then(|| file.watcher.clone()))
+            .unwrap_or(d.watchers),
         quick_channel: env("BUZZ_VIM_QUICK_CHANNEL")
             .or(file.quick_channel.clone())
             .unwrap_or(d.quick_channel),
@@ -205,4 +206,26 @@ fn write_private(p: &std::path::Path, bytes: &[u8]) -> Result<()> {
 fn write_private(p: &std::path::Path, bytes: &[u8]) -> Result<()> {
     std::fs::write(p, bytes)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// No `watcher` in config.json: the watcher seat's state still counts
+    /// (it did not, so the status line never showed it).
+    #[test]
+    fn watchers_default_to_the_watcher_seat() {
+        if env("BUZZ_VIM_WATCHER").is_some() {
+            return;
+        }
+        let d = loop_settings(&File::default());
+        assert_eq!(d.watchers, Loop::default().watchers);
+        assert!(!d.watchers.is_empty());
+        let set = File {
+            watcher: vec!["abc".into()],
+            ..File::default()
+        };
+        assert_eq!(loop_settings(&set).watchers, vec!["abc".to_string()]);
+    }
 }
