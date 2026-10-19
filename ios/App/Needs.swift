@@ -177,9 +177,11 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         c.requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
-    /// On every sync poke (main thread). `quiet`: mark rows seen, post nothing.
+    /// On every sync poke (main thread). Only the watcher's rows notify,
+    /// as with push. `quiet` (a push lease is live and covers them): mark
+    /// rows seen, post nothing.
     func check(_ client: Client, quiet: Bool) {
-        let fresh = client.needsYou().filter { $0.section == .answer && !seenSet.contains($0.key) }
+        let fresh = client.needsYou().filter { $0.watcher && !seenSet.contains($0.key) }
         guard !fresh.isEmpty else { return }
         for r in fresh where r.at >= since && !quiet {
             post(r)

@@ -1,5 +1,6 @@
 import DeviceCheck
 import Foundation
+import Observation
 import UIKit
 
 /// Push to the closed app, on upstream Buzz's native push (see
@@ -11,6 +12,7 @@ import UIKit
 /// Renewal: the grant lasts 29 days and is renewed when a week is left,
 /// whenever the app runs. The lease follows the subscriptions (the watcher)
 /// and is published again when they change.
+@Observable
 final class Push {
     static let shared = Push()
     /// The push gateway this app enrolls with.
@@ -30,7 +32,7 @@ final class Push {
     private(set) var failure: String?
 
     /// A lease the relay took is in force: tab 0 posts no local
-    /// notifications then, the push covers them.
+    /// notifications then, the push covers the watcher's rows.
     var live: Bool {
         state.leased != nil && state.leaseExpires > Self.now()
     }
@@ -47,8 +49,15 @@ final class Push {
     /// most every 30 seconds, one attempt at a time.
     func refresh(_ client: Client, relay: String) {
         guard !busy, Date().timeIntervalSince(checked) > 30, let token,
-              DCAppAttestService.shared.isSupported,
-              let subs = try? client.pushSubscriptions() else { return }
+              DCAppAttestService.shared.isSupported else { return }
+        let subs: String
+        do {
+            guard let s = try client.pushSubscriptions() else { return }
+            subs = s
+        } catch {
+            failure = "subscriptions: \(error)"
+            return
+        }
         checked = Date()
         let now = Self.now()
         let endpoint = token.map { String(format: "%02x", $0) }.joined()
@@ -90,6 +99,7 @@ final class Push {
     /// The App Attest key and installation stay for the next login.
     func stop(_ client: Client, relay: String) {
         session += 1
+        failure = nil
         guard state.leased != nil || state.grant != nil else { return }
         let was = state
         state.leased = nil

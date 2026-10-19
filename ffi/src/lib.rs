@@ -397,6 +397,8 @@ pub struct NeedRow {
     pub section: NeedSection,
     /// "waiting on lucian", "stalled", "parked", "mention", "dm", "bot".
     pub kind: String,
+    /// The watcher flagged it: the only rows that notify (push and local).
+    pub watcher: bool,
     pub channel: String,
     /// "#name", or "@name" for a DM.
     pub channel_label: String,
@@ -879,7 +881,7 @@ impl Client {
         })
     }
 
-    /// Tab 0: what needs an answer, then FYI, oldest first in each.
+    /// Tab 0: what needs an answer (oldest first), then FYI (newest first).
     pub fn needs_you(&self) -> Vec<NeedRow> {
         let e = self.engine.lock().unwrap();
         e.needs_rows()
@@ -890,6 +892,7 @@ impl Client {
                     needs::Section::Fyi => NeedSection::Fyi,
                 },
                 kind: r.label(),
+                watcher: matches!(r.reason, needs::Reason::Watch(_)),
                 channel_label: e.label(&r.channel),
                 who_name: if r.who.is_empty() {
                     "watcher".into()

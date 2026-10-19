@@ -469,9 +469,9 @@ impl Note {
     }
 }
 
-/// The queries for recent events the lease could have woken us for: one
-/// filter per DM, since a multi-`#h` filter narrows to one channel on
-/// `POST /query`.
+/// The queries for recent events the lease could have woken us for. An
+/// `#h` list (leases from before watcher-only push) splits into one filter
+/// per channel, since a multi-`#h` filter narrows to one on `POST /query`.
 pub fn resolve_filters(subs: &[Value], now: u64) -> Vec<Value> {
     let since = now.saturating_sub(RESOLVE_WINDOW);
     let mut out = vec![];

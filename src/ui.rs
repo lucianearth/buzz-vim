@@ -1638,7 +1638,7 @@ fn needs_who(app: &App, r: &crate::needs::Row) -> String {
     }
 }
 
-/// Tab 0, Needs you: what waits on the operator, then FYI, oldest first.
+/// Tab 0, Needs you: what waits on the operator, then FYI (newest first, latest 20).
 /// One row each: age, channel, who, one line.
 fn draw_needs(f: &mut Frame, app: &mut App, area: Rect) {
     use crate::needs::{Reason, Section};
@@ -3089,7 +3089,7 @@ mod tests {
         assert!(s.contains("no checklist in this channel"), "{s}");
     }
 
-    /// Tab 0: what needs an answer, then FYI, oldest first; ⏎ opens a row,
+    /// Tab 0: what needs an answer, then FYI, newest first; ⏎ opens a row,
     /// r answers it in its thread (and the row goes), ! goes round them.
     #[test]
     fn tab_zero_lists_what_needs_you() {
