@@ -97,21 +97,22 @@ final class Push {
     }
 
     /// Logout: an inactive lease, then the gateway forgets the relay key.
-    /// The App Attest key and installation stay for the next login.
+    /// The App Attest key and installation stay for the next login. The
+    /// lease and grant are cleared only once the tombstone is out, so a
+    /// stop that failed (offline) is tried again by the next one.
     func stop(_ client: Client, relay: String) {
         session += 1
         failure = nil
         guard state.leased != nil || state.grant != nil else { return }
         let was = state
-        state.leased = nil
-        state.grant = nil
-        state.save()
         Task { @MainActor in
             do {
                 let r = try await pushRelay(relayUrl: relay)
                 let generation = max(was.leaseGeneration + 1, UInt64(Self.now()))
                 try await client.pushTombstone(relay: r, installation: was.lease, generation: generation)
                 state.leaseGeneration = generation
+                state.leased = nil
+                state.grant = nil
                 state.save()
                 guard let keyId = was.keyId, let installation = was.installation,
                       let relayPubkey = was.relayPubkey else { return }
