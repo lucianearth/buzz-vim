@@ -19,6 +19,7 @@ use buzz_vim_core::live::{self, Cmd, ConnState, Live};
 use buzz_vim_core::model::{self, Applied, Store};
 use buzz_vim_core::needs;
 use buzz_vim_core::palette::{self, Role};
+use buzz_vim_core::quick;
 use buzz_vim_core::readstate::{self, ReadState};
 use buzz_vim_core::relay::{BlobDescriptor, Relay};
 use buzz_vim_core::sections::{self, Lanes, Section};
@@ -413,6 +414,22 @@ pub struct NeedRow {
     pub link: String,
     /// The thread a reply goes into (`send`'s root); None: the channel.
     pub thread: Option<String>,
+}
+
+/// The Q box as it opens: where the question goes, and what a second tap
+/// adds.
+#[derive(uniffi::Record, Clone)]
+pub struct QuickBox {
+    /// #quick's id.
+    pub channel: String,
+    /// "#quick".
+    pub label: String,
+    /// The agent asked, by name ("taskbot").
+    pub agent: String,
+    /// The channel you're in as the second tap adds it ("#buzz-vim"), with
+    /// its latest messages; None when there's nothing to add (no channel
+    /// open, or you're in #quick).
+    pub here: Option<String>,
 }
 
 // ---------- the client ----------
@@ -1034,6 +1051,44 @@ impl Client {
     ) -> Result<String, BuzzError> {
         let mut e = self.engine.lock().unwrap();
         e.send(channel, root, text, &attachments, &to)
+    }
+
+    /// Open the Q box, as `Q` does in the terminal: fails with why when
+    /// there's no #quick (buzz-vim never makes it). `here` is the channel
+    /// on screen; #quick's members' names load for the mention.
+    pub fn open_quick(&self, here: Option<String>) -> Result<QuickBox, BuzzError> {
+        let mut e = self.engine.lock().unwrap();
+        if let Some(why) = quick::unavailable(&e.store, quick::CHANNEL, e.channels_loaded) {
+            return Err(BuzzError::Failed(why));
+        }
+        let q = quick::find_channel(&e.store, quick::CHANNEL)
+            .ok_or_else(|| BuzzError::Failed(format!("no #{} channel", quick::CHANNEL)))?;
+        let (id, members) = (q.id.clone(), q.members.clone());
+        let here = quick::can_add(&e.store, quick::CHANNEL, here.as_deref())
+            .ok()
+            .and(here)
+            .map(|h| e.label(&h));
+        e.want_profiles(members);
+        Ok(QuickBox {
+            label: e.label(&id),
+            channel: id,
+            agent: quick::AGENT.to_string(),
+            here,
+        })
+    }
+
+    /// Send a Q: a new top-level message in #quick, `[Q]` first, that
+    /// @mentions taskbot. `here` (with its open `thread`) adds that channel
+    /// and its latest messages; None sends the question alone. Returns the
+    /// message id: the answer comes in its thread.
+    pub fn ask_quick(
+        &self,
+        text: String,
+        here: Option<String>,
+        thread: Option<String>,
+    ) -> Result<String, BuzzError> {
+        let mut e = self.engine.lock().unwrap();
+        e.ask_quick(&text, here.as_deref(), thread.as_deref())
     }
 
     /// Agents `text` @mentions, by pubkey: they become the sticky audience.
@@ -2218,6 +2273,36 @@ impl Engine {
         Ok(id)
     }
 
+    /// A Q, signed as the terminal app signs it: p-tag and mention tag
+    /// for the agent, no thread.
+    fn ask_quick(
+        &mut self,
+        text: &str,
+        here: Option<&str>,
+        thread: Option<&str>,
+    ) -> Result<String, BuzzError> {
+        let here = match here {
+            Some(h) => {
+                quick::can_add(&self.store, quick::CHANNEL, Some(h)).map_err(BuzzError::Failed)?;
+                Some((h, thread))
+            }
+            None => None,
+        };
+        let a = quick::ask(&self.store, quick::CHANNEL, quick::AGENT, text, here)
+            .map_err(BuzzError::Failed)?;
+        let uuid = uuid::Uuid::parse_str(&a.channel)
+            .map_err(|_| BuzzError::Failed("bad #quick channel id".into()))?;
+        let builder =
+            buzz_sdk::build_message(uuid, &a.content, None, &[a.agent.as_str()], false, &[], &[])
+                .map_err(|e| BuzzError::Failed(e.to_string()))?
+                .tags(Tag::parse(["mention", a.agent.as_str()]).ok());
+        let ev = self.relay.sign(builder)?;
+        let id = ev.id.to_hex();
+        self.store.apply(&ev);
+        self.publish_message(ev, a.channel, vec![]);
+        Ok(id)
+    }
+
     fn publish_message(&mut self, ev: Event, channel: String, invite: Vec<String>) {
         let id = ev.id.to_hex();
         self.sending.insert(id.clone(), ev.clone());
@@ -2549,6 +2634,98 @@ mod tests {
             .unwrap();
         c.engine.lock().unwrap().fold(&reply, true);
         assert_eq!(c.needs_count(), 0);
+    }
+
+    /// Q from the phone: the same core message as the terminal's, the
+    /// question alone first, then with the channel on screen.
+    #[test]
+    fn q_asks_taskbot_in_quick_alone_or_with_this_channel() {
+        let here = "2130646b-d6c8-4ec3-93e3-36f77bee1a37";
+        let q = quick::CHANNEL_ID;
+        let tb = Keys::generate().public_key().to_hex();
+        let mut e = engine();
+        let ch = e.store.channel_mut(here);
+        ch.name = "buzz-vim".into();
+        ch.timeline = vec!["m1".into(), "m2".into()];
+        let c = Client {
+            engine: Arc::new(Mutex::new(e)),
+            stop: Arc::new(tokio::sync::Notify::new()),
+        };
+        let err = |r: Result<QuickBox, BuzzError>| match r {
+            Err(BuzzError::Failed(m)) => m,
+            _ => String::new(),
+        };
+        assert!(err(c.open_quick(Some(here.into()))).contains("still loading"));
+        c.engine.lock().unwrap().channels_loaded = true;
+        assert!(err(c.open_quick(Some(here.into()))).starts_with("no #quick channel"));
+        {
+            let mut e = c.engine.lock().unwrap();
+            let me = e.store.me.clone();
+            let qc = e.store.channel_mut(q);
+            qc.name = "quick".into();
+            qc.members = vec![me, tb.clone()];
+            e.store.profiles.entry(tb.clone()).or_default().name = "taskbot".into();
+        }
+        let b = c.open_quick(Some(here.into())).ok().unwrap();
+        assert_eq!((b.channel.as_str(), b.label.as_str()), (q, "#quick"));
+        assert_eq!(
+            (b.agent.as_str(), b.here.as_deref()),
+            ("taskbot", Some("#buzz-vim"))
+        );
+        assert!(c.engine.lock().unwrap().requested_profiles.contains(&tb));
+        // In #quick, or nowhere: nothing for a second tap to add.
+        assert!(c.open_quick(Some(q.into())).ok().unwrap().here.is_none());
+        assert!(c.open_quick(None).ok().unwrap().here.is_none());
+        let sent = |id: &str| c.engine.lock().unwrap().sending.get(id).cloned().unwrap();
+        let tags = |ev: &Event| -> Vec<Vec<String>> {
+            ev.tags.iter().map(|t| t.as_slice().to_vec()).collect()
+        };
+        // First Q: the question alone, top level, to taskbot.
+        let id = c
+            .ask_quick(" how do we ship? ".into(), None, None)
+            .ok()
+            .unwrap();
+        let ev = sent(&id);
+        assert_eq!(ev.content, "[Q]\n@taskbot how do we ship?");
+        let tg = tags(&ev);
+        assert!(tg.contains(&vec!["h".into(), q.into()]));
+        assert!(tg.iter().any(|t| t[0] == "p" && t[1] == tb));
+        assert!(tg.contains(&vec!["mention".into(), tb.clone()]));
+        assert!(!tg.iter().any(|t| t[0] == "e"));
+        assert!(
+            c.engine.lock().unwrap().store.channels[q]
+                .messages
+                .contains_key(&id)
+        );
+        // Q again: + this channel, its open thread and latest messages.
+        let id = c
+            .ask_quick("why?".into(), Some(here.into()), Some("m1".into()))
+            .ok()
+            .unwrap();
+        let ev = sent(&id);
+        assert!(
+            ev.content
+                .starts_with("[Q]\nContext: #buzz-vim (channel 2130646b")
+        );
+        assert!(
+            ev.content
+                .contains("Open thread: buzz://message?channel=2130646b")
+        );
+        assert!(ev.content.contains("Last 2 messages (oldest first): m1 m2"));
+        assert!(ev.content.ends_with("\n\n@taskbot why?"));
+        // The landing link opens that thread.
+        let f = c
+            .follow(format!("buzz://message?channel={q}&id={id}&thread={id}"))
+            .unwrap();
+        assert_eq!(
+            (f.channel.as_str(), f.root.as_deref()),
+            (q, Some(id.as_str()))
+        );
+        // Nothing typed, or #quick as the context: says why, sends nothing.
+        assert!(matches!(c.ask_quick(" ".into(), None, None),
+            Err(BuzzError::Failed(m)) if m == "type a question first"));
+        assert!(matches!(c.ask_quick("x".into(), Some(q.into()), None),
+            Err(BuzzError::Failed(m)) if m.contains("already")));
     }
 
     /// Records and crash notices folded live show up in the checklist and

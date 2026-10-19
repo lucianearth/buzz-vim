@@ -1169,28 +1169,19 @@ impl App {
     /// `Q` / `^q`: open the Q box; pressed again while it's open, the
     /// current channel goes along (or comes off again).
     fn quick(&mut self) {
+        let name = &self.loop_.quick_channel;
         if self.mode == Mode::Quick {
-            let here = self.current().and_then(|c| self.store.channels.get(c));
-            let quick = crate::quick::find_channel(&self.store, &self.loop_.quick_channel);
-            match here {
-                Some(h) if quick.is_some_and(|q| q.id == h.id) => {
-                    self.say("you're in the Q channel already; nothing to add")
-                }
-                Some(_) => self.quick_include = !self.quick_include,
-                None => self.say("no channel open to add"),
+            match crate::quick::can_add(&self.store, name, self.current()) {
+                Ok(()) => self.quick_include = !self.quick_include,
+                Err(e) => self.say(e),
             }
             return;
         }
-        let Some(q) = crate::quick::find_channel(&self.store, &self.loop_.quick_channel) else {
-            let msg = if self.channels_loaded {
-                format!(
-                    "no #{} channel: Q posts there, and buzz-vim doesn't make channels",
-                    self.loop_.quick_channel
-                )
-            } else {
-                "channels are still loading; try Q again in a moment".to_string()
-            };
+        if let Some(msg) = crate::quick::unavailable(&self.store, name, self.channels_loaded) {
             return self.say(msg);
+        }
+        let Some(q) = crate::quick::find_channel(&self.store, name) else {
+            return;
         };
         let members = q.members.clone();
         self.actions.push(Action::WantProfiles(members));
@@ -1235,31 +1226,26 @@ impl App {
     /// The Q as it will be sent, or why it can't be: (#quick id, agent
     /// pubkey, content).
     pub fn quick_message(&self) -> Result<(String, String, String), String> {
-        let text = self.quick_draft.text.trim();
-        if text.is_empty() {
-            return Err("type a question first".into());
-        }
-        let l = &self.loop_;
-        let q = crate::quick::find_channel(&self.store, &l.quick_channel)
-            .ok_or_else(|| format!("no #{} channel", l.quick_channel))?;
-        let agent = crate::quick::find_agent(&self.store, Some(q), &l.quick_agent)
-            .ok_or_else(|| format!("no agent named {} found to ask", l.quick_agent))?;
-        let context = if self.quick_include {
-            let here = self
-                .current()
-                .and_then(|c| self.store.channels.get(c))
-                .ok_or("no channel open to add")?;
+        let here = if self.quick_include {
+            let here = self.current().ok_or("no channel open to add")?;
             let root = self
                 .thread
                 .as_ref()
-                .filter(|t| t.0 == here.id)
+                .filter(|t| t.0 == here)
                 .map(|t| t.1.as_str());
-            Some(crate::quick::context_block(here, root))
+            Some((here, root))
         } else {
             None
         };
-        let content = crate::quick::compose(&l.quick_agent, text, context.as_deref());
-        Ok((q.id.clone(), agent, content))
+        let l = &self.loop_;
+        let a = crate::quick::ask(
+            &self.store,
+            &l.quick_channel,
+            &l.quick_agent,
+            &self.quick_draft.text,
+            here,
+        )?;
+        Ok((a.channel, a.agent, a.content))
     }
 
     fn send_quick(&mut self) {

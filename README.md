@@ -69,6 +69,12 @@ its thread), and ⚑ N on every channel's status line. It posts a local notifica
 Needs-an-answer row its sync sees, once per row, and only for rows that began after the phone started
 watching. That works while the app runs.
 
+Q is the button at the top right, beside the online line. It opens the same Q as the terminal's (the same
+core function builds the message): a new top-level message in #quick, starting with `[Q]` and @mentioning
+taskbot. Tap the Q chip in the sheet to add the channel you're in (its name, id, link, open thread and
+latest 30 messages' ids); tap it again to take that off. Closing the sheet keeps the text. Send lands you in
+the new thread in #quick, where the answer comes.
+
 Closed, it gets real pushes through upstream Buzz's push (`buzz-push-v1`): the phone enrolls its APNs token
 with the push gateway (`Push.gateway` in `ios/App/Push.swift`, App Attest), delegates to the relay's push
 key, and publishes a lease (kind 30350, encrypted to the relay) for @mentions and DMs to you, minus your own

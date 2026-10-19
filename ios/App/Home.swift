@@ -47,6 +47,8 @@ struct Home: View {
     @State private var showAgents = false
     @State private var showChecklist = false
     @State private var switcher = false
+    /// The Q sheet, while it's up.
+    @State private var quick: QuickBox?
 
     var body: some View {
         let _ = model.version
@@ -54,7 +56,7 @@ struct Home: View {
         VStack(spacing: 0) {
             Header(client: client, tabs: tabs, selected: $selected,
                    showAgents: $showAgents, showChecklist: $showChecklist,
-                   switcher: $switcher, openSwitcher: openSwitcher)
+                   switcher: $switcher, openSwitcher: openSwitcher, openQuick: openQuick)
             if tabs.isEmpty {
                 Spacer()
                 Text(client.ready() ? "no channels yet" : "loading channels…")
@@ -129,6 +131,31 @@ struct Home: View {
                     .presentationDragIndicator(.visible)
                     .modifier(Themed())
             }
+        }
+        .sheet(isPresented: Binding(get: { quick != nil }, set: { if !$0 { quick = nil } })) {
+            if let b = quick {
+                let here = selected == Needs.id ? nil : selected
+                QuickSheet(client: client, box: b, here: here, thread: here.flatMap { threads[$0]?.root }) { ch, id in
+                    // Into the new thread, where the answer comes.
+                    if let f = client.follow(url: "buzz://message?channel=\(ch)&id=\(id)&thread=\(id)") {
+                        follow(f)
+                    }
+                }
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+                .modifier(Themed())
+            }
+        }
+    }
+
+    /// The Q button: the sheet, or why there's no #quick to ask in.
+    private func openQuick() {
+        do {
+            quick = try client.openQuick(here: selected == Needs.id ? nil : selected)
+        } catch let BuzzError.Failed(message) {
+            model.say(message)
+        } catch {
+            model.say(error.localizedDescription)
         }
     }
 
@@ -257,6 +284,7 @@ struct Header: View {
     @Binding var showChecklist: Bool
     @Binding var switcher: Bool
     let openSwitcher: () -> Void
+    let openQuick: () -> Void
     @Environment(Model.self) private var model
     @Environment(\.theme) private var theme
     /// Each tab's place in the row, to tell which one a hold landed on.
@@ -264,10 +292,23 @@ struct Header: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            status
-                .padding(.horizontal, 22)
-                .onTapGesture { showAgents = true }
-                .onLongPressGesture { openSwitcher() }
+            HStack(spacing: 8) {
+                status
+                    .onTapGesture { showAgents = true }
+                    .onLongPressGesture { openSwitcher() }
+                Spacer()
+                // Q: a quick question to taskbot in #quick.
+                Button(action: openQuick) {
+                    Text("Q")
+                        .font(.chipOn)
+                        .foregroundStyle(theme.muted)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 4)
+                        .background(theme.chipOff, in: RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 22)
             // The operator loop's line for the open channel, when it has
             // one; ⚑ N (tab 0's count) in every channel's.
             let flags = client.needsCount()

@@ -97,9 +97,132 @@ pub fn compose(agent: &str, text: &str, context: Option<&str>) -> String {
     out
 }
 
+/// Why Q can't open now (no #quick, or channels still loading), or None
+/// when it can. buzz-vim never makes the channel.
+pub fn unavailable(store: &Store, name: &str, channels_loaded: bool) -> Option<String> {
+    if find_channel(store, name).is_some() {
+        return None;
+    }
+    Some(if channels_loaded {
+        format!(
+            "no #{} channel: Q posts there, and buzz-vim doesn't make channels",
+            name.trim_start_matches('#')
+        )
+    } else {
+        "channels are still loading; try Q again in a moment".to_string()
+    })
+}
+
+/// Whether the channel you're in can go along with a Q: not when there is
+/// none, and not #quick itself.
+pub fn can_add(store: &Store, name: &str, here: Option<&str>) -> Result<(), String> {
+    let here = here
+        .and_then(|h| store.channels.get(h))
+        .ok_or("no channel open to add")?;
+    if find_channel(store, name).is_some_and(|q| q.id == here.id) {
+        return Err("you're in the Q channel already; nothing to add".into());
+    }
+    Ok(())
+}
+
+/// A Q ready to sign: post `content` as a new top-level message in
+/// `channel`, p-tagging and mention-tagging `agent`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ask {
+    pub channel: String,
+    pub agent: String,
+    pub content: String,
+}
+
+/// The Q as it will be sent, or why it can't be. `here` is the channel to
+/// add (with its open thread, if any); None asks the question alone.
+pub fn ask(
+    store: &Store,
+    name: &str,
+    agent: &str,
+    text: &str,
+    here: Option<(&str, Option<&str>)>,
+) -> Result<Ask, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("type a question first".into());
+    }
+    let q = find_channel(store, name)
+        .ok_or_else(|| format!("no #{} channel", name.trim_start_matches('#')))?;
+    let agent_pk = find_agent(store, Some(q), agent)
+        .ok_or_else(|| format!("no agent named {agent} found to ask"))?;
+    let context = match here {
+        Some((h, root)) => {
+            let ch = store.channels.get(h).ok_or("no channel open to add")?;
+            Some(context_block(ch, root))
+        }
+        None => None,
+    };
+    Ok(Ask {
+        channel: q.id.clone(),
+        agent: agent_pk,
+        content: compose(agent, text, context.as_deref()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ask_builds_both_variants_or_says_why_not() {
+        let mut s = Store::new("me".into());
+        assert_eq!(
+            unavailable(&s, "quick", false).as_deref(),
+            Some("channels are still loading; try Q again in a moment")
+        );
+        assert!(
+            unavailable(&s, "#quick", true).is_some_and(|m| m.starts_with("no #quick channel"))
+        );
+        assert_eq!(
+            ask(&s, "quick", AGENT, "hi", None),
+            Err("no #quick channel".into())
+        );
+        let q = s.channel_mut("q1");
+        q.name = "quick".into();
+        q.members = vec!["me".into(), "tb".into()];
+        s.profiles.entry("tb".into()).or_default().name = "taskbot".into();
+        let c = s.channel_mut("c1");
+        c.name = "buzz-vim".into();
+        c.timeline = vec!["m1".into(), "m2".into()];
+        assert_eq!(unavailable(&s, "quick", false), None);
+        assert_eq!(
+            ask(&s, "quick", AGENT, "  ", None),
+            Err("type a question first".into())
+        );
+        // First Q: the question alone.
+        let a = ask(&s, "quick", AGENT, " how do we ship? ", None).unwrap();
+        assert_eq!((a.channel.as_str(), a.agent.as_str()), ("q1", "tb"));
+        assert_eq!(a.content, "[Q]\n@taskbot how do we ship?");
+        // Q again: + the channel and its latest messages (and open thread).
+        assert_eq!(can_add(&s, "quick", Some("c1")), Ok(()));
+        let a = ask(&s, "quick", AGENT, "why?", Some(("c1", Some("m1")))).unwrap();
+        assert!(
+            a.content
+                .starts_with("[Q]\nContext: #buzz-vim (channel c1)"),
+            "{}",
+            a.content
+        );
+        assert!(
+            a.content
+                .contains("Open thread: buzz://message?channel=c1&id=m1")
+        );
+        assert!(a.content.contains("Last 2 messages (oldest first): m1 m2"));
+        assert!(a.content.ends_with("\n\n@taskbot why?"));
+        // Nothing to add from #quick itself, or from nowhere.
+        assert!(can_add(&s, "quick", Some("q1")).is_err_and(|e| e.contains("already")));
+        assert!(can_add(&s, "quick", None).is_err_and(|e| e == "no channel open to add"));
+        assert_eq!(
+            ask(&s, "quick", AGENT, "x", Some(("gone", None))),
+            Err("no channel open to add".into())
+        );
+        assert!(ask(&s, "quick", "nobody", "x", None).is_err_and(|e| e.contains("nobody")));
+    }
 
     #[test]
     fn finds_quick_and_its_agent() {
