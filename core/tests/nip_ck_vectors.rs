@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const VECTORS: &[u8] = include_bytes!("nip-ck-vectors.json");
-const SHA256: &str = "249cdb9bf543c7536b610210ec13d528911a674a76a6265629a7a6378fca40ee";
+const SHA256: &str = "4bcbc5970212dd47e48f89c13a1812b07efb3988606b992911b14e9b22606442";
 
 fn vectors() -> Value {
     serde_json::from_slice(VECTORS).unwrap()
@@ -43,7 +43,7 @@ fn every_case_reads_as_expected() {
             .collect(),
     };
     let cases = v["cases"].as_array().unwrap();
-    assert_eq!(cases.len(), 25);
+    assert_eq!(cases.len(), 31);
     let mut failed = vec![];
     for case in cases {
         let mut lists = Checklists::new(trust.clone());
