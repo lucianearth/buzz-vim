@@ -234,13 +234,13 @@ pub fn rows(
                     at,
                     message: w.ping.clone(),
                     thread,
-                    // Stable across republishes that only bump nudges.
+                    // Stable across republishes that only bump nudges; a
+                    // new stall with neither ping nor since is a new key.
                     key: format!(
                         "watch:{channel}:{label}:{}",
                         w.ping
                             .clone()
-                            .or(w.since.map(|t| t.to_string()))
-                            .unwrap_or_default()
+                            .unwrap_or_else(|| w.since.unwrap_or(w.began).to_string())
                     ),
                 });
             }
@@ -719,6 +719,35 @@ mod tests {
         // No thread anywhere: a top-level answer in the channel clears the watch row.
         w.post(&op, CH, "nightly", None, None, NOW - 100);
         assert_eq!(keys(&w.rows()), [(Section::Answer, "parked".to_string())]);
+    }
+
+    #[test]
+    fn a_new_stall_without_ping_or_since_gets_a_new_key() {
+        let mut w = World::new();
+        let wk = w.watcher.clone();
+        let watch = |w: &mut World, state: &str, at: u64| {
+            w.record(
+                &wk,
+                30472,
+                format!("buzz-checklist/watch/{CH}"),
+                at,
+                serde_json::json!({"state": state, "nudges": at}),
+            );
+        };
+        let key = |w: &World| w.rows().first().map(|r| r.key.clone());
+        watch(&mut w, "stalled", NOW - 900);
+        let first = key(&w).unwrap();
+        // A nudge: the same stall.
+        watch(&mut w, "stalled", NOW - 800);
+        assert_eq!(key(&w).as_ref(), Some(&first));
+        // Working again, then stalled again: a new row.
+        watch(&mut w, "working", NOW - 700);
+        assert_eq!(key(&w), None);
+        watch(&mut w, "stalled", NOW - 600);
+        let second = key(&w).unwrap();
+        assert_ne!(second, first);
+        watch(&mut w, "stalled", NOW - 500);
+        assert_eq!(key(&w), Some(second));
     }
 
     #[test]

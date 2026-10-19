@@ -171,6 +171,9 @@ pub struct Watch {
     pub nudges: u32,
     pub reason: String,
     pub updated_at: u64,
+    /// When this run of versions in the same state began, as far as we
+    /// have seen: a nudge republish keeps it, a new stall starts it again.
+    pub began: u64,
 }
 
 /// Who a reader trusts.
@@ -202,6 +205,9 @@ struct Version {
     /// its versions seen: only the newest is kept, and its time is not the
     /// claim's.
     first_claim: Option<(u64, String)>,
+    /// Watch records: when this signer's run of versions in the same
+    /// state began (seen here; the relay keeps only the newest).
+    began: u64,
 }
 
 impl Version {
@@ -420,6 +426,7 @@ impl Checklists {
             id,
             content,
             first_claim: claim.clone(),
+            began: at,
         };
         let recs = self.channels.entry(channel.to_string()).or_default();
         let slot = match kind {
@@ -438,7 +445,12 @@ impl Checklists {
                 false
             }
             old => {
-                v.first_claim = earliest(old.and_then(|o| o.first_claim.clone()), claim);
+                if let Some(o) = &old {
+                    v.first_claim = earliest(o.first_claim.clone(), claim);
+                    if o.content.get("state") == v.content.get("state") {
+                        v.began = o.began;
+                    }
+                }
                 slot.insert(v.signer.clone(), v);
                 true
             }
@@ -550,6 +562,7 @@ impl Checklists {
             nudges: j.nudges,
             reason: j.reason,
             updated_at: v.at,
+            began: v.began,
         })
     }
 
