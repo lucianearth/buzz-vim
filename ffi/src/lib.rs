@@ -13,11 +13,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
+use buzz_vim_core::checklist::{self, Checklists};
 use buzz_vim_core::links;
 use buzz_vim_core::live::{self, Cmd, ConnState, Live};
 use buzz_vim_core::mention;
 use buzz_vim_core::model::{self, Applied, Store};
+use buzz_vim_core::needs;
 use buzz_vim_core::palette::{self, Role};
+use buzz_vim_core::quick;
 use buzz_vim_core::readstate::{self, ReadState};
 use buzz_vim_core::relay::{BlobDescriptor, Relay};
 use buzz_vim_core::sections::{self, Lanes, Section};
@@ -29,15 +32,22 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 mod pairing;
+mod push;
 pub use pairing::{PairStep, Pairing};
+pub use push::{PushChallenge, PushDelegation, PushNote, PushRelay};
 
 uniffi::setup_scaffolding!();
 
-static RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
-    // reqwest and the websocket both link rustls with more than one crypto
-    // backend, so rustls won't pick one itself: without this every TLS
-    // connection panics inside its task and the app sits at "connecting".
+/// reqwest and the websocket both link rustls with more than one crypto
+/// backend, so rustls won't pick one itself: without this every TLS
+/// connection panics inside its task and the app sits at "connecting".
+/// The notification extension makes no `Client`, so push calls it too.
+fn tls() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+static RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tls();
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -50,6 +60,9 @@ static RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
 pub enum BuzzError {
     #[error("{0}")]
     Failed(String),
+    /// The push gateway no longer knows this installation: enroll again.
+    #[error("{0}")]
+    Gone(String),
 }
 
 impl From<anyhow::Error> for BuzzError {
@@ -306,6 +319,128 @@ pub fn new_read_id() -> String {
     readstate::new_id()
 }
 
+// ---------- operator loop ----------
+
+#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq)]
+pub enum ItemStatus {
+    Open,
+    Done,
+    Parked,
+}
+
+/// One evidence entry; `link` when it can open (a message, a URL).
+#[derive(uniffi::Record, Clone)]
+pub struct Evidence {
+    pub text: String,
+    pub link: Option<String>,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct ChecklistItem {
+    pub id: String,
+    pub text: String,
+    /// Markdown, any length.
+    pub details: String,
+    pub status: ItemStatus,
+    /// Needs lucian to release it.
+    pub release: bool,
+    /// "first" / "last" for the two standing items.
+    pub standing: Option<String>,
+    pub evidence: Vec<Evidence>,
+    /// Done with no evidence: the spec requires some.
+    pub missing_evidence: bool,
+    pub parked_question: Option<String>,
+    pub creator: String,
+    pub updated_at: u64,
+}
+
+/// A channel's checklist, read-only (agents write it with `buzz checklist`).
+#[derive(uniffi::Record, Clone)]
+pub struct Checklist {
+    pub title: String,
+    /// "ideating" / "running", None without a header.
+    pub mode: Option<String>,
+    /// Branch, worktree and work log, joined.
+    pub resume: String,
+    pub items: Vec<ChecklistItem>,
+}
+
+/// The status line for a channel in the operator loop.
+#[derive(uniffi::Record, Clone)]
+pub struct LoopStatus {
+    pub mode: Option<String>,
+    pub running: bool,
+    /// The watcher's state ("waiting on lucian"), if it has said.
+    pub watch: Option<String>,
+    /// Stalled or waiting on lucian: worth a look.
+    pub needs_you: bool,
+    pub since: Option<u64>,
+    /// `buzz://` link to the watcher's ping.
+    pub ping_link: Option<String>,
+    pub open: u32,
+    pub done: u32,
+    pub parked: u32,
+    pub crashes_today: u32,
+    /// Two or more lists claim the channel and no list shows until the
+    /// owner picks a driver: "contested: name, name". None otherwise.
+    pub contested: Option<String>,
+}
+
+#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq)]
+pub enum NeedSection {
+    /// Waits on the operator.
+    Answer,
+    /// Bots mentioned him; nothing waits.
+    Fyi,
+}
+
+/// A row on tab 0, Needs you (see `buzz_vim_core::needs`).
+#[derive(uniffi::Record, Clone)]
+pub struct NeedRow {
+    /// Stable while the row stands for the same thing: notifications go by it.
+    pub key: String,
+    pub section: NeedSection,
+    /// "waiting on lucian", "stalled", "parked", "contested", "mention",
+    /// "dm", "bot".
+    pub kind: String,
+    /// The watcher flagged it: the only rows that notify (push and local).
+    pub watcher: bool,
+    /// A watcher row with its ping out: the push lease wakes the phone for
+    /// that message, so a live lease covers it. Other watcher rows notify
+    /// locally even then.
+    pub pushed: bool,
+    pub channel: String,
+    /// "#name", or "@name" for a DM.
+    pub channel_label: String,
+    /// Pubkey of whoever asks, "" for the watcher alone.
+    pub who: String,
+    pub who_name: String,
+    /// One line.
+    pub text: String,
+    pub at: u64,
+    /// Opens the row (`follow`): its message in its thread, else the
+    /// thread, else the channel.
+    pub link: String,
+    /// The thread a reply goes into (`send`'s root); None: the channel.
+    pub thread: Option<String>,
+}
+
+/// The Q box as it opens: where the question goes, and what a second tap
+/// adds.
+#[derive(uniffi::Record, Clone)]
+pub struct QuickBox {
+    /// #quick's id.
+    pub channel: String,
+    /// "#quick".
+    pub label: String,
+    /// The agent asked, by name ("taskbot").
+    pub agent: String,
+    /// The channel you're in as the second tap adds it ("#buzz-vim"), with
+    /// its latest messages; None when there's nothing to add (no channel
+    /// open, or you're in #quick).
+    pub here: Option<String>,
+}
+
 // ---------- the client ----------
 
 enum Msg {
@@ -335,6 +470,12 @@ enum Msg {
         result: anyhow::Result<()>,
     },
     Notice(String),
+    /// A channel's checklist records, and its messages since midnight.
+    Checklist {
+        channel: String,
+        records: anyhow::Result<Vec<Event>>,
+        today: anyhow::Result<Vec<Event>>,
+    },
 }
 
 struct Engine {
@@ -375,6 +516,9 @@ struct Engine {
     sending: HashMap<String, Event>,
     failed: HashMap<String, Event>,
     notices: Vec<String>,
+    checklists: Checklists,
+    /// The channel whose checklist records are tailed live.
+    checklist_for: Option<String>,
 }
 
 fn now() -> u64 {
@@ -461,6 +605,8 @@ impl Client {
             sending: HashMap::new(),
             failed: HashMap::new(),
             notices: vec![],
+            checklists: Checklists::default(),
+            checklist_for: None,
         };
         let engine = Arc::new(Mutex::new(engine));
         {
@@ -663,6 +809,11 @@ impl Client {
     pub fn open_channel(&self, channel: Option<String>) {
         let mut e = self.engine.lock().unwrap();
         e.current = channel.clone();
+        if let Some(id) = &channel {
+            if e.checklist_for.as_ref() != Some(id) {
+                e.load_checklist(id);
+            }
+        }
         if let Some(id) = channel {
             e.mark_read(&id);
             e.open(&id);
@@ -681,6 +832,121 @@ impl Client {
             e.load_channels();
             e.load_lanes();
         }
+    }
+
+    /// A channel's checklist: header and items in list order.
+    pub fn checklist(&self, channel: String) -> Checklist {
+        let e = self.engine.lock().unwrap();
+        let h = e.checklists.header(&channel);
+        let items = e
+            .checklists
+            .items(&channel)
+            .into_iter()
+            .map(|i| ChecklistItem {
+                missing_evidence: i.missing_evidence(),
+                status: match i.status {
+                    checklist::Status::Open => ItemStatus::Open,
+                    checklist::Status::Done => ItemStatus::Done,
+                    checklist::Status::Parked => ItemStatus::Parked,
+                },
+                evidence: i
+                    .evidence
+                    .iter()
+                    .map(|t| Evidence {
+                        link: checklist::evidence_link(&channel, t),
+                        text: t.clone(),
+                    })
+                    .collect(),
+                creator: e.store.name_of(&i.creator),
+                id: i.id,
+                text: i.text,
+                details: i.details,
+                release: i.release,
+                standing: i.standing,
+                parked_question: i.parked_question,
+                updated_at: i.updated_at,
+            })
+            .collect();
+        Checklist {
+            title: h.as_ref().map(|h| h.title.clone()).unwrap_or_default(),
+            mode: h.as_ref().map(|h| h.mode.label().to_string()),
+            resume: h
+                .map(|h| {
+                    [h.resume.branch, h.resume.worktree, h.resume.worklog]
+                        .into_iter()
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                })
+                .unwrap_or_default(),
+            items,
+        }
+    }
+
+    /// The channel's status line, or None when it has no list, no watcher
+    /// and no crashes today.
+    pub fn loop_status(&self, channel: String) -> Option<LoopStatus> {
+        let e = self.engine.lock().unwrap();
+        let s = e
+            .checklists
+            .summary(&channel, checklist::local_midnight(now()));
+        if s.is_empty() {
+            return None;
+        }
+        Some(LoopStatus {
+            running: s.mode == Some(checklist::Mode::Running),
+            mode: s.mode.map(|m| m.label().to_string()),
+            needs_you: s.watch.as_ref().is_some_and(|w| w.state.needs_you()),
+            since: s.watch.as_ref().and_then(|w| w.since),
+            watch: s.watch.map(|w| w.state.label()),
+            ping_link: s.ping_link,
+            open: s.open as u32,
+            done: s.done as u32,
+            parked: s.parked as u32,
+            crashes_today: s.crashes_today as u32,
+            contested: (!s.contested.is_empty()).then(|| {
+                let names: Vec<String> = s.contested.iter().map(|c| e.store.name_of(c)).collect();
+                format!("contested: {}", names.join(", "))
+            }),
+        })
+    }
+
+    /// Tab 0: what needs an answer (oldest first), then FYI (newest first).
+    pub fn needs_you(&self) -> Vec<NeedRow> {
+        let e = self.engine.lock().unwrap();
+        e.needs_rows()
+            .into_iter()
+            .map(|r| NeedRow {
+                section: match r.section {
+                    needs::Section::Answer => NeedSection::Answer,
+                    needs::Section::Fyi => NeedSection::Fyi,
+                },
+                kind: r.label(),
+                watcher: matches!(r.reason, needs::Reason::Watch(_)),
+                pushed: matches!(r.reason, needs::Reason::Watch(_)) && r.message.is_some(),
+                channel_label: e.label(&r.channel),
+                who_name: if let needs::Reason::Contested(c) = &r.reason {
+                    let names: Vec<String> = c.iter().map(|c| e.store.name_of(c)).collect();
+                    names.join(", ")
+                } else if r.who.is_empty() {
+                    "watcher".into()
+                } else {
+                    e.store.name_of(&r.who)
+                },
+                link: r.link(),
+                key: r.key,
+                channel: r.channel,
+                who: r.who,
+                text: r.text,
+                at: r.at,
+                thread: r.thread,
+            })
+            .collect()
+    }
+
+    /// How many rows need an answer: tab 0's badge, the status line's ⚑ N.
+    pub fn needs_count(&self) -> u32 {
+        needs::answer_count(&self.engine.lock().unwrap().needs_rows()) as u32
     }
 
     /// Ids of our messages the relay hasn't confirmed yet (sending or failed).
@@ -802,6 +1068,44 @@ impl Client {
     ) -> Result<String, BuzzError> {
         let mut e = self.engine.lock().unwrap();
         e.send(channel, root, text, &attachments, &to)
+    }
+
+    /// Open the Q box, as `Q` does in the terminal: fails with why when
+    /// there's no #quick (buzz-vim never makes it). `here` is the channel
+    /// on screen; #quick's members' names load for the mention.
+    pub fn open_quick(&self, here: Option<String>) -> Result<QuickBox, BuzzError> {
+        let mut e = self.engine.lock().unwrap();
+        if let Some(why) = quick::unavailable(&e.store, quick::CHANNEL, e.channels_loaded) {
+            return Err(BuzzError::Failed(why));
+        }
+        let q = quick::find_channel(&e.store, quick::CHANNEL)
+            .ok_or_else(|| BuzzError::Failed(format!("no #{} channel", quick::CHANNEL)))?;
+        let (id, members) = (q.id.clone(), q.members.clone());
+        let here = quick::can_add(&e.store, quick::CHANNEL, here.as_deref())
+            .ok()
+            .and(here)
+            .map(|h| e.label(&h));
+        e.want_profiles(members);
+        Ok(QuickBox {
+            label: e.label(&id),
+            channel: id,
+            agent: quick::AGENT.to_string(),
+            here,
+        })
+    }
+
+    /// Send a Q: a new top-level message in #quick, `[Q]` first, that
+    /// @mentions taskbot. `here` (with its open `thread`) adds that channel
+    /// and its latest messages; None sends the question alone. Returns the
+    /// message id: the answer comes in its thread.
+    pub fn ask_quick(
+        &self,
+        text: String,
+        here: Option<String>,
+        thread: Option<String>,
+    ) -> Result<String, BuzzError> {
+        let mut e = self.engine.lock().unwrap();
+        e.ask_quick(&text, here.as_deref(), thread.as_deref())
     }
 
     /// Agents `text` @mentions, by pubkey: they become the sticky audience.
@@ -987,7 +1291,10 @@ impl Client {
 
     /// The app came back: reload what may have moved while iOS froze us.
     pub fn resume(&self) {
-        let e = self.engine.lock().unwrap();
+        let mut e = self.engine.lock().unwrap();
+        if let Some(c) = e.current.clone() {
+            e.load_checklist(&c);
+        }
         e.load_channels();
         let open: Vec<String> = e.opened.iter().cloned().collect();
         for id in open {
@@ -1131,30 +1438,7 @@ impl Engine {
     }
 
     fn label(&self, id: &str) -> String {
-        let Some(c) = self.store.channels.get(id) else {
-            return format!("#{}", id.chars().take(8).collect::<String>());
-        };
-        if c.is_dm {
-            let others: Vec<String> = c
-                .members
-                .iter()
-                .filter(|m| **m != self.store.me)
-                .map(|m| self.store.name_of(m))
-                .collect();
-            if !others.is_empty() {
-                return format!("@{}", others.join(", "));
-            }
-        }
-        let n = if c.name.is_empty() {
-            c.id.chars().take(8).collect()
-        } else {
-            c.name.clone()
-        };
-        if c.is_dm {
-            format!("@{n}")
-        } else {
-            format!("#{n}")
-        }
+        self.store.label(id)
     }
 
     /// Startup: channels, sidebar lanes, read state and the global live
@@ -1384,6 +1668,33 @@ impl Engine {
         });
     }
 
+    /// The channel's checklist records and today's crash notices, and a
+    /// live tail of its records while it's on screen.
+    fn load_checklist(&mut self, id: &str) {
+        self.checklist_for = Some(id.to_string());
+        self.sub(
+            "checklist",
+            vec![json!({"kinds": checklist::KINDS, "#h": [id], "since": now(), "limit": 0})],
+        );
+        let r = self.relay.clone();
+        let channel = id.to_string();
+        let today = checklist::local_midnight(now());
+        self.spawn(async move {
+            let records = r.query(&Checklists::filters(&channel)).await;
+            let today = r
+                .query(&[
+                    json!({"kinds": model::UNREAD_KINDS, "#h": [channel], "since": today,
+                    "limit": 500}),
+                ])
+                .await;
+            Msg::Checklist {
+                channel,
+                records,
+                today,
+            }
+        });
+    }
+
     fn open(&mut self, id: &str) {
         self.subscribe_channel(id);
         if self.opened.insert(id.to_string()) {
@@ -1449,6 +1760,38 @@ impl Engine {
             ch.unread.clear();
             ch.mentioned.clear();
         }
+    }
+
+    fn needs_rows(&self) -> Vec<needs::Row> {
+        let bot = |pk: &str| needs::is_bot(&self.store, &self.agents, &self.checklists, pk);
+        needs::rows(&self.store, &self.checklists, bot, now())
+    }
+
+    /// Tab 0's data across every channel we're in (see the terminal app's
+    /// `load_needs`): the last week as history, and a live tail.
+    fn load_needs(&mut self) {
+        let mine: Vec<&model::Channel> = self
+            .store
+            .channels
+            .values()
+            .filter(|c| c.is_member && !c.archived)
+            .collect();
+        let ids: Vec<String> = mine.iter().map(|c| c.id.clone()).collect();
+        let dms: Vec<String> = mine
+            .iter()
+            .filter(|c| c.is_dm)
+            .map(|c| c.id.clone())
+            .collect();
+        let op = self.checklists.trust.owner.clone();
+        let now = now();
+        let live = needs::filters(&ids, &dms, &op, now, true);
+        if live.is_empty() {
+            return;
+        }
+        self.sub("needs", live);
+        let r = self.relay.clone();
+        let history = needs::filters(&ids, &dms, &op, now, false);
+        self.spawn(async move { Msg::Events(Ok(r.query(&history).await.unwrap_or_default())) });
     }
 
     fn is_agent(&self, pk: &str) -> bool {
@@ -1578,6 +1921,7 @@ impl Engine {
                     .collect();
                 self.want_profiles(people);
                 self.refresh_sections();
+                self.load_needs();
             }
             Msg::Channels(Err(e)) => self.notices.push(format!("couldn't load channels: {e}")),
             Msg::Lanes(Ok(evs)) => {
@@ -1676,6 +2020,29 @@ impl Engine {
             }
             Msg::Events(Err(e)) => self.notices.push(format!("couldn't load: {e}")),
             Msg::Notice(n) => self.notices.push(n),
+            // Errors are expected while the relay lacks the kinds: no notice.
+            Msg::Checklist {
+                channel,
+                records,
+                today,
+            } => {
+                let mut want = vec![];
+                for ev in records.iter().flatten() {
+                    if self.checklists.apply(ev) {
+                        want.push(ev.pubkey.to_hex());
+                    }
+                }
+                for ev in today.iter().flatten() {
+                    let id = ev.id.to_hex();
+                    self.checklists.note_message(
+                        &channel,
+                        &id,
+                        ev.created_at.as_secs(),
+                        &ev.content,
+                    );
+                }
+                self.want_profiles(want);
+            }
             Msg::Sent { id, result } => {
                 let Some(ev) = self.sending.remove(&id) else {
                     return;
@@ -1695,7 +2062,10 @@ impl Engine {
     fn on_live(&mut self, l: Live, was_online: &mut bool) {
         match l {
             Live::Event { sub, event } => {
-                let want = self.fold(&event, sub.starts_with("ch:"));
+                // Tab 0's tail carries tabs' messages too: count them as the tab's.
+                let tab = sub == "needs"
+                    && model::tag(&event, "h").is_some_and(|h| self.subscribed.contains(h));
+                let want = self.fold(&event, sub.starts_with("ch:") || tab);
                 self.want_profiles(want);
             }
             Live::Status(s) => {
@@ -1711,6 +2081,10 @@ impl Engine {
                         for id in self.opened.clone() {
                             self.window(&id, None);
                         }
+                        if let Some(c) = self.current.clone() {
+                            self.load_checklist(&c);
+                        }
+                        self.load_needs();
                     }
                     *was_online = true;
                 }
@@ -1766,6 +2140,10 @@ impl Engine {
                 self.load_channels();
                 return vec![];
             }
+            k if checklist::KINDS.contains(&k) => {
+                self.checklists.apply(ev);
+                return vec![ev.pubkey.to_hex()];
+            }
             39000 => {
                 // Only channels we know: the relay sends every channel's.
                 let known =
@@ -1796,6 +2174,8 @@ impl Engine {
         let applied = self.store.apply(ev);
         let mut want = vec![ev.pubkey.to_hex()];
         if let Applied::Message { channel, id } = applied {
+            self.checklists
+                .note_message(&channel, &id, ev.created_at.as_secs(), &ev.content);
             let active = self.visible && self.current.as_deref() == Some(channel.as_str());
             let at = ev.created_at.as_secs();
             let author = ev.pubkey.to_hex();
@@ -1901,6 +2281,36 @@ impl Engine {
             .store
             .outsiders(&channel, &mentioned, |pk| ours.is_owned(pk));
         self.publish_message(ev, channel, invite);
+        Ok(id)
+    }
+
+    /// A Q, signed as the terminal app signs it: p-tag and mention tag
+    /// for the agent, no thread.
+    fn ask_quick(
+        &mut self,
+        text: &str,
+        here: Option<&str>,
+        thread: Option<&str>,
+    ) -> Result<String, BuzzError> {
+        let here = match here {
+            Some(h) => {
+                quick::can_add(&self.store, quick::CHANNEL, Some(h)).map_err(BuzzError::Failed)?;
+                Some((h, thread))
+            }
+            None => None,
+        };
+        let a = quick::ask(&self.store, quick::CHANNEL, quick::AGENT, text, here)
+            .map_err(BuzzError::Failed)?;
+        let uuid = uuid::Uuid::parse_str(&a.channel)
+            .map_err(|_| BuzzError::Failed("bad #quick channel id".into()))?;
+        let builder =
+            buzz_sdk::build_message(uuid, &a.content, None, &[a.agent.as_str()], false, &[], &[])
+                .map_err(|e| BuzzError::Failed(e.to_string()))?
+                .tags(Tag::parse(["mention", a.agent.as_str()]).ok());
+        let ev = self.relay.sign(builder)?;
+        let id = ev.id.to_hex();
+        self.store.apply(&ev);
+        self.publish_message(ev, a.channel, vec![]);
         Ok(id)
     }
 
@@ -2184,7 +2594,234 @@ mod tests {
             sending: HashMap::new(),
             failed: HashMap::new(),
             notices: vec![],
+            checklists: Checklists::default(),
+            checklist_for: None,
         }
+    }
+
+    /// Tab 0's rows come from folded events, with what Swift shows, and a
+    /// reply in the thread clears them.
+    #[test]
+    fn needs_you_rows_from_folded_events() {
+        use nostr::{EventBuilder, Kind, Timestamp};
+        let ch = "2130646b-d6c8-4ec3-93e3-36f77bee1a37";
+        let mut e = engine();
+        let (op, alice) = (Keys::generate(), Keys::generate());
+        let opk = op.public_key().to_hex();
+        e.checklists.trust.owner = opk.clone();
+        e.store.channel_mut(ch).name = "beacon".into();
+        let ask = EventBuilder::new(Kind::Custom(9), "@lucian ship it?\nmore")
+            .tags([
+                Tag::parse(["h", ch]).unwrap(),
+                Tag::parse(["p", &opk]).unwrap(),
+            ])
+            .custom_created_at(Timestamp::from(now() - 60))
+            .sign_with_keys(&alice)
+            .unwrap();
+        e.fold(&ask, true);
+        let c = Client {
+            engine: Arc::new(Mutex::new(e)),
+            stop: Arc::new(tokio::sync::Notify::new()),
+        };
+        let rows = c.needs_you();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert!(r.section == NeedSection::Answer);
+        assert_eq!(
+            (r.kind.as_str(), r.channel_label.as_str()),
+            ("mention", "#beacon")
+        );
+        assert_eq!(r.text, "@lucian ship it?");
+        assert_eq!(r.thread.as_deref(), Some(ask.id.to_hex().as_str()));
+        assert!(c.follow(r.link.clone()).is_some_and(|f| f.channel == ch));
+        assert_eq!(c.needs_count(), 1);
+        // His answer in its thread clears it.
+        let reply = EventBuilder::new(Kind::Custom(9), "yes")
+            .tags([
+                Tag::parse(["h", ch]).unwrap(),
+                Tag::parse(["e", &ask.id.to_hex(), "", "reply"]).unwrap(),
+            ])
+            .sign_with_keys(&op)
+            .unwrap();
+        c.engine.lock().unwrap().fold(&reply, true);
+        assert_eq!(c.needs_count(), 0);
+    }
+
+    /// Q from the phone: the same core message as the terminal's, the
+    /// question alone first, then with the channel on screen.
+    #[test]
+    fn q_asks_taskbot_in_quick_alone_or_with_this_channel() {
+        let here = "2130646b-d6c8-4ec3-93e3-36f77bee1a37";
+        let q = quick::CHANNEL_ID;
+        let tb = Keys::generate().public_key().to_hex();
+        let mut e = engine();
+        let ch = e.store.channel_mut(here);
+        ch.name = "buzz-vim".into();
+        ch.timeline = vec!["m1".into(), "m2".into()];
+        let c = Client {
+            engine: Arc::new(Mutex::new(e)),
+            stop: Arc::new(tokio::sync::Notify::new()),
+        };
+        let err = |r: Result<QuickBox, BuzzError>| match r {
+            Err(BuzzError::Failed(m)) => m,
+            _ => String::new(),
+        };
+        assert!(err(c.open_quick(Some(here.into()))).contains("still loading"));
+        c.engine.lock().unwrap().channels_loaded = true;
+        assert!(err(c.open_quick(Some(here.into()))).starts_with("no #quick channel"));
+        {
+            let mut e = c.engine.lock().unwrap();
+            let me = e.store.me.clone();
+            let qc = e.store.channel_mut(q);
+            qc.name = "quick".into();
+            qc.members = vec![me, tb.clone()];
+            e.store.profiles.entry(tb.clone()).or_default().name = "taskbot".into();
+        }
+        let b = c.open_quick(Some(here.into())).ok().unwrap();
+        assert_eq!((b.channel.as_str(), b.label.as_str()), (q, "#quick"));
+        assert_eq!(
+            (b.agent.as_str(), b.here.as_deref()),
+            ("taskbot", Some("#buzz-vim"))
+        );
+        assert!(c.engine.lock().unwrap().requested_profiles.contains(&tb));
+        // In #quick, or nowhere: nothing for a second tap to add.
+        assert!(c.open_quick(Some(q.into())).ok().unwrap().here.is_none());
+        assert!(c.open_quick(None).ok().unwrap().here.is_none());
+        let sent = |id: &str| c.engine.lock().unwrap().sending.get(id).cloned().unwrap();
+        let tags = |ev: &Event| -> Vec<Vec<String>> {
+            ev.tags.iter().map(|t| t.as_slice().to_vec()).collect()
+        };
+        // First Q: the question alone, top level, to taskbot.
+        let id = c
+            .ask_quick(" how do we ship? ".into(), None, None)
+            .ok()
+            .unwrap();
+        let ev = sent(&id);
+        assert_eq!(ev.content, "[Q]\n@taskbot how do we ship?");
+        let tg = tags(&ev);
+        assert!(tg.contains(&vec!["h".into(), q.into()]));
+        assert!(tg.iter().any(|t| t[0] == "p" && t[1] == tb));
+        assert!(tg.contains(&vec!["mention".into(), tb.clone()]));
+        assert!(!tg.iter().any(|t| t[0] == "e"));
+        assert!(
+            c.engine.lock().unwrap().store.channels[q]
+                .messages
+                .contains_key(&id)
+        );
+        // Q again: + this channel, its open thread and latest messages.
+        let id = c
+            .ask_quick("why?".into(), Some(here.into()), Some("m1".into()))
+            .ok()
+            .unwrap();
+        let ev = sent(&id);
+        assert!(
+            ev.content
+                .starts_with("[Q]\nContext: #buzz-vim (channel 2130646b")
+        );
+        assert!(
+            ev.content
+                .contains("Open thread: buzz://message?channel=2130646b")
+        );
+        assert!(ev.content.contains("Last 2 messages (oldest first): m1 m2"));
+        assert!(ev.content.ends_with("\n\n@taskbot why?"));
+        // The landing link opens that thread.
+        let f = c
+            .follow(format!("buzz://message?channel={q}&id={id}&thread={id}"))
+            .unwrap();
+        assert_eq!(
+            (f.channel.as_str(), f.root.as_deref()),
+            (q, Some(id.as_str()))
+        );
+        // Nothing typed, or #quick as the context: says why, sends nothing.
+        assert!(matches!(c.ask_quick(" ".into(), None, None),
+            Err(BuzzError::Failed(m)) if m == "type a question first"));
+        assert!(matches!(c.ask_quick("x".into(), Some(q.into()), None),
+            Err(BuzzError::Failed(m)) if m.contains("already")));
+    }
+
+    /// Records and crash notices folded live show up in the checklist and
+    /// the status line the app reads.
+    #[test]
+    fn checklist_and_loop_status_from_live_events() {
+        use nostr::{EventBuilder, Kind, Timestamp};
+        let ch = "2130646b-d6c8-4ec3-93e3-36f77bee1a37";
+        let mut e = engine();
+        let bot = Keys::generate();
+        let bk = bot.public_key().to_hex();
+        // The bot is the watcher here too.
+        e.checklists.trust.watchers = vec![bk.clone()];
+        let rec = |kind: u16, d: String, v: Value| {
+            EventBuilder::new(Kind::Custom(kind), v.to_string())
+                .tags(
+                    [
+                        ["d", d.as_str()],
+                        ["h", ch],
+                        ["t", "buzz-checklist"],
+                        ["channel", ch],
+                        ["checklist-type", d.split('/').nth(1).unwrap()],
+                    ]
+                    .map(|t| Tag::parse(t).unwrap()),
+                )
+                .custom_created_at(Timestamp::from(now() - 10))
+                .sign_with_keys(&bot)
+                .unwrap()
+        };
+        e.fold(
+            &rec(
+                30471,
+                format!("buzz-checklist/header/{ch}/{bk}"),
+                json!({"title": "loop", "mode": "running", "resume": {"branch": "agent/x"}}),
+            ),
+            true,
+        );
+        e.fold(
+            &rec(30470, format!("buzz-checklist/item/{ch}/{bk}/000000a1"),
+                json!({"text": "ship it", "status": "done", "order": 1, "evidence": ["msg:abc", "commit:123"]})),
+            true,
+        );
+        e.fold(
+            &rec(
+                30472,
+                format!("buzz-checklist/watch/{ch}"),
+                json!({"state": "stalled", "since": now() - 60}),
+            ),
+            true,
+        );
+        let crash = EventBuilder::new(Kind::Custom(9), "agent process crashed, respawning")
+            .tags([Tag::parse(["h", ch]).unwrap()])
+            .sign_with_keys(&bot)
+            .unwrap();
+        e.fold(&crash, true);
+        let c = Client {
+            engine: Arc::new(Mutex::new(e)),
+            stop: Arc::new(tokio::sync::Notify::new()),
+        };
+        let list = c.checklist(ch.into());
+        assert_eq!(
+            (list.title.as_str(), list.mode.as_deref()),
+            ("loop", Some("running"))
+        );
+        assert_eq!(list.resume, "agent/x");
+        let it = &list.items[0];
+        assert!(it.status == ItemStatus::Done && !it.missing_evidence);
+        assert!(
+            it.evidence[0]
+                .link
+                .as_deref()
+                .is_some_and(|l| l.ends_with("id=abc"))
+        );
+        assert!(it.evidence[1].link.is_none());
+        let s = c.loop_status(ch.into()).unwrap();
+        assert!(s.running && s.needs_you);
+        assert_eq!(s.watch.as_deref(), Some("stalled"));
+        // A stall with no ping: no push covers it, so it notifies locally.
+        let rows = c.needs_you();
+        assert!(
+            rows.iter()
+                .any(|r| r.watcher && !r.pushed && r.kind == "stalled")
+        );
+        assert_eq!((s.open, s.done, s.crashes_today), (0, 1, 1));
+        assert!(c.loop_status("other".into()).is_none());
     }
 
     #[test]

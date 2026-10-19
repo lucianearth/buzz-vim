@@ -17,6 +17,23 @@ pub const DEFAULT_RELAY: &str = "wss://buzz.gitcoin.co";
 struct File {
     relay: Option<String>,
     nsec: Option<String>,
+    /// Operator loop: who else may edit any checklist record (default lucian).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
+    /// The watcher's pubkeys; its state counts only from these. A list, or
+    /// one string, comma separated; any other type is warned about and the
+    /// default used, so it can't drop the rest of the file (the nsec too).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "watcher_keys"
+    )]
+    watcher: Vec<String>,
+    /// The Q pop-up's channel name and the agent it @mentions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quick_channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quick_agent: Option<String>,
 }
 
 pub struct Config {
@@ -24,6 +41,83 @@ pub struct Config {
     pub keys: Keys,
     /// NIP-OA owner delegation (`BUZZ_AUTH_TAG`), only for agent identities.
     pub auth_tag: Option<nostr::Tag>,
+    pub loop_: Loop,
+}
+
+/// Operator-loop settings: `owner`, `watcher`, `quick_channel` and
+/// `quick_agent` in config.json, or `BUZZ_VIM_OWNER`, `BUZZ_VIM_WATCHER`
+/// (comma separated), `BUZZ_VIM_QUICK_CHANNEL`, `BUZZ_VIM_QUICK_AGENT`.
+#[derive(Clone, Debug)]
+pub struct Loop {
+    pub owner: String,
+    pub watchers: Vec<String>,
+    pub quick_channel: String,
+    pub quick_agent: String,
+}
+
+impl Default for Loop {
+    fn default() -> Self {
+        Loop {
+            owner: crate::checklist::DEFAULT_OWNER.to_string(),
+            watchers: crate::checklist::WATCHERS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            quick_channel: crate::quick::CHANNEL.to_string(),
+            quick_agent: crate::quick::AGENT.to_string(),
+        }
+    }
+}
+
+/// `watcher` as a list of keys or one comma-separated string. Anything
+/// else: a warning, and none (so the default).
+fn watcher_keys<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let split = |s: &str| -> Vec<String> {
+        s.split(',')
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .collect()
+    };
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => split(&s),
+        serde_json::Value::Array(a) if a.iter().all(|v| v.is_string()) => a
+            .iter()
+            .filter_map(|v| v.as_str())
+            .flat_map(split)
+            .collect(),
+        serde_json::Value::Null => vec![],
+        other => {
+            let msg = format!(
+                "config.json: `watcher` should be a list of pubkeys or a comma-separated string, not {other}; using the default"
+            );
+            eprintln!("buzz-vim: {msg}");
+            crate::log::line(msg);
+            vec![]
+        }
+    })
+}
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|s| !s.trim().is_empty())
+}
+
+fn loop_settings(file: &File) -> Loop {
+    let d = Loop::default();
+    Loop {
+        owner: env("BUZZ_VIM_OWNER")
+            .or(file.owner.clone())
+            .unwrap_or(d.owner),
+        watchers: env("BUZZ_VIM_WATCHER")
+            .map(|s| s.split(',').map(|k| k.trim().to_string()).collect())
+            .or_else(|| (!file.watcher.is_empty()).then(|| file.watcher.clone()))
+            .unwrap_or(d.watchers),
+        quick_channel: env("BUZZ_VIM_QUICK_CHANNEL")
+            .or(file.quick_channel.clone())
+            .unwrap_or(d.quick_channel),
+        quick_agent: env("BUZZ_VIM_QUICK_AGENT")
+            .or(file.quick_agent.clone())
+            .unwrap_or(d.quick_agent),
+    }
 }
 
 fn path() -> Result<PathBuf> {
@@ -48,6 +142,7 @@ pub fn parse_key(s: &str) -> Result<Keys> {
 
 pub fn load() -> Result<Config> {
     let file = read_file();
+    let loop_ = loop_settings(&file);
     let relay = std::env::var("BUZZ_RELAY_URL")
         .ok()
         .filter(|s| !s.is_empty())
@@ -78,6 +173,7 @@ pub fn load() -> Result<Config> {
         relay,
         keys,
         auth_tag,
+        loop_,
     })
 }
 
@@ -113,6 +209,7 @@ pub fn login() -> Result<()> {
     let body = serde_json::to_string_pretty(&File {
         relay: Some(relay),
         nsec: Some(keys.secret_key().to_bech32()?),
+        ..file
     })?;
     write_private(&p, body.as_bytes())?;
     println!(
@@ -143,4 +240,52 @@ fn write_private(p: &std::path::Path, bytes: &[u8]) -> Result<()> {
 fn write_private(p: &std::path::Path, bytes: &[u8]) -> Result<()> {
     std::fs::write(p, bytes)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// No `watcher` in config.json: the watcher seat's state still counts
+    /// (it did not, so the status line never showed it).
+    #[test]
+    fn watchers_default_to_the_watcher_seat() {
+        if env("BUZZ_VIM_WATCHER").is_some() {
+            return;
+        }
+        let d = loop_settings(&File::default());
+        assert_eq!(d.watchers, Loop::default().watchers);
+        assert!(!d.watchers.is_empty());
+        let set = File {
+            watcher: vec!["abc".into()],
+            ..File::default()
+        };
+        assert_eq!(loop_settings(&set).watchers, vec!["abc".to_string()]);
+    }
+
+    /// A `watcher` of the wrong type mustn't lose the file: a string is
+    /// split on commas, a number warns and leaves the default, and the
+    /// nsec and relay stay either way.
+    #[test]
+    fn a_mistyped_watcher_keeps_the_rest_of_the_config() {
+        let parse = |w: &str| -> File {
+            serde_json::from_str(&format!(
+                r#"{{"relay": "wss://r", "nsec": "nsec1x", "watcher": {w}}}"#
+            ))
+            .unwrap()
+        };
+        let f = parse(r#""aa, bb,""#);
+        assert_eq!(f.watcher, ["aa", "bb"]);
+        assert_eq!(parse(r#"["aa", "bb"]"#).watcher, ["aa", "bb"]);
+        for bad in ["42", "{}", "[1]", "true"] {
+            let f = parse(bad);
+            assert!(f.watcher.is_empty(), "{bad}");
+            assert_eq!(
+                (f.nsec.as_deref(), f.relay.as_deref()),
+                (Some("nsec1x"), Some("wss://r"))
+            );
+        }
+        let f: File = serde_json::from_str(r#"{"nsec": "nsec1x"}"#).unwrap();
+        assert!(f.watcher.is_empty());
+    }
 }

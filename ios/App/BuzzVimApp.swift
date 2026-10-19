@@ -3,6 +3,7 @@ import UIKit
 
 @main
 struct BuzzVimApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var model = Model()
     @Environment(\.scenePhase) private var phase
 
@@ -19,6 +20,7 @@ struct BuzzVimApp: App {
                 model.client?.flush()
                 model.saveContext()
             case .active:
+                Push.shared.retryStop()
                 model.client?.setVisible(visible: true)
                 model.client?.resume()
             default: break

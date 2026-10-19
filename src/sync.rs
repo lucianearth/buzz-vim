@@ -11,8 +11,10 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::{Action, App};
+use crate::checklist::{self, Checklists};
 use crate::live::Cmd;
 use crate::model::{self, Applied};
+use crate::needs;
 use crate::readstate::{self, ReadState};
 use crate::relay::{BlobDescriptor, Relay};
 use crate::sections::{self, Lanes};
@@ -80,6 +82,19 @@ pub enum Msg {
     Encoded {
         key: (String, u16, u16),
         result: anyhow::Result<ratatui_image::protocol::Protocol>,
+    },
+    /// A channel's checklist records, and its messages since midnight
+    /// (to count crash notices).
+    Checklist {
+        channel: String,
+        records: anyhow::Result<Vec<Event>>,
+        today: anyhow::Result<Vec<Event>>,
+    },
+    /// A Q went out, or didn't: what was typed, to put back.
+    QuickSent {
+        id: String,
+        result: anyhow::Result<()>,
+        text: String,
     },
     /// A dropped file (`label` is its path) or the clipboard, read.
     Attachment {
@@ -362,7 +377,71 @@ impl Sync {
         });
     }
 
+    /// The channel's checklist records and today's crash notices, and a
+    /// live tail of its records while it's the one on screen. Every switch
+    /// asks again, since only the current channel is tailed.
+    pub fn load_checklist(&mut self, id: &str) {
+        let _ = self.live.send(Cmd::Sub {
+            id: "checklist".into(),
+            filters: vec![
+                json!({"kinds": checklist::KINDS, "#h": [id], "since": now(), "limit": 0}),
+            ],
+        });
+        let r = self.relay.clone();
+        let channel = id.to_string();
+        let today = checklist::local_midnight(now());
+        self.spawn(async move {
+            let records = r.query(&Checklists::filters(&channel)).await;
+            let today = r
+                .query(&[
+                    json!({"kinds": model::UNREAD_KINDS, "#h": [channel], "since": today,
+                    "limit": 500}),
+                ])
+                .await;
+            Msg::Checklist {
+                channel,
+                records,
+                today,
+            }
+        });
+    }
+
+    /// Tab 0's data across every channel we're in: mentions of the
+    /// operator, his own posts, DMs and checklist records, the last week
+    /// of them and a live tail. Asked again whenever channels load.
+    pub fn load_needs(&mut self, store: &model::Store, operator: &str) {
+        let mine: Vec<&model::Channel> = store
+            .channels
+            .values()
+            .filter(|c| c.is_member && !c.archived)
+            .collect();
+        let ids: Vec<String> = mine.iter().map(|c| c.id.clone()).collect();
+        let dms: Vec<String> = mine
+            .iter()
+            .filter(|c| c.is_dm)
+            .map(|c| c.id.clone())
+            .collect();
+        let now = now();
+        let live = needs::filters(&ids, &dms, operator, now, true);
+        if live.is_empty() {
+            return;
+        }
+        let _ = self.live.send(Cmd::Sub {
+            id: "needs".into(),
+            filters: live,
+        });
+        let r = self.relay.clone();
+        let history = needs::filters(&ids, &dms, operator, now, false);
+        self.spawn(async move {
+            Msg::Events(r.query(&history).await.unwrap_or_else(|e| {
+                crate::log::line(format!("needs: {e}"));
+                vec![]
+            }))
+        });
+    }
+
     pub fn open_channel(&mut self, id: &str) {
+        self.load_checklist(id);
         self.subscribe_channel(id);
         if self.opened.insert(id.to_string()) {
             self.window(id, None);
@@ -511,7 +590,27 @@ impl Sync {
                 channel,
                 root,
                 parent,
-            } => self.send(app, channel, root, parent),
+            } => {
+                let draft = std::mem::take(app.draft_mut());
+                self.send(app, channel, root, parent, draft, vec![])
+            }
+            Action::SendDraft {
+                channel,
+                root,
+                draft,
+                to,
+            } => {
+                let before: HashSet<String> = app.pending_sends.keys().cloned().collect();
+                self.send(app, channel, root.clone(), root, draft, to);
+                // Remember which send came from the reply box.
+                if let Some(row) = app.reply_sent.take() {
+                    for id in app.pending_sends.keys() {
+                        if !before.contains(id) {
+                            app.reply_sends.insert(id.clone(), row.clone());
+                        }
+                    }
+                }
+            }
             Action::ThumbsUp { target } => self.thumbs_up(app, target),
             Action::Reset {
                 channel,
@@ -590,6 +689,13 @@ impl Sync {
                 });
             }
             Action::EncodeImage(key) => self.encode(app, key),
+            Action::WantProfiles(pks) => self.want_profiles(pks),
+            Action::SendQuick {
+                channel,
+                content,
+                agent,
+                text,
+            } => self.send_quick(app, channel, content, agent, text),
             Action::SaveState | Action::Quit => {}
         }
     }
@@ -600,8 +706,9 @@ impl Sync {
         channel: String,
         root: Option<String>,
         parent: Option<String>,
+        draft: crate::draft::Draft,
+        to: Vec<String>,
     ) {
-        let draft = std::mem::take(app.draft_mut());
         let mut content = draft.text.trim_end().to_string();
         for a in &draft.attachments {
             let label = if a.mime_type.starts_with("video/") {
@@ -613,6 +720,11 @@ impl Sync {
         }
         let content = content.trim_start_matches('\n').to_string();
         let mut mentions = draft.mention_pubkeys();
+        for pk in to {
+            if pk != app.store.me && !mentions.contains(&pk) {
+                mentions.push(pk);
+            }
+        }
         // In a DM everyone else is notified, as Desktop does.
         if let Some(ch) = app.store.channels.get(&channel).filter(|c| c.is_dm) {
             for m in &ch.members {
@@ -701,6 +813,44 @@ impl Sync {
             }
             let result = r.publish(&ev).await.map(|_| ());
             Msg::Sent { id, result }
+        });
+    }
+
+    /// A Q: a new top-level message in #quick that @mentions the agent.
+    fn send_quick(
+        &mut self,
+        app: &mut App,
+        channel: String,
+        content: String,
+        agent: String,
+        text: String,
+    ) {
+        let Ok(uuid) = uuid::Uuid::parse_str(&channel) else {
+            app.quick_draft.insert(&text);
+            return app.say("bad #quick channel id");
+        };
+        let ev =
+            match buzz_sdk::build_message(uuid, &content, None, &[agent.as_str()], false, &[], &[])
+                .map(|b| b.tags(Tag::parse(["mention", agent.as_str()]).ok()))
+                .map_err(anyhow::Error::from)
+                .and_then(|b| self.relay.sign(b))
+            {
+                Ok(ev) => ev,
+                Err(e) => {
+                    app.quick_draft.insert(&text);
+                    return app.say(format!("couldn't build the Q: {e}"));
+                }
+            };
+        app.store.apply(&ev);
+        app.say("asking in #quick…");
+        let r = self.relay.clone();
+        let id = ev.id.to_hex();
+        self.spawn(async move {
+            Msg::QuickSent {
+                result: r.publish(&ev).await,
+                id,
+                text,
+            }
         });
     }
 
@@ -1029,11 +1179,17 @@ pub fn fold(app: &mut App, sync: &mut Sync, ev: &Event, live_channel: bool) -> V
             sync.load_channels();
             return vec![];
         }
+        k if checklist::KINDS.contains(&k) => {
+            app.checklists.apply(ev);
+            return vec![ev.pubkey.to_hex()];
+        }
         _ => {}
     }
     let applied = app.store.apply(ev);
     let mut want = vec![ev.pubkey.to_hex()];
     if let Applied::Message { channel, id } = applied {
+        app.checklists
+            .note_message(&channel, &id, ev.created_at.as_secs(), &ev.content);
         let active = app.current() == Some(channel.as_str());
         let at = ev.created_at.as_secs();
         let author = ev.pubkey.to_hex();

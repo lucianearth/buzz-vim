@@ -16,8 +16,10 @@ targets:
     platform: iOS
     sources:
       - path: App
+      - path: Shared
       - path: Generated/buzz_vim_ffi.swift
     dependencies:
+      - target: NotificationService
       - framework: BuzzVimCore.xcframework
         embed: false
       - sdk: Security.framework
@@ -33,6 +35,8 @@ targets:
         UILaunchScreen: {}
         UIAppFonts: [FiraMono-Regular.ttf, FiraMono-Medium.ttf, FiraMono-Bold.ttf, FiraSans-Regular.ttf, FiraSans-Medium.ttf, FiraSans-SemiBold.ttf, FiraSans-Bold.ttf]
         ITSAppUsesNonExemptEncryption: false
+        # The Keychain group the notification extension shares (Keychain.swift).
+        KeychainGroup: $(AppIdentifierPrefix)com.lucianhymer.buzzvim.shared
         NSCameraUsageDescription: Scan the pairing code Buzz Desktop shows, to log in.
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         UIApplicationSceneManifest:
@@ -41,6 +45,38 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.lucianhymer.buzzvim
         TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_ENTITLEMENTS: BuzzVim.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+  # Turns the gateway's content-free wake into the message (push_note).
+  NotificationService:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: NotificationService
+      - path: Shared
+      - path: Generated/buzz_vim_ffi.swift
+    dependencies:
+      - framework: BuzzVimCore.xcframework
+        embed: false
+      - sdk: Security.framework
+      - sdk: SystemConfiguration.framework
+      - sdk: CoreFoundation.framework
+      - sdk: libresolv.tbd
+    info:
+      path: NotificationService/Info.plist
+      properties:
+        CFBundleDisplayName: Buzz Vim
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        KeychainGroup: $(AppIdentifierPrefix)com.lucianhymer.buzzvim.shared
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.usernotifications.service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lucianhymer.buzzvim.NotificationService
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_ENTITLEMENTS: NotificationService.entitlements
         ENABLE_USER_SCRIPT_SANDBOXING: NO
