@@ -351,33 +351,58 @@ impl Summary {
     }
 }
 
+/// Read one content field leniently (NIP-CK content reading): a value of the
+/// wrong type reads as the field's default instead of blanking the record.
+fn lenient<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    Ok(serde_json::from_value(Value::deserialize(d)?).unwrap_or_default())
+}
+
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct ItemJson {
+    #[serde(deserialize_with = "lenient")]
     text: String,
+    #[serde(deserialize_with = "lenient")]
     details: String,
+    #[serde(deserialize_with = "lenient")]
     status: String,
+    #[serde(deserialize_with = "lenient")]
     release: bool,
-    order: Option<f64>,
+    #[serde(deserialize_with = "lenient")]
+    order: f64,
+    #[serde(deserialize_with = "lenient")]
     standing: Option<String>,
+    #[serde(deserialize_with = "lenient")]
     evidence: Vec<String>,
+    #[serde(deserialize_with = "lenient")]
     parked_question: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct HeaderJson {
+    #[serde(deserialize_with = "lenient")]
     title: String,
+    #[serde(deserialize_with = "lenient")]
     mode: String,
+    #[serde(deserialize_with = "lenient")]
     go: Option<String>,
+    #[serde(deserialize_with = "lenient")]
     resume: ResumeJson,
 }
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct ResumeJson {
+    #[serde(deserialize_with = "lenient")]
     worktree: String,
+    #[serde(deserialize_with = "lenient")]
     branch: String,
+    #[serde(deserialize_with = "lenient")]
     worklog: String,
 }
 
@@ -435,7 +460,12 @@ impl Checklists {
         let Some((channel, addr)) = address(ev) else {
             return false;
         };
-        let content = serde_json::from_str::<Value>(&ev.content).unwrap_or(Value::Null);
+        // Content never decides selection: anything that is not a JSON
+        // object reads as `{}` (NIP-CK content reading).
+        let content = serde_json::from_str::<Value>(&ev.content)
+            .ok()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| Value::Object(Default::default()));
         let at = ev.created_at.as_secs();
         let mut v = Version {
             signer: ev.pubkey.to_hex(),
@@ -582,8 +612,8 @@ impl Checklists {
                     details: j.details,
                     status: Status::parse(&j.status),
                     release: j.release,
-                    order: j.order.unwrap_or(f64::MAX),
-                    standing: j.standing.filter(|s| !s.is_empty()),
+                    order: j.order,
+                    standing: j.standing.filter(|s| s == "first" || s == "last"),
                     evidence: j.evidence,
                     parked_question: j.parked_question.filter(|q| !q.is_empty()),
                     creator: creator.clone(),
@@ -688,6 +718,11 @@ mod tests {
 
     /// A record with a valid envelope at `d`, signed by `keys`.
     fn rec(keys: &Keys, kind: u16, d: &str, at: u64, content: Value) -> Event {
+        rec_raw(keys, kind, d, at, &content.to_string())
+    }
+
+    /// [`rec`] with the content as written, JSON or not.
+    fn rec_raw(keys: &Keys, kind: u16, d: &str, at: u64, content: &str) -> Event {
         let ty = match kind {
             KIND_ITEM => "item",
             KIND_HEADER => "header",
@@ -700,7 +735,7 @@ mod tests {
             ["channel", CH],
             ["checklist-type", ty],
         ];
-        EventBuilder::new(Kind::Custom(kind), content.to_string())
+        EventBuilder::new(Kind::Custom(kind), content)
             .tags(t.into_iter().map(|t| Tag::parse(t).unwrap()))
             .custom_created_at(Timestamp::from(at))
             .sign_with_keys(keys)
@@ -912,6 +947,76 @@ mod tests {
         assert_eq!(texts, ["reconcile", "b", "a", "no evidence", "wrap-up"]);
         let last = &s.items(CH)[3];
         assert!(last.release && last.missing_evidence());
+    }
+
+    #[test]
+    fn odd_content_reads_field_by_field() {
+        let (owner, bot) = (Keys::generate(), Keys::generate());
+        let bk = hex(&bot);
+        // An array would otherwise fill the fields in order.
+        for odd in [
+            "",
+            "not json",
+            "[1]",
+            r#"["t","running"]"#,
+            "{}",
+            r#"{"mode":"paused","title":5}"#,
+        ] {
+            let mut s = store(&owner);
+            s.apply(&rec_raw(&bot, KIND_HEADER, &head_d(&bk), 1, odd));
+            let h = s.header(CH).expect(odd);
+            assert_eq!(
+                (h.title.as_str(), h.mode, h.go),
+                ("", Mode::Ideating, None),
+                "{odd}"
+            );
+        }
+        let mut s = store(&owner);
+        s.apply(&rec(
+            &bot,
+            KIND_HEADER,
+            &head_d(&bk),
+            1,
+            serde_json::json!({"title": "t", "mode": "running", "go": 5,
+                "resume": {"worktree": "w", "branch": 1}}),
+        ));
+        let h = s.header(CH).unwrap();
+        assert_eq!((h.title.as_str(), h.mode, h.go), ("t", Mode::Running, None));
+        assert_eq!(
+            h.resume,
+            Resume {
+                worktree: "w".into(),
+                ..Resume::default()
+            }
+        );
+        s.apply(&rec_raw(&bot, KIND_ITEM, &item_d(&bk, "aaaa0001"), 2, ""));
+        s.apply(&rec(
+            &bot,
+            KIND_ITEM,
+            &item_d(&bk, "aaaa0002"),
+            2,
+            serde_json::json!({"text": 5, "details": "d", "status": "wip", "release": "yes",
+                "order": "3", "standing": "middle", "evidence": ["commit:a", 7],
+                "parked_question": 7}),
+        ));
+        let items = s.items(CH);
+        assert_eq!(items.len(), 2);
+        for (i, details) in items.iter().zip(["", "d"]) {
+            assert_eq!(
+                (
+                    i.text.as_str(),
+                    i.details.as_str(),
+                    i.status,
+                    i.release,
+                    i.order
+                ),
+                ("", details, Status::Open, false, 0.0)
+            );
+            assert_eq!(
+                (&i.standing, &i.evidence, &i.parked_question),
+                (&None, &vec![], &None)
+            );
+        }
     }
 
     #[test]
