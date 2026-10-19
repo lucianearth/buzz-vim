@@ -15,35 +15,42 @@ pub const MARKER: &str = "[Q]";
 /// How many of the channel's latest messages the context names.
 pub const RECENT: usize = 30;
 
-/// #quick by name (not archived, not a DM), else by its known id.
+/// #quick: its known id when the name is the default's, else by name (not
+/// archived, not a DM), one we're in first, then the lowest id.
 pub fn find_channel<'a>(store: &'a Store, name: &str) -> Option<&'a Channel> {
     let name = name.trim_start_matches('#');
     store
         .channels
-        .values()
-        .find(|c| !c.is_dm && !c.archived && c.name.eq_ignore_ascii_case(name))
+        .get(CHANNEL_ID)
+        .filter(|c| !c.archived && name == CHANNEL)
         .or_else(|| {
             store
                 .channels
-                .get(CHANNEL_ID)
-                .filter(|c| !c.archived && name == CHANNEL)
+                .values()
+                .filter(|c| !c.is_dm && !c.archived && c.name.eq_ignore_ascii_case(name))
+                .min_by_key(|c| (!c.is_member, c.id.as_str()))
         })
 }
 
-/// The agent's pubkey: a profile with that name, members of #quick first;
-/// else the default key when the name is the default's.
+/// The agent's pubkey. For the default name, the known key when #quick has
+/// it as a member or we hold its profile; else a profile with that name,
+/// members of #quick first, the lowest key of each; else the known key.
 pub fn find_agent(store: &Store, quick: Option<&Channel>, name: &str) -> Option<String> {
     let name = name.trim_start_matches('@');
-    let named = |pk: &String| {
+    let known = (name == AGENT).then_some(AGENT_PUBKEY);
+    let named = |pk: &&String| {
         store
             .profiles
-            .get(pk)
+            .get(*pk)
             .is_some_and(|p| p.name.eq_ignore_ascii_case(name))
     };
-    quick
-        .and_then(|c| c.members.iter().find(|pk| named(pk)).cloned())
-        .or_else(|| store.profiles.keys().find(|pk| named(pk)).cloned())
-        .or_else(|| (name == AGENT).then(|| AGENT_PUBKEY.to_string()))
+    let members = quick.map(|c| c.members.as_slice()).unwrap_or_default();
+    known
+        .filter(|k| members.iter().any(|m| m == k) || store.profiles.contains_key(*k))
+        .map(str::to_string)
+        .or_else(|| members.iter().filter(named).min().cloned())
+        .or_else(|| store.profiles.keys().filter(named).min().cloned())
+        .or_else(|| known.map(str::to_string))
 }
 
 /// What the current channel adds: its name, id and link, the open thread
@@ -249,6 +256,45 @@ mod tests {
         s.channel_mut(CHANNEL_ID);
         assert!(find_channel(&s, "quick").is_some());
         assert!(find_channel(&s, "elsewhere").is_none());
+    }
+
+    #[test]
+    fn known_quick_and_taskbot_come_first_then_the_lowest() {
+        let mut s = Store::new("me".into());
+        for id in ["q3", "q2", "q1"] {
+            s.channel_mut(id).name = "quick".into();
+        }
+        // By name: one we're in first, else the lowest id.
+        assert_eq!(find_channel(&s, "quick").map(|c| c.id.as_str()), Some("q1"));
+        s.channel_mut("q3").is_member = true;
+        assert_eq!(find_channel(&s, "quick").map(|c| c.id.as_str()), Some("q3"));
+        // The known #quick beats them all, for the default name only.
+        s.channel_mut(CHANNEL_ID).name = "quick".into();
+        assert_eq!(
+            find_channel(&s, "quick").map(|c| c.id.as_str()),
+            Some(CHANNEL_ID)
+        );
+        s.channel_mut("q4").name = "ask".into();
+        assert_eq!(find_channel(&s, "ask").map(|c| c.id.as_str()), Some("q4"));
+        // Agents by name: #quick's members first, the lowest key of each.
+        for pk in ["b", "a", "z", "y"] {
+            s.profiles.entry(pk.into()).or_default().name = "taskbot".into();
+        }
+        s.channel_mut(CHANNEL_ID).members = vec!["me".into(), "z".into(), "y".into()];
+        let q = s.channels.get(CHANNEL_ID);
+        assert_eq!(find_agent(&s, q, "taskbot").as_deref(), Some("y"));
+        assert_eq!(find_agent(&s, None, "taskbot").as_deref(), Some("a"));
+        // The known taskbot, once it's a member or its profile is here.
+        s.channel_mut(CHANNEL_ID).members.push(AGENT_PUBKEY.into());
+        let q = s.channels.get(CHANNEL_ID);
+        assert_eq!(find_agent(&s, q, "taskbot").as_deref(), Some(AGENT_PUBKEY));
+        s.profiles.entry(AGENT_PUBKEY.into()).or_default().name = "taskbot".into();
+        assert_eq!(
+            find_agent(&s, None, "taskbot").as_deref(),
+            Some(AGENT_PUBKEY)
+        );
+        // Another name: never the known key.
+        assert_eq!(find_agent(&s, None, "helper"), None);
     }
 
     #[test]
