@@ -1472,7 +1472,7 @@ fn draw_quick(f: &mut Frame, app: &mut App, area: Rect) {
     let l = &app.loop_;
     let title = format!(" Q · ask {} in #{} ", l.quick_agent, l.quick_channel);
     let here = app
-        .current()
+        .quick_here()
         .and_then(|c| app.store.channels.get(c))
         .map(channel_label)
         .unwrap_or_default();
@@ -1488,8 +1488,13 @@ fn draw_quick(f: &mut Frame, app: &mut App, area: Rect) {
             ),
         ])
     } else {
+        let add = if here.is_empty() {
+            String::new()
+        } else {
+            format!("  ^q again: + {here}")
+        };
         Line::styled(
-            format!(" a new thread in #{}.  ^q again: + {here}", l.quick_channel),
+            format!(" a new thread in #{}.{add}", l.quick_channel),
             theme::faint(),
         )
     };

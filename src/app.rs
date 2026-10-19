@@ -1166,12 +1166,22 @@ impl App {
 
     // ---------- Q ----------
 
+    /// The channel a Q can add: none while tab 0 is shown, since the tab
+    /// under it is hidden.
+    pub fn quick_here(&self) -> Option<&str> {
+        if self.needs_view {
+            None
+        } else {
+            self.current()
+        }
+    }
+
     /// `Q` / `^q`: open the Q box; pressed again while it's open, the
     /// current channel goes along (or comes off again).
     fn quick(&mut self) {
         let name = &self.loop_.quick_channel;
         if self.mode == Mode::Quick {
-            match crate::quick::can_add(&self.store, name, self.current()) {
+            match crate::quick::can_add(&self.store, name, self.quick_here()) {
                 Ok(()) => self.quick_include = !self.quick_include,
                 Err(e) => self.say(e),
             }
@@ -1227,7 +1237,7 @@ impl App {
     /// pubkey, content).
     pub fn quick_message(&self) -> Result<(String, String, String), String> {
         let here = if self.quick_include {
-            let here = self.current().ok_or("no channel open to add")?;
+            let here = self.quick_here().ok_or("no channel open to add")?;
             let root = self
                 .thread
                 .as_ref()
@@ -2205,6 +2215,37 @@ mod tests {
         key(&mut app, ctrl_c);
         assert_eq!(app.mode, Mode::Normal);
         assert!(!app.actions.iter().any(|a| matches!(a, Action::Quit)));
+    }
+
+    /// On tab 0 the channel under it is hidden: a Q can't add it.
+    #[test]
+    fn q_on_tab_zero_adds_no_channel() {
+        let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        let mut app = App::new("me".into(), None);
+        app.channels_loaded = true;
+        app.store.channel_mut("a").name = "hidden".into();
+        app.tabs = vec!["a".into()];
+        let qc = app.store.channel_mut(crate::quick::CHANNEL_ID);
+        qc.name = "quick".into();
+        qc.members = vec!["me".into(), "tb".into()];
+        app.store.profiles.entry("tb".into()).or_default().name = "taskbot".into();
+        app.on_key(KeyEvent::from(KeyCode::Char('0')));
+        assert!(app.needs_view);
+        app.on_key(KeyEvent::from(KeyCode::Char('Q')));
+        assert_eq!(app.mode, Mode::Quick);
+        app.on_key(KeyEvent::from(KeyCode::Char('x')));
+        app.on_key(ctrl_q);
+        assert!(!app.quick_include);
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|s| s.0 == "no channel open to add")
+        );
+        app.quick_include = true;
+        assert_eq!(app.quick_message(), Err("no channel open to add".into()));
+        app.quick_include = false;
+        let (_, _, content) = app.quick_message().unwrap();
+        assert_eq!(content, "[Q]\n@taskbot x");
     }
 
     #[test]
