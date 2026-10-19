@@ -20,6 +20,7 @@ struct BuzzVimApp: App {
                 model.client?.flush()
                 model.saveContext()
             case .active:
+                Push.shared.retryStop()
                 model.client?.setVisible(visible: true)
                 model.client?.resume()
             default: break

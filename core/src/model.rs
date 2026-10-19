@@ -156,6 +156,8 @@ pub struct Channel {
     pub name: String,
     pub about: String,
     pub is_dm: bool,
+    /// The 39000 carries NIP-29's `private` marker.
+    pub private: bool,
     pub archived: bool,
     pub is_member: bool,
     /// First `t` tag of the 39000: stream, forum, dm, workflow, system.
@@ -421,7 +423,9 @@ impl Store {
                 let hidden = tags(ev, "hidden").next().is_some();
                 let is_dm = ctype.as_deref() == Some("dm") || (ctype.is_none() && hidden);
                 let archived = tag(ev, "archived") == Some("true");
+                let private = tags(ev, "private").next().is_some();
                 let ch = self.channel_mut(&d);
+                ch.private = private;
                 ch.name = name;
                 ch.about = about;
                 ch.is_dm = is_dm;
@@ -625,6 +629,27 @@ mod tests {
             1,
         );
         assert_eq!(Message::from_event(&m).mentions, vec![pk]);
+    }
+
+    #[test]
+    fn channel_meta_marks_private_channels() {
+        let relay = Keys::generate();
+        let mut s = Store::new("me".into());
+        s.apply(&ev(
+            &relay,
+            39000,
+            "",
+            vec![vec!["d", "p1"], vec!["name", "x"], vec!["private"]],
+            1,
+        ));
+        s.apply(&ev(
+            &relay,
+            39000,
+            "",
+            vec![vec!["d", "o1"], vec!["name", "y"], vec!["public"]],
+            1,
+        ));
+        assert!(s.channels["p1"].private && !s.channels["o1"].private);
     }
 
     #[test]

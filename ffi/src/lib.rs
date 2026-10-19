@@ -380,6 +380,9 @@ pub struct LoopStatus {
     pub done: u32,
     pub parked: u32,
     pub crashes_today: u32,
+    /// Two or more lists claim the channel and no list shows until the
+    /// owner picks a driver: "contested: name, name". None otherwise.
+    pub contested: Option<String>,
 }
 
 #[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq)]
@@ -396,7 +399,8 @@ pub struct NeedRow {
     /// Stable while the row stands for the same thing: notifications go by it.
     pub key: String,
     pub section: NeedSection,
-    /// "waiting on lucian", "stalled", "parked", "mention", "dm", "bot".
+    /// "waiting on lucian", "stalled", "parked", "contested", "mention",
+    /// "dm", "bot".
     pub kind: String,
     /// The watcher flagged it: the only rows that notify (push and local).
     pub watcher: bool,
@@ -899,6 +903,10 @@ impl Client {
             done: s.done as u32,
             parked: s.parked as u32,
             crashes_today: s.crashes_today as u32,
+            contested: (!s.contested.is_empty()).then(|| {
+                let names: Vec<String> = s.contested.iter().map(|c| e.store.name_of(c)).collect();
+                format!("contested: {}", names.join(", "))
+            }),
         })
     }
 
@@ -916,7 +924,10 @@ impl Client {
                 watcher: matches!(r.reason, needs::Reason::Watch(_)),
                 pushed: matches!(r.reason, needs::Reason::Watch(_)) && r.message.is_some(),
                 channel_label: e.label(&r.channel),
-                who_name: if r.who.is_empty() {
+                who_name: if let needs::Reason::Contested(c) = &r.reason {
+                    let names: Vec<String> = c.iter().map(|c| e.store.name_of(c)).collect();
+                    names.join(", ")
+                } else if r.who.is_empty() {
                     "watcher".into()
                 } else {
                     e.store.name_of(&r.who)
@@ -2747,8 +2758,14 @@ mod tests {
         let rec = |kind: u16, d: String, v: Value| {
             EventBuilder::new(Kind::Custom(kind), v.to_string())
                 .tags(
-                    [["d", d.as_str()], ["h", ch], ["creator", bk.as_str()]]
-                        .map(|t| Tag::parse(t).unwrap()),
+                    [
+                        ["d", d.as_str()],
+                        ["h", ch],
+                        ["t", "buzz-checklist"],
+                        ["channel", ch],
+                        ["checklist-type", d.split('/').nth(1).unwrap()],
+                    ]
+                    .map(|t| Tag::parse(t).unwrap()),
                 )
                 .custom_created_at(Timestamp::from(now() - 10))
                 .sign_with_keys(&bot)
@@ -2757,13 +2774,13 @@ mod tests {
         e.fold(
             &rec(
                 30471,
-                format!("buzz-checklist/header/{ch}"),
+                format!("buzz-checklist/header/{ch}/{bk}"),
                 json!({"title": "loop", "mode": "running", "resume": {"branch": "agent/x"}}),
             ),
             true,
         );
         e.fold(
-            &rec(30470, format!("buzz-checklist/item/{ch}/a1"),
+            &rec(30470, format!("buzz-checklist/item/{ch}/{bk}/000000a1"),
                 json!({"text": "ship it", "status": "done", "order": 1, "evidence": ["msg:abc", "commit:123"]})),
             true,
         );

@@ -27,7 +27,8 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
 - `j` `k` move, `1`–`9` jump to a tab, `H` `L` or `⇥` cycle tabs (tab 0 included)
 - `0` is tab 0, **Needs you**, pinned first (it can't be moved, closed or archived). *Needs an answer*: channels
   the watcher marks stalled, waiting on lucian or waiting on release (the row opens its ping), parked checklist
-  items with their question, and people's @mentions and DMs to the operator (`owner`) that he hasn't answered.
+  items with their question (the driving list's only, five a channel and then one "+N more"), a contested
+  channel whose lists run ("two lists claim this channel; pick a driver"), and people's @mentions and DMs to the operator (`owner`) that he hasn't answered.
   *FYI*: bots' @mentions of him the watcher didn't flag. One row each (channel, who, one line, age), oldest
   first. `⏎` opens the row at its message, `r` answers it in a box that posts into that row's thread. A row
   goes once he posts in its thread after it (in a DM: anywhere in it), or the watch state or item moves on.
@@ -45,10 +46,13 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
   them with `buzz checklist`). Items in order with open / done / parked, the release flag and evidence, and
   the picked item's details, evidence links and parked question beside them. Above a channel's messages a
   status line shows its mode (ideating / running), the watcher's state (working, stalled, waiting on lucian,
-  waiting on release, with a link to its ping), open / done / parked counts and agent crashes today
+  waiting on release, with a link to its ping), open / done / parked counts and agent crashes today. A channel
+  where two or more lists claim the checklist and the owner hasn't picked a driver shows `contested` with
+  their creators, and no list until he does
 - `Q` (or `^q`, which also works while writing) asks a quick question: a box that posts a new top-level message
   in #quick, starting with `[Q]` and @mentioning taskbot. Press `^q` again in the box to add the channel you're
-  in (its name, id, link and latest 30 messages' ids) so taskbot can read it; again takes it off. `Esc` keeps
+  in (its name, id, link and latest 30 messages' ids) so taskbot can read it; again takes it off. A DM or
+  private channel never goes along. `Esc` keeps
   the text for next time. The answer comes in that message's thread in #quick. If there is no #quick channel
   it says so; buzz-vim never makes one
 - `s` pick which sections become tabs (`m` there moves the current channel into the section under the cursor, the same
@@ -72,8 +76,8 @@ without one. That works while the app runs.
 
 Q is the button at the top right, beside the online line. It opens the same Q as the terminal's (the same
 core function builds the message): a new top-level message in #quick, starting with `[Q]` and @mentioning
-taskbot. Tap the Q chip in the sheet to add the channel you're in (its name, id, link, open thread and
-latest 30 messages' ids); tap it again to take that off. Closing the sheet keeps the text. Send lands you in
+taskbot. Tap the Q chip in the sheet to add the channel you're in, unless it is a DM or private (its
+name, id, link, open thread and latest 30 messages' ids); tap it again to take that off. Closing the sheet keeps the text. Send lands you in
 the new thread in #quick, where the answer comes.
 
 Closed, it gets real pushes through upstream Buzz's push (`buzz-push-v1`): the phone enrolls its APNs token
@@ -81,17 +85,20 @@ with the push gateway (`Push.gateway` in `ios/App/Push.swift`, App Attest), dele
 key, and publishes a lease (kind 30350, encrypted to the relay) for one thing only: the watcher's messages
 that @mention you. @mentions and DMs from anyone else never push. The push itself says nothing;
 the notification extension fetches the message and shows it like a tab 0 row. The lease follows the
-watcher's keys, renews while the app runs, and goes on logout. While it is live the app posts no local
-notification for a watcher row with its ping out, so nothing comes twice; a watcher row without a ping
-still gets one. It needs a relay that advertises `buzz-push-v1` in its NIP-11.
+watcher's keys, renews while the app runs, and goes on logout (a logout offline finishes at the next
+launch or foreground: the gateway forgets the relay key, and no new lease goes out before that). While it
+is live the app posts no local notification for a watcher row with its ping out, so nothing comes twice;
+a watcher row without a ping still gets one. It needs a relay that advertises `buzz-push-v1` in its NIP-11.
 
 ## Operator loop settings
 
 In `buzz-vim/config.json` (or the env var):
 
-- `owner` (`BUZZ_VIM_OWNER`): who may edit any checklist record besides its creator. Default lucian.
-- `watcher` (`BUZZ_VIM_WATCHER`, comma separated): the watcher's pubkeys; its state counts only from these
-  (and the owner). Default the watcher seat (`d84ddba9…`).
+- `owner` (`BUZZ_VIM_OWNER`): who may edit any checklist record besides its creator, and who picks the
+  driving list when two claim a channel. Default lucian.
+- `watcher` (`BUZZ_VIM_WATCHER`, comma separated; in config.json a list or a comma-separated string): the
+  watcher's pubkeys; its state counts only from these. Default the watcher seat (`d84ddba9…`). A value of
+  another type is ignored with a warning, and the default used.
 - `quick_channel` (`BUZZ_VIM_QUICK_CHANNEL`), default `quick`, and `quick_agent` (`BUZZ_VIM_QUICK_AGENT`),
   default `taskbot`: where Q posts and who it @mentions.
 

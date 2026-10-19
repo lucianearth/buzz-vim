@@ -11,6 +11,10 @@ struct LoopLine: View {
 
     var body: some View {
         HStack(spacing: 8) {
+            // Two lists claim the channel: none shows until the owner picks.
+            if let c = status.contested {
+                Text(c).foregroundStyle(theme.bright)
+            }
             if status.running {
                 Text("RUNNING")
                     .font(.tiny)

@@ -3,9 +3,13 @@
 //! addressable and channel-scoped by `h`. Agents write them with
 //! `buzz checklist`; both apps only fold and show them.
 //!
-//! Ownership (spec v0): per `d`, the newest version signed by the record's
-//! creator or by the owner. Other signers are ignored. Watch records count
-//! only from the watcher's key.
+//! Ownership (NIP-CK reader rule v3): the creator is part of the address
+//! (`buzz-checklist/header/<channel>/<creator-hex>`, items under
+//! `.../item/<channel>/<creator-hex>/<item-id>`). Per address, the newest
+//! version signed by that creator or by the owner counts; other signers are
+//! ignored. The owner's newest header picks the driver; with none, one list
+//! drives and two or more are contested. Watch records count only from the
+//! watcher's keys. The vectors in `core/tests/nip-ck-vectors.json` pin it.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -21,13 +25,15 @@ pub const KIND_WATCH: u16 = 30472;
 pub const KINDS: &[u16] = &[KIND_ITEM, KIND_HEADER, KIND_WATCH];
 /// The `t` tag every record carries.
 pub const TAG: &str = "buzz-checklist";
-/// lucian: accepted on every record (default, overridable).
-pub const OWNER: &str = "5c017fc7a0525e163d44fae1b4e853ad236e690c4f607fd2c603088d854bc36a";
-/// The watcher's keys, accepted on watch records by default: the fleet-skills
-/// seat, which aei's buzz-watch and stall-judge sign with. `watcher` in the
-/// config (or `BUZZ_VIM_WATCHER`) overrides it. The owner's watch records
-/// always count.
-pub const WATCHERS: &[&str] = &["d84ddba92b7e936304ec9ea81c9b59594b9f974dd0ebeb0aa2227fe7d54d70d4"];
+/// lucian: accepted on every record, and he picks the driver (default,
+/// overridable).
+pub const DEFAULT_OWNER: &str = "5c017fc7a0525e163d44fae1b4e853ad236e690c4f607fd2c603088d854bc36a";
+/// The watcher's key, the only one accepted on watch records by default:
+/// the fleet-skills seat, which aei's buzz-watch and stall-judge sign with.
+/// `watcher` in the config (or `BUZZ_VIM_WATCHER`) overrides it.
+pub const DEFAULT_WATCHER: &str =
+    "d84ddba92b7e936304ec9ea81c9b59594b9f974dd0ebeb0aa2227fe7d54d70d4";
+pub const WATCHERS: &[&str] = &[DEFAULT_WATCHER];
 /// What buzz-acp's notice says when it respawns a crashed agent process.
 pub const CRASH_NEEDLE: &str = "agent process crashed";
 
@@ -133,6 +139,8 @@ pub struct Item {
     pub creator: String,
     /// Who signed the version shown.
     pub signer: String,
+    /// The version shown.
+    pub event_id: String,
     pub updated_at: u64,
 }
 
@@ -156,7 +164,10 @@ pub struct Header {
     pub mode: Mode,
     pub go: Option<String>,
     pub resume: Resume,
+    /// The driver: the creator in the header's address.
     pub creator: String,
+    /// The version shown.
+    pub event_id: String,
     pub updated_at: u64,
 }
 
@@ -174,20 +185,22 @@ pub struct Watch {
     /// When this run of versions in the same state began, as far as we
     /// have seen: a nudge republish keeps it, a new stall starts it again.
     pub began: u64,
+    /// The version shown.
+    pub event_id: String,
 }
 
 /// Who a reader trusts.
 #[derive(Debug, Clone)]
 pub struct Trust {
     pub owner: String,
-    /// Keys whose watch records count, besides the owner's.
+    /// The only keys whose watch records count.
     pub watchers: Vec<String>,
 }
 
 impl Default for Trust {
     fn default() -> Self {
         Trust {
-            owner: OWNER.to_string(),
+            owner: DEFAULT_OWNER.to_string(),
             watchers: WATCHERS.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -197,14 +210,9 @@ impl Default for Trust {
 #[derive(Debug, Clone)]
 struct Version {
     signer: String,
-    creator: Option<String>,
     at: u64,
     id: String,
     content: Value,
-    /// The earliest (at, id) this signer claimed to be the creator, of all
-    /// its versions seen: only the newest is kept, and its time is not the
-    /// claim's.
-    first_claim: Option<(u64, String)>,
     /// Watch records: when this signer's run of versions in the same
     /// state began (seen here; the relay keeps only the newest).
     began: u64,
@@ -217,56 +225,93 @@ impl Version {
     }
 }
 
-/// The version a reader takes for one `d`: the newest signed by the
-/// creator or the owner. The creator is what the owner's version says;
-/// else `preferred` (the list's own creator, for items) when it claims it;
-/// else the signer with the earliest claim. Relays keep only each signer's
-/// newest version, so "earliest" is what we have seen, and a backdated
-/// claim can still win it: hence the owner and the list's creator first.
-fn pick<'a>(
-    versions: &'a [Version],
-    owner: &str,
-    preferred: Option<&str>,
-) -> Option<(&'a Version, String)> {
-    let newest = |a: &&Version, b: &&Version| {
-        if a.newer_than(b) {
-            std::cmp::Ordering::Greater
-        } else {
-            std::cmp::Ordering::Less
-        }
+/// The newer of two versions.
+fn newest<'a>(a: Option<&'a Version>, b: Option<&'a Version>) -> Option<&'a Version> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if b.newer_than(a) { b } else { a }),
+        (a, b) => a.or(b),
+    }
+}
+
+/// One address's versions: signer -> that signer's newest.
+type Slot = BTreeMap<String, Version>;
+
+/// The version a reader takes at an address: the newest signed by the
+/// address's creator or by the owner. Every other signer is ignored.
+fn accepted<'a>(slot: &'a Slot, creator: &str, owner: &str) -> Option<&'a Version> {
+    newest(slot.get(creator), slot.get(owner))
+}
+
+/// 64 lowercase hex: a creator in a `d`.
+fn is_key(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// 8 lowercase hex: an item id.
+fn is_item_id(s: &str) -> bool {
+    s.len() == 8 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Where a record lives, from its canonical `d`.
+#[derive(Debug, PartialEq, Eq)]
+enum Addr<'a> {
+    Header { creator: &'a str },
+    Item { creator: &'a str, id: &'a str },
+    Watch,
+}
+
+/// A record's channel and address, or None unless the envelope is valid:
+/// one of our kinds, `t` and `checklist-type` right for it, `h` ==
+/// `channel` == the d's channel, and a canonical `d` (no case folding, no
+/// npubs, no missing or extra segments).
+fn address(ev: &Event) -> Option<(&str, Addr<'_>)> {
+    let ty = match ev.kind.as_u16() {
+        KIND_ITEM => "item",
+        KIND_HEADER => "header",
+        KIND_WATCH => "watch",
+        _ => return None,
     };
-    let creator = versions
-        .iter()
-        .filter(|v| v.signer == owner)
-        .max_by(newest)
-        .map(|v| v.creator.clone().unwrap_or_else(|| v.signer.clone()))
-        .or_else(|| {
-            let p = preferred?;
-            versions
-                .iter()
-                .any(|v| v.signer == p && v.first_claim.is_some())
-                .then(|| p.to_string())
-        })
-        .or_else(|| {
-            versions
-                .iter()
-                .filter_map(|v| Some((v.first_claim.clone()?, &v.signer)))
-                .min()
-                .map(|(_, s)| s.clone())
-        })?;
-    let v = versions
-        .iter()
-        .filter(|v| v.signer == owner || v.signer == creator)
-        .max_by(newest)?;
-    Some((v, creator))
+    if tag(ev, "t") != Some(TAG) || tag(ev, "checklist-type") != Some(ty) {
+        return None;
+    }
+    let h = tag(ev, "h").filter(|h| !h.is_empty())?;
+    if tag(ev, "channel") != Some(h) {
+        return None;
+    }
+    let p: Vec<&str> = tag(ev, "d")?.split('/').collect();
+    if p.len() < 3 || p[0] != TAG || p[1] != ty || p[2] != h {
+        return None;
+    }
+    let addr = match (ty, &p[3..]) {
+        ("watch", []) => Addr::Watch,
+        ("header", [c]) if is_key(c) => Addr::Header { creator: c },
+        ("item", [c, id]) if is_key(c) && is_item_id(id) => Addr::Item { creator: c, id },
+        _ => return None,
+    };
+    Some((h, addr))
+}
+
+/// Who drives a channel's list (NIP-CK rule v3).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Driver {
+    /// The list's creator, whose header and items show.
+    pub driver: Option<String>,
+    /// Two or more lists claim the channel and the owner hasn't picked:
+    /// their creators, sorted. No header or items show then.
+    pub contested: Vec<String>,
+    /// Contested, and at least one of those lists is running.
+    pub contested_running: bool,
+    /// Contested: the newest of those lists' header versions (0 if not).
+    pub since: u64,
 }
 
 #[derive(Debug, Default)]
 struct ChannelRecords {
-    /// d -> signer -> newest version from that signer.
-    items: HashMap<String, BTreeMap<String, Version>>,
-    header: BTreeMap<String, Version>,
-    watch: BTreeMap<String, Version>,
+    /// Header addresses: creator -> signer -> newest.
+    headers: BTreeMap<String, Slot>,
+    /// Item addresses: (creator, item id) -> signer -> newest.
+    items: BTreeMap<(String, String), Slot>,
+    watch: Slot,
     /// Crash notices seen here: message id -> created_at.
     crashes: HashMap<String, u64>,
 }
@@ -290,12 +335,16 @@ pub struct Summary {
     /// `buzz://` link to the ping, when one is out.
     pub ping_link: Option<String>,
     pub crashes_today: usize,
+    /// Two or more lists claim the channel: their creators.
+    pub contested: Vec<String>,
+    pub contested_running: bool,
 }
 
 impl Summary {
-    /// Nothing to show: no list, no watcher, no crashes.
+    /// Nothing to show: no list, no contest, no watcher, no crashes.
     pub fn is_empty(&self) -> bool {
         self.mode.is_none()
+            && self.contested.is_empty()
             && self.open + self.done + self.parked == 0
             && self.watch.is_none()
             && self.crashes_today == 0
@@ -380,80 +429,90 @@ impl Checklists {
         vec![serde_json::json!({"kinds": KINDS, "#h": [channel], "limit": 500})]
     }
 
-    /// Fold one record. Returns true when it was one of ours and well formed.
+    /// Fold one record. Returns true when it is a valid record and the
+    /// newest seen from its signer at its address.
     pub fn apply(&mut self, ev: &Event) -> bool {
-        let kind = ev.kind.as_u16();
-        if !KINDS.contains(&kind) {
-            return false;
-        }
-        let channel = tag(ev, "h").or_else(|| tag(ev, "channel"));
-        let (Some(channel), Some(d)) = (channel, tag(ev, "d")) else {
+        let Some((channel, addr)) = address(ev) else {
             return false;
         };
-        let mut parts = d.split('/');
-        let ok = parts.next() == Some(TAG)
-            && parts.next()
-                == Some(match kind {
-                    KIND_ITEM => "item",
-                    KIND_HEADER => "header",
-                    _ => "watch",
-                })
-            && parts.next() == Some(channel);
-        let rest: Vec<&str> = parts.collect();
-        let ok = ok
-            && match kind {
-                KIND_ITEM => rest.len() == 1 && !rest[0].is_empty(),
-                _ => rest.is_empty(),
-            };
-        if !ok {
-            return false;
-        }
-        let Ok(content) = serde_json::from_str::<Value>(&ev.content) else {
-            return false;
-        };
-        let signer = ev.pubkey.to_hex();
-        let creator = tag(ev, "creator").map(str::to_string);
+        let content = serde_json::from_str::<Value>(&ev.content).unwrap_or(Value::Null);
         let at = ev.created_at.as_secs();
-        let id = ev.id.to_hex();
-        let claim = creator
-            .as_deref()
-            .is_none_or(|c| c == signer)
-            .then(|| (at, id.clone()));
         let mut v = Version {
-            signer,
-            creator,
+            signer: ev.pubkey.to_hex(),
             at,
-            id,
+            id: ev.id.to_hex(),
             content,
-            first_claim: claim.clone(),
             began: at,
         };
         let recs = self.channels.entry(channel.to_string()).or_default();
-        let slot = match kind {
-            KIND_ITEM => recs.items.entry(d.to_string()).or_default(),
-            KIND_HEADER => &mut recs.header,
-            _ => &mut recs.watch,
+        let slot = match addr {
+            Addr::Header { creator } => recs.headers.entry(creator.to_string()).or_default(),
+            Addr::Item { creator, id } => recs
+                .items
+                .entry((creator.to_string(), id.to_string()))
+                .or_default(),
+            Addr::Watch => &mut recs.watch,
         };
-        let earliest = |a: Option<(u64, String)>, b: Option<(u64, String)>| match (a, b) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        match slot.get_mut(&v.signer) {
-            Some(old) if !v.newer_than(old) => {
-                // Older, but its claim still counts.
-                old.first_claim = earliest(old.first_claim.take(), claim);
-                false
-            }
+        match slot.get(&v.signer) {
+            Some(old) if !v.newer_than(old) => false,
             old => {
-                if let Some(o) = &old {
-                    v.first_claim = earliest(o.first_claim.clone(), claim);
-                    if o.content.get("state") == v.content.get("state") {
-                        v.began = o.began;
-                    }
+                if let Some(o) = old
+                    && o.content.get("state") == v.content.get("state")
+                {
+                    v.began = o.began;
                 }
                 slot.insert(v.signer.clone(), v);
                 true
             }
+        }
+    }
+
+    /// Who drives the channel's list: the creator the owner's newest header
+    /// names; else the one list with an accepted header; two or more and
+    /// it is contested (no first-come).
+    pub fn driver(&self, channel: &str) -> Driver {
+        let Some(recs) = self.channels.get(channel) else {
+            return Driver::default();
+        };
+        self.driver_in(recs)
+    }
+
+    fn driver_in(&self, recs: &ChannelRecords) -> Driver {
+        let owner = self.trust.owner.as_str();
+        let picked = recs
+            .headers
+            .iter()
+            .filter_map(|(c, slot)| Some((c, slot.get(owner)?)))
+            .fold(None::<(&String, &Version)>, |best, (c, v)| match best {
+                Some((_, b)) if !v.newer_than(b) => best,
+                _ => Some((c, v)),
+            });
+        if let Some((c, _)) = picked {
+            return Driver {
+                driver: Some(c.clone()),
+                ..Driver::default()
+            };
+        }
+        let heads: Vec<(&String, &Version)> = recs
+            .headers
+            .iter()
+            .filter_map(|(c, slot)| Some((c, accepted(slot, c, owner)?)))
+            .collect();
+        match heads.as_slice() {
+            [] => Driver::default(),
+            [(c, _)] => Driver {
+                driver: Some((*c).clone()),
+                ..Driver::default()
+            },
+            _ => Driver {
+                driver: None,
+                // BTreeMap order: sorted.
+                contested: heads.iter().map(|(c, _)| (*c).clone()).collect(),
+                contested_running: heads
+                    .iter()
+                    .any(|(_, v)| v.content.get("mode").and_then(Value::as_str) == Some("running")),
+                since: heads.iter().map(|(_, v)| v.at).max().unwrap_or(0),
+            },
         }
     }
 
@@ -477,8 +536,8 @@ impl Checklists {
 
     pub fn header(&self, channel: &str) -> Option<Header> {
         let recs = self.channels.get(channel)?;
-        let versions: Vec<Version> = recs.header.values().cloned().collect();
-        let (v, creator) = pick(&versions, &self.trust.owner, None)?;
+        let creator = self.driver_in(recs).driver?;
+        let v = accepted(recs.headers.get(&creator)?, &creator, &self.trust.owner)?;
         let j: HeaderJson = serde_json::from_value(v.content.clone()).unwrap_or_default();
         Some(Header {
             title: j.title,
@@ -494,6 +553,7 @@ impl Checklists {
                 worklog: j.resume.worklog,
             },
             creator,
+            event_id: v.id.clone(),
             updated_at: v.at,
         })
     }
@@ -504,16 +564,20 @@ impl Checklists {
         let Some(recs) = self.channels.get(channel) else {
             return vec![];
         };
-        let list_creator = self.header(channel).map(|h| h.creator);
+        // Only a list with a header has items: the driver's, and the owner's.
+        let Some(driver) = self.driver_in(recs).driver else {
+            return vec![];
+        };
+        let owner = self.trust.owner.as_str();
         let mut out: Vec<Item> = recs
             .items
             .iter()
-            .filter_map(|(d, by)| {
-                let versions: Vec<Version> = by.values().cloned().collect();
-                let (v, creator) = pick(&versions, &self.trust.owner, list_creator.as_deref())?;
+            .filter(|((creator, _), _)| *creator == driver || creator == owner)
+            .filter_map(|((creator, id), slot)| {
+                let v = accepted(slot, creator, owner)?;
                 let j: ItemJson = serde_json::from_value(v.content.clone()).unwrap_or_default();
                 Some(Item {
-                    id: d.rsplit('/').next().unwrap_or_default().to_string(),
+                    id: id.clone(),
                     text: j.text,
                     details: j.details,
                     status: Status::parse(&j.status),
@@ -522,8 +586,9 @@ impl Checklists {
                     standing: j.standing.filter(|s| !s.is_empty()),
                     evidence: j.evidence,
                     parked_question: j.parked_question.filter(|q| !q.is_empty()),
-                    creator,
+                    creator: creator.clone(),
                     signer: v.signer.clone(),
+                    event_id: v.id.clone(),
                     updated_at: v.at,
                 })
             })
@@ -545,14 +610,13 @@ impl Checklists {
     pub fn watch(&self, channel: &str) -> Option<Watch> {
         let recs = self.channels.get(channel)?;
         let w = &self.trust.watchers;
-        let v = recs
-            .watch
-            .values()
-            .filter(|v| v.signer == self.trust.owner || w.contains(&v.signer))
-            .fold(None::<&Version>, |best, v| match best {
+        let v = recs.watch.values().filter(|v| w.contains(&v.signer)).fold(
+            None::<&Version>,
+            |best, v| match best {
                 Some(b) if !v.newer_than(b) => Some(b),
                 _ => Some(v),
-            })?;
+            },
+        )?;
         let j: WatchJson = serde_json::from_value(v.content.clone()).unwrap_or_default();
         Some(Watch {
             state: WatchState::parse(&j.state),
@@ -563,6 +627,7 @@ impl Checklists {
             reason: j.reason,
             updated_at: v.at,
             began: v.began,
+            event_id: v.id.clone(),
         })
     }
 
@@ -578,6 +643,7 @@ impl Checklists {
         let count = |s: Status| items.iter().filter(|i| i.status == s).count();
         let header = self.header(channel);
         let watch = self.watch(channel);
+        let driver = self.driver(channel);
         let ping_link = watch.as_ref().and_then(|w| {
             let p = w.ping.as_deref()?;
             Some(message_link(channel, p, w.thread.as_deref()))
@@ -594,6 +660,8 @@ impl Checklists {
             watch,
             ping_link,
             crashes_today: self.crashes_since(channel, today),
+            contested: driver.contested,
+            contested_running: driver.contested_running,
         }
     }
 }
@@ -614,23 +682,24 @@ mod tests {
 
     const CH: &str = "2130646b-d6c8-4ec3-93e3-36f77bee1a37";
 
-    fn rec(
-        keys: &Keys,
-        kind: u16,
-        d: &str,
-        creator: Option<&str>,
-        at: u64,
-        content: Value,
-    ) -> Event {
-        let mut t = vec![
-            vec!["d".to_string(), d.to_string()],
-            vec!["h".into(), CH.into()],
-            vec!["t".into(), TAG.into()],
-            vec!["channel".into(), CH.into()],
+    fn hex(k: &Keys) -> String {
+        k.public_key().to_hex()
+    }
+
+    /// A record with a valid envelope at `d`, signed by `keys`.
+    fn rec(keys: &Keys, kind: u16, d: &str, at: u64, content: Value) -> Event {
+        let ty = match kind {
+            KIND_ITEM => "item",
+            KIND_HEADER => "header",
+            _ => "watch",
+        };
+        let t = [
+            ["d", d],
+            ["h", CH],
+            ["t", TAG],
+            ["channel", CH],
+            ["checklist-type", ty],
         ];
-        if let Some(c) = creator {
-            t.push(vec!["creator".into(), c.into()]);
-        }
         EventBuilder::new(Kind::Custom(kind), content.to_string())
             .tags(t.into_iter().map(|t| Tag::parse(t).unwrap()))
             .custom_created_at(Timestamp::from(at))
@@ -638,8 +707,16 @@ mod tests {
             .unwrap()
     }
 
-    fn item_d(id: &str) -> String {
-        format!("{TAG}/item/{CH}/{id}")
+    fn head_d(creator: &str) -> String {
+        format!("{TAG}/header/{CH}/{creator}")
+    }
+
+    fn item_d(creator: &str, id: &str) -> String {
+        format!("{TAG}/item/{CH}/{creator}/{id}")
+    }
+
+    fn head(title: &str, mode: &str) -> Value {
+        serde_json::json!({"v": 1, "title": title, "mode": mode})
     }
 
     fn item(text: &str, status: &str, order: f64) -> Value {
@@ -649,193 +726,170 @@ mod tests {
 
     fn store(owner: &Keys) -> Checklists {
         Checklists::new(Trust {
-            owner: owner.public_key().to_hex(),
+            owner: hex(owner),
             watchers: vec![],
         })
+    }
+
+    fn title(s: &Checklists) -> Option<String> {
+        s.header(CH).map(|h| h.title)
     }
 
     #[test]
     fn newest_version_from_creator_or_owner_wins() {
         let (owner, bot, other) = (Keys::generate(), Keys::generate(), Keys::generate());
-        let bk = bot.public_key().to_hex();
+        let bk = hex(&bot);
         let mut s = store(&owner);
-        let d = item_d("aaaa0001");
-        assert!(s.apply(&rec(
+        s.apply(&rec(
             &bot,
-            KIND_ITEM,
-            &d,
-            Some(&bk),
-            10,
-            item("first", "open", 1.0)
-        )));
-        // Someone else's later version is ignored, creator tag or not.
-        s.apply(&rec(
-            &other,
-            KIND_ITEM,
-            &d,
-            Some(&bk),
-            20,
-            item("hijack", "done", 1.0),
+            KIND_HEADER,
+            &head_d(&bk),
+            1,
+            head("t", "ideating"),
         ));
-        s.apply(&rec(
-            &other,
-            KIND_ITEM,
-            &d,
-            None,
-            21,
-            item("hijack2", "done", 1.0),
-        ));
+        let d = item_d(&bk, "aaaa0001");
+        assert!(s.apply(&rec(&bot, KIND_ITEM, &d, 10, item("first", "open", 1.0))));
+        // Someone else's later version at the bot's address is ignored.
+        s.apply(&rec(&other, KIND_ITEM, &d, 20, item("hijack", "done", 1.0)));
         assert_eq!(s.items(CH)[0].text, "first");
         // The owner's edit counts.
         s.apply(&rec(
             &owner,
             KIND_ITEM,
             &d,
-            Some(&bk),
             30,
             item("owner edit", "parked", 1.0),
         ));
         let i = &s.items(CH)[0];
         assert_eq!((i.text.as_str(), i.status), ("owner edit", Status::Parked));
-        assert_eq!(i.creator, bk);
+        assert_eq!(
+            (i.creator.as_str(), i.signer.clone()),
+            (bk.as_str(), hex(&owner))
+        );
         // Then the creator's newer one.
-        s.apply(&rec(
-            &bot,
-            KIND_ITEM,
-            &d,
-            Some(&bk),
-            40,
-            item("ticked", "done", 1.0),
-        ));
+        s.apply(&rec(&bot, KIND_ITEM, &d, 40, item("ticked", "done", 1.0)));
         let i = &s.items(CH)[0];
         assert_eq!((i.text.as_str(), i.status), ("ticked", Status::Done));
         // An older version from the same signer doesn't replace a newer one.
-        assert!(!s.apply(&rec(
-            &bot,
-            KIND_ITEM,
-            &d,
-            Some(&bk),
-            35,
-            item("stale", "open", 1.0)
-        )));
+        assert!(!s.apply(&rec(&bot, KIND_ITEM, &d, 35, item("stale", "open", 1.0))));
         assert_eq!(s.items(CH)[0].text, "ticked");
     }
 
+    /// judgebot's takeover repro: the bot inits at t=100, X signs a header
+    /// at the bot's own address at t=200, the bot edits at t=300. X never
+    /// shows, whichever versions the relay kept.
     #[test]
-    fn the_first_self_claimed_signer_is_the_creator() {
-        let (owner, bot, late) = (Keys::generate(), Keys::generate(), Keys::generate());
-        let mut s = store(&owner);
-        let d = item_d("aaaa0002");
-        let bk = bot.public_key().to_hex();
-        let lk = late.public_key().to_hex();
-        s.apply(&rec(
-            &late,
-            KIND_ITEM,
-            &d,
-            Some(&lk),
-            50,
-            item("late claim", "open", 1.0),
-        ));
-        s.apply(&rec(
-            &bot,
-            KIND_ITEM,
-            &d,
-            Some(&bk),
-            10,
-            item("original", "open", 1.0),
-        ));
-        assert_eq!(s.items(CH)[0].text, "original");
-        // The owner's creator tag settles it.
-        s.apply(&rec(
-            &owner,
-            KIND_ITEM,
-            &d,
-            Some(&lk),
-            5,
-            item("by owner", "open", 1.0),
-        ));
-        s.apply(&rec(
-            &late,
-            KIND_ITEM,
-            &d,
-            Some(&lk),
-            60,
-            item("late again", "open", 1.0),
-        ));
-        assert_eq!(s.items(CH)[0].text, "late again");
-    }
-
-    /// A later self-claim doesn't take an item over when the creator edits
-    /// it, and the list's creator wins a claim it shares.
-    #[test]
-    fn a_later_claim_does_not_take_an_item_over() {
+    fn a_member_cannot_take_a_list_over() {
         let (owner, bot, x) = (Keys::generate(), Keys::generate(), Keys::generate());
-        let (bk, xk) = (bot.public_key().to_hex(), x.public_key().to_hex());
-        let d = item_d("aaaa0009");
+        let (bk, xk) = (hex(&bot), hex(&x));
         let mut s = store(&owner);
-        s.apply(&rec(
-            &bot,
-            KIND_ITEM,
-            &d,
-            Some(&bk),
-            10,
-            item("mine", "open", 1.0),
-        ));
-        s.apply(&rec(
-            &x,
-            KIND_ITEM,
-            &d,
-            Some(&xk),
-            20,
-            item("x's", "open", 1.0),
-        ));
-        s.apply(&rec(
-            &bot,
-            KIND_ITEM,
-            &d,
-            Some(&bk),
-            40,
-            item("mine, edited", "open", 1.0),
-        ));
-        assert_eq!(s.items(CH)[0].text, "mine, edited");
-        // Seen fresh, only the newest of each survives: the list's creator
-        // (who ran init) is preferred over an earlier-looking claim.
-        let mut s = store(&owner);
-        let hd = format!("{TAG}/header/{CH}");
         s.apply(&rec(
             &bot,
             KIND_HEADER,
-            &hd,
-            Some(&bk),
-            5,
-            serde_json::json!({"title": "t"}),
+            &head_d(&bk),
+            100,
+            head("bot's", "running"),
         ));
         s.apply(&rec(
             &x,
-            KIND_ITEM,
-            &d,
-            Some(&xk),
-            20,
-            item("x's", "open", 1.0),
+            KIND_HEADER,
+            &head_d(&bk),
+            200,
+            head("x's", "running"),
+        ));
+        assert_eq!(title(&s).as_deref(), Some("bot's"));
+        s.apply(&rec(
+            &bot,
+            KIND_HEADER,
+            &head_d(&bk),
+            300,
+            head("bot's, edited", "running"),
+        ));
+        let h = s.header(CH).unwrap();
+        assert_eq!(
+            (h.title.as_str(), h.creator.as_str()),
+            ("bot's, edited", bk.as_str())
+        );
+        // Pruned to each signer's newest, seen fresh: the same.
+        let mut s = store(&owner);
+        s.apply(&rec(
+            &x,
+            KIND_HEADER,
+            &head_d(&bk),
+            200,
+            head("x's", "running"),
         ));
         s.apply(&rec(
             &bot,
-            KIND_ITEM,
-            &d,
-            Some(&bk),
-            40,
-            item("mine, edited", "open", 1.0),
+            KIND_HEADER,
+            &head_d(&bk),
+            300,
+            head("bot's, edited", "running"),
         ));
-        assert_eq!(s.items(CH)[0].text, "mine, edited");
+        assert_eq!(title(&s).as_deref(), Some("bot's, edited"));
+        // Nor its items: X's flip of the bot's item, and X's own items.
+        let d = item_d(&bk, "aaaa0001");
+        s.apply(&rec(&bot, KIND_ITEM, &d, 100, item("mine", "open", 1.0)));
+        s.apply(&rec(&x, KIND_ITEM, &d, 400, item("x's", "done", 1.0)));
+        s.apply(&rec(
+            &x,
+            KIND_ITEM,
+            &item_d(&xk, "aaaa0002"),
+            400,
+            item("x's own", "parked", 2.0),
+        ));
+        let texts: Vec<String> = s.items(CH).into_iter().map(|i| i.text).collect();
+        assert_eq!(texts, ["mine"]);
+        // X's own list, even backdated, only contests: no header, no items.
+        s.apply(&rec(
+            &x,
+            KIND_HEADER,
+            &head_d(&xk),
+            50,
+            head("x's", "running"),
+        ));
+        assert_eq!(s.header(CH), None);
+        assert!(s.items(CH).is_empty());
+        let mut both = vec![bk.clone(), xk.clone()];
+        both.sort();
+        assert_eq!(
+            s.driver(CH),
+            Driver {
+                driver: None,
+                contested: both.clone(),
+                contested_running: true,
+                since: 300,
+            }
+        );
+        let sum = s.summary(CH, 0);
+        assert_eq!((sum.contested, sum.contested_running), (both, true));
+        assert!(!s.summary(CH, 0).is_empty());
+        // The owner picks the bot: it drives again.
+        s.apply(&rec(
+            &owner,
+            KIND_HEADER,
+            &head_d(&bk),
+            500,
+            head("bot's", "running"),
+        ));
+        assert_eq!(s.driver(CH).driver.as_deref(), Some(bk.as_str()));
+        assert_eq!(s.items(CH).len(), 1);
     }
 
     #[test]
     fn items_sort_with_standing_ones_at_the_ends() {
         let (owner, bot) = (Keys::generate(), Keys::generate());
-        let bk = bot.public_key().to_hex();
+        let bk = hex(&bot);
         let mut s = store(&owner);
+        s.apply(&rec(
+            &bot,
+            KIND_HEADER,
+            &head_d(&bk),
+            1,
+            head("t", "running"),
+        ));
         let put = |s: &mut Checklists, id: &str, v: Value| {
-            s.apply(&rec(&bot, KIND_ITEM, &item_d(id), Some(&bk), 10, v));
+            s.apply(&rec(&bot, KIND_ITEM, &item_d(&bk, id), 10, v));
         };
         put(
             &mut s,
@@ -863,42 +917,31 @@ mod tests {
     #[test]
     fn malformed_and_misplaced_records_are_ignored() {
         let (owner, bot) = (Keys::generate(), Keys::generate());
+        let bk = hex(&bot);
         let mut s = store(&owner);
-        // d names another channel.
-        let other = format!("{TAG}/item/bcd11c3d-f78b-4934-8e48-c08b6baed1c5/aaaa0003");
-        assert!(!s.apply(&rec(
-            &bot,
-            KIND_ITEM,
-            &other,
-            None,
-            1,
-            item("x", "open", 1.0)
-        )));
-        // Wrong record type in d, no item id, bad JSON.
-        assert!(!s.apply(&rec(
-            &bot,
-            KIND_ITEM,
-            &format!("{TAG}/header/{CH}"),
-            None,
-            1,
-            item("x", "open", 1.0)
-        )));
-        assert!(!s.apply(&rec(
-            &bot,
-            KIND_ITEM,
-            &format!("{TAG}/item/{CH}"),
-            None,
-            1,
-            item("x", "open", 1.0)
-        )));
-        let bad = EventBuilder::new(Kind::Custom(KIND_ITEM), "not json")
+        let bad = |d: String| rec(&bot, KIND_ITEM, &d, 1, item("x", "open", 1.0));
+        // d names another channel; the wrong type; no creator; a bad item id;
+        // an uppercase creator; an extra segment.
+        for d in [
+            format!("{TAG}/item/bcd11c3d-f78b-4934-8e48-c08b6baed1c5/{bk}/aaaa0003"),
+            format!("{TAG}/header/{CH}/{bk}"),
+            format!("{TAG}/item/{CH}/aaaa0003"),
+            item_d(&bk, "AAAA0003"),
+            item_d(&bk.to_uppercase(), "aaaa0003"),
+            format!("{}/x", item_d(&bk, "aaaa0003")),
+        ] {
+            assert!(!s.apply(&bad(d.clone())), "{d}");
+        }
+        // No checklist-type or channel tag.
+        let bare = EventBuilder::new(Kind::Custom(KIND_ITEM), "{}")
             .tags([
-                Tag::parse(["d", &item_d("aaaa0004")]).unwrap(),
+                Tag::parse(["d", &item_d(&bk, "aaaa0004")]).unwrap(),
                 Tag::parse(["h", CH]).unwrap(),
+                Tag::parse(["t", TAG]).unwrap(),
             ])
             .sign_with_keys(&bot)
             .unwrap();
-        assert!(!s.apply(&bad));
+        assert!(!s.apply(&bare));
         assert!(s.items(CH).is_empty());
     }
 
@@ -910,15 +953,14 @@ mod tests {
             Keys::generate(),
             Keys::generate(),
         );
-        let bk = bot.public_key().to_hex();
+        let bk = hex(&bot);
         let mut s = store(&owner);
-        s.trust.watchers = vec![watcher.public_key().to_hex()];
-        let hd = format!("{TAG}/header/{CH}");
+        s.trust.watchers = vec![hex(&watcher)];
+        let hd = head_d(&bk);
         s.apply(&rec(
             &bot,
             KIND_HEADER,
             &hd,
-            Some(&bk),
             10,
             serde_json::json!({
             "v": 1, "title": "operator loop", "mode": "ideating", "go": null,
@@ -928,7 +970,6 @@ mod tests {
             &bot,
             KIND_HEADER,
             &hd,
-            Some(&bk),
             20,
             serde_json::json!({
             "v": 1, "title": "operator loop", "mode": "running", "go": "abc"}),
@@ -939,21 +980,19 @@ mod tests {
             s.apply(&rec(
                 &bot,
                 KIND_ITEM,
-                &item_d(&format!("0000000{i}")),
-                Some(&bk),
+                &item_d(&bk, &format!("0000000{i}")),
                 10,
                 item("x", st, i as f64),
             ));
         }
         let wd = format!("{TAG}/watch/{CH}");
-        s.apply(&rec(&watcher, KIND_WATCH, &wd, None, 30, serde_json::json!({
+        s.apply(&rec(&watcher, KIND_WATCH, &wd, 30, serde_json::json!({
             "v": 1, "state": "waiting_on_lucian", "since": 100, "thread": "root1", "ping": "ping1", "nudges": 2})));
         // Not the watcher: ignored even though it's newer.
         s.apply(&rec(
             &fake,
             KIND_WATCH,
             &wd,
-            None,
             40,
             serde_json::json!({"state": "working"}),
         ));
@@ -966,6 +1005,7 @@ mod tests {
         assert_eq!((sum.open, sum.done, sum.parked), (2, 1, 1));
         assert_eq!(sum.mode, Some(Mode::Running));
         assert_eq!(sum.title.as_deref(), Some("operator loop"));
+        assert!(sum.contested.is_empty());
         let w = sum.watch.clone().unwrap();
         assert_eq!(w.state, WatchState::WaitingOnLucian);
         assert!(w.state.needs_you());
@@ -976,18 +1016,17 @@ mod tests {
         assert_eq!(sum.crashes_today, 1);
         assert!(!sum.is_empty());
         assert!(s.summary("elsewhere", today).is_empty());
-        // No watcher configured: only the owner's count.
-        s.trust.watchers.clear();
-        assert!(s.watch(CH).is_none());
+        // Watch records count only from the watcher's keys, the owner's too.
         s.apply(&rec(
             &owner,
             KIND_WATCH,
             &wd,
-            None,
             50,
             serde_json::json!({"state": "idle"}),
         ));
-        assert_eq!(s.watch(CH).unwrap().state, WatchState::Idle);
+        assert_eq!(s.watch(CH).unwrap().state, WatchState::WaitingOnLucian);
+        s.trust.watchers.clear();
+        assert!(s.watch(CH).is_none());
     }
 
     #[test]

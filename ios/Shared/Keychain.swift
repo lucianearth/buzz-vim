@@ -75,6 +75,9 @@ struct PushState: Codable {
     /// no lease is live.
     var leased: String?
     var leaseExpires: Int64 = 0
+    /// A logout's stop the gateway hasn't confirmed yet: retried at launch
+    /// and foreground. Optional, so state saved before it still decodes.
+    var stopPending: Bool?
 
     static func load() -> PushState {
         Keychain.read(account: "push")

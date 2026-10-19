@@ -20,8 +20,14 @@ struct File {
     /// Operator loop: who else may edit any checklist record (default lucian).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     owner: Option<String>,
-    /// The watcher's pubkeys; its state counts only from these (and the owner).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// The watcher's pubkeys; its state counts only from these. A list, or
+    /// one string, comma separated; any other type is warned about and the
+    /// default used, so it can't drop the rest of the file (the nsec too).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "watcher_keys"
+    )]
     watcher: Vec<String>,
     /// The Q pop-up's channel name and the agent it @mentions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,7 +58,7 @@ pub struct Loop {
 impl Default for Loop {
     fn default() -> Self {
         Loop {
-            owner: crate::checklist::OWNER.to_string(),
+            owner: crate::checklist::DEFAULT_OWNER.to_string(),
             watchers: crate::checklist::WATCHERS
                 .iter()
                 .map(|s| s.to_string())
@@ -61,6 +67,34 @@ impl Default for Loop {
             quick_agent: crate::quick::AGENT.to_string(),
         }
     }
+}
+
+/// `watcher` as a list of keys or one comma-separated string. Anything
+/// else: a warning, and none (so the default).
+fn watcher_keys<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let split = |s: &str| -> Vec<String> {
+        s.split(',')
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .collect()
+    };
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => split(&s),
+        serde_json::Value::Array(a) if a.iter().all(|v| v.is_string()) => a
+            .iter()
+            .filter_map(|v| v.as_str())
+            .flat_map(split)
+            .collect(),
+        serde_json::Value::Null => vec![],
+        other => {
+            let msg = format!(
+                "config.json: `watcher` should be a list of pubkeys or a comma-separated string, not {other}; using the default"
+            );
+            eprintln!("buzz-vim: {msg}");
+            crate::log::line(msg);
+            vec![]
+        }
+    })
 }
 
 fn env(k: &str) -> Option<String> {
@@ -227,5 +261,31 @@ mod tests {
             ..File::default()
         };
         assert_eq!(loop_settings(&set).watchers, vec!["abc".to_string()]);
+    }
+
+    /// A `watcher` of the wrong type mustn't lose the file: a string is
+    /// split on commas, a number warns and leaves the default, and the
+    /// nsec and relay stay either way.
+    #[test]
+    fn a_mistyped_watcher_keeps_the_rest_of_the_config() {
+        let parse = |w: &str| -> File {
+            serde_json::from_str(&format!(
+                r#"{{"relay": "wss://r", "nsec": "nsec1x", "watcher": {w}}}"#
+            ))
+            .unwrap()
+        };
+        let f = parse(r#""aa, bb,""#);
+        assert_eq!(f.watcher, ["aa", "bb"]);
+        assert_eq!(parse(r#"["aa", "bb"]"#).watcher, ["aa", "bb"]);
+        for bad in ["42", "{}", "[1]", "true"] {
+            let f = parse(bad);
+            assert!(f.watcher.is_empty(), "{bad}");
+            assert_eq!(
+                (f.nsec.as_deref(), f.relay.as_deref()),
+                (Some("nsec1x"), Some("wss://r"))
+            );
+        }
+        let f: File = serde_json::from_str(r#"{"nsec": "nsec1x"}"#).unwrap();
+        assert!(f.watcher.is_empty());
     }
 }

@@ -1163,6 +1163,15 @@ fn ago(secs: u64) -> String {
     }
 }
 
+/// The creators of a contested channel's lists, by name.
+fn contested_names(app: &App, creators: &[String]) -> String {
+    creators
+        .iter()
+        .map(|c| app.store.name_of(c))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// One channel's status line: mode, the watcher's state (and the ping it
 /// sent, as a link), item counts, crashes today. Nothing when the channel
 /// has no list, no watcher and no crashes.
@@ -1193,11 +1202,19 @@ fn draw_status(f: &mut Frame, app: &mut App, row: Rect, channel: &str, hint: boo
         return;
     }
     let mut spans = vec![Span::raw(" ")];
+    if !sum.contested.is_empty() {
+        // No list shows until the owner picks a driver.
+        spans.push(Span::styled(
+            format!("contested: {}", contested_names(app, &sum.contested)),
+            theme::bright(),
+        ));
+    }
     match sum.mode {
         Some(crate::checklist::Mode::Running) => {
             spans.push(Span::styled(" RUNNING ", theme::badge()))
         }
         Some(m) => spans.push(Span::styled(format!("[ {} ]", m.label()), theme::muted())),
+        None if !sum.contested.is_empty() => {}
         None => spans.push(Span::styled("no list", theme::faint())),
     }
     let mut link = None;
@@ -1636,7 +1653,9 @@ fn draw_box(
 
 /// Who a tab-0 row is from: their name, or the watcher's when nobody is.
 fn needs_who(app: &App, r: &crate::needs::Row) -> String {
-    if r.who.is_empty() {
+    if let crate::needs::Reason::Contested(c) = &r.reason {
+        contested_names(app, c)
+    } else if r.who.is_empty() {
         "watcher".into()
     } else {
         app.store.name_of(&r.who)
@@ -1702,6 +1721,7 @@ fn draw_needs(f: &mut Frame, app: &mut App, area: Rect) {
             Reason::Watch(crate::checklist::WatchState::Stalled) => "⚠",
             Reason::Watch(_) => "⚑",
             Reason::Parked => "‖",
+            Reason::Contested(_) => "⚑",
             Reason::Mention => "@",
             Reason::Dm => "✉",
             Reason::Bot => "·",
@@ -2917,7 +2937,16 @@ mod tests {
                         vec!["d".to_string(), d],
                         vec!["h".into(), ch.into()],
                         vec!["t".into(), "buzz-checklist".into()],
-                        vec!["creator".into(), bk.clone()],
+                        vec!["channel".into(), ch.into()],
+                        vec![
+                            "checklist-type".into(),
+                            match kind {
+                                30470 => "item",
+                                30471 => "header",
+                                _ => "watch",
+                            }
+                            .into(),
+                        ],
                     ]
                     .into_iter()
                     .map(|t| Tag::parse(t).unwrap()),
@@ -2926,7 +2955,7 @@ mod tests {
                 .sign_with_keys(k)
                 .unwrap()
         };
-        app.checklists.apply(&rec(&bot, 30471, format!("buzz-checklist/header/{ch}"), now - 3000,
+        app.checklists.apply(&rec(&bot, 30471, format!("buzz-checklist/header/{ch}/{bk}"), now - 3000,
             serde_json::json!({"v": 1, "title": "Operator loop: buzz-vim", "mode": "running", "go": "b756649f",
                 "resume": {"worktree": "buzz-vim-oploop", "branch": "agent/operator-loop", "worklog": "2026-10-18_OPERATOR_LOOP.md"}})));
         let items = [
@@ -2985,7 +3014,7 @@ mod tests {
         for (i, (id, text, status, release, standing, ev, details, q)) in
             items.into_iter().enumerate()
         {
-            app.checklists.apply(&rec(&bot, 30470, format!("buzz-checklist/item/{ch}/{id}"), now - 2000 + i as u64,
+            app.checklists.apply(&rec(&bot, 30470, format!("buzz-checklist/item/{ch}/{bk}/000000{id}"), now - 2000 + i as u64,
                 serde_json::json!({"v": 1, "text": text, "details": details, "status": status, "release": release,
                     "order": i, "standing": standing, "evidence": ev, "parked_question": q})));
         }
@@ -3029,6 +3058,44 @@ mod tests {
         (0..h)
             .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
             .collect()
+    }
+
+    /// A second list in the loop channel: the status line says contested
+    /// with both creators, no list shows, and tab 0 asks for a driver.
+    #[test]
+    fn a_contested_channel_says_so() {
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+        let mut app = loop_fixture();
+        let ch = "2130646b-d6c8-4ec3-93e3-36f77bee1a37";
+        let x = Keys::generate();
+        let xk = x.public_key().to_hex();
+        let d = format!("buzz-checklist/header/{ch}/{xk}");
+        let ev = EventBuilder::new(Kind::Custom(30471), r#"{"title":"x","mode":"running"}"#)
+            .tags(
+                [
+                    ["d", d.as_str()],
+                    ["h", ch],
+                    ["t", "buzz-checklist"],
+                    ["channel", ch],
+                    ["checklist-type", "header"],
+                ]
+                .map(|t| Tag::parse(t).unwrap()),
+            )
+            .custom_created_at(Timestamp::from(crate::sync::now() - 100))
+            .sign_with_keys(&x)
+            .unwrap();
+        assert!(app.checklists.apply(&ev));
+        let s = screen_text(&mut app, 120, 34);
+        assert!(s.contains("contested: ") && s.contains("taskbot"), "{s}");
+        assert!(s.contains(&format!("{}…", &xk[..8])), "{s}");
+        assert!(!s.contains("RUNNING") && !s.contains("3 open"), "{s}");
+        assert!(
+            app.needs
+                .iter()
+                .any(|r| r.text == "two lists claim this channel; pick a driver"),
+            "{:?}",
+            app.needs
+        );
     }
 
     #[test]

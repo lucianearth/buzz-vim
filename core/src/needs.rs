@@ -3,8 +3,10 @@
 //! rows and nothing is a local flag.
 //!
 //! Needs an answer: channels the watcher says wait on him (stalled, waiting
-//! on lucian, waiting on release), parked items with their question, and
-//! people's @mentions and DMs he hasn't answered. FYI: bots' @mentions of
+//! on lucian, waiting on release), parked items with their question (the
+//! driving list's only, at most `PARKED_MAX` a channel), a contested
+//! channel whose lists run, and people's @mentions and DMs he hasn't
+//! answered. FYI: bots' @mentions of
 //! him the watcher didn't flag. A message row clears once he posts in its
 //! thread (in a DM: anywhere in it) after the message; a watch or item row
 //! once the record moves on.
@@ -32,6 +34,9 @@ pub enum Reason {
     Watch(WatchState),
     /// A parked checklist item.
     Parked,
+    /// Two or more lists claim the channel and one runs: the owner picks a
+    /// driver. Their creators.
+    Contested(Vec<String>),
     /// A person @mentioned him.
     Mention,
     /// A person wrote to him in a DM.
@@ -78,6 +83,7 @@ impl Row {
         match &self.reason {
             Reason::Watch(s) => s.label(),
             Reason::Parked => "parked".into(),
+            Reason::Contested(_) => "contested".into(),
             Reason::Mention => "mention".into(),
             Reason::Dm => "dm".into(),
             Reason::Bot => "bot".into(),
@@ -245,10 +251,40 @@ pub fn rows(
                 });
             }
         }
-        for it in lists.items(channel) {
-            if it.status != Status::Parked {
-                continue;
-            }
+        let driver = lists.driver(channel);
+        if driver.contested_running {
+            let n = driver.contested.len();
+            out.push(Row {
+                section: Section::Answer,
+                reason: Reason::Contested(driver.contested.clone()),
+                channel: channel.to_string(),
+                who: String::new(),
+                text: format!(
+                    "{} lists claim this channel; pick a driver",
+                    if n == 2 {
+                        "two".to_string()
+                    } else {
+                        n.to_string()
+                    }
+                ),
+                at: driver.since,
+                message: None,
+                thread: None,
+                // A new list joining is a new ask.
+                key: format!("contested:{channel}:{}", driver.contested.join(",")),
+            });
+        }
+        // The driving list's parked items (the reader drops everyone
+        // else's), oldest first, at most PARKED_MAX and then one row for
+        // the rest.
+        let mut parked: Vec<_> = lists
+            .items(channel)
+            .into_iter()
+            .filter(|it| it.status == Status::Parked)
+            .collect();
+        parked.sort_by(|a, b| (a.updated_at, &a.id).cmp(&(b.updated_at, &b.id)));
+        let rest = parked.split_off(parked.len().min(PARKED_MAX));
+        for it in parked {
             out.push(Row {
                 section: Section::Answer,
                 reason: Reason::Parked,
@@ -268,6 +304,19 @@ pub fn rows(
                     it.id,
                     it.parked_question.as_deref().unwrap_or_default()
                 ),
+            });
+        }
+        if let Some(first) = rest.first() {
+            out.push(Row {
+                section: Section::Answer,
+                reason: Reason::Parked,
+                channel: channel.to_string(),
+                who: first.creator.clone(),
+                text: format!("+{} more parked (c: the checklist)", rest.len()),
+                at: first.updated_at,
+                message: None,
+                thread: thread.clone(),
+                key: format!("item:{channel}:more"),
             });
         }
     }
@@ -327,6 +376,9 @@ pub fn rows(
 
 /// FYI rows kept: the newest ones.
 pub const FYI_MAX: usize = 20;
+
+/// Parked rows a channel gets before the rest fold into one "+N more".
+pub const PARKED_MAX: usize = 5;
 
 /// How many rows need an answer: the "⚑ N".
 pub fn answer_count(rows: &[Row]) -> usize {
@@ -432,12 +484,19 @@ mod tests {
         }
 
         fn record(&mut self, who: &Keys, kind: u16, d: String, at: u64, v: serde_json::Value) {
+            let ty = match kind {
+                30470 => "item",
+                30471 => "header",
+                _ => "watch",
+            };
             let ev: Event = EventBuilder::new(Kind::Custom(kind), v.to_string())
                 .tags(
                     [
                         vec!["d".to_string(), d],
                         vec!["h".into(), CH.into()],
                         vec!["t".into(), "buzz-checklist".into()],
+                        vec!["channel".into(), CH.into()],
+                        vec!["checklist-type".into(), ty.into()],
                     ]
                     .into_iter()
                     .map(|t| Tag::parse(t).unwrap()),
@@ -638,16 +697,16 @@ mod tests {
         w.record(
             &bot,
             30471,
-            format!("buzz-checklist/header/{CH}"),
+            format!("buzz-checklist/header/{CH}/{bk}"),
             NOW - 5000,
             serde_json::json!({"title": "t", "mode": "running", "go": root}),
         );
-        w.record(&bot, 30470, format!("buzz-checklist/item/{CH}/a1"), NOW - 650,
+        w.record(&bot, 30470, format!("buzz-checklist/item/{CH}/{bk}/000000a1"), NOW - 650,
             serde_json::json!({"text": "migrate relay", "status": "parked", "parked_question": "tonight or nightly?\nmore"}));
         w.record(
             &bot,
             30470,
-            format!("buzz-checklist/item/{CH}/a2"),
+            format!("buzz-checklist/item/{CH}/{bk}/000000a2"),
             NOW - 640,
             serde_json::json!({"text": "open one", "status": "open"}),
         );
@@ -677,7 +736,7 @@ mod tests {
         w.record(
             &bot,
             30470,
-            format!("buzz-checklist/item/{CH}/a1"),
+            format!("buzz-checklist/item/{CH}/{bk}/000000a1"),
             NOW - 10,
             serde_json::json!({"text": "migrate relay", "status": "open"}),
         );
@@ -692,7 +751,15 @@ mod tests {
     fn republishing_keeps_row_keys_and_threadless_rows_clear() {
         let mut w = World::new();
         let (op, bot) = (w.op.clone(), w.bot.clone());
-        w.record(&bot, 30470, format!("buzz-checklist/item/{CH}/a1"), NOW - 650,
+        let bk = World::pk(&bot);
+        w.record(
+            &bot,
+            30471,
+            format!("buzz-checklist/header/{CH}/{bk}"),
+            NOW - 5000,
+            serde_json::json!({"title": "t", "mode": "running"}),
+        );
+        w.record(&bot, 30470, format!("buzz-checklist/item/{CH}/{bk}/000000a1"), NOW - 650,
             serde_json::json!({"text": "migrate relay", "status": "parked", "parked_question": "tonight?"}));
         let wk = w.watcher.clone();
         let watch = |w: &mut World, at: u64| {
@@ -709,7 +776,7 @@ mod tests {
         assert_eq!(before.len(), 2);
         // A nudge bump and a details edit: same asks, same keys.
         watch(&mut w, NOW - 300);
-        w.record(&bot, 30470, format!("buzz-checklist/item/{CH}/a1"), NOW - 290,
+        w.record(&bot, 30470, format!("buzz-checklist/item/{CH}/{bk}/000000a1"), NOW - 290,
             serde_json::json!({"text": "migrate relay", "details": "more", "status": "parked", "parked_question": "tonight?"}));
         let after: Vec<String> = w.rows().iter().map(|r| r.key.clone()).collect();
         assert_eq!(
@@ -773,6 +840,83 @@ mod tests {
         );
         assert_eq!(r[0].at, NOW - 600);
         w.post(&op, CH, "released", None, Some(&root), NOW - 60);
+        assert!(w.rows().is_empty());
+    }
+
+    /// Forged parked items (another member's, at its own address or the
+    /// driver's) make no rows; the driver's own fold past PARKED_MAX.
+    #[test]
+    fn parked_rows_come_from_the_driver_only_and_are_capped() {
+        let mut w = World::new();
+        let (bot, human) = (w.bot.clone(), w.human.clone());
+        let (bk, hk) = (World::pk(&bot), World::pk(&human));
+        w.record(
+            &bot,
+            30471,
+            format!("buzz-checklist/header/{CH}/{bk}"),
+            NOW - 5000,
+            serde_json::json!({"title": "t", "mode": "running"}),
+        );
+        let parked =
+            serde_json::json!({"text": "x", "status": "parked", "parked_question": "forged?"});
+        for i in 0..50u64 {
+            w.record(
+                &human,
+                30470,
+                format!("buzz-checklist/item/{CH}/{hk}/{i:08x}"),
+                NOW - 100,
+                parked.clone(),
+            );
+            w.record(
+                &human,
+                30470,
+                format!("buzz-checklist/item/{CH}/{bk}/{i:08x}"),
+                NOW - 100,
+                parked.clone(),
+            );
+        }
+        assert!(w.rows().is_empty());
+        for i in 0..(PARKED_MAX as u64 + 3) {
+            w.record(&bot, 30470, format!("buzz-checklist/item/{CH}/{bk}/{:08x}", 100 + i), NOW - 900 + i,
+                serde_json::json!({"text": "q", "status": "parked", "parked_question": format!("q{i}")}));
+        }
+        let r = w.rows();
+        assert_eq!(answer_count(&r), PARKED_MAX + 1);
+        let texts: Vec<&str> = r.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts[..PARKED_MAX], ["q0", "q1", "q2", "q3", "q4"]);
+        assert_eq!(texts[PARKED_MAX], "+3 more parked (c: the checklist)");
+    }
+
+    /// Two lists claim a channel: one "Needs an answer" row while one runs,
+    /// none while both ideate.
+    #[test]
+    fn a_contested_running_channel_asks_for_a_driver() {
+        let mut w = World::new();
+        let (bot, human) = (w.bot.clone(), w.human.clone());
+        let (bk, hk) = (World::pk(&bot), World::pk(&human));
+        let head = |w: &mut World, k: &Keys, pk: &str, mode: &str, at: u64| {
+            w.record(
+                k,
+                30471,
+                format!("buzz-checklist/header/{CH}/{pk}"),
+                at,
+                serde_json::json!({"title": "t", "mode": mode}),
+            );
+        };
+        head(&mut w, &bot, &bk, "ideating", NOW - 500);
+        head(&mut w, &human, &hk, "ideating", NOW - 400);
+        assert!(w.rows().is_empty());
+        head(&mut w, &human, &hk, "running", NOW - 300);
+        let r = w.rows();
+        assert_eq!(keys(&r), [(Section::Answer, "contested".to_string())]);
+        assert_eq!(r[0].text, "two lists claim this channel; pick a driver");
+        let mut both = vec![bk.clone(), hk.clone()];
+        both.sort();
+        assert_eq!(r[0].reason, Reason::Contested(both.clone()));
+        assert_eq!(r[0].key, format!("contested:{CH}:{}", both.join(",")));
+        // The owner picks: the row goes.
+        let op = w.op.clone();
+        head(&mut w, &op, &bk, "running", NOW - 200);
         assert!(w.rows().is_empty());
     }
 }

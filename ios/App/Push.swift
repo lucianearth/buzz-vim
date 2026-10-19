@@ -23,6 +23,8 @@ final class Push {
     private var state = PushState.load()
     private var token: Data?
     private var busy = false
+    /// A logout's stop is in flight.
+    private var stopping = false
     private var checked = Date.distantPast
     /// Bumped on logout, so a lease already on its way isn't published after.
     private var session = 0
@@ -51,6 +53,13 @@ final class Push {
     func refresh(_ client: Client, relay: String) {
         guard !busy, Date().timeIntervalSince(checked) > 30, let token,
               DCAppAttestService.shared.isSupported else { return }
+        if state.stopPending == true {
+            // A logout's revoke first: done later, it would revoke the
+            // grant a new lease goes out on.
+            checked = Date()
+            retryStop()
+            return
+        }
         let subs: String
         do {
             guard let s = try client.pushSubscriptions() else { return }
@@ -98,34 +107,70 @@ final class Push {
 
     /// Logout: an inactive lease, then the gateway forgets the relay key.
     /// The App Attest key and installation stay for the next login. The
-    /// lease and grant are cleared only once the tombstone is out, so a
-    /// stop that failed (offline) is tried again by the next one.
+    /// stop stays pending (saved) until the gateway has revoked the relay
+    /// key; one that failed (offline) is tried again at the next launch or
+    /// foreground, and no lease goes out before it.
     func stop(_ client: Client, relay: String) {
         session += 1
         failure = nil
         guard state.leased != nil || state.grant != nil else { return }
+        state.stopPending = true
+        state.save()
         let was = state
+        stopping = true
         Task { @MainActor in
+            defer { stopping = false }
             do {
                 let r = try await pushRelay(relayUrl: relay)
                 let generation = max(was.leaseGeneration + 1, UInt64(Self.now()))
                 try await client.pushTombstone(relay: r, installation: was.lease, generation: generation)
                 state.leaseGeneration = generation
                 state.leased = nil
-                state.grant = nil
                 state.save()
-                guard let keyId = was.keyId, let installation = was.installation,
-                      let relayPubkey = was.relayPubkey else { return }
-                let d = PushDelegation(installation: installation, generation: was.generation,
+            } catch {
+                // Signed with the account's key, which logout deletes: it
+                // can't be retried. The revoke still stops the pushes.
+                NSLog("push stop: tombstone: \(error)")
+            }
+            await revoke()
+        }
+    }
+
+    /// At launch and on foreground: finish a logout's stop that failed.
+    func retryStop() {
+        guard state.stopPending == true, !stopping else { return }
+        stopping = true
+        Task { @MainActor in
+            defer { stopping = false }
+            await revoke()
+        }
+    }
+
+    /// The gateway forgets the relay key (App Attest only, no account key),
+    /// so the relay can't push here whatever lease is left. Clears the
+    /// pending stop once through, or when there is nothing left to revoke.
+    @MainActor
+    private func revoke() async {
+        do {
+            if let keyId = state.keyId, let installation = state.installation,
+               let relayPubkey = state.relayPubkey {
+                let d = PushDelegation(installation: installation, generation: state.generation,
                                        relayPubkey: relayPubkey, notBefore: 0, expiresAt: 0)
                 let c = try await pushChallenge(gateway: Self.gateway)
                 let assertion = try await DCAppAttestService.shared.generateAssertion(
                     keyId, clientDataHash: pushRevokeHash(challenge: c, delegation: d))
                 try await pushRevoke(gateway: Self.gateway, challenge: c, delegation: d, assertion: assertion)
-            } catch {
-                NSLog("push stop: \(error)")
             }
+        } catch let e where !Self.lost(e) {
+            NSLog("push stop: revoke: \(e); trying again at the next launch")
+            return
+        } catch {
+            // The installation is gone: nothing left that could push.
         }
+        state.leased = nil
+        state.grant = nil
+        state.stopPending = nil
+        state.save()
     }
 
     /// A fresh grant for the relay key, enrolling first when there is no

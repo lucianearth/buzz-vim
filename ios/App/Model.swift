@@ -59,6 +59,8 @@ final class Model {
     }
 
     init() {
+        // A logout's push stop that didn't get through.
+        Push.shared.retryStop()
         if let secret = Keychain.read() {
             let relay = UserDefaults.standard.string(forKey: "relay") ?? Model.defaultRelay
             try? start(relay: relay, secret: secret)

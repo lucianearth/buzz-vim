@@ -120,14 +120,22 @@ pub fn unavailable(store: &Store, name: &str, channels_loaded: bool) -> Option<S
     })
 }
 
+/// A DM or private channel: its name and ids stay out of #quick.
+fn kept_out(ch: &Channel) -> bool {
+    ch.is_dm || ch.private
+}
+
 /// Whether the channel you're in can go along with a Q: not when there is
-/// none, and not #quick itself.
+/// none, not #quick itself, and not a DM or private channel.
 pub fn can_add(store: &Store, name: &str, here: Option<&str>) -> Result<(), String> {
     let here = here
         .and_then(|h| store.channels.get(h))
         .ok_or("no channel open to add")?;
     if find_channel(store, name).is_some_and(|q| q.id == here.id) {
         return Err("you're in the Q channel already; nothing to add".into());
+    }
+    if kept_out(here) {
+        return Err("a DM or private channel stays out of #quick; Q asks without it".into());
     }
     Ok(())
 }
@@ -161,7 +169,8 @@ pub fn ask(
     let context = match here {
         Some((h, root)) => {
             let ch = store.channels.get(h).ok_or("no channel open to add")?;
-            Some(context_block(ch, root))
+            // Asked anyway: the question goes alone.
+            (!kept_out(ch)).then(|| context_block(ch, root))
         }
         None => None,
     };
@@ -229,6 +238,27 @@ mod tests {
             Err("no channel open to add".into())
         );
         assert!(ask(&s, "quick", "nobody", "x", None).is_err_and(|e| e.contains("nobody")));
+    }
+
+    /// Q+ from a DM or a private channel adds nothing: can_add says no and
+    /// the Q goes as a plain one.
+    #[test]
+    fn dms_and_private_channels_stay_out_of_quick() {
+        let mut s = Store::new("me".into());
+        let q = s.channel_mut("q1");
+        q.name = "quick".into();
+        q.members = vec!["me".into(), "tb".into()];
+        s.profiles.entry("tb".into()).or_default().name = "taskbot".into();
+        s.channel_mut("dm1").is_dm = true;
+        let p = s.channel_mut("p1");
+        p.name = "secret-plans".into();
+        p.private = true;
+        p.timeline = vec!["m1".into()];
+        for h in ["dm1", "p1"] {
+            assert!(can_add(&s, "quick", Some(h)).is_err_and(|e| e.contains("private")));
+            let a = ask(&s, "quick", AGENT, "why?", Some((h, Some("m1")))).unwrap();
+            assert_eq!(a.content, "[Q]\n@taskbot why?");
+        }
     }
 
     #[test]
