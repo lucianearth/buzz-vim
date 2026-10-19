@@ -243,23 +243,15 @@ pub async fn push_note(relay_url: String, secret: String, subscriptions: String)
 
 #[uniffi::export]
 impl Client {
-    /// The lease's subscriptions as JSON, the same text for the same
-    /// inputs: lease again when it changes. None until the channels are in
-    /// (a lease without the DMs would only be replaced at once).
+    /// The lease's subscriptions as JSON (the watcher's asks), the same
+    /// text for the same inputs: lease again when it changes. None until
+    /// the channels are in.
     pub fn push_subscriptions(&self) -> Result<Option<String>, BuzzError> {
         let e = self.engine.lock().unwrap();
         if !e.channels_loaded {
             return Ok(None);
         }
-        let dms: Vec<String> = e
-            .store
-            .channels
-            .values()
-            .filter(|c| c.is_dm && c.is_member && !c.archived)
-            .map(|c| c.id.clone())
-            .collect();
-        let quiet = push::quiet_authors(&e.store, &e.agents, &e.checklists);
-        let subs = push::subscriptions(&e.store.me, &dms, &quiet)?;
+        let subs = push::subscriptions(&e.store.me, &e.checklists.trust.watchers)?;
         Ok(Some(serde_json::Value::Array(subs).to_string()))
     }
 }

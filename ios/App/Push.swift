@@ -9,7 +9,7 @@ import UIKit
 /// content: the notification extension fetches it.
 ///
 /// Renewal: the grant lasts 29 days and is renewed when a week is left,
-/// whenever the app runs. The lease follows the subscriptions (DMs, bots)
+/// whenever the app runs. The lease follows the subscriptions (the watcher)
 /// and is published again when they change.
 final class Push {
     static let shared = Push()

@@ -22,17 +22,12 @@ use nostr::{Event, EventBuilder, Keys, Kind, PublicKey, Tag, Timestamp};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::checklist::Checklists;
 use crate::model::{Message, Store, UNREAD_KINDS};
 use crate::relay::{Relay, http_base};
-use crate::telemetry::Agents;
 
 pub const LEASE_KIND: u16 = 30350;
 /// The relay's caps (its NIP-11 `push.limitation`, fixed at 30873ba).
-const MAX_SUBS: usize = 16;
-const MAX_IGNORE: usize = 8;
 const MAX_AUTHORS: usize = 20;
-const MAX_H: usize = 50;
 /// How far back the extension looks for the event that woke it.
 const RESOLVE_WINDOW: u64 = 15 * 60;
 
@@ -112,59 +107,31 @@ fn is_hex64(s: &str) -> bool {
 }
 
 /// The relay takes only lowercase v4 UUIDs in `#h`.
+#[cfg(test)]
 fn is_channel_id(s: &str) -> bool {
     uuid::Uuid::parse_str(s).is_ok_and(|u| u.get_version_num() == 4 && u.to_string() == s)
 }
 
-/// Authors whose messages never push: the bots tab 0 files under FYI
-/// (`needs::is_bot`) minus the watcher, whose asks do push.
-pub fn quiet_authors(store: &Store, agents: &Agents, lists: &Checklists) -> Vec<String> {
-    let out: BTreeSet<&String> = store
-        .profiles
-        .iter()
-        .filter(|(_, p)| p.is_agent)
-        .map(|(pk, _)| pk)
-        .chain(agents.by_pubkey.keys())
-        .filter(|pk| !lists.trust.watchers.contains(pk) && **pk != store.me)
-        .collect();
-    out.into_iter().cloned().collect()
-}
-
-/// The lease's subscriptions: kinds tab 0 counts that p-tag `me`, and every
-/// message in the DMs, each ignoring our own posts and the quiet authors.
-/// Sorted, so the same inputs give the same lease (re-lease on change).
-pub fn subscriptions(me: &str, dms: &[String], quiet: &[String]) -> Result<Vec<Value>> {
+/// The lease's subscriptions: only the watcher wakes the phone (lucian
+/// 2026-10-19, "just watcher"). Its posts that p-tag `me` are the asks it
+/// decided need him; people's mentions and DMs wait in tab 0 unbuzzed.
+pub fn subscriptions(me: &str, watchers: &[String]) -> Result<Vec<Value>> {
     ensure!(is_hex64(me), "bad pubkey");
-    let kinds = UNREAD_KINDS;
-    let quiet: BTreeSet<&String> = quiet
+    let watchers: BTreeSet<&String> = watchers
         .iter()
         .filter(|pk| is_hex64(pk) && *pk != me)
         .collect();
-    let quiet: Vec<&String> = quiet.into_iter().collect();
-    let mut ignore = vec![json!({"kinds": kinds, "authors": [me]})];
-    for chunk in quiet.chunks(MAX_AUTHORS) {
-        ignore.push(json!({"kinds": kinds, "authors": chunk}));
-    }
+    ensure!(!watchers.is_empty(), "no watcher to push for");
     ensure!(
-        ignore.len() <= MAX_IGNORE,
-        "too many bots for one push lease ({}, at most {})",
-        quiet.len(),
-        (MAX_IGNORE - 1) * MAX_AUTHORS
+        watchers.len() <= MAX_AUTHORS,
+        "too many watchers for one push lease ({}, at most {MAX_AUTHORS})",
+        watchers.len()
     );
-    let sub = |filter: Value| json!({"filter": filter, "class": "default", "ignore": ignore});
-    let mut out = vec![sub(json!({"kinds": kinds, "#p": [me]}))];
-    let dms: BTreeSet<&String> = dms.iter().filter(|c| is_channel_id(c)).collect();
-    let dms: Vec<&String> = dms.into_iter().collect();
-    for chunk in dms.chunks(MAX_H) {
-        out.push(sub(json!({"kinds": kinds, "#h": chunk})));
-    }
-    ensure!(
-        out.len() <= MAX_SUBS,
-        "too many DMs for one push lease ({}, at most {})",
-        dms.len(),
-        (MAX_SUBS - 1) * MAX_H
-    );
-    Ok(out)
+    Ok(vec![json!({
+        "filter": {"kinds": UNREAD_KINDS, "authors": watchers, "#p": [me]},
+        "class": "default",
+        "ignore": [],
+    })])
 }
 
 /// The next lease generation: the relay keeps only a strictly higher one.
@@ -620,12 +587,9 @@ pub fn parse_subscriptions(json: &str) -> Result<Vec<Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checklist::Trust;
     use crate::model::Profile;
-    use crate::telemetry::Agent;
 
     const DM1: &str = "bcd11c3d-f78b-4934-8e48-c08b6baed1c5";
-    const DM2: &str = "2130646b-d6c8-4ec3-93e3-36f77bee1a37";
     const CH: &str = "6b8bdafd-1111-4222-8333-444455556666";
     const NOW: u64 = 1_800_000_000;
 
@@ -635,12 +599,6 @@ mod tests {
 
     fn hexes(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("{i:064x}")).collect()
-    }
-
-    fn uuids(n: usize) -> Vec<String> {
-        (0..n)
-            .map(|i| format!("{i:08x}-0000-4000-8000-000000000000"))
-            .collect()
     }
 
     /// The relay's NIP-11 push descriptor as 30873ba serves it.
@@ -799,99 +757,28 @@ mod tests {
     }
 
     #[test]
-    fn subscriptions_mention_and_dms_minus_self_and_bots() {
+    fn subscriptions_are_the_watchers_asks_only() {
         let me = "f".repeat(64);
-        let bot = "b".repeat(64);
-        let dms = vec![
-            DM1.to_string(),
-            DM2.to_string(),
-            "not-a-uuid".into(),
-            DM1.into(),
-        ];
-        let subs = subscriptions(&me, &dms, &[bot.clone(), me.clone()]).unwrap();
-        let ignore = json!([
-            {"kinds": [9, 40002], "authors": [me]},
-            {"kinds": [9, 40002], "authors": [bot]},
-        ]);
+        let watcher = "a".repeat(64);
+        let subs = subscriptions(&me, &[watcher.clone(), me.clone(), "nope".into()]).unwrap();
         assert_eq!(
             Value::Array(subs.clone()),
-            json!([
-                {"filter": {"kinds": [9, 40002], "#p": [me]}, "class": "default", "ignore": ignore},
-                {"filter": {"kinds": [9, 40002], "#h": [DM2, DM1]}, "class": "default", "ignore": ignore},
-            ])
+            json!([{"filter": {"kinds": [9, 40002], "authors": [watcher], "#p": [me]},
+                "class": "default", "ignore": []}])
         );
         relay_accepts(&subs, &me).unwrap();
-        // No DMs, no bots: the mention subscription alone, ignoring us.
-        let subs = subscriptions(&me, &[], &[]).unwrap();
-        assert_eq!(subs.len(), 1);
-        assert_eq!(subs[0]["ignore"].as_array().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn subscriptions_chunk_to_the_relay_limits() {
-        let me = "f".repeat(64);
-        let subs = subscriptions(&me, &uuids(120), &hexes(45)).unwrap();
-        relay_accepts(&subs, &me).unwrap();
-        assert_eq!(subs.len(), 1 + 3);
-        let hs: Vec<usize> = subs[1..]
-            .iter()
-            .map(|s| s["filter"]["#h"].as_array().unwrap().len())
-            .collect();
-        assert_eq!(hs, [50, 50, 20]);
-        let ig: Vec<usize> = subs[0]["ignore"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|f| f["authors"].as_array().unwrap().len())
-            .collect();
-        assert_eq!(ig, [1, 20, 20, 5]);
-        // At the caps, then one past each.
-        relay_accepts(&subscriptions(&me, &uuids(750), &hexes(140)).unwrap(), &me).unwrap();
-        assert!(subscriptions(&me, &uuids(751), &[]).is_err());
-        assert!(subscriptions(&me, &[], &hexes(141)).is_err());
-    }
-
-    #[test]
-    fn quiet_authors_are_bots_but_not_the_watcher_or_us() {
-        let me = "1".repeat(64);
-        let (profiled, telemetry, watcher, human) = (
-            "2".repeat(64),
-            "3".repeat(64),
-            "4".repeat(64),
-            "5".repeat(64),
-        );
-        let mut store = Store::new(me.clone());
-        for (who, agent) in [
-            (&profiled, true),
-            (&watcher, true),
-            (&me, true),
-            (&human, false),
-        ] {
-            store.profiles.insert(
-                who.clone(),
-                Profile {
-                    is_agent: agent,
-                    ..Default::default()
-                },
-            );
-        }
-        let mut agents = Agents::default();
-        agents.by_pubkey.insert(telemetry.clone(), Agent::default());
-        let lists = Checklists::new(Trust {
-            owner: me.clone(),
-            watchers: vec![watcher.clone()],
-        });
-        assert_eq!(
-            quiet_authors(&store, &agents, &lists),
-            vec![profiled, telemetry]
-        );
+        // No watcher, no lease; at the relay's author cap, then one past it.
+        assert!(subscriptions(&me, &[]).is_err());
+        assert!(subscriptions(&me, std::slice::from_ref(&me)).is_err());
+        relay_accepts(&subscriptions(&me, &hexes(20)).unwrap(), &me).unwrap();
+        assert!(subscriptions(&me, &hexes(21)).is_err());
     }
 
     #[test]
     fn lease_is_encrypted_to_the_relay_with_only_its_public_tags() {
         let (me, relay) = (Keys::generate(), Keys::generate());
         let d = Descriptor::from_nip11(&nip11(&relay)).unwrap();
-        let subs = subscriptions(&pk(&me), &[DM1.into()], &hexes(3)).unwrap();
+        let subs = subscriptions(&pk(&me), &hexes(3)).unwrap();
         let inst = "0123456789abcdef0123456789abcdef";
         let ev = lease(&me, &d, inst, 7, "grant", NOW + 86_400, &subs, NOW).unwrap();
         ev.verify().unwrap();
@@ -934,7 +821,7 @@ mod tests {
         let (me, relay) = (Keys::generate(), Keys::generate());
         let mut d = Descriptor::from_nip11(&nip11(&relay)).unwrap();
         d.max_plaintext = 200;
-        let subs = subscriptions(&pk(&me), &uuids(10), &[]).unwrap();
+        let subs = subscriptions(&pk(&me), &hexes(20)).unwrap();
         let err = lease(&me, &d, "00", 1, "grant", NOW + 60, &subs, NOW).unwrap_err();
         assert!(err.to_string().contains("too large"), "{err}");
     }
@@ -959,41 +846,36 @@ mod tests {
     }
 
     #[test]
-    fn resolve_asks_once_per_dm() {
+    fn resolve_asks_for_the_watchers_mentions() {
         let me = "f".repeat(64);
-        let subs = subscriptions(&me, &[DM1.into(), DM2.into()], &[]).unwrap();
+        let watcher = "a".repeat(64);
+        let subs = subscriptions(&me, std::slice::from_ref(&watcher)).unwrap();
         let since = NOW - RESOLVE_WINDOW;
         assert_eq!(
             Value::Array(resolve_filters(&subs, NOW)),
-            json!([
-                {"kinds": [9, 40002], "#p": [me], "since": since, "limit": 5},
-                {"kinds": [9, 40002], "#h": [DM2], "since": since, "limit": 5},
-                {"kinds": [9, 40002], "#h": [DM1], "since": since, "limit": 5},
-            ])
+            json!([{"kinds": [9, 40002], "authors": [watcher], "#p": [me], "since": since, "limit": 5}])
         );
     }
 
     #[test]
-    fn newest_skips_our_own_and_bots_but_not_the_watcher() {
+    fn newest_is_the_watchers_ask_and_nothing_else() {
         let (me, human, bot, watcher) = (
             Keys::generate(),
             Keys::generate(),
             Keys::generate(),
             Keys::generate(),
         );
-        let subs = subscriptions(&pk(&me), &[DM1.into()], &[pk(&bot)]).unwrap();
+        let subs = subscriptions(&pk(&me), &[pk(&watcher)]).unwrap();
         let ask = message(&human, CH, "can you look?", Some(&pk(&me)), NOW - 30);
         let fyi = message(&bot, CH, "done", Some(&pk(&me)), NOW - 10);
-        let mine = message(&me, DM1, "hi", None, NOW - 5);
-        let other = message(&human, CH, "not for you", None, NOW);
-        let events = vec![ask.clone(), fyi.clone(), mine.clone(), other];
-        assert_eq!(newest(&events, &subs), Some(&ask));
         let dm = message(&human, DM1, "ping", None, NOW - 20);
-        let events = vec![ask.clone(), dm.clone(), fyi.clone()];
-        assert_eq!(newest(&events, &subs), Some(&dm));
-        let watch = message(&watcher, CH, "waiting on you", Some(&pk(&me)), NOW - 1);
-        assert_eq!(newest(&[ask, watch.clone(), fyi], &subs), Some(&watch));
-        assert_eq!(newest(&[mine], &subs), None);
+        assert_eq!(newest(&[ask.clone(), fyi.clone(), dm.clone()], &subs), None);
+        let watch = message(&watcher, CH, "waiting on you", Some(&pk(&me)), NOW - 40);
+        let chatter = message(&watcher, CH, "nudge for the agent", None, NOW - 1);
+        assert_eq!(
+            newest(&[ask, watch.clone(), fyi, dm, chatter], &subs),
+            Some(&watch)
+        );
     }
 
     #[test]
