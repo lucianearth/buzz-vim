@@ -400,6 +400,10 @@ pub struct NeedRow {
     pub kind: String,
     /// The watcher flagged it: the only rows that notify (push and local).
     pub watcher: bool,
+    /// A watcher row with its ping out: the push lease wakes the phone for
+    /// that message, so a live lease covers it. Other watcher rows notify
+    /// locally even then.
+    pub pushed: bool,
     pub channel: String,
     /// "#name", or "@name" for a DM.
     pub channel_label: String,
@@ -910,6 +914,7 @@ impl Client {
                 },
                 kind: r.label(),
                 watcher: matches!(r.reason, needs::Reason::Watch(_)),
+                pushed: matches!(r.reason, needs::Reason::Watch(_)) && r.message.is_some(),
                 channel_label: e.label(&r.channel),
                 who_name: if r.who.is_empty() {
                     "watcher".into()
@@ -2797,6 +2802,12 @@ mod tests {
         let s = c.loop_status(ch.into()).unwrap();
         assert!(s.running && s.needs_you);
         assert_eq!(s.watch.as_deref(), Some("stalled"));
+        // A stall with no ping: no push covers it, so it notifies locally.
+        let rows = c.needs_you();
+        assert!(
+            rows.iter()
+                .any(|r| r.watcher && !r.pushed && r.kind == "stalled")
+        );
         assert_eq!((s.open, s.done, s.crashes_today), (0, 1, 1));
         assert!(c.loop_status("other".into()).is_none());
     }

@@ -32,7 +32,8 @@ final class Push {
     private(set) var failure: String?
 
     /// A lease the relay took is in force: tab 0 posts no local
-    /// notifications then, the push covers the watcher's rows.
+    /// notifications then for watcher rows with a ping out, the push
+    /// covers those.
     var live: Bool {
         state.leased != nil && state.leaseExpires > Self.now()
     }
