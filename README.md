@@ -65,9 +65,10 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
 
 The iPhone app (`ios/`, on the same core through `ffi/`) has the same tab 0: a ⚑ needs you chip first in the
 tab row with the Needs-an-answer count as its badge, the same rows (tap one to open it, Reply to answer it in
-its thread), and ⚑ N on every channel's status line. It posts a local notification for each new
-Needs-an-answer row its sync sees, once per row, and only for rows that began after the phone started
-watching. That works while the app runs.
+its thread), and ⚑ N on every channel's status line. It posts a local notification for each new watcher
+row its sync sees (stalled, waiting on lucian, waiting on release), once per row, and only for rows that
+began after the phone started watching. People's @mentions and DMs, parked items and FYI wait in tab 0
+without one. That works while the app runs.
 
 Q is the button at the top right, beside the online line. It opens the same Q as the terminal's (the same
 core function builds the message): a new top-level message in #quick, starting with `[Q]` and @mentioning
@@ -77,11 +78,12 @@ the new thread in #quick, where the answer comes.
 
 Closed, it gets real pushes through upstream Buzz's push (`buzz-push-v1`): the phone enrolls its APNs token
 with the push gateway (`Push.gateway` in `ios/App/Push.swift`, App Attest), delegates to the relay's push
-key, and publishes a lease (kind 30350, encrypted to the relay) for @mentions and DMs to you, minus your own
-posts and bots' (FYI never pushes) except the watcher's. The push itself says nothing; the notification
-extension fetches the message and shows it like a tab 0 row. The lease follows your DMs and bots, renews
-while the app runs, and goes on logout. While it is live the app posts no local notifications, so nothing
-comes twice. It needs a relay that advertises `buzz-push-v1` in its NIP-11.
+key, and publishes a lease (kind 30350, encrypted to the relay) for one thing only: the watcher's messages
+that @mention you. @mentions and DMs from anyone else never push. The push itself says nothing;
+the notification extension fetches the message and shows it like a tab 0 row. The lease follows the
+watcher's keys, renews while the app runs, and goes on logout. While it is live the app posts no local
+notification for a watcher row with its ping out, so nothing comes twice; a watcher row without a ping
+still gets one. It needs a relay that advertises `buzz-push-v1` in its NIP-11.
 
 ## Operator loop settings
 
@@ -89,7 +91,7 @@ In `buzz-vim/config.json` (or the env var):
 
 - `owner` (`BUZZ_VIM_OWNER`): who may edit any checklist record besides its creator. Default lucian.
 - `watcher` (`BUZZ_VIM_WATCHER`, comma separated): the watcher's pubkeys; its state counts only from these
-  (and the owner). Until it is set, the status line shows no watcher state.
+  (and the owner). Default the watcher seat (`d84ddba9…`).
 - `quick_channel` (`BUZZ_VIM_QUICK_CHANNEL`), default `quick`, and `quick_agent` (`BUZZ_VIM_QUICK_AGENT`),
   default `taskbot`: where Q posts and who it @mentions.
 
