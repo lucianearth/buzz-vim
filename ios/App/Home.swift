@@ -27,7 +27,8 @@ extension EnvironmentValues {
     }
 }
 
-/// Tabs across the top, one channel per page: swipe sideways between them,
+/// Tabs across the top, Needs you (tab 0) first, then one channel per
+/// page: swipe sideways between them,
 /// tap a message for its thread (it opens in the tab, which remembers it;
 /// swipes still change tabs), pull the header down for the agents,
 /// hold a tab or the status line for the switcher
@@ -44,14 +45,18 @@ struct Home: View {
     @State private var wanted: String? = UserDefaults.standard.string(forKey: "active")
     @State private var fallback = false
     @State private var showAgents = false
+    @State private var showChecklist = false
     @State private var switcher = false
+    /// The Q sheet, while it's up.
+    @State private var quick: QuickBox?
 
     var body: some View {
         let _ = model.version
         let tabs = client.tabs()
         VStack(spacing: 0) {
             Header(client: client, tabs: tabs, selected: $selected,
-                   showAgents: $showAgents, switcher: $switcher, openSwitcher: openSwitcher)
+                   showAgents: $showAgents, showChecklist: $showChecklist,
+                   switcher: $switcher, openSwitcher: openSwitcher, openQuick: openQuick)
             if tabs.isEmpty {
                 Spacer()
                 Text(client.ready() ? "no channels yet" : "loading channels…")
@@ -64,6 +69,12 @@ struct Home: View {
                 // while a compose field holds the keyboard.
                 ScrollView(.horizontal) {
                     LazyHStack(spacing: 0) {
+                        // Tab 0 first, always.
+                        NeedsView(client: client) { link in
+                            if let f = client.follow(url: link) { follow(f) }
+                        }
+                        .containerRelativeFrame([.horizontal, .vertical])
+                        .id(Needs.id)
                         ForEach(tabs, id: \.id) { t in
                             page(t.id)
                                 .containerRelativeFrame([.horizontal, .vertical])
@@ -98,7 +109,7 @@ struct Home: View {
         }
         .onChange(of: tabs.map(\.id)) { _, _ in settle(client.tabs()) }
         .onChange(of: selected) { _, now in
-            client.openChannel(channel: now)
+            client.openChannel(channel: now == Needs.id ? nil : now)
             if fallback {
                 fallback = false
             } else {
@@ -107,21 +118,57 @@ struct Home: View {
             }
         }
         .sheet(isPresented: $showAgents) {
-            AgentsView(client: client, channel: selected, root: selected.flatMap { threads[$0]?.root })
+            let here = selected == Needs.id ? nil : selected
+            AgentsView(client: client, channel: here, root: here.flatMap { threads[$0]?.root })
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
                 .modifier(Themed())
         }
+        .sheet(isPresented: $showChecklist) {
+            if let s = selected {
+                ChecklistView(client: client, channel: s)
+                    .presentationDetents([.medium, .large])
+                    .presentationDragIndicator(.visible)
+                    .modifier(Themed())
+            }
+        }
+        .sheet(isPresented: Binding(get: { quick != nil }, set: { if !$0 { quick = nil } })) {
+            if let b = quick {
+                let here = selected == Needs.id ? nil : selected
+                QuickSheet(client: client, box: b, here: here, thread: here.flatMap { threads[$0]?.root }) { ch, id in
+                    // Into the new thread, where the answer comes.
+                    if let f = client.follow(url: "buzz://message?channel=\(ch)&id=\(id)&thread=\(id)") {
+                        follow(f)
+                    }
+                }
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+                .modifier(Themed())
+            }
+        }
     }
 
-    /// The tab `by` places along, wrapping, on its open thread if it has
-    /// one. The keyboard stays up on the new tab.
+    /// The Q button: the sheet, or why there's no #quick to ask in.
+    private func openQuick() {
+        do {
+            quick = try client.openQuick(here: selected == Needs.id ? nil : selected)
+        } catch let BuzzError.Failed(message) {
+            model.say(message)
+        } catch {
+            model.say(error.localizedDescription)
+        }
+    }
+
+    /// The tab `by` places along, wrapping (tab 0 included), on its open
+    /// thread if it has one. The keyboard stays up on a channel tab.
     private func step(_ by: Int) {
-        let tabs = client.tabs()
-        guard !tabs.isEmpty else { return }
-        let i = tabs.firstIndex { $0.id == selected } ?? 0
-        let id = tabs[((i + by) % tabs.count + tabs.count) % tabs.count].id
-        model.focusKey = threads[id].map { "\(id)/\($0.root)" } ?? id
+        // Tab 0 (Needs you) sits before the first channel in the ring.
+        let ring = [Needs.id] + client.tabs().map(\.id)
+        let i = ring.firstIndex { $0 == selected } ?? 0
+        let id = ring[((i + by) % ring.count + ring.count) % ring.count]
+        if id != Needs.id {
+            model.focusKey = threads[id].map { "\(id)/\($0.root)" } ?? id
+        }
         go(id)
     }
 
@@ -217,10 +264,11 @@ struct Home: View {
 
     /// Keep the selection on a tab that exists, and tell Rust what's open.
     private func settle(_ tabs: [ChannelTab]) {
-        if let w = wanted, w != selected, tabs.contains(where: { $0.id == w }) {
+        let here = { (id: String) in id == Needs.id || tabs.contains(where: { $0.id == id }) }
+        if let w = wanted, w != selected, here(w) {
             selected = w
-        } else if let s = selected, tabs.contains(where: { $0.id == s }) {
-            client.openChannel(channel: s)
+        } else if let s = selected, here(s) {
+            client.openChannel(channel: s == Needs.id ? nil : s)
         } else if let first = tabs.first?.id, first != selected {
             fallback = true
             selected = first
@@ -233,8 +281,10 @@ struct Header: View {
     let tabs: [ChannelTab]
     @Binding var selected: String?
     @Binding var showAgents: Bool
+    @Binding var showChecklist: Bool
     @Binding var switcher: Bool
     let openSwitcher: () -> Void
+    let openQuick: () -> Void
     @Environment(Model.self) private var model
     @Environment(\.theme) private var theme
     /// Each tab's place in the row, to tell which one a hold landed on.
@@ -242,13 +292,47 @@ struct Header: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            status
-                .padding(.horizontal, 22)
-                .onTapGesture { showAgents = true }
-                .onLongPressGesture { openSwitcher() }
+            HStack(spacing: 8) {
+                status
+                    .onTapGesture { showAgents = true }
+                    .onLongPressGesture { openSwitcher() }
+                Spacer()
+                // Q: a quick question to taskbot in #quick.
+                Button(action: openQuick) {
+                    Text("Q")
+                        .font(.chipOn)
+                        .foregroundStyle(theme.muted)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 4)
+                        .background(theme.chipOff, in: RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 22)
+            // The operator loop's line for the open channel, when it has
+            // one; ⚑ N (tab 0's count) in every channel's.
+            let flags = client.needsCount()
+            if let s = selected, s != Needs.id, let loop = client.loopStatus(channel: s) {
+                LoopLine(status: loop, flags: flags)
+                    .padding(.horizontal, 22)
+                    .padding(.top, -8)
+                    .contentShape(Rectangle())
+                    .onTapGesture { showChecklist = true }
+            } else if let s = selected, s != Needs.id, flags > 0 {
+                Text("⚑ \(flags) need you")
+                    .font(.small)
+                    .foregroundStyle(theme.bright)
+                    .padding(.horizontal, 22)
+                    .padding(.top, -8)
+                    .contentShape(Rectangle())
+                    .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { selected = Needs.id } }
+            }
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
+                        needsChip(flags)
+                            .id(Needs.id)
+                            .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { selected = Needs.id } }
                         ForEach(tabs, id: \.id) { t in
                             chip(t)
                                 .id(t.id)
@@ -323,6 +407,9 @@ struct Header: View {
     /// Where the open tab sits in the row, like a page indicator.
     private var dots: some View {
         HStack(spacing: 8) {
+            Circle()
+                .fill(selected == Needs.id ? theme.chipOn : theme.rule)
+                .frame(width: 7, height: 7)
             ForEach(tabs, id: \.id) { t in
                 Circle()
                     .fill(t.id == selected ? theme.chipOn : theme.rule)
@@ -330,6 +417,28 @@ struct Header: View {
             }
         }
         .frame(maxWidth: .infinity)
+    }
+
+    /// Tab 0's chip, its badge the count of rows that need an answer.
+    private func needsChip(_ n: UInt32) -> some View {
+        let on = selected == Needs.id
+        return HStack(spacing: 5) {
+            Text("⚑ needs you")
+                .font(on ? .chipOn : .chip)
+                .lineLimit(1)
+            if n > 0 {
+                Text("\(n)")
+                    .font(.tiny)
+                    .foregroundStyle(theme.onAccent)
+                    .padding(.horizontal, 5)
+                    .frame(minWidth: 17, minHeight: 17)
+                    .background(theme.badge, in: Capsule())
+            }
+        }
+        .foregroundStyle(on ? theme.onAccent : theme.muted)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 11)
+        .background(on ? theme.chipOn : theme.chipOff, in: RoundedRectangle(cornerRadius: 10))
     }
 
     private func chip(_ t: ChannelTab) -> some View {

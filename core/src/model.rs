@@ -156,6 +156,8 @@ pub struct Channel {
     pub name: String,
     pub about: String,
     pub is_dm: bool,
+    /// The 39000 carries NIP-29's `private` marker.
+    pub private: bool,
     pub archived: bool,
     pub is_member: bool,
     /// First `t` tag of the 39000: stream, forum, dm, workflow, system.
@@ -253,6 +255,34 @@ impl Store {
         match self.profiles.get(pubkey) {
             Some(p) if !p.name.is_empty() => p.name.clone(),
             _ => format!("{}…", pubkey.chars().take(8).collect::<String>()),
+        }
+    }
+
+    /// "#name", or "@who" for a DM (the members besides us).
+    pub fn label(&self, id: &str) -> String {
+        let Some(c) = self.channels.get(id) else {
+            return format!("#{}", id.chars().take(8).collect::<String>());
+        };
+        if c.is_dm {
+            let others: Vec<String> = c
+                .members
+                .iter()
+                .filter(|m| **m != self.me)
+                .map(|m| self.name_of(m))
+                .collect();
+            if !others.is_empty() {
+                return format!("@{}", others.join(", "));
+            }
+        }
+        let n = if c.name.is_empty() {
+            c.id.chars().take(8).collect()
+        } else {
+            c.name.clone()
+        };
+        if c.is_dm {
+            format!("@{n}")
+        } else {
+            format!("#{n}")
         }
     }
 
@@ -393,7 +423,9 @@ impl Store {
                 let hidden = tags(ev, "hidden").next().is_some();
                 let is_dm = ctype.as_deref() == Some("dm") || (ctype.is_none() && hidden);
                 let archived = tag(ev, "archived") == Some("true");
+                let private = tags(ev, "private").next().is_some();
                 let ch = self.channel_mut(&d);
+                ch.private = private;
                 ch.name = name;
                 ch.about = about;
                 ch.is_dm = is_dm;
@@ -597,6 +629,27 @@ mod tests {
             1,
         );
         assert_eq!(Message::from_event(&m).mentions, vec![pk]);
+    }
+
+    #[test]
+    fn channel_meta_marks_private_channels() {
+        let relay = Keys::generate();
+        let mut s = Store::new("me".into());
+        s.apply(&ev(
+            &relay,
+            39000,
+            "",
+            vec![vec!["d", "p1"], vec!["name", "x"], vec!["private"]],
+            1,
+        ));
+        s.apply(&ev(
+            &relay,
+            39000,
+            "",
+            vec![vec!["d", "o1"], vec!["name", "y"], vec!["public"]],
+            1,
+        ));
+        assert!(s.channels["p1"].private && !s.channels["o1"].private);
     }
 
     #[test]

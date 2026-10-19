@@ -45,6 +45,10 @@ final class Model {
     var scrollTarget: (channel: String, id: String)?
     /// Where Home goes for a tapped channel or message link.
     @ObservationIgnored var follow: (Follow) -> Void = { _ in }
+    /// Local notifications for new tab-0 rows.
+    private let notifier = Notifier()
+    /// The relay we're logged in to.
+    private var relay = Model.defaultRelay
 
     static let defaultRelay = "wss://buzz.gitcoin.co"
 
@@ -55,6 +59,8 @@ final class Model {
     }
 
     init() {
+        // A logout's push stop that didn't get through.
+        Push.shared.retryStop()
         if let secret = Keychain.read() {
             let relay = UserDefaults.standard.string(forKey: "relay") ?? Model.defaultRelay
             try? start(relay: relay, secret: secret)
@@ -84,8 +90,10 @@ final class Model {
 
     func logout() {
         client?.flush()
+        if let c = client { Push.shared.stop(c, relay: relay) }
         client = nil
         Keychain.delete()
+        Keychain.delete(account: "relay")
         UserDefaults.standard.removeObject(forKey: "chosen")
         UserDefaults.standard.removeObject(forKey: "tabOrder")
         UserDefaults.standard.removeObject(forKey: "threads")
@@ -106,6 +114,9 @@ final class Model {
         let chosen = d.stringArray(forKey: "chosen") ?? []
         client = try Client(relayUrl: relay, secret: secret, chosen: chosen,
                             readSlot: slot, readClient: cid, authTag: authTag, listener: Poke(model: self))
+        self.relay = relay
+        // The notification extension reads the relay from here.
+        Keychain.save(relay, account: "relay")
         // Tab order used to live only on this phone: send it up once, and
         // from then on it is synced (the terminal app shares it).
         if let old = d.dictionary(forKey: "tabOrder") as? [String: [String]] {
@@ -115,6 +126,9 @@ final class Model {
             d.removeObject(forKey: "tabOrder")
         }
         restoreUnsent()
+        notifier.model = self
+        notifier.authorize()
+        UIApplication.shared.registerForRemoteNotifications()
         if let saved = d.string(forKey: "agentContext") {
             client?.restoreContext(json: saved)
         }
@@ -182,6 +196,10 @@ final class Model {
         }
         if let n = client?.takeNotices(), let last = n.last {
             say(last)
+        }
+        if let c = client {
+            notifier.check(c, quiet: Push.shared.live)
+            Push.shared.refresh(c, relay: relay)
         }
     }
 
@@ -266,35 +284,4 @@ final class Poke: Listener, @unchecked Sendable {
     weak var model: Model?
     init(model: Model) { self.model = model }
     func changed() { model?.changed() }
-}
-
-/// The nsec lives in the Keychain, this device only.
-enum Keychain {
-    private static let query: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: "buzz-vim",
-        kSecAttrAccount as String: "nsec",
-    ]
-
-    static func save(_ secret: String) {
-        delete()
-        var q = query
-        q[kSecValueData as String] = Data(secret.utf8)
-        q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        SecItemAdd(q as CFDictionary, nil)
-    }
-
-    static func read() -> String? {
-        var q = query
-        q[kSecReturnData as String] = true
-        q[kSecMatchLimit as String] = kSecMatchLimitOne
-        var out: AnyObject?
-        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
-              let data = out as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
-    }
-
-    static func delete() {
-        SecItemDelete(query as CFDictionary)
-    }
 }

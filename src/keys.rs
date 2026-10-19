@@ -13,6 +13,10 @@ pub enum Mode {
     Hint,
     /// Asking before `!rotate`-ing an agent from the agents screen.
     Reset,
+    /// The Q box: a quick question to #quick.
+    Quick,
+    /// A reply box for a tab-0 row, into its thread.
+    Reply,
     /// Asking before archiving the tab picked in the tab menu.
     Archive,
 }
@@ -29,6 +33,8 @@ impl Mode {
             Mode::Help => "HELP",
             Mode::Hint => "LINK",
             Mode::Reset => "RESET?",
+            Mode::Quick => "Q",
+            Mode::Reply => "REPLY",
             Mode::Archive => "ARCHIVE?",
         }
     }
@@ -40,7 +46,9 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
         Mode::Normal => &[
             ("j k ↑↓", "move", true),
             ("n", "latest message (into its thread)", true),
-            ("0-9", "tab", false),
+            ("0", "needs you", true),
+            ("1-9", "tab", false),
+            ("!", "next ⚑, oldest first", false),
             ("H L ⇥", "prev/next tab", false),
             ("< >", "move this tab left / right", false),
             ("T", "tab order", false),
@@ -54,9 +62,16 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("⌫ ^o", "back to where a link took you from", false),
             ("[ ]", "narrower / wider (or drag the right edge)", false),
             ("a", "agents", true),
+            ("c", "checklist: items, evidence, details", true),
+            (
+                "Q ^q",
+                "ask #quick; again in the box: + this channel",
+                false,
+            ),
             ("r", "agents screen: reset the picked agent here", false),
             ("?", "help", true),
             ("r", "reply in thread", false),
+            ("⏎ r", "tab 0: open / reply", false),
             ("h ← esc", "back (thread, agents)", false),
             ("g G", "oldest / newest", false),
             ("d u", "page down / up", false),
@@ -99,7 +114,22 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
         ],
         Mode::Confirm => &[("y", "upload to Buzz", true), ("n esc", "cancel", true)],
         Mode::Reset => &[("y ⏎", "reset", true), ("n esc", "cancel", true)],
+        Mode::Quick => &[
+            ("⏎", "send to #quick", true),
+            (
+                "^q",
+                "+ this channel and its latest messages (again: off)",
+                true,
+            ),
+            ("⇧⏎ ^j", "new line", true),
+            ("esc", "close (keeps the text)", true),
+        ],
         Mode::Archive => &[("y ⏎", "archive", true), ("n esc", "cancel", true)],
+        Mode::Reply => &[
+            ("⏎", "send into its thread", true),
+            ("⇧⏎ ^j", "new line", true),
+            ("esc", "close (keeps the text)", true),
+        ],
         Mode::Viewer => &[
             ("← →", "prev / next image", true),
             ("esc q o", "close", true),

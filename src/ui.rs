@@ -24,6 +24,7 @@ const THUMB_COLS: u16 = 36;
 const THUMB_MAX_ROWS: u16 = 12;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
+    app.needs = app.needs_rows();
     app.hits.clear();
     app.links.clear();
     app.empty_prev = app.empty.take();
@@ -43,8 +44,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // goes back up.
     let main = slider(f, app, body);
     let mut images = vec![];
-    if app.agents_view {
+    if app.needs_view {
+        draw_needs(f, app, main);
+    } else if app.agents_view {
         draw_agents(f, app, main);
+    } else if app.checklist_view {
+        draw_checklist(f, app, main);
     } else if app.thread.is_some() {
         draw_thread(f, app, main, &mut images);
     } else {
@@ -56,7 +61,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // graphics sit on top of text, and a popup can't cover them otherwise.
     let overlay = matches!(
         app.mode,
-        Mode::Sections | Mode::Order | Mode::Archive | Mode::Confirm | Mode::Help | Mode::Viewer
+        Mode::Sections
+            | Mode::Order
+            | Mode::Archive
+            | Mode::Confirm
+            | Mode::Help
+            | Mode::Viewer
+            | Mode::Quick
+            | Mode::Reply
     ) || (app.mode == Mode::Insert && !app.mention_candidates().is_empty());
     for (rect, key) in images.into_iter().filter(|_| !overlay) {
         if let Some(p) = app.media.encoded.get(&key) {
@@ -70,6 +82,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Help => draw_help(f, area),
         Mode::Viewer => draw_viewer(f, app, area),
         Mode::Hint => draw_hints(f, app),
+        Mode::Quick => draw_quick(f, app, area),
+        Mode::Reply => draw_reply(f, app, area),
         _ => {}
     }
 }
@@ -156,6 +170,30 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
     };
     // Tabs get the whole row up to the count.
     let limit = area.x + area.width.saturating_sub(right.width() as u16 + 1);
+    // Tab 0, Needs you, pinned first: it never scrolls away or closes.
+    let n = crate::needs::answer_count(&app.needs);
+    let label = if n > 0 {
+        format!(" 0 ⚑ needs you {n} ")
+    } else {
+        " 0 needs you ".to_string()
+    };
+    let w = (label.width() as u16).min(limit.saturating_sub(x));
+    let style = if app.needs_view {
+        theme::tab_active()
+    } else if n > 0 {
+        theme::tab_idle().add_modifier(Modifier::BOLD)
+    } else {
+        theme::tab_idle()
+    };
+    let r = Rect {
+        x,
+        y: area.y,
+        width: w,
+        height: 1,
+    };
+    f.render_widget(Paragraph::new(Span::styled(label, style)), r);
+    app.hits.push((r, Hit::NeedsTab));
+    x += w + 1;
     let labels: Vec<(String, usize)> = app
         .tabs
         .iter()
@@ -187,8 +225,8 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 SPIN[app.tick as usize % SPIN.len()]
             };
-            let label = if i < 10 {
-                format!(" {i} {name} {dot}{spin}")
+            let label = if i < 9 {
+                format!(" {} {name} {dot}{spin}", i + 1)
             } else {
                 format!(" {name} {dot}{spin}")
             };
@@ -234,7 +272,7 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
             break;
         }
         let hue = theme::hue(&app.tabs[i]);
-        let style = if i == app.active {
+        let style = if i == app.active && !app.needs_view {
             theme::chip(hue)
         } else if unread > 0 {
             theme::tab_idle()
@@ -771,7 +809,9 @@ fn draw_timeline(
         return;
     };
     let focused = app.focus == Pane::Timeline;
-    // No title row: the tab says which channel, the header who's working.
+    // No title row: the tab says which channel. The row above the
+    // messages is the operator loop's status line, when there is one.
+    draw_status(f, app, Rect { height: 1, ..area }, &id, true);
     let area = Rect {
         y: area.y + 1,
         height: area.height.saturating_sub(1),
@@ -1110,6 +1150,628 @@ fn draw_agents(f: &mut Frame, app: &mut App, area: Rect) {
         }
         y += h + 1;
     }
+}
+
+// ---------- operator loop ----------
+
+fn ago(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86_400 => format!("{}h{:02}m", secs / 3600, secs % 3600 / 60),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+/// The creators of a contested channel's lists, by name.
+fn contested_names(app: &App, creators: &[String]) -> String {
+    creators
+        .iter()
+        .map(|c| app.store.name_of(c))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One channel's status line: mode, the watcher's state (and the ping it
+/// sent, as a link), item counts, crashes today. Nothing when the channel
+/// has no list, no watcher and no crashes.
+fn draw_status(f: &mut Frame, app: &mut App, row: Rect, channel: &str, hint: bool) {
+    let now = crate::sync::now();
+    let sum = app
+        .checklists
+        .summary(channel, crate::checklist::local_midnight(now));
+    let flags = crate::needs::answer_count(&app.needs);
+    if row.height == 0 || (sum.is_empty() && flags == 0) {
+        return;
+    }
+    let sep = || Span::styled("  ·  ", theme::faint());
+    // ⚑ N: what needs an answer, in every channel; `!` goes through it.
+    let flag = |spans: &mut Vec<Span<'static>>| {
+        spans.push(Span::styled(format!("⚑ {flags}"), theme::bright()));
+    };
+    if sum.is_empty() {
+        let mut spans = vec![Span::raw(" ")];
+        flag(&mut spans);
+        if hint {
+            spans.push(Span::styled(
+                "  need you · 0 to see · ! next",
+                theme::faint(),
+            ));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), row);
+        return;
+    }
+    let mut spans = vec![Span::raw(" ")];
+    if !sum.contested.is_empty() {
+        // No list shows until the owner picks a driver.
+        spans.push(Span::styled(
+            format!("contested: {}", contested_names(app, &sum.contested)),
+            theme::bright(),
+        ));
+    }
+    match sum.mode {
+        Some(crate::checklist::Mode::Running) => {
+            spans.push(Span::styled(" RUNNING ", theme::badge()))
+        }
+        Some(m) => spans.push(Span::styled(format!("[ {} ]", m.label()), theme::muted())),
+        None if !sum.contested.is_empty() => {}
+        None => spans.push(Span::styled("no list", theme::faint())),
+    }
+    let mut link = None;
+    if let Some(w) = &sum.watch {
+        use crate::checklist::WatchState;
+        spans.push(sep());
+        let (glyph, style) = match w.state {
+            WatchState::Working => (SPIN[app.tick as usize % SPIN.len()], theme::bright()),
+            WatchState::Stalled => ("⚠", theme::bright()),
+            WatchState::WaitingOnLucian | WatchState::WaitingOnRelease => ("⚑", theme::bright()),
+            _ => ("○", theme::muted()),
+        };
+        let since = w
+            .since
+            .map(|t| format!(" {}", ago(now.saturating_sub(t))))
+            .unwrap_or_default();
+        spans.push(Span::styled(
+            format!("{glyph} {}{since}", w.state.label()),
+            style,
+        ));
+        if let Some(url) = &sum.ping_link {
+            spans.push(Span::raw("  "));
+            let x = row.x + Line::from(spans.clone()).width() as u16;
+            let label = "ping ↗";
+            link = Some((x, label.width() as u16, url.clone()));
+            spans.push(Span::styled(label, theme::key()));
+        }
+    }
+    let total = sum.open + sum.done + sum.parked;
+    if total > 0 {
+        spans.push(sep());
+        spans.push(Span::styled(format!("{} open", sum.open), theme::text()));
+        spans.push(Span::styled(
+            format!(" · {} done", sum.done),
+            theme::muted(),
+        ));
+        if sum.parked > 0 {
+            spans.push(Span::styled(
+                format!(" · {} parked", sum.parked),
+                theme::muted(),
+            ));
+        }
+    }
+    if sum.crashes_today > 0 {
+        spans.push(sep());
+        let n = sum.crashes_today;
+        spans.push(Span::styled(
+            format!("✖ {n} crash{} today", if n == 1 { "" } else { "es" }),
+            theme::bright(),
+        ));
+    }
+    if flags > 0 {
+        spans.push(Span::raw("   "));
+        flag(&mut spans);
+    }
+    if hint && total > 0 {
+        spans.push(Span::styled("    c checklist", theme::faint()));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), row);
+    if let Some((x, w, url)) = link {
+        if x + w <= row.right() {
+            app.links.push(crate::app::LinkHit {
+                rect: Rect { x, width: w, ..row },
+                url,
+                key: ("status".into(), 0),
+            });
+        }
+    }
+}
+
+/// The checklist pane (`c`): the channel's items in order, the picked
+/// one's details, evidence and parked question beside or under them.
+fn draw_checklist(f: &mut Frame, app: &mut App, area: Rect) {
+    use crate::checklist::Status;
+    let Some(channel) = app.current().map(str::to_string) else {
+        return;
+    };
+    let label = app
+        .store
+        .channels
+        .get(&channel)
+        .map(channel_label)
+        .unwrap_or_default();
+    let area = breadcrumb(f, app, area, &label, "checklist", None);
+    draw_status(f, app, Rect { height: 1, ..area }, &channel, false);
+    let area = Rect {
+        y: area.y + 2,
+        height: area.height.saturating_sub(2),
+        ..area
+    };
+    let header = app.checklists.header(&channel);
+    let items = app.checklists.items(&channel);
+    if items.is_empty() && header.is_none() {
+        draw_empty(
+            f,
+            app,
+            area,
+            "no checklist in this channel. agents start one with buzz checklist init",
+        );
+        return;
+    }
+    let mut top: Vec<Line> = vec![];
+    if let Some(h) = &header {
+        let mut l = vec![Span::styled(format!(" {}", h.title), theme::bright())];
+        let r = &h.resume;
+        let resume: Vec<&str> = [r.branch.as_str(), r.worktree.as_str(), r.worklog.as_str()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !resume.is_empty() {
+            l.push(Span::styled(
+                format!("   {}", resume.join(" · ")),
+                theme::faint(),
+            ));
+        }
+        top.push(Line::from(l));
+        top.push(Line::raw(""));
+    }
+    let top_h = top.len() as u16;
+    f.render_widget(
+        Paragraph::new(top),
+        Rect {
+            height: top_h,
+            ..area
+        },
+    );
+    let area = Rect {
+        y: area.y + top_h,
+        height: area.height.saturating_sub(top_h),
+        ..area
+    };
+    if items.is_empty() {
+        draw_empty(f, app, area, "no items yet");
+        return;
+    }
+    app.checklist_cursor = app.checklist_cursor.min(items.len() - 1);
+    let cur = app.checklist_cursor;
+    // Details beside the list when there's room, under it otherwise.
+    let wide = area.width >= 100;
+    let (list, detail) = if wide {
+        let [l, _, d] = Layout::horizontal([
+            Constraint::Percentage(48),
+            Constraint::Length(2),
+            Constraint::Min(0),
+        ])
+        .areas(area);
+        (l, d)
+    } else {
+        let rows = (items.len() as u16 + 1).min(area.height / 2).max(3);
+        let [l, d] = Layout::vertical([Constraint::Length(rows), Constraint::Min(0)]).areas(area);
+        (l, d)
+    };
+    let rows = list.height as usize;
+    let first = cur.saturating_sub(rows.saturating_sub(1));
+    let mut lines = vec![];
+    for (i, it) in items.iter().enumerate().skip(first).take(rows) {
+        let (mark, st) = match it.status {
+            Status::Open => ("○", theme::text()),
+            Status::Done => ("✓", theme::muted()),
+            Status::Parked => ("‖", theme::muted()),
+        };
+        let mut tail = String::new();
+        if it.release {
+            tail.push_str("  release");
+        }
+        if it.status == Status::Parked {
+            tail.push_str("  parked");
+        }
+        if it.missing_evidence() {
+            tail.push_str("  ⚠ no evidence");
+        }
+        let room = (list.width as usize).saturating_sub(tail.width() + 5);
+        let row_style = if i == cur { theme::tab_active() } else { st };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {mark} "), row_style),
+            Span::styled(clip(&it.text, room), row_style),
+            Span::styled(tail, if i == cur { row_style } else { theme::faint() }),
+        ]));
+        app.hits.push((
+            Rect {
+                y: list.y + (i - first) as u16,
+                height: 1,
+                ..list
+            },
+            Hit::ChecklistItem(i),
+        ));
+    }
+    f.render_widget(Paragraph::new(lines), list);
+    // The picked item.
+    let it = &items[cur];
+    let w = detail.width.saturating_sub(2) as usize;
+    let mut d: Vec<Line> = vec![];
+    if !wide {
+        d.push(Line::styled(
+            "─".repeat(detail.width as usize),
+            theme::rule(),
+        ));
+    }
+    for l in wrap_plain(&it.text, w) {
+        d.push(Line::styled(format!(" {l}"), theme::bright()));
+    }
+    let mut meta = vec![it.status.label().to_string()];
+    if it.release {
+        meta.push("release: needs lucian".into());
+    }
+    if let Some(s) = &it.standing {
+        meta.push(format!("standing ({s})"));
+    }
+    meta.push(format!("by {}", app.store.name_of(&it.creator)));
+    if it.signer != it.creator {
+        meta.push(format!("edited by {}", app.store.name_of(&it.signer)));
+    }
+    meta.push(format!(
+        "{} ago",
+        ago(crate::sync::now().saturating_sub(it.updated_at))
+    ));
+    d.push(Line::styled(
+        format!(" {}", meta.join(" · ")),
+        theme::muted(),
+    ));
+    if let Some(q) = &it.parked_question {
+        d.push(Line::raw(""));
+        for l in wrap_plain(&format!("? {q}"), w) {
+            d.push(Line::styled(format!(" {l}"), theme::bright()));
+        }
+    }
+    // Evidence: msg and url entries are links (click, or f).
+    let mut ev_links = vec![];
+    if !it.evidence.is_empty() {
+        d.push(Line::raw(""));
+        d.push(Line::styled(" evidence", theme::faint()));
+        for e in &it.evidence {
+            let link = crate::checklist::evidence_link(&channel, e);
+            let text = clip(e, w.saturating_sub(2));
+            if let Some(url) = link {
+                ev_links.push((d.len() as u16, text.width() as u16, url));
+            }
+            d.push(Line::from(vec![
+                Span::raw("   "),
+                Span::styled(text, theme::text()),
+            ]));
+        }
+    } else if it.missing_evidence() {
+        d.push(Line::styled(" ⚠ ticked without evidence", theme::bright()));
+    }
+    if !it.details.trim().is_empty() {
+        d.push(Line::raw(""));
+        for l in render_markdown_links(&it.details, w, &[], &|_| None).lines {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(l.spans);
+            d.push(Line::from(spans));
+        }
+    }
+    let h = detail.height;
+    for (row, width, url) in ev_links.into_iter().filter(|(r, _, _)| *r < h) {
+        app.links.push(crate::app::LinkHit {
+            rect: Rect {
+                x: detail.x + 3,
+                y: detail.y + row,
+                width: width.min(detail.width.saturating_sub(3)),
+                height: 1,
+            },
+            url,
+            key: (format!("ev:{}", it.id), row as usize),
+        });
+    }
+    f.render_widget(Paragraph::new(d), detail);
+}
+
+/// The Q box: a question for the agent in #quick, over everything.
+fn draw_quick(f: &mut Frame, app: &mut App, area: Rect) {
+    let l = &app.loop_;
+    let title = format!(" Q · ask {} in #{} ", l.quick_agent, l.quick_channel);
+    let here = app
+        .quick_here()
+        .and_then(|c| app.store.channels.get(c))
+        .map(channel_label)
+        .unwrap_or_default();
+    let head = if app.quick_include {
+        Line::from(vec![
+            Span::styled(" + ", theme::badge()),
+            Span::styled(
+                format!(
+                    " {here}: its id, link and latest {} messages",
+                    crate::quick::RECENT
+                ),
+                theme::bright(),
+            ),
+        ])
+    } else {
+        let add = if here.is_empty() {
+            String::new()
+        } else {
+            format!("  ^q again: + {here}")
+        };
+        Line::styled(
+            format!(" a new thread in #{}.{add}", l.quick_channel),
+            theme::faint(),
+        )
+    };
+    let short = [
+        ("⏎", "send"),
+        (
+            "^q",
+            if app.quick_include {
+                "drop channel"
+            } else {
+                "+ channel"
+            },
+        ),
+        ("⇧⏎", "new line"),
+        ("esc", "close"),
+    ];
+    draw_box(
+        f,
+        area,
+        title,
+        head,
+        &app.quick_draft,
+        "type your question",
+        &short,
+    );
+}
+
+/// `r` on tab 0: a reply to the picked row, into its thread.
+fn draw_reply(f: &mut Frame, app: &mut App, area: Rect) {
+    let Some(r) = app.reply_to.clone() else {
+        return;
+    };
+    let ch = app
+        .store
+        .channels
+        .get(&r.channel)
+        .map(channel_label)
+        .unwrap_or_else(|| "#…".into());
+    let title = if r.thread.is_some() {
+        format!(" reply in {ch} › thread ")
+    } else {
+        format!(" message {ch} ")
+    };
+    let who = needs_who(app, &r);
+    let head = Line::from(vec![
+        Span::styled(format!(" {who}: "), theme::muted()),
+        Span::styled(
+            clip(
+                &r.text,
+                (area.width as usize).saturating_sub(who.width() + 12),
+            ),
+            theme::text(),
+        ),
+    ]);
+    let short = [("⏎", "send"), ("⇧⏎", "new line"), ("esc", "close")];
+    draw_box(
+        f,
+        area,
+        title,
+        head,
+        &app.reply_draft,
+        "type your reply",
+        &short,
+    );
+}
+
+/// A box over everything for a short text: a line saying where it goes,
+/// the text, and its keys.
+fn draw_box(
+    f: &mut Frame,
+    area: Rect,
+    title: String,
+    head: Line<'static>,
+    d: &crate::draft::Draft,
+    placeholder: &str,
+    short: &[(&str, &str)],
+) {
+    let w = 76.min(area.width.saturating_sub(2));
+    let cols = (w as usize).saturating_sub(4).max(4);
+    let text_rows = d
+        .text
+        .split('\n')
+        .map(|l| wrap_cols(&crate::draft::expand_tabs(l), cols).len())
+        .sum::<usize>()
+        .clamp(1, 8) as u16;
+    let r = centered(area, w, text_rows + 6);
+    clear(f, r);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(theme::bright())
+        .title(Span::styled(title, theme::bright()));
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    let mut lines = vec![head];
+    lines.push(Line::raw(""));
+    let text_top = inner.y + lines.len() as u16;
+    if d.text.is_empty() {
+        lines.push(Line::styled(format!(" {placeholder}"), theme::faint()));
+    } else {
+        for l in d.text.split('\n') {
+            for l in wrap_cols(&crate::draft::expand_tabs(l), cols) {
+                lines.push(Line::styled(format!(" {l}"), theme::text()));
+            }
+        }
+    }
+    let (cl, cc) = d.cursor_line_col();
+    let cl = d
+        .text
+        .split('\n')
+        .take(cl)
+        .map(|l| wrap_cols(&crate::draft::expand_tabs(l), cols).len())
+        .sum::<usize>()
+        + cc / cols;
+    let cc = cc % cols;
+    let skip = (cl + 1).saturating_sub(text_rows as usize);
+    let head: Vec<Line> = lines.drain(..2).collect();
+    let body: Vec<Line> = lines
+        .into_iter()
+        .skip(skip)
+        .take(text_rows as usize)
+        .collect();
+    let mut all = [head, body].concat();
+    while all.len() < 2 + text_rows as usize + 1 {
+        all.push(Line::raw(""));
+    }
+    // The footer has the long forms; here, what fits in the box.
+    let mut legend = vec![Span::raw(" ")];
+    for (i, (k, what)) in short.iter().enumerate() {
+        legend.push(Span::styled(format!(" {k} "), theme::chip(theme::nth(i))));
+        legend.push(Span::styled(format!(" {what}  "), theme::muted()));
+    }
+    all.push(Line::from(legend));
+    f.render_widget(Paragraph::new(all), inner);
+    f.set_cursor_position((
+        (inner.x + 1 + cc as u16).min(inner.right().saturating_sub(1)),
+        (text_top + cl.saturating_sub(skip) as u16).min(inner.bottom().saturating_sub(1)),
+    ));
+}
+
+/// Who a tab-0 row is from: their name, or the watcher's when nobody is.
+fn needs_who(app: &App, r: &crate::needs::Row) -> String {
+    if let crate::needs::Reason::Contested(c) = &r.reason {
+        contested_names(app, c)
+    } else if r.who.is_empty() {
+        "watcher".into()
+    } else {
+        app.store.name_of(&r.who)
+    }
+}
+
+/// Tab 0, Needs you: what waits on the operator, then FYI (newest first, latest 20).
+/// One row each: age, channel, who, one line.
+fn draw_needs(f: &mut Frame, app: &mut App, area: Rect) {
+    use crate::needs::{Reason, Section};
+    let now = crate::sync::now();
+    let rows = app.needs.clone();
+    let answer = crate::needs::answer_count(&rows);
+    let [title, rule, body] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" ⚑ needs you", theme::bright()),
+            Span::styled(
+                format!("   {answer} need an answer · {} FYI", rows.len() - answer),
+                theme::muted(),
+            ),
+            Span::styled("    ⏎ open  r reply  ! next", theme::faint()),
+        ])),
+        title,
+    );
+    f.render_widget(
+        Block::new()
+            .borders(Borders::TOP)
+            .border_style(theme::rule()),
+        rule,
+    );
+    if rows.is_empty() {
+        draw_empty(f, app, body, "nothing needs you");
+        return;
+    }
+    app.needs_cursor = app.needs_cursor.min(rows.len() - 1);
+    let cur = app.needs_cursor;
+    let width = body.width as usize;
+    // (line, row index) with the section headings in between.
+    let mut lines: Vec<(Line<'static>, Option<usize>)> = vec![];
+    let mut last = None;
+    for (i, r) in rows.iter().enumerate() {
+        if last != Some(r.section) {
+            if last.is_some() {
+                lines.push((Line::raw(""), None));
+            }
+            let (name, n) = match r.section {
+                Section::Answer => ("needs an answer", answer),
+                Section::Fyi => ("FYI", rows.len() - answer),
+            };
+            lines.push((
+                Line::styled(format!(" {name} ({n})"), theme::bright()),
+                None,
+            ));
+            last = Some(r.section);
+        }
+        let mark = match &r.reason {
+            Reason::Watch(crate::checklist::WatchState::Stalled) => "⚠",
+            Reason::Watch(_) => "⚑",
+            Reason::Parked => "‖",
+            Reason::Contested(_) => "⚑",
+            Reason::Mention => "@",
+            Reason::Dm => "✉",
+            Reason::Bot => "·",
+        };
+        let ch = app
+            .store
+            .channels
+            .get(&r.channel)
+            .map(channel_label)
+            .unwrap_or_else(|| format!("#{}", r.channel.chars().take(8).collect::<String>()));
+        let head = format!(
+            " {mark} {:>5}  {}  {}  ",
+            ago(now.saturating_sub(r.at)),
+            pad_to(&clip(&ch, 20), 19),
+            pad_to(&clip(&needs_who(app, r), 13), 12),
+        );
+        let text = clip(&r.text, width.saturating_sub(head.width()));
+        let (hs, ts) = if i == cur {
+            (theme::tab_active(), theme::tab_active())
+        } else if r.section == Section::Answer {
+            (theme::muted(), theme::text())
+        } else {
+            (theme::faint(), theme::muted())
+        };
+        lines.push((
+            Line::from(vec![
+                Span::styled(head, hs),
+                Span::styled(pad_to(&text, width.saturating_sub(0)), ts),
+            ]),
+            Some(i),
+        ));
+    }
+    let h = body.height as usize;
+    let at = lines.iter().position(|(_, i)| *i == Some(cur)).unwrap_or(0);
+    let first = at.saturating_sub(h.saturating_sub(1));
+    let mut out = vec![];
+    for (y, (l, i)) in lines.into_iter().skip(first).take(h).enumerate() {
+        if let Some(i) = i {
+            app.hits.push((
+                Rect {
+                    y: body.y + y as u16,
+                    height: 1,
+                    ..body
+                },
+                Hit::NeedsRow(i),
+            ));
+        }
+        out.push(l);
+    }
+    f.render_widget(Paragraph::new(out), body);
 }
 
 fn clip(s: &str, w: usize) -> String {
@@ -1699,7 +2361,17 @@ fn draw_confirm(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    let r = centered(area, 84, 29);
+    let right = [
+        Mode::Insert,
+        Mode::Sections,
+        Mode::Order,
+        Mode::Confirm,
+        Mode::Quick,
+        Mode::Reply,
+    ];
+    let tall = (legend(Mode::Normal).len() + 2)
+        .max(right.iter().map(|m| legend(*m).len() + 2).sum::<usize>());
+    let r = centered(area, 84, tall as u16 + art::BANNER.len() as u16 + 3);
     clear(f, r);
     let block = Block::bordered()
         .border_style(theme::text())
@@ -1739,6 +2411,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
             (Mode::Sections, "sections (s)"),
             (Mode::Order, "tab order (T)"),
             (Mode::Confirm, "upload"),
+            (Mode::Quick, "Q box (Q ^q)"),
+            (Mode::Reply, "reply (r on tab 0)"),
         ])),
         right,
     );
@@ -2102,6 +2776,7 @@ fn wrap_spans(spans: Vec<Tagged>, width: usize) -> Vec<Vec<Tagged>> {
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::KeyCode;
     /// `BUZZ_VIM_SHOT=dir cargo test shot_` writes cell dumps of screens
     /// that need data the relay won't give us (your agents' live frames);
     /// `tools/shot.py` turns them into PNGs.
@@ -2226,6 +2901,471 @@ mod tests {
             );
         }
         crate::theme::set_light(false);
+    }
+
+    /// A channel in the operator loop: header, items, the watcher waiting
+    /// on lucian with a ping, a crash notice, and a few messages.
+    fn loop_fixture() -> App {
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+        let ch = "2130646b-d6c8-4ec3-93e3-36f77bee1a37";
+        let (lucian, bot, watcher) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let bk = bot.public_key().to_hex();
+        let mut app = App::new(lucian.public_key().to_hex(), None);
+        app.checklists = crate::checklist::Checklists::new(crate::checklist::Trust {
+            owner: lucian.public_key().to_hex(),
+            watchers: vec![watcher.public_key().to_hex()],
+        });
+        for (k, name, agent) in [(&lucian, "lucian", false), (&bot, "taskbot", true)] {
+            app.store.profiles.insert(
+                k.public_key().to_hex(),
+                crate::model::Profile {
+                    name: name.into(),
+                    is_agent: agent,
+                    ..Default::default()
+                },
+            );
+        }
+        app.store.channel_mut(ch).name = "operator-loop".into();
+        app.store.channel_mut("c2").name = "beacon".into();
+        app.store.channel_mut(crate::quick::CHANNEL_ID).name = "quick".into();
+        app.tabs = vec![ch.into(), "c2".into()];
+        let now = crate::sync::now();
+        let rec = |k: &Keys, kind: u16, d: String, at: u64, v: serde_json::Value| {
+            EventBuilder::new(Kind::Custom(kind), v.to_string())
+                .tags(
+                    [
+                        vec!["d".to_string(), d],
+                        vec!["h".into(), ch.into()],
+                        vec!["t".into(), "buzz-checklist".into()],
+                        vec!["channel".into(), ch.into()],
+                        vec![
+                            "checklist-type".into(),
+                            match kind {
+                                30470 => "item",
+                                30471 => "header",
+                                _ => "watch",
+                            }
+                            .into(),
+                        ],
+                    ]
+                    .into_iter()
+                    .map(|t| Tag::parse(t).unwrap()),
+                )
+                .custom_created_at(Timestamp::from(at))
+                .sign_with_keys(k)
+                .unwrap()
+        };
+        app.checklists.apply(&rec(&bot, 30471, format!("buzz-checklist/header/{ch}/{bk}"), now - 3000,
+            serde_json::json!({"v": 1, "title": "Operator loop: buzz-vim", "mode": "running", "go": "b756649f",
+                "resume": {"worktree": "buzz-vim-oploop", "branch": "agent/operator-loop", "worklog": "2026-10-18_OPERATOR_LOOP.md"}})));
+        let items = [
+            (
+                "a1",
+                "Reconcile the list with the conversation",
+                "done",
+                false,
+                Some("first"),
+                vec!["msg:7a1d46eb"],
+                "",
+                "",
+            ),
+            (
+                "a2",
+                "Checklist pane per channel",
+                "done",
+                false,
+                None,
+                vec!["commit:873d8c3", "url:https://buzz.gitcoin.co/pr/12"],
+                "Items in order with status, release flag and evidence; **details** on select.",
+                "",
+            ),
+            (
+                "a3",
+                "Status line per channel",
+                "open",
+                false,
+                None,
+                vec![],
+                "Mode, watcher state with the ping link, open/done counts, crashes today.",
+                "",
+            ),
+            ("a4", "Q pop-up", "open", false, None, vec![], "", ""),
+            (
+                "a5",
+                "Migrate the prod relay to the patched image",
+                "parked",
+                true,
+                None,
+                vec![],
+                "Needs the relay patch from R0.",
+                "Restart prod relay tonight or wait for the nightly?",
+            ),
+            (
+                "a6",
+                "Wrap-up: voiceover demo video + plain report",
+                "open",
+                false,
+                Some("last"),
+                vec![],
+                "",
+                "",
+            ),
+        ];
+        for (i, (id, text, status, release, standing, ev, details, q)) in
+            items.into_iter().enumerate()
+        {
+            app.checklists.apply(&rec(&bot, 30470, format!("buzz-checklist/item/{ch}/{bk}/000000{id}"), now - 2000 + i as u64,
+                serde_json::json!({"v": 1, "text": text, "details": details, "status": status, "release": release,
+                    "order": i, "standing": standing, "evidence": ev, "parked_question": q})));
+        }
+        app.checklists.apply(&rec(
+            &watcher,
+            30472,
+            format!("buzz-checklist/watch/{ch}"),
+            now - 60,
+            serde_json::json!({"v": 1, "state": "waiting_on_lucian", "since": now - 25 * 60,
+                "thread": "5dbdf585", "ping": "c0ffee01", "nudges": 1}),
+        ));
+        let mut post = |who: &Keys, text: &str, at: u64| {
+            let ev = EventBuilder::new(Kind::Custom(9), text)
+                .tags([Tag::parse(["h", ch]).unwrap()])
+                .custom_created_at(Timestamp::from(at))
+                .sign_with_keys(who)
+                .unwrap();
+            app.store.apply(&ev);
+            app.checklists
+                .note_message(ch, &ev.id.to_hex(), at, &ev.content);
+        };
+        post(&lucian, "go: build the operator loop", now - 3000);
+        post(
+            &bot,
+            "⚠ agent process crashed (exit 137); respawned",
+            now - 1200,
+        );
+        post(
+            &bot,
+            "Parked the relay item: restart prod tonight or wait for the nightly? @lucian",
+            now - 25 * 60,
+        );
+        app.store.channel_mut(ch).loaded = true;
+        app
+    }
+
+    fn screen_text(app: &mut App, w: u16, h: u16) -> String {
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        t.draw(|f| draw(f, app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
+            .collect()
+    }
+
+    /// A second list in the loop channel: the status line says contested
+    /// with both creators, no list shows, and tab 0 asks for a driver.
+    #[test]
+    fn a_contested_channel_says_so() {
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+        let mut app = loop_fixture();
+        let ch = "2130646b-d6c8-4ec3-93e3-36f77bee1a37";
+        let x = Keys::generate();
+        let xk = x.public_key().to_hex();
+        let d = format!("buzz-checklist/header/{ch}/{xk}");
+        let ev = EventBuilder::new(Kind::Custom(30471), r#"{"title":"x","mode":"running"}"#)
+            .tags(
+                [
+                    ["d", d.as_str()],
+                    ["h", ch],
+                    ["t", "buzz-checklist"],
+                    ["channel", ch],
+                    ["checklist-type", "header"],
+                ]
+                .map(|t| Tag::parse(t).unwrap()),
+            )
+            .custom_created_at(Timestamp::from(crate::sync::now() - 100))
+            .sign_with_keys(&x)
+            .unwrap();
+        assert!(app.checklists.apply(&ev));
+        let s = screen_text(&mut app, 120, 34);
+        assert!(s.contains("contested: ") && s.contains("taskbot"), "{s}");
+        assert!(s.contains(&format!("{}…", &xk[..8])), "{s}");
+        assert!(!s.contains("RUNNING") && !s.contains("3 open"), "{s}");
+        assert!(
+            app.needs
+                .iter()
+                .any(|r| r.text == "two lists claim this channel; pick a driver"),
+            "{:?}",
+            app.needs
+        );
+    }
+
+    #[test]
+    fn status_line_and_checklist_pane_show_the_loop() {
+        let mut app = loop_fixture();
+        let s = screen_text(&mut app, 120, 34);
+        assert!(s.contains("RUNNING"), "{s}");
+        assert!(s.contains("waiting on lucian 25m"), "{s}");
+        assert!(
+            s.contains("ping ↗") && s.contains("3 open · 2 done · 1 parked"),
+            "{s}"
+        );
+        assert!(
+            s.contains("1 crash today") && s.contains("c checklist"),
+            "{s}"
+        );
+        // The ping is a link: f and a click find it.
+        let ping = app.links.iter().find(|l| l.key.0 == "status").unwrap();
+        assert!(
+            ping.url.ends_with("id=c0ffee01&thread=5dbdf585"),
+            "{}",
+            ping.url
+        );
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('c').into()));
+        let s = screen_text(&mut app, 120, 34);
+        assert!(
+            s.contains("›  checklist") && s.contains("Operator loop: buzz-vim"),
+            "{s}"
+        );
+        // Standing first item on top, wrap-up last, release flag shown.
+        let first = s.find("Reconcile the list").unwrap();
+        let last = s.find("Wrap-up: voiceover").unwrap();
+        assert!(first < last && s.contains("release  parked"), "{s}");
+        // Details of the picked item, its evidence linked.
+        for _ in 0..4 {
+            app.on_term(crossterm::event::Event::Key(KeyCode::Char('j').into()));
+        }
+        let s = screen_text(&mut app, 120, 34);
+        assert!(s.contains("? Restart prod relay tonight"), "{s}");
+        assert!(
+            s.contains("release: needs lucian") && s.contains("by taskbot"),
+            "{s}"
+        );
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('k').into()));
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('k').into()));
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('k').into()));
+        let s = screen_text(&mut app, 120, 34);
+        assert!(
+            s.contains("commit:873d8c3") && s.contains("details on select"),
+            "{s}"
+        );
+        assert!(
+            app.links
+                .iter()
+                .any(|l| l.url == "https://buzz.gitcoin.co/pr/12")
+        );
+        // Narrow: details under the list.
+        let s = screen_text(&mut app, 80, 34);
+        assert!(s.contains("commit:873d8c3"), "{s}");
+        // No records: no status line, and the pane says how to start one.
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('L').into()));
+        let s = screen_text(&mut app, 120, 34);
+        assert!(s.contains("no checklist in this channel"), "{s}");
+    }
+
+    /// Tab 0: what needs an answer, then FYI, newest first; ⏎ opens a row,
+    /// r answers it in its thread (and the row goes), ! goes round them.
+    #[test]
+    fn tab_zero_lists_what_needs_you() {
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+        let ch = "2130646b-d6c8-4ec3-93e3-36f77bee1a37";
+        let mut app = loop_fixture();
+        let lucian = app.store.me.clone();
+        let (alice, judge) = (Keys::generate(), Keys::generate());
+        for (k, name, agent) in [(&alice, "alice", false), (&judge, "judgebot", true)] {
+            app.store.profiles.insert(
+                k.public_key().to_hex(),
+                crate::model::Profile {
+                    name: name.into(),
+                    is_agent: agent,
+                    ..Default::default()
+                },
+            );
+        }
+        let now = crate::sync::now();
+        let post = |app: &mut App, k: &Keys, text: &str, root: Option<&str>, at: u64| {
+            let mut tags = vec![
+                Tag::parse(["h", "c2"]).unwrap(),
+                Tag::parse(["p", &lucian]).unwrap(),
+            ];
+            if let Some(r) = root {
+                tags.push(Tag::parse(["e", r, "", "reply"]).unwrap());
+            }
+            let ev = EventBuilder::new(Kind::Custom(9), text)
+                .tags(tags)
+                .custom_created_at(Timestamp::from(at))
+                .sign_with_keys(k)
+                .unwrap();
+            app.store.apply(&ev);
+            ev.id.to_hex()
+        };
+        let ask = post(
+            &mut app,
+            &alice,
+            "@lucian can you review the beacon PR?",
+            None,
+            now - 3600,
+        );
+        post(
+            &mut app,
+            &judge,
+            "@lucian deployed beacon v2",
+            None,
+            now - 120,
+        );
+        app.store.channel_mut("c2").loaded = true;
+        // A channel with no list still shows the count.
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('2').into()));
+        let s = screen_text(&mut app, 120, 34);
+        assert!(s.contains("⚑ 3  need you · 0 to see · ! next"), "{s}");
+        assert!(s.contains("0 ⚑ needs you 3"), "{s}");
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('0').into()));
+        let s = screen_text(&mut app, 120, 34);
+        assert!(
+            s.contains("needs an answer (3)") && s.contains("FYI (1)"),
+            "{s}"
+        );
+        let at = |t: &str| s.find(t).unwrap_or_else(|| panic!("{t}: {s}"));
+        // Oldest first: alice an hour ago, the parked item, the watcher's ask.
+        assert!(at("can you review the beacon PR?") < at("Restart prod relay tonight"));
+        assert!(at("Restart prod relay tonight") < at("waiting on lucian"));
+        assert!(
+            at("waiting on lucian") < at("FYI (1)") && at("FYI (1)") < at("deployed beacon v2")
+        );
+        assert!(
+            s.contains("#beacon") && s.contains("alice") && s.contains("judgebot"),
+            "{s}"
+        );
+        // ⏎ opens alice's message.
+        app.on_term(crossterm::event::Event::Key(KeyCode::Enter.into()));
+        assert!(!app.needs_view);
+        assert_eq!(
+            (app.current(), app.selected.get("c2")),
+            (Some("c2"), Some(&ask))
+        );
+        // r on her row: a reply into her thread.
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('0').into()));
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('r').into()));
+        for c in "on it".chars() {
+            app.on_term(crossterm::event::Event::Key(KeyCode::Char(c).into()));
+        }
+        let s = screen_text(&mut app, 120, 34);
+        assert!(
+            s.contains("reply in #beacon › thread") && s.contains("alice: @lucian can you review"),
+            "{s}"
+        );
+        app.actions.clear();
+        app.on_term(crossterm::event::Event::Key(KeyCode::Enter.into()));
+        assert!(matches!(app.actions.first(),
+            Some(crate::app::Action::SendDraft { channel, root, draft, to })
+                if channel == "c2" && root.as_ref() == Some(&ask) && draft.text == "on it"
+                    && to == &vec![alice.public_key().to_hex()]));
+        // Once the reply is in the store, her row is gone.
+        let m = crate::model::Message {
+            id: "lucian-reply".into(),
+            author: lucian.clone(),
+            created_at: now - 1,
+            content: "on it".into(),
+            root: Some(ask.clone()),
+            ..Default::default()
+        };
+        app.store.channel_mut("c2").messages.insert(m.id.clone(), m);
+        let s = screen_text(&mut app, 120, 34);
+        assert!(
+            s.contains("needs an answer (2)") && !s.contains("can you review the beacon"),
+            "{s}"
+        );
+        // ! goes oldest first: the parked item's thread, then the ping in it.
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('!').into()));
+        assert_eq!(app.thread, Some((ch.to_string(), "5dbdf585".to_string())));
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .0
+                .starts_with("⚑ 1/2  taskbot: Restart prod relay")
+        );
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('!').into()));
+        assert_eq!(app.thread_selected.as_deref(), Some("c0ffee01"));
+        assert!(app.status.as_ref().unwrap().0.starts_with("⚑ 2/2"));
+        // H from the first channel tab comes round to tab 0.
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('1').into()));
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('H').into()));
+        assert!(app.needs_view);
+        app.mode = Mode::Help;
+        let s = screen_text(&mut app, 120, 60);
+        assert!(
+            s.contains("next ⚑, oldest first") && s.contains("reply (r on tab 0)"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn the_q_box_shows_what_it_sends() {
+        let mut app = loop_fixture();
+        app.channels_loaded = true;
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('Q').into()));
+        for c in "why is the relay item parked?".chars() {
+            app.on_term(crossterm::event::Event::Key(KeyCode::Char(c).into()));
+        }
+        let s = screen_text(&mut app, 120, 34);
+        assert!(s.contains("Q · ask taskbot in #quick"), "{s}");
+        assert!(s.contains("^q again: + #operator-loop"), "{s}");
+        app.on_term(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('q'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+        ));
+        let s = screen_text(&mut app, 120, 34);
+        assert!(
+            s.contains("#operator-loop: its id, link and latest 30 messages"),
+            "{s}"
+        );
+        app.mode = Mode::Help;
+        let s = screen_text(&mut app, 120, 40);
+        assert!(
+            s.contains("Q box (Q ^q)") && s.contains("checklist: items"),
+            "{s}"
+        );
+    }
+
+    /// The operator loop pane, status line and Q box, for README shots.
+    #[test]
+    fn shot_operator_loop() {
+        let Ok(dir) = std::env::var("BUZZ_VIM_SHOT") else {
+            return;
+        };
+        let mut app = loop_fixture();
+        app.channels_loaded = true;
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 34)).unwrap();
+        let mut shot = |app: &mut App, name: &str| {
+            t.draw(|f| draw(f, app)).unwrap();
+            dump(t.backend().buffer(), &format!("{dir}/{name}.cells"));
+        };
+        shot(&mut app, "loop-status");
+        let key = |app: &mut App, k: crossterm::event::KeyEvent| {
+            app.on_term(crossterm::event::Event::Key(k))
+        };
+        key(&mut app, KeyCode::Char('c').into());
+        key(&mut app, KeyCode::Char('j').into());
+        shot(&mut app, "loop-checklist");
+        for _ in 0..3 {
+            key(&mut app, KeyCode::Char('j').into());
+        }
+        shot(&mut app, "loop-checklist-parked");
+        key(&mut app, KeyCode::Esc.into());
+        key(&mut app, KeyCode::Char('Q').into());
+        for c in "why is the relay item parked?".chars() {
+            key(&mut app, KeyCode::Char(c).into());
+        }
+        shot(&mut app, "loop-q");
+        key(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('q'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+        );
+        shot(&mut app, "loop-q-channel");
     }
 
     /// A busy channel, dark and light.
@@ -2426,10 +3566,10 @@ mod tests {
             app.store.channel_mut(&format!("c{i}")).name = format!("chan-{i}");
         }
         app.tabs = (0..5).map(|i| format!("c{i}")).collect();
-        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 10)).unwrap();
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(114, 10)).unwrap();
         t.draw(|f| draw(f, &mut app)).unwrap();
         let buf = t.backend().buffer().clone();
-        let top: String = (0..100).map(|x| buf[(x, 0)].symbol()).collect();
+        let top: String = (0..114).map(|x| buf[(x, 0)].symbol()).collect();
         assert!(top.contains("chan-4") && !top.contains('…'), "{top}");
     }
 

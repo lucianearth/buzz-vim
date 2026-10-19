@@ -16,7 +16,8 @@ mod theme;
 mod ui;
 
 use buzz_vim_core::{
-    draft, links, live, log, model, readstate, relay, sections, telemetry, unread,
+    checklist, draft, links, live, log, model, needs, quick, readstate, relay, sections, telemetry,
+    unread,
 };
 
 use std::sync::Arc;
@@ -135,6 +136,11 @@ async fn run(
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
     let mut app = App::new(cfg.keys.public_key().to_hex(), picker);
     app.relay_host = relay.base.clone();
+    app.checklists = checklist::Checklists::new(checklist::Trust {
+        owner: cfg.loop_.owner.clone(),
+        watchers: cfg.loop_.watchers.clone(),
+    });
+    app.loop_ = cfg.loop_.clone();
     let saved = state::load(&relay.base, &app.store.me);
     app.chosen = saved.chosen.clone();
     app.read_width = saved.read_width;
@@ -184,7 +190,11 @@ async fn run(
             Some(l) = live_rx.recv() => {
                 match l {
                     Live::Event { sub, event } => {
-                        let want = sync::fold(&mut app, &mut sync, &event, sub.starts_with("ch:"));
+                        // Tab 0's tail also carries tabs' messages; whichever
+                        // sub brings one first, it counts as a tab's.
+                        let tab = sub == "needs"
+                            && model::tag(&event, "h").is_some_and(|h| app.tabs.iter().any(|t| t == h));
+                        let want = sync::fold(&mut app, &mut sync, &event, sub.starts_with("ch:") || tab);
                         sync.want_profiles(want);
                     }
                     Live::Status(s) => {
@@ -193,13 +203,19 @@ async fn run(
                             sync.heartbeat();
                             if was_online {
                                 sync.refetch_open();
+                                if let Some(c) = app.current().map(str::to_string) {
+                                    sync.load_checklist(&c);
+                                }
+                                sync.load_needs(&app.store, &app.checklists.trust.owner);
                             }
                             was_online = true;
                         }
                     }
                     Live::Closed { sub, reason } => {
                         log::line(format!("closed {sub}: {reason}"));
-                        if !reason.is_empty() {
+                        // A relay without the checklist kinds refuses that
+                        // tail; the rest works without it, so no need to say.
+                        if !reason.is_empty() && sub != "checklist" && sub != "needs" {
                             app.say(format!("relay closed {sub}: {reason}"));
                         }
                     }
@@ -285,6 +301,56 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
             }
             Err(e) => log::line(format!("unread {channel}: {e}")),
         },
+        Msg::Checklist {
+            channel,
+            records,
+            today,
+        } => {
+            let mut want = vec![];
+            match records {
+                Ok(evs) => {
+                    for ev in &evs {
+                        if app.checklists.apply(ev) {
+                            want.push(ev.pubkey.to_hex());
+                        }
+                    }
+                }
+                // Before the relay knows the kinds this is expected.
+                Err(e) => log::line(format!("checklist {channel}: {e}")),
+            }
+            match today {
+                Ok(evs) => {
+                    for ev in &evs {
+                        let id = ev.id.to_hex();
+                        let at = ev.created_at.as_secs();
+                        app.checklists.note_message(&channel, &id, at, &ev.content);
+                    }
+                }
+                Err(e) => log::line(format!("crashes {channel}: {e}")),
+            }
+            sync.want_profiles(want);
+        }
+        Msg::QuickSent { id, result, text } => match result {
+            Ok(()) => {
+                let agent = app.loop_.quick_agent.clone();
+                app.say(format!(
+                    "asked {agent} in #{}; the answer lands in that thread",
+                    app.loop_.quick_channel
+                ));
+            }
+            Err(e) => {
+                // It never landed: off the screen, and its text back in the
+                // box, after anything typed since.
+                app.store.remove_message(&id);
+                let d = &mut app.quick_draft;
+                if !d.is_empty() {
+                    d.end();
+                    d.insert("\n\n");
+                }
+                d.insert(&text);
+                app.say(format!("Q not sent: {e}. Q opens it again."));
+            }
+        },
         Msg::Archived(r) => match r {
             Ok(pks) => app.archived = pks.into_iter().collect(),
             Err(e) => log::line(format!("archived: {e}")),
@@ -304,6 +370,7 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
                 .collect();
             sync.want_profiles(people);
             refresh_sections(app, sync, restore_active);
+            sync.load_needs(&app.store, &app.checklists.trust.owner);
         }
         Msg::Channels(Err(e)) => app.say(format!("couldn't load channels: {e}")),
         Msg::Lanes(Ok(evs)) => {
@@ -383,6 +450,7 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
         }
         Msg::Sent { id, result } => {
             let pending = app.pending_sends.remove(&id);
+            let reply = app.reply_sends.remove(&id);
             match result {
                 Ok(()) => {
                     app.sent_flash = Some((app.tick as usize % art::SENT.len(), Instant::now()));
@@ -399,6 +467,13 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
                     // again; only a send lost in transit is worth repeating.
                     if e.to_string().starts_with("relay rejected") {
                         d.sent_as = None;
+                    }
+                    // From tab 0's reply box: back in that box, for that row.
+                    if let Some(row) = reply {
+                        app.reply_draft.restore(d);
+                        app.reply_to = Some(row);
+                        app.say(format!("not sent: {e}. Your reply is back in its box (r)."));
+                        return;
                     }
                     match app.draft_for(&channel, root.as_deref()) {
                         Some(slot) => {
@@ -594,6 +669,73 @@ mod tests {
         assert_eq!(sent[0], sent[1]);
         assert_ne!(sent[1], sent[2]);
         assert_ne!(sent[2], sent[3]);
+    }
+
+    /// A tab-0 reply the relay never took goes back in the reply box, for
+    /// its row, and leaves the channel's compose box alone.
+    #[tokio::test]
+    async fn a_failed_inline_reply_comes_back_to_its_box() {
+        let relay = relay::Relay::new("http://127.0.0.1:1", nostr::Keys::generate(), None).unwrap();
+        let (live_tx, _live_rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut sync = sync::Sync::new(relay, live_tx, tx);
+        let mut app = App::new("me".into(), None);
+        let ch = "2130646b-d6c8-4ec3-93e3-36f77bee1a37".to_string();
+        let root = "ab".repeat(32);
+        app.tabs = vec![ch.clone()];
+        let row = needs::Row {
+            section: needs::Section::Answer,
+            reason: needs::Reason::Mention,
+            channel: ch.clone(),
+            who: String::new(),
+            text: "ship it?".into(),
+            at: 1,
+            message: Some(root.clone()),
+            thread: Some(root.clone()),
+            key: format!("msg:{root}"),
+        };
+        app.reply_to = Some(row.clone());
+        app.mode = keys::Mode::Reply;
+        app.reply_draft.insert("yes");
+        app.on_term(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Enter),
+        ));
+        assert!(app.reply_to.is_none() && app.reply_draft.is_empty());
+        for a in std::mem::take(&mut app.actions) {
+            sync.run(&mut app, a);
+        }
+        let msg = rx.recv().await.unwrap();
+        handle(&mut app, &mut sync, msg, &mut None);
+        assert_eq!(app.reply_draft.text, "yes");
+        assert_eq!(app.reply_to.as_ref().map(|r| r.key.clone()), Some(row.key));
+        assert!(app.draft.is_empty());
+    }
+
+    /// A Q the relay never took leaves #quick and goes back in the box,
+    /// after anything typed since.
+    #[tokio::test]
+    async fn a_failed_q_comes_back_to_the_box() {
+        let relay = relay::Relay::new("http://127.0.0.1:1", nostr::Keys::generate(), None).unwrap();
+        let (live_tx, _live_rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut sync = sync::Sync::new(relay, live_tx, tx);
+        let mut app = App::new("me".into(), None);
+        let q = quick::CHANNEL_ID.to_string();
+        sync.run(
+            &mut app,
+            Action::SendQuick {
+                channel: q.clone(),
+                content: "[Q]\n@taskbot why?".into(),
+                agent: quick::AGENT_PUBKEY.into(),
+                text: "why?".into(),
+            },
+        );
+        assert_eq!(app.store.channels[&q].timeline.len(), 1);
+        app.quick_draft.insert("next one");
+        let msg = rx.recv().await.unwrap();
+        handle(&mut app, &mut sync, msg, &mut None);
+        assert!(app.store.channels[&q].timeline.is_empty());
+        assert_eq!(app.quick_draft.text, "next one\n\nwhy?");
     }
 
     /// A dropped file is read off the UI loop, then offered for upload.
