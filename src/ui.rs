@@ -4215,6 +4215,39 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         }));
         assert_eq!(app.selected, before);
+        // judgebot on 3d0b79d: one gate, not one key at a time. Paste, ^v,
+        // ^+ ^r ^l and a click on the compose box all stay off the channel.
+        screen_text(&mut app, 120, 40);
+        app.actions.clear();
+        app.on_term(TermEvent::Paste("hello".into()));
+        for c in ['v', '+', 'r', 'l', 'i'] {
+            app.on_term(TermEvent::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::CONTROL,
+            )));
+        }
+        for (r, _) in app
+            .hits
+            .clone()
+            .iter()
+            .filter(|(_, h)| *h == crate::app::Hit::Compose)
+        {
+            app.on_term(TermEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: r.x,
+                row: r.y,
+                modifiers: KeyModifiers::NONE,
+            }));
+        }
+        assert!(app.routing_view && app.mode == crate::keys::Mode::Normal);
+        assert!(app.thread.is_none() && app.draft_ref().is_empty());
+        assert!(app.actions.is_empty(), "{}", app.actions.len());
+        assert_eq!(app.selected, before);
+        // A link from Why to where the channel already is shows it.
+        let c = app.current().unwrap().to_string();
+        let m = app.store.channels[&c].timeline.last().unwrap().clone();
+        app.follow(&crate::checklist::message_link(&c, &m, None));
+        assert!(!app.routing_view);
     }
 
     #[test]

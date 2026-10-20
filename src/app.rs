@@ -904,20 +904,6 @@ impl App {
                     self.routing_view = false;
                 }
             }
-            // These act on the channel under the view, out of sight.
-            KeyCode::Char('i')
-            | KeyCode::Char('+')
-            | KeyCode::Char('o')
-            | KeyCode::Char('O')
-            | KeyCode::Char('n')
-            | KeyCode::Char('d')
-            | KeyCode::Char('u')
-            | KeyCode::Char('r')
-            | KeyCode::Char('s')
-            | KeyCode::Char('<')
-            | KeyCode::Char('>')
-            | KeyCode::PageDown
-            | KeyCode::PageUp => {}
             _ => return false,
         }
         true
@@ -980,7 +966,9 @@ impl App {
                         }
                 });
                 if same {
-                    // Already here: just pick the reply, keep the timeline as is.
+                    // Already here: just pick the reply, keep the timeline as
+                    // is, and show it (a link followed from the routing view).
+                    self.routing_view = false;
                     if let Some((_, Some(pick))) = jump.thread {
                         self.thread_selected = Some(pick);
                         self.focus = Pane::Thread;
@@ -1489,6 +1477,10 @@ impl App {
             self.reply_draft.insert(&text);
             return;
         }
+        // Nor does the routing view.
+        if self.routing_view {
+            return;
+        }
         // Tab 0 has no compose box: the channel under it mustn't get it.
         if self.needs_view {
             return self.say("to paste a reply, pick a row and press r");
@@ -1558,6 +1550,9 @@ impl App {
             } else {
                 self.actions.push(Action::Quit);
             }
+            return;
+        }
+        if ctrl && k.code == KeyCode::Char('v') && self.routing_view && self.mode == Mode::Normal {
             return;
         }
         if ctrl && k.code == KeyCode::Char('v') && self.needs_view && self.mode == Mode::Normal {
@@ -1707,12 +1702,23 @@ impl App {
         if self.needs_view && !ctrl && self.key_needs(k) {
             return;
         }
-        if self.routing_view && !ctrl && self.key_routing(k) {
-            return;
-        }
-        // ^d ^u would page the channel under the routing view.
-        if self.routing_view && ctrl && matches!(k.code, KeyCode::Char('d') | KeyCode::Char('u')) {
-            return;
+        if self.routing_view {
+            if !ctrl && self.key_routing(k) {
+                return;
+            }
+            // One gate for the channel hidden under the view: past the view's
+            // own keys, only those that leave it or open another view get
+            // through (^c and ^q are handled before this).
+            let leaves = match k.code {
+                KeyCode::Char('o') => ctrl,
+                KeyCode::Char(c) if !ctrl => {
+                    matches!(c, 'q' | '0'..='9' | '!' | 'L' | 'H' | 'c' | 'a' | '?' | 'f')
+                }
+                _ => false,
+            };
+            if !leaves {
+                return;
+            }
         }
         // ^d ^u page tab 0's rows, not the channel under it.
         if self.needs_view && ctrl && matches!(k.code, KeyCode::Char('d') | KeyCode::Char('u')) {
@@ -2239,6 +2245,12 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => match hit {
+                // Under the routing view only the tab row and its boxes take clicks.
+                _ if self.routing_view
+                    && !matches!(
+                        hit,
+                        Some(Hit::Tab(_) | Hit::NeedsTab | Hit::RoutingNode(_) | Hit::Handle)
+                    ) => {}
                 Some(Hit::Tab(i)) => self.switch_tab(i),
                 Some(Hit::NeedsTab) => self.open_needs(),
                 Some(Hit::NeedsRow(_)) if self.mode != Mode::Normal => {}

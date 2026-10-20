@@ -215,8 +215,10 @@ impl Decision {
         let mut p = vec![Node::Seen];
         if !matches!(self.stage.as_str(), "not_running" | "contested_idle") {
             p.push(Node::Running);
-            if self.stage == "judged" {
-                let s = stream(self.jev.as_deref());
+            // Judged routes that never asked Jev (owner or bot unanswered,
+            // long-turn status, backoff, contested ping) go straight on.
+            if let (true, Some(jev)) = (self.stage == "judged", self.jev.as_deref()) {
+                let s = stream(Some(jev));
                 p.push(Node::Jev(s));
                 if s == Stream::Asks {
                     p.push(Node::Claude(check(self.model.as_deref())));
@@ -332,7 +334,13 @@ pub fn why(d: &Decision) -> Vec<Step> {
     if !claude && !d.reason.is_empty() {
         detail.push(d.reason.clone());
     }
-    let post = d.posts.last();
+    // A ping run with open items posts the ping, then the nudge: "ping you"
+    // is the first post. Any other run's result is its last.
+    let post = if d.outcome == "ping" {
+        d.posts.first()
+    } else {
+        d.posts.last()
+    };
     out.push(Step {
         node: last,
         title: "result",
@@ -877,9 +885,9 @@ mod tests {
             ]
         );
         assert_eq!(
-            d("judged", None, None, "none").path()[2],
-            Jev(Stream::Other),
-            "judged with no label"
+            d("judged", None, None, "nudge").path(),
+            [Seen, Running, Outcome(super::Outcome::Nudge)],
+            "judged without asking Jev skips its layer"
         );
         assert_eq!(
             d("judged", Some("needs_access"), Some("maybe"), "ping").path()[3],
@@ -1011,6 +1019,40 @@ mod tests {
             dec(NOW - 20, "judged", Some("reported_done"), None, "none"),
             dec(NOW - 10, "turn_started", None, None, "none"),
         ])
+    }
+
+    #[test]
+    fn the_result_step_opens_the_ping_and_no_label_skips_jev() {
+        let d = |jev: Option<&str>, model: Option<&str>, out: &str, posts: &[&str]| Decision {
+            channel: CH.into(),
+            record: "r".into(),
+            watch: None,
+            at: NOW,
+            thread: None,
+            stop: None,
+            trigger: "idle".into(),
+            stage: "judged".into(),
+            jev: jev.map(String::from),
+            model: model.map(String::from),
+            outcome: out.into(),
+            posts: posts.iter().map(|p| p.to_string()).collect(),
+            state: None,
+            reason: String::new(),
+        };
+        // needs_owner with open items posts the ping, then the nudge.
+        let ping = d(
+            Some("asks_decision"),
+            Some("needs_owner"),
+            "ping",
+            &["p1", "n1"],
+        );
+        assert_eq!(why(&ping).last().unwrap().event.as_deref(), Some("p1"));
+        let nudge = d(Some("will_continue"), None, "nudge", &["s1", "n1"]);
+        assert_eq!(why(&nudge).last().unwrap().event.as_deref(), Some("n1"));
+        // A contested ping never asked Jev: no jev step, no "other" box.
+        let contested = d(None, None, "ping", &["p2"]);
+        assert!(why(&contested).iter().all(|s| s.title != "jev"));
+        assert!(!contested.path().iter().any(|n| matches!(n, Node::Jev(_))));
     }
 
     #[test]
