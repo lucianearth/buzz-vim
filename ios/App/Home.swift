@@ -28,7 +28,7 @@ extension EnvironmentValues {
 }
 
 /// Tabs across the top, Needs you (tab 0) first, then one channel per
-/// page: swipe sideways between them,
+/// page, then Routing last: swipe sideways between them,
 /// tap a message for its thread (it opens in the tab, which remembers it;
 /// swipes still change tabs), pull the header down for the agents,
 /// hold a tab or the status line for the switcher
@@ -80,6 +80,12 @@ struct Home: View {
                                 .containerRelativeFrame([.horizontal, .vertical])
                                 .id(t.id)
                         }
+                        // Routing last, always.
+                        RoutingView(client: client) { link in
+                            if let f = client.follow(url: link) { follow(f) }
+                        }
+                        .containerRelativeFrame([.horizontal, .vertical])
+                        .id(Routing.id)
                     }
                     .scrollTargetLayout()
                 }
@@ -109,7 +115,7 @@ struct Home: View {
         }
         .onChange(of: tabs.map(\.id)) { _, _ in settle(client.tabs()) }
         .onChange(of: selected) { _, now in
-            client.openChannel(channel: now == Needs.id ? nil : now)
+            client.openChannel(channel: channelPage(now))
             if fallback {
                 fallback = false
             } else {
@@ -118,14 +124,14 @@ struct Home: View {
             }
         }
         .sheet(isPresented: $showAgents) {
-            let here = selected == Needs.id ? nil : selected
+            let here = channelPage(selected)
             AgentsView(client: client, channel: here, root: here.flatMap { threads[$0]?.root })
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
                 .modifier(Themed())
         }
         .sheet(isPresented: $showChecklist) {
-            if let s = selected {
+            if let s = channelPage(selected) {
                 ChecklistView(client: client, channel: s)
                     .presentationDetents([.medium, .large])
                     .presentationDragIndicator(.visible)
@@ -134,7 +140,7 @@ struct Home: View {
         }
         .sheet(isPresented: Binding(get: { quick != nil }, set: { if !$0 { quick = nil } })) {
             if let b = quick {
-                let here = selected == Needs.id ? nil : selected
+                let here = channelPage(selected)
                 QuickSheet(client: client, box: b, here: here, thread: here.flatMap { threads[$0]?.root }) { ch, id in
                     // Into the new thread, where the answer comes.
                     if let f = client.follow(url: "buzz://message?channel=\(ch)&id=\(id)&thread=\(id)") {
@@ -151,7 +157,7 @@ struct Home: View {
     /// The Q button: the sheet, or why there's no #quick to ask in.
     private func openQuick() {
         do {
-            quick = try client.openQuick(here: selected == Needs.id ? nil : selected)
+            quick = try client.openQuick(here: channelPage(selected))
         } catch let BuzzError.Failed(message) {
             model.say(message)
         } catch {
@@ -162,11 +168,12 @@ struct Home: View {
     /// The tab `by` places along, wrapping (tab 0 included), on its open
     /// thread if it has one. The keyboard stays up on a channel tab.
     private func step(_ by: Int) {
-        // Tab 0 (Needs you) sits before the first channel in the ring.
-        let ring = [Needs.id] + client.tabs().map(\.id)
+        // Tab 0 (Needs you) sits before the first channel in the ring,
+        // Routing after the last.
+        let ring = [Needs.id] + client.tabs().map(\.id) + [Routing.id]
         let i = ring.firstIndex { $0 == selected } ?? 0
         let id = ring[((i + by) % ring.count + ring.count) % ring.count]
-        if id != Needs.id {
+        if channelPage(id) != nil {
             model.focusKey = threads[id].map { "\(id)/\($0.root)" } ?? id
         }
         go(id)
@@ -176,7 +183,7 @@ struct Home: View {
     /// thread opens on its first new reply. The same place again until
     /// something newer arrives. Never leaves the tab.
     private func bell() {
-        guard let s = selected, let j = client.bell(channel: s) else { return }
+        guard let s = channelPage(selected), let j = client.bell(channel: s) else { return }
         land(s, j)
     }
 
@@ -264,11 +271,11 @@ struct Home: View {
 
     /// Keep the selection on a tab that exists, and tell Rust what's open.
     private func settle(_ tabs: [ChannelTab]) {
-        let here = { (id: String) in id == Needs.id || tabs.contains(where: { $0.id == id }) }
+        let here = { (id: String) in channelPage(id) == nil || tabs.contains(where: { $0.id == id }) }
         if let w = wanted, w != selected, here(w) {
             selected = w
         } else if let s = selected, here(s) {
-            client.openChannel(channel: s == Needs.id ? nil : s)
+            client.openChannel(channel: channelPage(s))
         } else if let first = tabs.first?.id, first != selected {
             fallback = true
             selected = first
@@ -312,13 +319,13 @@ struct Header: View {
             // The operator loop's line for the open channel, when it has
             // one; ⚑ N (tab 0's count) in every channel's.
             let flags = client.needsCount()
-            if let s = selected, s != Needs.id, let loop = client.loopStatus(channel: s) {
+            if let s = channelPage(selected), let loop = client.loopStatus(channel: s) {
                 LoopLine(status: loop, flags: flags)
                     .padding(.horizontal, 22)
                     .padding(.top, -8)
                     .contentShape(Rectangle())
                     .onTapGesture { showChecklist = true }
-            } else if let s = selected, s != Needs.id, flags > 0 {
+            } else if channelPage(selected) != nil, flags > 0 {
                 Text("⚑ \(flags) need you")
                     .font(.small)
                     .foregroundStyle(theme.bright)
@@ -341,6 +348,9 @@ struct Header: View {
                                     chipFrames[t.id] = $0
                                 }
                         }
+                        routingChip
+                            .id(Routing.id)
+                            .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { selected = Routing.id } }
                     }
                     .padding(.horizontal, 22)
                     .coordinateSpace(.named("tabrow"))
@@ -415,6 +425,9 @@ struct Header: View {
                     .fill(t.id == selected ? theme.chipOn : theme.rule)
                     .frame(width: 7, height: 7)
             }
+            Circle()
+                .fill(selected == Routing.id ? theme.chipOn : theme.rule)
+                .frame(width: 7, height: 7)
         }
         .frame(maxWidth: .infinity)
     }
@@ -439,6 +452,18 @@ struct Header: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 11)
         .background(on ? theme.chipOn : theme.chipOff, in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    /// The Routing page's chip, last in the row.
+    private var routingChip: some View {
+        let on = selected == Routing.id
+        return Text("routing")
+            .font(on ? .chipOn : .chip)
+            .lineLimit(1)
+            .foregroundStyle(on ? theme.onAccent : theme.muted)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 11)
+            .background(on ? theme.chipOn : theme.chipOff, in: RoundedRectangle(cornerRadius: 10))
     }
 
     private func chip(_ t: ChannelTab) -> some View {
