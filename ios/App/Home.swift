@@ -90,25 +90,33 @@ struct Home: View {
                 // A paging scroll view, not a paged TabView: the TabView
                 // stalls halfway between pages when the selection moves
                 // while a compose field holds the keyboard.
-                ScrollView(.horizontal) {
-                    LazyHStack(spacing: 0) {
-                        // Tab 0 first, always.
-                        NeedsView(client: client) { link in
-                            if let f = client.follow(url: link) { follow(f) }
+                ScrollViewReader { proxy in
+                    ScrollView(.horizontal) {
+                        LazyHStack(spacing: 0) {
+                            // Tab 0 first, always.
+                            NeedsView(client: client) { link in
+                                if let f = client.follow(url: link) { follow(f) }
+                            }
+                            .containerRelativeFrame([.horizontal, .vertical])
+                            .id(Needs.id)
+                            ForEach(tabs, id: \.id) { t in
+                                page(t.id, t.label)
+                                    .containerRelativeFrame([.horizontal, .vertical])
+                                    .id(t.id)
+                            }
                         }
-                        .containerRelativeFrame([.horizontal, .vertical])
-                        .id(Needs.id)
-                        ForEach(tabs, id: \.id) { t in
-                            page(t.id, t.label)
-                                .containerRelativeFrame([.horizontal, .vertical])
-                                .id(t.id)
-                        }
+                        .scrollTargetLayout()
                     }
-                    .scrollTargetLayout()
+                    .scrollIndicators(.hidden)
+                    .scrollTargetBehavior(.paging)
+                    .scrollPosition(id: $selected)
+                    // A rebuilt scroll view can open on page 0 with the
+                    // selection elsewhere (a link or ↰ that changed the tab
+                    // row): put it on the selected page once it's laid out.
+                    .onAppear {
+                        DispatchQueue.main.async { if let s = selected { proxy.scrollTo(s) } }
+                    }
                 }
-                .scrollIndicators(.hidden)
-                .scrollTargetBehavior(.paging)
-                .scrollPosition(id: $selected)
                 // Rebuild when the tab list changes, so a restored
                 // selection lands on its page.
                 .id(tabs.map(\.id))
