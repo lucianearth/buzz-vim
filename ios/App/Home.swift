@@ -10,10 +10,30 @@ struct Route: Hashable {
     var focus: String? = nil
 }
 
-/// Tab moves for the keyboard bar, from wherever the compose box is.
+/// Where a jump left from: a tab and the thread open in it. Two places
+/// are the same by tab and thread; the rest is what going back needs.
+struct Place: Equatable {
+    let tab: String
+    let root: String?
+    /// The open thread as it was, focus included, so going back doesn't
+    /// rebuild it.
+    var route: Route? = nil
+    /// The tab row's sections, to bring back a row a link moved off.
+    var sections: [String] = []
+    var label: String = "a channel"
+
+    static func == (a: Place, b: Place) -> Bool { a.tab == b.tab && a.root == b.root }
+}
+
+/// Tab moves for the keyboard bar, from wherever the compose box is, and
+/// the jump chain for the ↰ chip.
 struct Nav {
     var step: (Int) -> Void = { _ in }
     var bell: () -> Void = {}
+    /// Where each jump left from, the last one first, as names.
+    var jumps: [String] = []
+    /// Back `n` jumps.
+    var back: (Int) -> Void = { _ in }
 }
 
 private struct NavKey: EnvironmentKey {
@@ -49,6 +69,9 @@ struct Home: View {
     @State private var switcher = false
     /// The Q sheet, while it's up.
     @State private var quick: QuickBox?
+    /// Where links, bell landings and Needs you rows jumped from, oldest
+    /// first; the ↰ chip walks back along it.
+    @State private var jumps: [Place] = []
 
     var body: some View {
         let _ = model.version
@@ -67,31 +90,39 @@ struct Home: View {
                 // A paging scroll view, not a paged TabView: the TabView
                 // stalls halfway between pages when the selection moves
                 // while a compose field holds the keyboard.
-                ScrollView(.horizontal) {
-                    LazyHStack(spacing: 0) {
-                        // Tab 0 first, always.
-                        NeedsView(client: client) { link in
-                            if let f = client.follow(url: link) { follow(f) }
+                ScrollViewReader { proxy in
+                    ScrollView(.horizontal) {
+                        LazyHStack(spacing: 0) {
+                            // Tab 0 first, always.
+                            NeedsView(client: client) { link in
+                                if let f = client.follow(url: link) { follow(f) }
+                            }
+                            .containerRelativeFrame([.horizontal, .vertical])
+                            .id(Needs.id)
+                            ForEach(tabs, id: \.id) { t in
+                                page(t.id, t.label)
+                                    .containerRelativeFrame([.horizontal, .vertical])
+                                    .id(t.id)
+                            }
+                            // Routing last, always.
+                            RoutingView(client: client) { link in
+                                if let f = client.follow(url: link) { follow(f) }
+                            }
+                            .containerRelativeFrame([.horizontal, .vertical])
+                            .id(Routing.id)
                         }
-                        .containerRelativeFrame([.horizontal, .vertical])
-                        .id(Needs.id)
-                        ForEach(tabs, id: \.id) { t in
-                            page(t.id)
-                                .containerRelativeFrame([.horizontal, .vertical])
-                                .id(t.id)
-                        }
-                        // Routing last, always.
-                        RoutingView(client: client) { link in
-                            if let f = client.follow(url: link) { follow(f) }
-                        }
-                        .containerRelativeFrame([.horizontal, .vertical])
-                        .id(Routing.id)
+                        .scrollTargetLayout()
                     }
-                    .scrollTargetLayout()
+                    .scrollIndicators(.hidden)
+                    .scrollTargetBehavior(.paging)
+                    .scrollPosition(id: $selected)
+                    // A rebuilt scroll view can open on page 0 with the
+                    // selection elsewhere (a link or ↰ that changed the tab
+                    // row): put it on the selected page once it's laid out.
+                    .onAppear {
+                        DispatchQueue.main.async { if let s = selected { proxy.scrollTo(s) } }
+                    }
                 }
-                .scrollIndicators(.hidden)
-                .scrollTargetBehavior(.paging)
-                .scrollPosition(id: $selected)
                 // Rebuild when the tab list changes, so a restored
                 // selection lands on its page.
                 .id(tabs.map(\.id))
@@ -108,7 +139,8 @@ struct Home: View {
             }
         }
         .sensoryFeedback(.impact, trigger: switcher) { _, now in now }
-        .environment(\.nav, Nav(step: step, bell: bell))
+        .environment(\.nav, Nav(step: step, bell: bell,
+                                 jumps: jumps.reversed().map { name($0, tabs) }, back: jumpBack))
         .onAppear {
             model.follow = follow
             settle(tabs)
@@ -181,18 +213,18 @@ struct Home: View {
 
     /// The bell key: the newest activity in this tab, read or not; a
     /// thread opens on its first new reply. The same place again until
-    /// something newer arrives. Never leaves the tab.
+    /// something newer arrives. Never leaves the tab, and leaves the
+    /// keyboard down.
     private func bell() {
         guard let s = channelPage(selected), let j = client.bell(channel: s) else { return }
         land(s, j)
     }
 
     private func land(_ channel: String, _ j: Jump) {
+        remember(Place(tab: channel, root: j.root))
         if let root = j.root {
-            model.focusKey = "\(channel)/\(root)"
             show(channel, Route(channel: channel, root: root, focus: j.id))
         } else {
-            model.focusKey = channel
             show(channel, nil)
             model.scrollTarget = (channel, j.id)
         }
@@ -208,6 +240,9 @@ struct Home: View {
     /// showing makes that section the tab row.
     private func pick(_ t: ChannelTab) {
         if !client.tabs().contains(where: { $0.section == t.section }) {
+            // settle() runs on the new row before onChange(selected)
+            // moves `wanted`; set it first, or Needs you or Routing wins.
+            wanted = t.id
             model.setChosen([t.section])
         }
         go(t.id)
@@ -216,11 +251,15 @@ struct Home: View {
     /// A tapped channel or message link: its tab (its section's tab row
     /// when it isn't showing), then its thread or the message.
     private func follow(_ f: Follow) {
-        if let s = f.section {
-            model.setChosen([s])
-        } else if !client.tabs().contains(where: { $0.id == f.channel }) {
+        if f.section == nil, !client.tabs().contains(where: { $0.id == f.channel }) {
             model.say("that channel isn't in your sidebar")
             return
+        }
+        // Before the tab row changes, so this tab and its row are still there.
+        remember(Place(tab: f.channel, root: f.root))
+        if let s = f.section {
+            wanted = f.channel
+            model.setChosen([s])
         }
         selected = f.channel
         if let root = f.root {
@@ -231,6 +270,47 @@ struct Home: View {
         }
     }
 
+    /// Before a jump to `to`: where we are now, unless that's the same place.
+    private func remember(_ to: Place) {
+        guard let s = selected else { return }
+        let route = channelPage(s).flatMap { threads[$0] }
+        let tab = client.tabs().first { $0.id == s }
+        let here = Place(tab: s, root: route?.root, route: route,
+                         sections: client.sections().filter(\.chosen).map(\.id),
+                         label: tab?.label ?? "a channel")
+        guard here != to, jumps.last != here else { return }
+        jumps.append(here)
+        if jumps.count > 30 { jumps.removeFirst() }
+    }
+
+    /// The ↰ chip: back `n` jumps, to that tab and the thread it had open.
+    private func jumpBack(_ n: Int) {
+        guard n > 0, n <= jumps.count else { return }
+        let p = jumps[jumps.count - n]
+        if channelPage(p.tab) != nil, !client.tabs().contains(where: { $0.id == p.tab }) {
+            // A link moved the tab row to another section: bring it back.
+            guard !p.sections.isEmpty else {
+                model.say("that channel isn't in your tab row now")
+                return
+            }
+            wanted = p.tab
+            model.setChosen(p.sections)
+        }
+        jumps.removeLast(n)
+        selected = p.tab
+        if channelPage(p.tab) != nil {
+            show(p.tab, p.route)
+        }
+    }
+
+    /// A place in the ↰ chip's chain.
+    private func name(_ p: Place, _ tabs: [ChannelTab]) -> String {
+        if p.tab == Needs.id { return "⚑ needs you" }
+        if p.tab == Routing.id { return "routing" }
+        let ch = tabs.first { $0.id == p.tab }?.label ?? p.label
+        return p.root == nil ? ch : "\(ch) › thread"
+    }
+
     /// Key-row moves only, so the keyboard is up: jump, no page slide.
     private func go(_ id: String) {
         selected = id
@@ -238,7 +318,7 @@ struct Home: View {
 
     /// A tab's page: its open thread over its channel. The channel stays
     /// underneath, so going back finds it where it was.
-    private func page(_ id: String) -> some View {
+    private func page(_ id: String, _ label: String) -> some View {
         ZStack {
             let thread = threads[id]
             ChannelView(client: client, channel: id) { root in
@@ -247,7 +327,7 @@ struct Home: View {
             .opacity(thread == nil ? 1 : 0)
             .allowsHitTesting(thread == nil)
             if let r = thread {
-                ThreadView(client: client, route: r, active: id == selected) { show(id, nil) }
+                ThreadView(client: client, route: r, channelName: label, active: id == selected) { show(id, nil) }
                     .id(r)
                     .transition(.move(edge: .trailing))
             }
@@ -258,7 +338,7 @@ struct Home: View {
     /// Open a thread in a tab, or close it (nil), and remember it.
     private func show(_ channel: String, _ r: Route?) {
         // The page underneath stays in the window: its box mustn't keep
-        // the keyboard. A bell landing claims it back after.
+        // the keyboard.
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
         withAnimation(.easeOut(duration: 0.2)) { threads[channel] = r }
         UserDefaults.standard.set(threads.mapValues(\.root), forKey: "threads")

@@ -178,6 +178,8 @@ pub struct Message {
     pub repliers: Vec<Person>,
     /// When the last reply landed, 0 if unknown.
     pub last_reply_at: u64,
+    /// Who wrote the last reply, empty until it has loaded.
+    pub last_reply_by: String,
     /// Replies from others you haven't seen in the thread.
     pub new_replies: u32,
     pub edited: bool,
@@ -2419,6 +2421,7 @@ impl Engine {
             .unwrap_or_default();
         let mut repliers: Vec<Person> = vec![];
         let mut last_reply_at = ch.summary_replies.get(&m.id).map_or(0, |s| s.1);
+        let mut last_reply_by = String::new();
         let new_replies = unread::new_replies(ch, &m.id, me, &self.read, now()).len() as u32;
         if let Some(ids) = ch.replies.get(&m.id) {
             for id in ids.iter().rev() {
@@ -2427,6 +2430,9 @@ impl Engine {
                 };
                 if r.deleted {
                     continue;
+                }
+                if last_reply_by.is_empty() && r.created_at >= last_reply_at {
+                    last_reply_by = self.store.name_of(&r.author);
                 }
                 last_reply_at = last_reply_at.max(r.created_at);
                 if repliers.len() < 3 && !repliers.iter().any(|p| p.pubkey == r.author) {
@@ -2470,6 +2476,7 @@ impl Engine {
             reply_count: ch.reply_count(&m.id) as u32,
             repliers,
             last_reply_at,
+            last_reply_by,
             new_replies,
             edited: m.edited,
             deleted: m.deleted,
@@ -2883,6 +2890,17 @@ mod tests {
             (1, t + 160, 3)
         );
         assert_eq!(m.repliers[0].pubkey, me);
+        assert_eq!(m.last_reply_by, e.store.name_of(&me));
+        // A summary newer than the replies we hold: who wrote it is unknown.
+        e.store
+            .channel_mut("c")
+            .summary_replies
+            .insert("root".into(), (4, t + 200));
+        assert_eq!(
+            (view(&e).last_reply_at, view(&e).last_reply_by),
+            (t + 200, String::new())
+        );
+        e.store.channel_mut("c").summary_replies.remove("root");
         e.read.mark("thread:root", t + 155);
         assert_eq!(view(&e).new_replies, 0);
     }

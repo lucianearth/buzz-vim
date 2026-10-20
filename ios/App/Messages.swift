@@ -78,6 +78,7 @@ struct ChannelView: View {
                 }
             }
             .overlay(alignment: .bottomLeading) { BellButton() }
+            .overlay(alignment: .bottom) { JumpChip() }
             .safeAreaInset(edge: .bottom) {
                 ComposeBar(client: client, channel: channel, root: nil, hint: "write…")
             }
@@ -140,7 +141,7 @@ struct EdgeButtons: View {
 }
 
 /// The bell, round at the bottom left of a list: the newest activity in
-/// this tab. In a thread it sits above the back arrow.
+/// this tab.
 struct BellButton: View {
     @Environment(\.nav) private var nav
     @Environment(\.theme) private var theme
@@ -156,6 +157,37 @@ struct BellButton: View {
         }
         .padding(.leading, 14)
         .padding(.bottom, 10)
+    }
+}
+
+/// ↰ at the bottom centre while a jump (a link, the bell, a Needs you row)
+/// can be undone: tap goes back one, hold lists the chain to pick from.
+struct JumpChip: View {
+    @Environment(\.nav) private var nav
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        if !nav.jumps.isEmpty {
+            Menu {
+                // Top to bottom as written, oldest first, so the last
+                // place sits nearest the chip.
+                ForEach(Array(nav.jumps.enumerated()).reversed(), id: \.offset) { i, name in
+                    Button(name) { nav.back(i + 1) }
+                }
+            } label: {
+                Image(systemName: "arrow.uturn.backward")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(theme.text)
+                    .frame(width: 38, height: 38)
+                    .background(theme.idle, in: Circle())
+                    .overlay(Circle().stroke(theme.rule, lineWidth: 1))
+            } primaryAction: {
+                nav.back(1)
+            }
+            .menuOrder(.fixed)
+            .padding(.bottom, 10)
+            .transition(.opacity)
+        }
     }
 }
 
@@ -320,7 +352,7 @@ struct MessageRow: View, Equatable {
 }
 
 /// Under a message with replies: who replied, how many, how many you
-/// haven't seen, and how long ago the last one came. Tapping the message
+/// haven't seen, who wrote the last one (when we hold it) and how long ago. Tapping the message
 /// opens the thread.
 struct ReplyLine: View {
     let client: Client
@@ -339,11 +371,15 @@ struct ReplyLine: View {
                 .foregroundStyle(m.newReplies > 0 ? theme.text : theme.muted)
              + Text(m.newReplies > 0 ? " (\(m.newReplies) new)" : "")
                 .foregroundStyle(theme.badge)
-             + Text(m.lastReplyAt > 0 ? " · " + ago(m.lastReplyAt) : "")
+             + Text(m.lastReplyAt > 0 ? " · " + last(m) : "")
                 .foregroundStyle(theme.faint))
                 .font(.small)
                 .lineLimit(1)
         }
+    }
+
+    private func last(_ m: Message) -> String {
+        m.lastReplyBy.isEmpty ? ago(m.lastReplyAt) : "last \(m.lastReplyBy) " + ago(m.lastReplyAt)
     }
 }
 
