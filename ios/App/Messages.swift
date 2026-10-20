@@ -169,7 +169,9 @@ struct JumpChip: View {
     var body: some View {
         if !nav.jumps.isEmpty {
             Menu {
-                ForEach(Array(nav.jumps.enumerated()), id: \.offset) { i, name in
+                // Top to bottom as written, oldest first, so the last
+                // place sits nearest the chip.
+                ForEach(Array(nav.jumps.enumerated()).reversed(), id: \.offset) { i, name in
                     Button(name) { nav.back(i + 1) }
                 }
             } label: {
@@ -182,6 +184,7 @@ struct JumpChip: View {
             } primaryAction: {
                 nav.back(1)
             }
+            .menuOrder(.fixed)
             .padding(.bottom, 10)
             .transition(.opacity)
         }
