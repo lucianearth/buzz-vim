@@ -2892,7 +2892,10 @@ mod tests {
             .channel_mut("c")
             .summary_replies
             .insert("root".into(), (4, t + 200));
-        assert_eq!((view(&e).last_reply_at, view(&e).last_reply_by), (t + 200, String::new()));
+        assert_eq!(
+            (view(&e).last_reply_at, view(&e).last_reply_by),
+            (t + 200, String::new())
+        );
         e.store.channel_mut("c").summary_replies.remove("root");
         e.read.mark("thread:root", t + 155);
         assert_eq!(view(&e).new_replies, 0);
