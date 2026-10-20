@@ -4199,6 +4199,25 @@ mod tests {
     }
 
     #[test]
+    fn the_routing_view_keeps_q_and_the_wheel_off_the_hidden_channel() {
+        use crossterm::event::{
+            Event as TermEvent, KeyCode, KeyModifiers, MouseEvent, MouseEventKind,
+        };
+        let mut app = routing_fixture();
+        assert!(app.current().is_some());
+        let before = app.selected.clone();
+        app.on_term(TermEvent::Key(KeyCode::Char('w').into()));
+        assert!(app.routing_view && app.quick_here().is_none());
+        app.on_term(TermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(app.selected, before);
+    }
+
+    #[test]
     fn the_routing_view_without_logs_says_so() {
         let mut app = App::new("me".into(), None);
         app.on_term(crossterm::event::Event::Key(KeyCode::Char('w').into()));

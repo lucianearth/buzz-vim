@@ -1356,10 +1356,10 @@ impl App {
 
     // ---------- Q ----------
 
-    /// The channel a Q can add: none while tab 0 is shown, since the tab
-    /// under it is hidden.
+    /// The channel a Q can add: none while tab 0 or the routing view is
+    /// shown, since the tab under it is hidden.
     pub fn quick_here(&self) -> Option<&str> {
-        if self.needs_view {
+        if self.needs_view || self.routing_view {
             None
         } else {
             self.current()
@@ -2212,6 +2212,10 @@ impl App {
                 if self.needs_view {
                     let c = self.needs_cursor as isize + d.signum();
                     self.needs_cursor = c.max(0) as usize;
+                    return;
+                }
+                // The routing view scrolls nothing; the channel under it stays put.
+                if self.routing_view {
                     return;
                 }
                 if self.mode == Mode::Sections {
