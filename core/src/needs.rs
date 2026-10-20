@@ -198,10 +198,21 @@ pub fn rows(
     for channel in lists.channels() {
         let header = lists.header(channel);
         let watch = lists.watch(channel);
+        // The go message is often a reply in a thread, not a root: open the
+        // thread it sits in, or the row lands on a one-message "thread".
+        let root_of = |id: String| {
+            store
+                .channels
+                .get(channel)
+                .and_then(|c| c.messages.get(&id))
+                .and_then(|m| m.root.clone())
+                .unwrap_or(id)
+        };
         let thread = watch
             .as_ref()
             .and_then(|w| w.thread.clone())
-            .or_else(|| header.as_ref().and_then(|h| h.go.clone()));
+            .or_else(|| header.as_ref().and_then(|h| h.go.clone()))
+            .map(root_of);
         if let Some(w) = watch.as_ref().filter(|w| w.state.needs_you()) {
             let ping = w
                 .ping
@@ -668,6 +679,29 @@ mod tests {
         assert_eq!(w.rows().len(), 1);
         w.post(&op, DM, "yes", None, None, NOW - 30);
         assert!(w.rows().is_empty());
+    }
+
+    #[test]
+    fn parked_row_opens_the_thread_the_go_reply_sits_in() {
+        let mut w = World::new();
+        let (op, bot) = (w.op.clone(), w.bot.clone());
+        let bk = World::pk(&bot);
+        let root = w.post(&op, CH, "how's it look?", None, None, NOW - 4000);
+        // The go is a reply in that thread, as it is when the operator says
+        // go mid-conversation.
+        let go = w.post(&op, CH, "yeah start a list", None, Some(&root), NOW - 3000);
+        w.record(
+            &bot,
+            30471,
+            format!("buzz-checklist/header/{CH}/{bk}"),
+            NOW - 2900,
+            serde_json::json!({"title": "t", "mode": "running", "go": go}),
+        );
+        w.record(&bot, 30470, format!("buzz-checklist/item/{CH}/{bk}/000000b1"), NOW - 2800,
+            serde_json::json!({"text": "page", "status": "parked", "parked_question": "which channel?"}));
+        let r = w.rows();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].thread.as_deref(), Some(root.as_str()));
     }
 
     #[test]
