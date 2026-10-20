@@ -175,7 +175,7 @@ struct JumpChip: View {
                     Button(name) { nav.back(i + 1) }
                 }
             } label: {
-                Image(systemName: "arrow.turn.left.up")
+                Image(systemName: "arrow.turn.up.left")
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(theme.text)
                     .frame(width: 38, height: 38)

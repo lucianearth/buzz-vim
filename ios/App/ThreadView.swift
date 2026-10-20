@@ -3,7 +3,8 @@ import SwiftUI
 
 /// A thread, flat: the root, then the replies oldest first. It sits in
 /// its channel's tab, under the tab row, with a bar on top that says where
-/// you are; tapping the bar goes back to the channel.
+/// you are; tapping the bar or the floating arrow bottom left goes back to
+/// the channel.
 struct ThreadView: View {
     let client: Client
     let route: Route
@@ -63,7 +64,21 @@ struct ThreadView: View {
                         withAnimation(.easeOut(duration: 0.25)) { position.scrollTo(edge: top ? .top : .bottom) }
                     }
                 }
-                .overlay(alignment: .bottomLeading) { BellButton() }
+                .overlay(alignment: .bottomLeading) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        BellButton()
+                        Button(action: back) {
+                            Image(systemName: "arrow.left")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(theme.text)
+                                .frame(width: 38, height: 38)
+                                .background(theme.idle, in: Circle())
+                                .overlay(Circle().stroke(theme.rule, lineWidth: 1))
+                        }
+                        .padding(.leading, 14)
+                        .padding(.bottom, 10)
+                    }
+                }
                 .overlay(alignment: .bottom) { JumpChip() }
                 .onChange(of: tl.messages.last?.id) { _, _ in
                     // Opened on a reply by the bell key: stay on it.
