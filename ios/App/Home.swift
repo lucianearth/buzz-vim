@@ -10,10 +10,19 @@ struct Route: Hashable {
     var focus: String? = nil
 }
 
-/// Where a jump left from: a tab and the thread open in it.
+/// Where a jump left from: a tab and the thread open in it. Two places
+/// are the same by tab and thread; the rest is what going back needs.
 struct Place: Equatable {
     let tab: String
     let root: String?
+    /// The open thread as it was, focus included, so going back doesn't
+    /// rebuild it.
+    var route: Route? = nil
+    /// The tab's section, to bring back a tab row a link moved off.
+    var section: String? = nil
+    var label: String = "a channel"
+
+    static func == (a: Place, b: Place) -> Bool { a.tab == b.tab && a.root == b.root }
 }
 
 /// Tab moves for the keyboard bar, from wherever the compose box is, and
@@ -243,7 +252,10 @@ struct Home: View {
     /// Before a jump to `to`: where we are now, unless that's the same place.
     private func remember(_ to: Place) {
         guard let s = selected else { return }
-        let here = Place(tab: s, root: s == Needs.id ? nil : threads[s]?.root)
+        let route = s == Needs.id ? nil : threads[s]
+        let tab = client.tabs().first { $0.id == s }
+        let here = Place(tab: s, root: route?.root, route: route,
+                         section: tab?.section, label: tab?.label ?? "a channel")
         guard here != to, jumps.last != here else { return }
         jumps.append(here)
         if jumps.count > 30 { jumps.removeFirst() }
@@ -253,21 +265,25 @@ struct Home: View {
     private func jumpBack(_ n: Int) {
         guard n > 0, n <= jumps.count else { return }
         let p = jumps[jumps.count - n]
-        jumps.removeLast(n)
-        guard p.tab == Needs.id || client.tabs().contains(where: { $0.id == p.tab }) else {
-            model.say("that channel isn't in your tab row now")
-            return
+        if p.tab != Needs.id, !client.tabs().contains(where: { $0.id == p.tab }) {
+            // A link moved the tab row to another section: bring it back.
+            guard let sec = p.section else {
+                model.say("that channel isn't in your tab row now")
+                return
+            }
+            model.setChosen([sec])
         }
+        jumps.removeLast(n)
         selected = p.tab
         if p.tab != Needs.id {
-            show(p.tab, p.root.map { Route(channel: p.tab, root: $0) })
+            show(p.tab, p.route)
         }
     }
 
     /// A place in the ↰ chip's chain.
     private func name(_ p: Place, _ tabs: [ChannelTab]) -> String {
         if p.tab == Needs.id { return "⚑ needs you" }
-        let ch = tabs.first { $0.id == p.tab }?.label ?? "a channel"
+        let ch = tabs.first { $0.id == p.tab }?.label ?? p.label
         return p.root == nil ? ch : "\(ch) › thread"
     }
 
