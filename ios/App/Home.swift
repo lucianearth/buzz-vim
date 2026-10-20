@@ -371,7 +371,13 @@ struct Header: View {
                     }
                 }
                 // On launch the restored tab may be off to the right.
-                .onAppear { proxy.scrollTo(selected, anchor: .center) }
+                .onAppear {
+                    proxy.scrollTo(selected, anchor: .center)
+                    // Same late widening when the app opens on Routing.
+                    if selected == Routing.id {
+                        DispatchQueue.main.async { proxy.scrollTo(Routing.id, anchor: .trailing) }
+                    }
+                }
                 .onChange(of: tabs.count) { _, _ in
                     DispatchQueue.main.async { proxy.scrollTo(selected, anchor: .center) }
                 }
