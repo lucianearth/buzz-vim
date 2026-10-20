@@ -240,6 +240,9 @@ struct Home: View {
     /// showing makes that section the tab row.
     private func pick(_ t: ChannelTab) {
         if !client.tabs().contains(where: { $0.section == t.section }) {
+            // settle() runs on the new row before onChange(selected)
+            // moves `wanted`; set it first, or Needs you or Routing wins.
+            wanted = t.id
             model.setChosen([t.section])
         }
         go(t.id)
@@ -254,7 +257,10 @@ struct Home: View {
         }
         // Before the tab row changes, so this tab and its row are still there.
         remember(Place(tab: f.channel, root: f.root))
-        if let s = f.section { model.setChosen([s]) }
+        if let s = f.section {
+            wanted = f.channel
+            model.setChosen([s])
+        }
         selected = f.channel
         if let root = f.root {
             show(f.channel, Route(channel: f.channel, root: root, focus: f.id))
@@ -287,6 +293,7 @@ struct Home: View {
                 model.say("that channel isn't in your tab row now")
                 return
             }
+            wanted = p.tab
             model.setChosen(p.sections)
         }
         jumps.removeLast(n)
