@@ -321,6 +321,8 @@ struct ChannelRecords {
 pub struct Checklists {
     pub trust: Trust,
     channels: HashMap<String, ChannelRecords>,
+    /// The judge's routing logs (30472, `checklist-type=routing`).
+    routing: crate::routing::Logs,
 }
 
 /// What the status line shows for one channel.
@@ -352,7 +354,7 @@ impl Summary {
 
 /// Read one content field leniently (NIP-CK content reading): a value of the
 /// wrong type reads as the field's default instead of blanking the record.
-fn lenient<'de, D, T>(d: D) -> Result<T, D::Error>
+pub(crate) fn lenient<'de, D, T>(d: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: serde::de::DeserializeOwned + Default,
@@ -444,7 +446,7 @@ impl Checklists {
     pub fn new(trust: Trust) -> Self {
         Checklists {
             trust,
-            channels: HashMap::new(),
+            ..Checklists::default()
         }
     }
 
@@ -456,6 +458,9 @@ impl Checklists {
     /// Fold one record. Returns true when it is a valid record and the
     /// newest seen from its signer at its address.
     pub fn apply(&mut self, ev: &Event) -> bool {
+        if crate::routing::channel_of(ev).is_some() {
+            return self.routing.apply(ev);
+        }
         let Some((channel, addr)) = address(ev) else {
             return false;
         };
@@ -658,6 +663,16 @@ impl Checklists {
             began: v.began,
             event_id: v.id.clone(),
         })
+    }
+
+    /// Every channel's routing decisions from the watcher's logs, each with
+    /// its channel's watch record.
+    pub fn decisions(&self) -> Vec<crate::routing::Decision> {
+        let mut ds = self.routing.decisions(&self.trust.watchers);
+        for d in &mut ds {
+            d.watch = self.watch(&d.channel).map(|w| w.event_id);
+        }
+        ds
     }
 
     pub fn crashes_since(&self, channel: &str, since: u64) -> usize {
