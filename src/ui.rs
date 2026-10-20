@@ -46,6 +46,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let mut images = vec![];
     if app.needs_view {
         draw_needs(f, app, main);
+    } else if app.routing_view {
+        draw_routing(f, app, main);
     } else if app.agents_view {
         draw_agents(f, app, main);
     } else if app.checklist_view {
@@ -1765,6 +1767,424 @@ fn draw_needs(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(out), body);
 }
 
+// ---------- routing ----------
+
+/// Chips flowed into lines `width` wide, each line after the first
+/// indented: (lines, (row, column, width, node) of every chip with one).
+type Chip = (String, Style, Option<crate::routing::Node>);
+type Placed = (u16, u16, u16, crate::routing::Node);
+
+fn flow_chips(
+    lead: Span<'static>,
+    chips: Vec<Chip>,
+    sep: &str,
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<Placed>) {
+    let indent = lead.width();
+    let (mut lines, mut placed) = (vec![], vec![]);
+    let mut cur = vec![lead];
+    let mut col = indent;
+    for (i, (text, style, node)) in chips.into_iter().enumerate() {
+        let gap = if i == 0 || col == indent { "" } else { sep };
+        if col + gap.width() + text.width() > width && col > indent {
+            lines.push(Line::from(std::mem::take(&mut cur)));
+            cur.push(Span::raw(" ".repeat(indent)));
+            col = indent;
+        } else if !gap.is_empty() {
+            cur.push(Span::styled(gap.to_string(), theme::faint()));
+            col += gap.width();
+        }
+        if let Some(n) = node {
+            placed.push((lines.len() as u16, col as u16, text.width() as u16, n));
+        }
+        col += text.width();
+        cur.push(Span::styled(text, style));
+    }
+    lines.push(Line::from(cur));
+    (lines, placed)
+}
+
+fn channel_name(app: &App, channel: &str) -> String {
+    app.store
+        .channels
+        .get(channel)
+        .map(channel_label)
+        .unwrap_or_else(|| format!("#{}", channel.chars().take(8).collect::<String>()))
+}
+
+/// The stop message's (author, text) when we hold it.
+fn stop_message(app: &App, d: &crate::routing::Decision) -> Option<(String, String)> {
+    let (_, m) = app.store.find_message(d.stop.as_deref()?)?;
+    Some((app.store.name_of(&m.author), m.content.clone()))
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// The routing view (`w`): the watcher's five layers with a count in every
+/// box and on every band between them, over a 1h / 24h / 7d window. Enter
+/// on a box samples a real decision from it; Enter again is its Why.
+fn draw_routing(f: &mut Frame, app: &mut App, area: Rect) {
+    use crate::routing::{self, Node, Window};
+    let now = crate::sync::now();
+    let ds = app.routing_decisions();
+    let picked = app.routing_picked(&ds);
+    if let (Some(_), Some(d)) = (app.routing_why, &picked) {
+        return draw_why(f, app, area, d);
+    }
+    // The sample aged out of the window (or its box emptied): back to the
+    // diagram, so the keys act on what's drawn.
+    if picked.is_none() {
+        app.routing_sample = None;
+        app.routing_why = None;
+    }
+    let win = app.routing_window;
+    let flow = routing::flow(&ds, now, win);
+    let [title, rule, body] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+    let mut t = vec![Span::styled(" ⤳ routing  ", theme::bright())];
+    for w in Window::ALL {
+        let st = if w == win {
+            theme::tab_active()
+        } else {
+            theme::faint()
+        };
+        t.push(Span::styled(format!(" {} ", w.label()), st));
+    }
+    t.push(Span::styled(
+        format!("   {} stops in {}", flow.count(Node::Seen), win.label()),
+        theme::muted(),
+    ));
+    let keys = if app.routing_sample.is_some() {
+        "    ⏎ why  s another  o open thread  t window  esc back"
+    } else {
+        "    t window  j k ⇥ box  ⏎ sample  esc back"
+    };
+    t.push(Span::styled(keys, theme::faint()));
+    f.render_widget(Paragraph::new(Line::from(t)), title);
+    f.render_widget(
+        Block::new()
+            .borders(Borders::TOP)
+            .border_style(theme::rule()),
+        rule,
+    );
+    if ds.is_empty() {
+        draw_empty(
+            f,
+            app,
+            body,
+            "no routing logs yet. the watcher's stall-judge writes one per channel it judges",
+        );
+        return;
+    }
+    if !flow.nodes().contains(&app.routing_node) {
+        app.routing_node = Node::Seen;
+    }
+    let width = body.width as usize;
+    let mut lines: Vec<Line> = vec![Line::raw("")];
+    let mut hits = vec![];
+    for (i, layer) in flow.layers.iter().enumerate() {
+        let lead = Span::styled(format!("  {:<14}", layer.name), theme::muted());
+        let chips = layer
+            .nodes
+            .iter()
+            .map(|(n, c)| {
+                let st = if *n == app.routing_node {
+                    theme::tab_active()
+                } else if *c == 0 {
+                    theme::faint()
+                } else {
+                    theme::bright()
+                };
+                // Marked as well as lit, so it reads in plain text too.
+                let (l, r) = if *n == app.routing_node {
+                    ("▶", "◀")
+                } else {
+                    ("[", "]")
+                };
+                (format!("{l} {} {c} {r}", n.label()), st, Some(*n))
+            })
+            .collect();
+        let (ls, placed) = flow_chips(lead, chips, " ", width);
+        let top = lines.len() as u16;
+        hits.extend(placed.into_iter().map(|(r, c, w, n)| (top + r, c, w, n)));
+        lines.extend(ls);
+        if i + 1 == flow.layers.len() {
+            break;
+        }
+        // The bands out of this layer: one box goes on, the rest skip
+        // straight to their outcome.
+        let one = layer.nodes.len() == 1;
+        let bands: Vec<Chip> = flow
+            .edges
+            .iter()
+            .filter(|e| e.from.layer() == i)
+            .map(|e| {
+                let arrow = if e.to.layer() == i + 1 { "↓" } else { "↘" };
+                let text = if one {
+                    format!("{arrow} {} {}", e.to.label(), e.count)
+                } else {
+                    format!("{} {arrow} {} {}", e.from.label(), e.to.label(), e.count)
+                };
+                (text, theme::muted(), None)
+            })
+            .collect();
+        let lead = Span::styled(format!("  {:<14}", ""), theme::faint());
+        let bands = if bands.is_empty() {
+            vec![("↓ 0".to_string(), theme::faint(), None)]
+        } else {
+            bands
+        };
+        lines.extend(flow_chips(lead, bands, " · ", width).0);
+    }
+    // A sample keeps its rows on a short screen; the diagram clips first.
+    let room = if picked.is_some() {
+        body.height.saturating_sub(10)
+    } else {
+        body.height
+    };
+    let diagram_h = (lines.len() as u16 + 1).min(room);
+    for (row, col, w, n) in hits.into_iter().filter(|h| h.0 < diagram_h) {
+        app.hits.push((
+            Rect {
+                x: body.x + col,
+                y: body.y + row,
+                width: w.min(body.width.saturating_sub(col)),
+                height: 1,
+            },
+            Hit::RoutingNode(n),
+        ));
+    }
+    f.render_widget(
+        Paragraph::new(lines),
+        Rect {
+            height: diagram_h,
+            ..body
+        },
+    );
+    let sheet = Rect {
+        y: body.y + diagram_h,
+        height: body.height - diagram_h,
+        ..body
+    };
+    let Some(d) = picked else {
+        return;
+    };
+    // The sample: where and who, the message, its route and result.
+    let total = flow.count(app.routing_node).max(1);
+    let n = app.routing_sample.unwrap_or(0) % total + 1;
+    let w = width.saturating_sub(4);
+    let head = format!(
+        "─ sample {n} of {total} · {} · {} ",
+        app.routing_node.label(),
+        win.label()
+    );
+    let mut s: Vec<Line> = vec![Line::styled(
+        format!(
+            " {head}{}",
+            "─".repeat(width.saturating_sub(head.width() + 2))
+        ),
+        theme::rule(),
+    )];
+    let msg = stop_message(app, &d);
+    let who = msg.as_ref().map_or("watcher", |m| m.0.as_str());
+    s.push(Line::styled(
+        format!(
+            "  {} · {who} · {}",
+            channel_name(app, &d.channel),
+            time_label(d.at)
+        ),
+        theme::muted(),
+    ));
+    match &msg {
+        Some((_, text)) => s.push(Line::styled(
+            format!("  “{}”", clip(text.trim(), w.saturating_sub(2))),
+            theme::bright(),
+        )),
+        None => s.push(Line::styled(
+            match &d.stop {
+                Some(id) => format!("  stop message {} not loaded", short_id(id)),
+                None => "  no stop message".to_string(),
+            },
+            theme::faint(),
+        )),
+    }
+    let mut row = |k: &str, v: String| {
+        if !v.is_empty() {
+            s.push(Line::from(vec![
+                Span::styled(format!("  {k:<8}"), theme::muted()),
+                Span::styled(clip(&v, w.saturating_sub(8)), theme::text()),
+            ]));
+        }
+    };
+    let path = d.path();
+    row("stage", d.stage.replace('_', " "));
+    if let Some(Node::Jev(_)) = path.get(2) {
+        row(
+            "jev",
+            format!("{} · {}", path[2].label(), d.jev.as_deref().unwrap_or("?")),
+        );
+    }
+    if let Some(Node::Claude(_)) = path.get(3) {
+        row("claude", path[3].label().to_string());
+    }
+    let last = path.last().copied().unwrap_or(Node::Seen);
+    let mut result = vec![last.label().to_string()];
+    if !d.posts.is_empty() {
+        result.push(format!("{} posted", d.posts.len()));
+    }
+    result.extend(d.state.as_deref().map(|s| s.replace('_', " ")));
+    row("result", result.join(" · "));
+    row("reason", d.reason.clone());
+    s.push(Line::raw(""));
+    s.push(Line::from(vec![
+        Span::styled("  ⏎ ", theme::key()),
+        Span::styled(" why   ", theme::muted()),
+        Span::styled(" s ", theme::key()),
+        Span::styled(" sample another   ", theme::muted()),
+        Span::styled(" o ", theme::key()),
+        Span::styled(" open thread", theme::muted()),
+    ]));
+    f.render_widget(Paragraph::new(s), sheet);
+}
+
+/// Why for one decision: each step of its route with the record behind it
+/// (the stop message, the watch record, the routing log, the post).
+fn draw_why(f: &mut Frame, app: &mut App, area: Rect, d: &crate::routing::Decision) {
+    let steps = crate::routing::why(d);
+    let cur = app.routing_why.unwrap_or(0).min(steps.len() - 1);
+    app.routing_why = Some(cur);
+    let [title, rule, body] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" ⤳ routing", theme::muted()),
+            Span::styled("  ›  ", theme::faint()),
+            Span::styled("why", theme::bright()),
+            Span::styled(
+                "    j k step  ⏎ open its record  f follow  o open thread  esc back",
+                theme::faint(),
+            ),
+        ])),
+        title,
+    );
+    f.render_widget(
+        Block::new()
+            .borders(Borders::TOP)
+            .border_style(theme::rule()),
+        rule,
+    );
+    let width = body.width as usize;
+    let w = width.saturating_sub(4);
+    let at = {
+        use chrono::{Local, TimeZone};
+        Local
+            .timestamp_opt(d.at as i64, 0)
+            .single()
+            .map_or(String::new(), |t| t.format("%H:%M:%S").to_string())
+    };
+    let msg = stop_message(app, d);
+    let who = msg.as_ref().map_or("watcher", |m| m.0.as_str());
+    let mut lines: Vec<Line> = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(format!("  {who}  "), theme::bright()),
+            Span::styled(
+                format!(
+                    "{} · {at} · {}",
+                    channel_name(app, &d.channel),
+                    time_label(d.at)
+                ),
+                theme::muted(),
+            ),
+        ]),
+    ];
+    if let Some((_, text)) = &msg {
+        lines.push(Line::styled(
+            format!("  “{}”", clip(text.trim(), w.saturating_sub(2))),
+            theme::text(),
+        ));
+    }
+    lines.push(Line::raw(""));
+    let mut links = vec![];
+    for (i, st) in steps.iter().enumerate() {
+        let sel = i == cur;
+        let (dot, ts) = if sel {
+            ("▶", theme::tab_active())
+        } else {
+            ("●", theme::bright())
+        };
+        let mut head = vec![
+            Span::styled(format!("  {dot} "), ts),
+            Span::styled(pad_to(st.title, 16), ts),
+            Span::styled(
+                format!(" {}", st.label),
+                if sel { ts } else { theme::text() },
+            ),
+        ];
+        if !st.detail.is_empty() {
+            let room = w.saturating_sub(st.label.width() + 22);
+            head.push(Span::styled(
+                format!("   {}", clip(&st.detail, room)),
+                theme::muted(),
+            ));
+        }
+        lines.push(Line::from(head));
+        // The record: its kind and id, a link when it's a message.
+        let kind = match (i, st.event.as_deref()) {
+            (_, None) => "",
+            (0, _) => "stop message",
+            (_, Some(e)) if e == d.record => "routing log",
+            (1, _) => "watch record",
+            _ => d.outcome.as_str(),
+        };
+        let bar = if i + 1 < steps.len() { "│" } else { " " };
+        let mut rec = vec![Span::styled(format!("  {bar}   "), theme::rule())];
+        match &st.event {
+            Some(id) => {
+                rec.push(Span::styled(format!("{kind} "), theme::faint()));
+                let text = short_id(id);
+                if let Some(url) = &st.link {
+                    // After "  │   " and the kind.
+                    let col = (6 + kind.width() + 1) as u16;
+                    links.push((lines.len() as u16, col, text.width() as u16, url.clone(), i));
+                    rec.push(Span::styled(text, theme::link()));
+                } else {
+                    rec.push(Span::styled(text, theme::muted()));
+                }
+            }
+            None => rec.push(Span::styled("no record", theme::faint())),
+        }
+        lines.push(Line::from(rec));
+        if i + 1 < steps.len() {
+            lines.push(Line::styled("  │", theme::rule()));
+        }
+    }
+    let h = body.height;
+    for (row, col, width, url, i) in links.into_iter().filter(|l| l.0 < h) {
+        app.links.push(crate::app::LinkHit {
+            rect: Rect {
+                x: body.x + col,
+                y: body.y + row,
+                width: width.min(body.width.saturating_sub(col)),
+                height: 1,
+            },
+            url,
+            key: (format!("why:{}", d.record), i),
+        });
+    }
+    f.render_widget(Paragraph::new(lines), body);
+}
+
 fn clip(s: &str, w: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
@@ -3424,6 +3844,454 @@ mod tests {
             dump(t.backend().buffer(), &format!("{dir}/pal-{mode}.cells"));
         }
         crate::theme::set_light(false);
+    }
+
+    /// Two channels' routing logs from the watcher, with the stop messages
+    /// and the ping held: the mock's routes, smaller.
+    fn routing_fixture() -> App {
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+        let (lucian, bot, watcher) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let mut app = App::new(lucian.public_key().to_hex(), None);
+        app.checklists = crate::checklist::Checklists::new(crate::checklist::Trust {
+            owner: lucian.public_key().to_hex(),
+            watchers: vec![watcher.public_key().to_hex()],
+        });
+        for (k, name) in [
+            (&lucian, "lucian"),
+            (&bot, "taskbot"),
+            (&watcher, "watcher"),
+        ] {
+            app.store.profiles.insert(
+                k.public_key().to_hex(),
+                crate::model::Profile {
+                    name: name.into(),
+                    is_agent: name != "lucian",
+                    ..Default::default()
+                },
+            );
+        }
+        let (c1, c2) = ("c1", "c2");
+        app.store.channel_mut(c1).name = "techne-sdk-shape".into();
+        app.store.channel_mut(c2).name = "buzz-vim".into();
+        app.tabs = vec![c1.into(), c2.into()];
+        let now = crate::sync::now();
+        let mut post = |who: &Keys, ch: &str, text: &str, at: u64| {
+            let ev = EventBuilder::new(Kind::Custom(9), text)
+                .tags([Tag::parse(["h", ch]).unwrap()])
+                .custom_created_at(Timestamp::from(at))
+                .sign_with_keys(who)
+                .unwrap();
+            app.store.apply(&ev);
+            ev.id.to_hex()
+        };
+        let ask = post(
+            &bot,
+            c1,
+            "Should staging get the new read role tonight?",
+            now - 300,
+        );
+        let ping = post(
+            &watcher,
+            c1,
+            "@lucian taskbot asks: should staging get the new read role tonight?",
+            now - 295,
+        );
+        let done = post(&bot, c2, "Pushed agent/routing, tests green.", now - 900);
+        let nudge = post(
+            &watcher,
+            c2,
+            "@taskbot the list is still running: next item?",
+            now - 890,
+        );
+        let d = |at: u64,
+                 stop: &str,
+                 stage: &str,
+                 jev: Option<&str>,
+                 model: Option<&str>,
+                 out: &str,
+                 posts: &[&str],
+                 reason: &str| {
+            serde_json::json!({"at": at, "thread": stop, "stop": stop, "trigger": "idle",
+                "stage": stage, "jev": jev, "model": model, "outcome": out, "posts": posts,
+                "state": if out == "ping" { "waiting_on_lucian" } else { "working" }, "reason": reason})
+        };
+        let mut l1 = vec![];
+        let mut l2 = vec![];
+        for i in 0..18 {
+            l1.push(d(
+                now - 3000 - i * 600,
+                "",
+                "not_running",
+                None,
+                None,
+                "none",
+                &[],
+                "list ideating",
+            ));
+        }
+        for i in 0..4 {
+            l2.push(d(
+                now - 7200 - i * 900,
+                "",
+                "turn_started",
+                None,
+                None,
+                "none",
+                &[],
+                "a turn started",
+            ));
+        }
+        for i in 0..5 {
+            l2.push(d(
+                now - 1200 - i * 400,
+                &done,
+                "judged",
+                Some(if i % 2 == 0 {
+                    "will_continue"
+                } else {
+                    "cut_off"
+                }),
+                None,
+                "nudge",
+                &[&nudge],
+                "list running, agent stopped mid-list",
+            ));
+        }
+        l2.push(d(
+            now - 890,
+            &done,
+            "judged",
+            Some("reported_done"),
+            None,
+            "nudge",
+            &[&nudge],
+            "reported done, open items left",
+        ));
+        l2.push(d(
+            now - 2000,
+            &done,
+            "judged",
+            Some("waiting_on_agent"),
+            None,
+            "none",
+            &[],
+            "waiting on judgebot's review",
+        ));
+        l1.push(d(
+            now - 1500,
+            &ask,
+            "judged",
+            Some("asks_decision"),
+            Some("agent_decides"),
+            "nudge",
+            &[&nudge],
+            "the agent can pick the test fixture",
+        ));
+        l1.push(d(
+            now - 4 * 86_400,
+            &ask,
+            "judged",
+            Some("needs_access"),
+            Some("not_a_question"),
+            "none",
+            &[],
+            "rhetorical",
+        ));
+        l1.push(d(
+            now - 295,
+            &ask,
+            "judged",
+            Some("asks_decision"),
+            Some("needs_owner"),
+            "ping",
+            &[&ping],
+            "staging write, release step",
+        ));
+        for (ch, ds) in [(c1, l1), (c2, l2)] {
+            let ev = EventBuilder::new(
+                Kind::Custom(30472),
+                serde_json::json!({"v": 1, "decisions": ds}).to_string(),
+            )
+            .tags(
+                [
+                    ["d", &format!("buzz-checklist/routing/{ch}")],
+                    ["h", ch],
+                    ["t", "buzz-checklist"],
+                    ["channel", ch],
+                    ["checklist-type", "routing"],
+                ]
+                .map(|[a, b]| Tag::parse([a, b]).unwrap()),
+            )
+            .custom_created_at(Timestamp::from(now - 290))
+            .sign_with_keys(&watcher)
+            .unwrap();
+            assert!(app.checklists.apply(&ev));
+        }
+        for ch in [c1, c2] {
+            let ev = EventBuilder::new(
+                Kind::Custom(30472),
+                serde_json::json!({"v": 1, "state": "working"}).to_string(),
+            )
+            .tags(
+                [
+                    ["d", &format!("buzz-checklist/watch/{ch}")],
+                    ["h", ch],
+                    ["t", "buzz-checklist"],
+                    ["channel", ch],
+                    ["checklist-type", "watch"],
+                ]
+                .map(|[a, b]| Tag::parse([a, b]).unwrap()),
+            )
+            .custom_created_at(Timestamp::from(now - 290))
+            .sign_with_keys(&watcher)
+            .unwrap();
+            assert!(app.checklists.apply(&ev));
+        }
+        app.store.channel_mut(c1).loaded = true;
+        app.store.channel_mut(c2).loaded = true;
+        app
+    }
+
+    /// `w`: the five layers with box and band counts; t steps the window;
+    /// ⏎ samples the picked box, s samples another, ⏎ again is its Why with
+    /// each step's record; esc walks back out.
+    #[test]
+    fn the_routing_view_samples_and_explains() {
+        let mut app = routing_fixture();
+        let key = |app: &mut App, c: KeyCode| app.on_term(crossterm::event::Event::Key(c.into()));
+        key(&mut app, KeyCode::Char('w'));
+        assert!(app.routing_view);
+        let s = screen_text(&mut app, 120, 40);
+        for want in [
+            " 24h ",
+            "31 stops in 24h",
+            "▶ stops seen 31 ◀",
+            "↓ running 13",
+            "↘ no action 18",
+            "[ running 13 ]",
+            "[ keeps going 5 ]",
+            "[ waiting on a bot 1 ]",
+            "[ finished 1 ]",
+            "[ asks something 2 ]",
+            "asks something ↓ needs you 1",
+            "[ agent decides 1 ]",
+            "[ needs you 1 ]",
+            "[ not a question 0 ]",
+            "needs you ↓ ping you 1",
+            "[ no action 23 ]",
+            "[ nudge the driver 7 ]",
+            "[ ping you 1 ]",
+        ] {
+            assert!(s.contains(want), "{want}\n{s}");
+        }
+        assert!(!s.contains("other"), "{s}");
+        // The window: 7d takes in the 4-day-old one; 1h drops most.
+        key(&mut app, KeyCode::Char('t'));
+        let s = screen_text(&mut app, 120, 40);
+        assert!(
+            s.contains("32 stops in 7d") && s.contains("[ not a question 1 ]"),
+            "{s}"
+        );
+        key(&mut app, KeyCode::Char('t'));
+        assert!(screen_text(&mut app, 120, 40).contains("stops in 1h"));
+        key(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.routing_window, crate::routing::Window::Day);
+        // ⇥ to "asks something" (box 6), then sample it.
+        for _ in 0..5 {
+            key(&mut app, KeyCode::Tab);
+        }
+        assert_eq!(app.routing_node.label(), "asks something");
+        assert!(screen_text(&mut app, 120, 40).contains("▶ asks something 2 ◀"));
+        key(&mut app, KeyCode::Enter);
+        let s = screen_text(&mut app, 120, 40);
+        assert!(s.contains("sample 1 of 2 · asks something · 24h"), "{s}");
+        assert!(s.contains("#techne-sdk-shape · taskbot · 4m ago"), "{s}");
+        assert!(
+            s.contains("“Should staging get the new read role tonight?”"),
+            "{s}"
+        );
+        assert!(
+            s.contains("claude  needs you")
+                && s.contains("ping you · 1 posted · waiting on lucian"),
+            "{s}"
+        );
+        key(&mut app, KeyCode::Char('s'));
+        let s = screen_text(&mut app, 120, 40);
+        assert!(
+            s.contains("sample 2 of 2") && s.contains("claude  agent decides"),
+            "{s}"
+        );
+        key(&mut app, KeyCode::Char('s'));
+        assert!(screen_text(&mut app, 120, 40).contains("sample 1 of 2"));
+        // Why: every step, each with its record.
+        key(&mut app, KeyCode::Enter);
+        let s = screen_text(&mut app, 120, 40);
+        let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        for want in [
+            "routing › why",
+            "taskbot #techne-sdk-shape",
+            "watcher saw it agent stopped",
+            "stop message ",
+            "checklist list running",
+            "watch record ",
+            "jev asks something asks_decision",
+            "routing log ",
+            "claude check needs you staging write, release step",
+            "result ping you waiting on lucian",
+        ] {
+            assert!(s.contains(want), "{want}\n{s}");
+        }
+        assert_eq!(app.links.len(), 2, "the stop message and the ping link");
+        // Each link sits on its id.
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        for l in &app.links {
+            let on: String = (l.rect.x..l.rect.right())
+                .map(|x| buf[(x, l.rect.y)].symbol().to_string())
+                .collect();
+            let id = l.url.split("id=").nth(1).unwrap_or("");
+            assert!(id.starts_with(&on) && on.len() == 8, "{on} {}", l.url);
+        }
+        // ⏎ on the last step opens the ping in its thread.
+        for _ in 0..9 {
+            key(&mut app, KeyCode::Char('j'));
+        }
+        key(&mut app, KeyCode::Enter);
+        assert!(!app.routing_view);
+        assert_eq!(app.thread.as_ref().map(|t| t.0.as_str()), Some("c1"));
+        // Back in: esc walks why -> sample -> pipeline -> closed.
+        key(&mut app, KeyCode::Char('w'));
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Enter);
+        assert!(app.routing_why.is_some());
+        key(&mut app, KeyCode::Esc);
+        assert!(app.routing_why.is_none() && app.routing_sample.is_some());
+        key(&mut app, KeyCode::Esc);
+        assert!(app.routing_sample.is_none() && app.routing_view);
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.routing_view);
+        // A sample follows j to an empty box by closing, and ⏎ there
+        // samples nothing rather than opening a Why with nothing in it.
+        key(&mut app, KeyCode::Char('w'));
+        app.routing_node = crate::routing::Node::Claude(crate::routing::Check::NeedsOwner);
+        key(&mut app, KeyCode::Enter);
+        assert!(app.routing_sample.is_some());
+        key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.routing_node.label(), "not a question");
+        assert!(app.routing_sample.is_none());
+        key(&mut app, KeyCode::Enter);
+        assert!(app.routing_sample.is_none() && app.routing_why.is_none());
+        // ^d doesn't page the channel underneath.
+        let sel = app.selected.clone();
+        app.on_term(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('d'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+        ));
+        assert_eq!(app.selected, sel);
+        key(&mut app, KeyCode::Esc);
+        // Opening another view closes it.
+        key(&mut app, KeyCode::Char('w'));
+        key(&mut app, KeyCode::Char('0'));
+        assert!(app.needs_view && !app.routing_view);
+    }
+
+    #[test]
+    fn the_routing_view_keeps_q_and_the_wheel_off_the_hidden_channel() {
+        use crossterm::event::{
+            Event as TermEvent, KeyCode, KeyModifiers, MouseEvent, MouseEventKind,
+        };
+        let mut app = routing_fixture();
+        assert!(app.current().is_some());
+        let before = app.selected.clone();
+        app.on_term(TermEvent::Key(KeyCode::Char('w').into()));
+        assert!(app.routing_view && app.quick_here().is_none());
+        app.on_term(TermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(app.selected, before);
+        // judgebot on 3d0b79d: one gate, not one key at a time. Paste, ^v,
+        // ^+ ^r ^l and a click on the compose box all stay off the channel.
+        screen_text(&mut app, 120, 40);
+        app.actions.clear();
+        app.on_term(TermEvent::Paste("hello".into()));
+        for c in ['v', '+', 'r', 'l', 'i'] {
+            app.on_term(TermEvent::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::CONTROL,
+            )));
+        }
+        for (r, _) in app
+            .hits
+            .clone()
+            .iter()
+            .filter(|(_, h)| *h == crate::app::Hit::Compose)
+        {
+            app.on_term(TermEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: r.x,
+                row: r.y,
+                modifiers: KeyModifiers::NONE,
+            }));
+        }
+        assert!(app.routing_view && app.mode == crate::keys::Mode::Normal);
+        assert!(app.thread.is_none() && app.draft_ref().is_empty());
+        assert!(app.actions.is_empty(), "{}", app.actions.len());
+        assert_eq!(app.selected, before);
+        // A link from Why to where the channel already is shows it.
+        let c = app.current().unwrap().to_string();
+        let m = app.store.channels[&c].timeline.last().unwrap().clone();
+        app.follow(&crate::checklist::message_link(&c, &m, None));
+        assert!(!app.routing_view);
+    }
+
+    #[test]
+    fn the_routing_view_without_logs_says_so() {
+        let mut app = App::new("me".into(), None);
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('w').into()));
+        let s = screen_text(&mut app, 100, 24);
+        assert!(s.contains("no routing logs yet"), "{s}");
+        // Enter on an empty box says why, rather than opening nothing.
+        app.on_term(crossterm::event::Event::Key(KeyCode::Enter.into()));
+        assert!(app.routing_sample.is_none());
+    }
+
+    /// The routing view's three screens as cells and plain text.
+    #[test]
+    fn shot_routing() {
+        let Ok(dir) = std::env::var("BUZZ_VIM_SHOT") else {
+            return;
+        };
+        let mut app = routing_fixture();
+        let (w, h) = (120, 40);
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        let mut shot = |app: &mut App, name: &str| {
+            t.draw(|f| draw(f, app)).unwrap();
+            let buf = t.backend().buffer();
+            dump(buf, &format!("{dir}/{name}.cells"));
+            let text: String = (0..h)
+                .map(|y| {
+                    let l: String = (0..w).map(|x| buf[(x, y)].symbol()).collect();
+                    l.trim_end().to_string() + "\n"
+                })
+                .collect();
+            std::fs::write(format!("{dir}/{name}.txt"), text).unwrap();
+        };
+        let key = |app: &mut App, c: KeyCode| app.on_term(crossterm::event::Event::Key(c.into()));
+        key(&mut app, KeyCode::Char('w'));
+        for _ in 0..5 {
+            key(&mut app, KeyCode::Tab);
+        }
+        shot(&mut app, "tui-pipeline");
+        key(&mut app, KeyCode::Enter);
+        shot(&mut app, "tui-sample");
+        key(&mut app, KeyCode::Enter);
+        shot(&mut app, "tui-why");
     }
 
     fn dump(buf: &ratatui::buffer::Buffer, path: &str) {

@@ -21,6 +21,7 @@ use crate::mention;
 use crate::model::Store;
 use crate::needs::{self, Row};
 use crate::readstate::{self, ReadState};
+use crate::routing::{self, Decision, Node, Window};
 use crate::sections::Section;
 use crate::telemetry::Agents;
 use crate::unread::{self, Next};
@@ -48,6 +49,8 @@ pub enum Hit {
     NeedsTab,
     /// A row on tab 0.
     NeedsRow(usize),
+    /// A box on the routing view.
+    RoutingNode(Node),
 }
 
 /// A piece of a link on screen, from the last draw.
@@ -267,6 +270,15 @@ pub struct App {
     pub reply_sends: HashMap<String, Row>,
     /// The row the last reply answered, until sync knows its event id.
     pub reply_sent: Option<Row>,
+    /// The routing view (`w`): how the watcher routed each stop it judged.
+    pub routing_view: bool,
+    pub routing_window: Window,
+    /// The box picked (j k ⇥).
+    pub routing_node: Node,
+    /// The sample on show from that box: its nth newest decision.
+    pub routing_sample: Option<usize>,
+    /// Why for the sample, and the step picked in it.
+    pub routing_why: Option<usize>,
 }
 
 impl App {
@@ -344,6 +356,11 @@ impl App {
             reply_draft: Draft::default(),
             reply_sends: HashMap::new(),
             reply_sent: None,
+            routing_view: false,
+            routing_window: Window::Day,
+            routing_node: Node::Seen,
+            routing_sample: None,
+            routing_why: None,
         }
     }
 
@@ -562,6 +579,7 @@ impl App {
 
     fn switch_tab(&mut self, i: usize) {
         self.needs_view = false;
+        self.routing_view = false;
         if i < self.tabs.len() && i != self.active {
             self.active = i;
             self.thread = None;
@@ -597,6 +615,7 @@ impl App {
 
     fn open_needs(&mut self) {
         self.needs_view = true;
+        self.routing_view = false;
         self.agents_view = false;
         self.checklist_view = false;
         self.needs = self.needs_rows();
@@ -736,6 +755,160 @@ impl App {
         true
     }
 
+    // ---------- routing ----------
+
+    fn open_routing(&mut self) {
+        self.routing_view = true;
+        self.needs_view = false;
+        self.agents_view = false;
+        self.checklist_view = false;
+        self.routing_sample = None;
+        self.routing_why = None;
+    }
+
+    /// The decisions the view draws: every channel's we read.
+    pub fn routing_decisions(&self) -> Vec<Decision> {
+        self.checklists.decisions()
+    }
+
+    /// The sampled decision on show, if any.
+    pub fn routing_picked(&self, ds: &[Decision]) -> Option<Decision> {
+        let n = self.routing_sample?;
+        let now = crate::sync::now();
+        routing::sample(ds, now, self.routing_window, self.routing_node, n).cloned()
+    }
+
+    fn pick_box(&mut self, n: Node) {
+        self.routing_node = n;
+        // A sample on show follows to the new box, unless it's empty.
+        if self.routing_sample.is_some() {
+            self.routing_sample = Some(0);
+            if self.routing_picked(&self.routing_decisions()).is_none() {
+                self.routing_sample = None;
+            }
+        }
+        self.routing_why = None;
+    }
+
+    /// The box `by` boxes on in drawing order: `wrap` goes round.
+    fn step_box(&mut self, by: isize, wrap: bool) {
+        let ds = self.routing_decisions();
+        let nodes = routing::flow(&ds, crate::sync::now(), self.routing_window).nodes();
+        let n = nodes.len() as isize;
+        let at = nodes
+            .iter()
+            .position(|x| *x == self.routing_node)
+            .unwrap_or(0) as isize;
+        let to = if wrap {
+            (at + by).rem_euclid(n)
+        } else {
+            (at + by).clamp(0, n - 1)
+        };
+        self.pick_box(nodes[to as usize]);
+    }
+
+    fn sample_box(&mut self) {
+        let ds = self.routing_decisions();
+        let f = routing::flow(&ds, crate::sync::now(), self.routing_window);
+        if f.count(self.routing_node) == 0 {
+            let w = self.routing_window.label();
+            return self.say(format!(
+                "nothing in {} in the last {w}",
+                self.routing_node.label()
+            ));
+        }
+        self.routing_sample = Some(self.routing_sample.map_or(0, |n| n + 1));
+        self.routing_why = None;
+    }
+
+    fn open_decision_thread(&mut self) {
+        let ds = self.routing_decisions();
+        match self.routing_picked(&ds).and_then(|d| d.link()) {
+            Some(url) => {
+                self.routing_view = false;
+                self.follow(&url);
+            }
+            None => self.say("no thread on this decision"),
+        }
+    }
+
+    /// Open the picked Why step's record: a message in its thread, else
+    /// copy the event id.
+    fn open_step(&mut self) {
+        let ds = self.routing_decisions();
+        let Some(d) = self.routing_picked(&ds) else {
+            return;
+        };
+        let steps = routing::why(&d);
+        let Some(s) = self
+            .routing_why
+            .and_then(|i| steps.get(i.min(steps.len() - 1)))
+        else {
+            return;
+        };
+        match (&s.link, &s.event) {
+            (Some(url), _) => {
+                self.routing_view = false;
+                self.follow(&url.clone());
+            }
+            (None, Some(id)) => {
+                self.actions.push(Action::Copy(id.clone()));
+                self.say(format!("copied {} event id", s.title));
+            }
+            (None, None) => self.say("no record for this step"),
+        }
+    }
+
+    /// Keys on the routing view. True when the key was its own.
+    fn key_routing(&mut self, k: KeyEvent) -> bool {
+        let why = self.routing_why;
+        match k.code {
+            KeyCode::Char('w') => self.routing_view = false,
+            KeyCode::Char('t') => {
+                let i = Window::ALL.iter().position(|w| *w == self.routing_window);
+                self.routing_window = Window::ALL[(i.unwrap_or(0) + 1) % Window::ALL.len()];
+                self.routing_sample = self.routing_sample.map(|_| 0);
+                self.routing_why = None;
+            }
+            KeyCode::Char('j') | KeyCode::Down if why.is_some() => {
+                self.routing_why = why.map(|i| i.saturating_add(1))
+            }
+            KeyCode::Char('k') | KeyCode::Up if why.is_some() => {
+                self.routing_why = why.map(|i| i.saturating_sub(1))
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') if why.is_some() => {
+                self.open_step()
+            }
+            KeyCode::Char('j') | KeyCode::Down => self.step_box(1, false),
+            KeyCode::Char('k') | KeyCode::Up => self.step_box(-1, false),
+            KeyCode::Tab => self.step_box(1, true),
+            KeyCode::BackTab => self.step_box(-1, true),
+            KeyCode::Char('g') | KeyCode::Home => self.step_box(-99, false),
+            KeyCode::Char('G') | KeyCode::End => self.step_box(99, false),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                if self.routing_picked(&self.routing_decisions()).is_some() {
+                    self.routing_why = Some(0);
+                } else {
+                    self.routing_sample = None;
+                    self.sample_box();
+                }
+            }
+            KeyCode::Char('s') if self.routing_sample.is_some() => self.sample_box(),
+            KeyCode::Char('o') if self.routing_sample.is_some() => self.open_decision_thread(),
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc | KeyCode::Backspace => {
+                if why.is_some() {
+                    self.routing_why = None;
+                } else if self.routing_sample.is_some() {
+                    self.routing_sample = None;
+                } else {
+                    self.routing_view = false;
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
     // ---------- links ----------
 
     /// Each link on screen once, at its first piece, in screen order.
@@ -793,7 +966,9 @@ impl App {
                         }
                 });
                 if same {
-                    // Already here: just pick the reply, keep the timeline as is.
+                    // Already here: just pick the reply, keep the timeline as
+                    // is, and show it (a link followed from the routing view).
+                    self.routing_view = false;
                     if let Some((_, Some(pick))) = jump.thread {
                         self.thread_selected = Some(pick);
                         self.focus = Pane::Thread;
@@ -825,6 +1000,7 @@ impl App {
 
     fn goto(&mut self, j: Jump) {
         self.needs_view = false;
+        self.routing_view = false;
         let left = self.current() != Some(j.channel.as_str());
         let i = match self.tabs.iter().position(|t| *t == j.channel) {
             Some(i) => i,
@@ -1168,10 +1344,10 @@ impl App {
 
     // ---------- Q ----------
 
-    /// The channel a Q can add: none while tab 0 is shown, since the tab
-    /// under it is hidden.
+    /// The channel a Q can add: none while tab 0 or the routing view is
+    /// shown, since the tab under it is hidden.
     pub fn quick_here(&self) -> Option<&str> {
-        if self.needs_view {
+        if self.needs_view || self.routing_view {
             None
         } else {
             self.current()
@@ -1301,6 +1477,10 @@ impl App {
             self.reply_draft.insert(&text);
             return;
         }
+        // Nor does the routing view.
+        if self.routing_view {
+            return;
+        }
         // Tab 0 has no compose box: the channel under it mustn't get it.
         if self.needs_view {
             return self.say("to paste a reply, pick a row and press r");
@@ -1370,6 +1550,9 @@ impl App {
             } else {
                 self.actions.push(Action::Quit);
             }
+            return;
+        }
+        if ctrl && k.code == KeyCode::Char('v') && self.routing_view && self.mode == Mode::Normal {
             return;
         }
         if ctrl && k.code == KeyCode::Char('v') && self.needs_view && self.mode == Mode::Normal {
@@ -1519,6 +1702,24 @@ impl App {
         if self.needs_view && !ctrl && self.key_needs(k) {
             return;
         }
+        if self.routing_view {
+            if !ctrl && self.key_routing(k) {
+                return;
+            }
+            // One gate for the channel hidden under the view: past the view's
+            // own keys, only those that leave it or open another view get
+            // through (^c and ^q are handled before this).
+            let leaves = match k.code {
+                KeyCode::Char('o') => ctrl,
+                KeyCode::Char(c) if !ctrl => {
+                    matches!(c, 'q' | '0'..='9' | '!' | 'L' | 'H' | 'c' | 'a' | '?' | 'f')
+                }
+                _ => false,
+            };
+            if !leaves {
+                return;
+            }
+        }
         // ^d ^u page tab 0's rows, not the channel under it.
         if self.needs_view && ctrl && matches!(k.code, KeyCode::Char('d') | KeyCode::Char('u')) {
             let step = (self.page / 2).max(1);
@@ -1584,11 +1785,13 @@ impl App {
             }
             KeyCode::Char('c') => {
                 self.needs_view = false;
+                self.routing_view = false;
                 self.checklist_view = true;
                 self.agents_view = false;
                 self.checklist_cursor = 0;
             }
             KeyCode::Char('Q') => self.quick(),
+            KeyCode::Char('w') => self.open_routing(),
             KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
             KeyCode::Char('d') | KeyCode::PageDown => self.move_cursor(self.page.max(1) as isize),
@@ -1612,6 +1815,7 @@ impl App {
             KeyCode::Char('i') => self.enter_insert(),
             KeyCode::Char('a') => {
                 self.needs_view = false;
+                self.routing_view = false;
                 self.agents_view = !self.agents_view;
                 self.checklist_view = false;
             }
@@ -2016,6 +2220,10 @@ impl App {
                     self.needs_cursor = c.max(0) as usize;
                     return;
                 }
+                // The routing view scrolls nothing; the channel under it stays put.
+                if self.routing_view {
+                    return;
+                }
                 if self.mode == Mode::Sections {
                     self.picker_cursor = (self.picker_cursor as isize + d.signum())
                         .clamp(0, self.sections.len().saturating_sub(1) as isize)
@@ -2037,6 +2245,12 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => match hit {
+                // Under the routing view only the tab row and its boxes take clicks.
+                _ if self.routing_view
+                    && !matches!(
+                        hit,
+                        Some(Hit::Tab(_) | Hit::NeedsTab | Hit::RoutingNode(_) | Hit::Handle)
+                    ) => {}
                 Some(Hit::Tab(i)) => self.switch_tab(i),
                 Some(Hit::NeedsTab) => self.open_needs(),
                 Some(Hit::NeedsRow(_)) if self.mode != Mode::Normal => {}
@@ -2081,6 +2295,15 @@ impl App {
                 Some(Hit::CloseThread) if self.agents_view => self.agents_view = false,
                 Some(Hit::CloseThread) if self.checklist_view => self.checklist_view = false,
                 Some(Hit::ChecklistItem(i)) => self.checklist_cursor = i,
+                Some(Hit::RoutingNode(_)) if self.mode != Mode::Normal => {}
+                Some(Hit::RoutingNode(n)) => {
+                    // Click a box to pick it, again to sample it.
+                    if self.routing_node == n && self.routing_sample.is_none() {
+                        self.on_key(KeyEvent::from(KeyCode::Enter));
+                    } else {
+                        self.pick_box(n);
+                    }
+                }
                 Some(Hit::CloseThread) => self.close_thread(),
                 Some(Hit::Handle) | None => {}
             },

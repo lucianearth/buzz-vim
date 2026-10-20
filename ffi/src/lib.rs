@@ -33,8 +33,12 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 
 mod pairing;
 mod push;
+mod routing;
 pub use pairing::{PairStep, Pairing};
 pub use push::{PushChallenge, PushDelegation, PushNote, PushRelay};
+pub use routing::{
+    RouteDecision, RouteEdge, RouteFlow, RouteNode, RouteStep, RouteWindow, route_why,
+};
 
 uniffi::setup_scaffolding!();
 
@@ -2919,5 +2923,148 @@ mod tests {
         e.rebuild_tabs();
         assert_eq!(e.tabs, vec!["c", "a", "b"]);
         assert_eq!(e.tab_section["b"], "s");
+    }
+
+    /// The routing view from a folded routing log: the flow's boxes and
+    /// bands, a sample with the stop message it read, and its Why with
+    /// the ping it posted. A stranger's log doesn't count.
+    #[test]
+    fn routing_view_from_a_folded_log() {
+        use nostr::{EventBuilder, Kind, Timestamp};
+        let ch = "2130646b-d6c8-4ec3-93e3-36f77bee1a37";
+        let mut e = engine();
+        let (watcher, bot) = (Keys::generate(), Keys::generate());
+        e.checklists.trust.watchers = vec![watcher.public_key().to_hex()];
+        e.store.channel_mut(ch).name = "beacon".into();
+        let t = now() - 120;
+        let stop = EventBuilder::new(Kind::Custom(9), "Should staging get the read role?\nmore")
+            .tags([Tag::parse(["h", ch]).unwrap()])
+            .custom_created_at(Timestamp::from(t - 60))
+            .sign_with_keys(&bot)
+            .unwrap();
+        e.fold(&stop, true);
+        let sid = stop.id.to_hex();
+        let content = json!({"v": 1, "decisions": [
+            {"at": t - 7200, "thread": null, "stop": null, "trigger": "idle",
+             "stage": "not_running", "outcome": "none", "posts": [], "reason": "list not running"},
+            {"at": t, "thread": sid, "stop": sid, "trigger": "idle", "stage": "judged",
+             "jev": "asks_decision", "model": "needs_owner", "outcome": "ping",
+             "posts": ["ping1"], "state": "waiting_on_lucian", "reason": "staging write"},
+        ]})
+        .to_string();
+        let log = |k: &Keys| {
+            EventBuilder::new(Kind::Custom(30472), content.clone())
+                .tags(
+                    [
+                        ["d", &format!("buzz-checklist/routing/{ch}")],
+                        ["h", ch],
+                        ["channel", ch],
+                        ["t", "buzz-checklist"],
+                        ["checklist-type", "routing"],
+                    ]
+                    .map(|t| Tag::parse(t).unwrap()),
+                )
+                .custom_created_at(Timestamp::from(t))
+                .sign_with_keys(k)
+                .unwrap()
+        };
+        e.fold(&log(&Keys::generate()), true);
+        let c = Client {
+            engine: Arc::new(Mutex::new(e)),
+            stop: Arc::new(tokio::sync::Notify::new()),
+        };
+        assert!(c.route_flow(RouteWindow::Week).edges.is_empty());
+        c.engine.lock().unwrap().fold(&log(&watcher), true);
+
+        let count = |f: &RouteFlow, k: &str| f.nodes.iter().find(|n| n.key == k).map(|n| n.count);
+        let hour = c.route_flow(RouteWindow::Hour);
+        assert_eq!(hour.layers.len(), 5);
+        assert_eq!(count(&hour, "stops_seen"), Some(1));
+        assert_eq!(count(&hour, "out:no_action"), Some(0));
+        // "other" only shows when something is in it.
+        assert_eq!(count(&hour, "jev:other"), None);
+        let day = c.route_flow(RouteWindow::Day);
+        assert_eq!(count(&day, "stops_seen"), Some(2));
+        assert_eq!(count(&day, "out:ping_you"), Some(1));
+        let node = day
+            .nodes
+            .iter()
+            .find(|n| n.key == "claude:needs_you")
+            .unwrap();
+        assert_eq!((node.layer, node.label.as_str()), (3, "needs you"));
+        let band = |a: &str, b: &str| {
+            day.edges
+                .iter()
+                .find(|e| e.from == a && e.to == b)
+                .map(|e| e.count)
+        };
+        // A no-op skips straight to its outcome.
+        assert_eq!(band("stops_seen", "out:no_action"), Some(1));
+        assert_eq!(band("jev:asks_something", "claude:needs_you"), Some(1));
+
+        let d = c
+            .route_sample(RouteWindow::Day, "jev:asks_something".into(), 0)
+            .unwrap();
+        assert_eq!(d.channel_label, "#beacon");
+        assert_eq!(d.text, "Should staging get the read role?");
+        assert_eq!(
+            d.who_name,
+            c.engine
+                .lock()
+                .unwrap()
+                .store
+                .name_of(&bot.public_key().to_hex())
+        );
+        assert_eq!(d.jev.as_deref(), Some("asks_decision"));
+        assert_eq!(
+            d.path,
+            [
+                "stops_seen",
+                "running",
+                "jev:asks_something",
+                "claude:needs_you",
+                "out:ping_you"
+            ]
+        );
+        let link = d.link.clone().unwrap();
+        assert!(c.follow(link).is_some_and(|f| f.channel == ch));
+        // Sampling wraps; an unknown key or an empty box gives nothing.
+        let again = c.route_sample(RouteWindow::Day, "jev:asks_something".into(), 1);
+        assert_eq!(again.map(|a| a.at), Some(d.at));
+        assert!(c.route_sample(RouteWindow::Day, "nope".into(), 0).is_none());
+        assert!(
+            c.route_sample(RouteWindow::Hour, "out:no_action".into(), 0)
+                .is_none()
+        );
+
+        let steps = route_why(d);
+        let titles: Vec<&str> = steps.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "watcher saw it",
+                "checklist",
+                "jev",
+                "claude check",
+                "result"
+            ]
+        );
+        assert_eq!(steps[0].event_id.as_deref(), Some(sid.as_str()));
+        assert!(steps[0].link.as_deref().is_some_and(|l| l.contains(&sid)));
+        assert_eq!(steps[2].label, "asks something");
+        assert_eq!(steps[2].detail, "asks_decision");
+        assert_eq!(steps[3].detail, "staging write");
+        let result = &steps[4];
+        assert_eq!(
+            (result.key.as_str(), result.label.as_str()),
+            ("out:ping_you", "ping you")
+        );
+        assert_eq!(result.event_id.as_deref(), Some("ping1"));
+        assert!(
+            result
+                .link
+                .as_deref()
+                .is_some_and(|l| l.contains("id=ping1"))
+        );
     }
 }
