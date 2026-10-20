@@ -52,6 +52,10 @@ struct Theme {
     var onAccent: Color { light ? tone(.surface, 1) : hex(0x1A1320) }
     /// The "online" dot: the code hue (a green) at the muted step.
     var live: Color { tone(.code, 14) }
+    /// Routing's two ends that post, as in its mock: a nudge to the driver
+    /// blue, a ping to you orange.
+    var routeNudge: Color { light ? hex(0x2F6BC9) : hex(0x4A90F0) }
+    var routePing: Color { light ? hex(0xC8621A) : hex(0xFF8A3D) }
 
     private func hex(_ v: UInt32) -> Color {
         Color(.sRGB, red: Double(v >> 16 & 0xFF) / 255, green: Double(v >> 8 & 0xFF) / 255,
