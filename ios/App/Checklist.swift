@@ -46,8 +46,7 @@ struct LoopLine: View {
     }
 
     private var counts: String {
-        var s = "\(status.open) open · \(status.done) done"
-        return s
+        "\(status.open) open · \(status.done) done"
     }
 
     private func watchText(_ w: String) -> String {
