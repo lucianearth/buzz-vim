@@ -18,8 +18,8 @@ struct Place: Equatable {
     /// The open thread as it was, focus included, so going back doesn't
     /// rebuild it.
     var route: Route? = nil
-    /// The tab's section, to bring back a tab row a link moved off.
-    var section: String? = nil
+    /// The tab row's sections, to bring back a row a link moved off.
+    var sections: [String] = []
     var label: String = "a channel"
 
     static func == (a: Place, b: Place) -> Bool { a.tab == b.tab && a.root == b.root }
@@ -233,13 +233,13 @@ struct Home: View {
     /// A tapped channel or message link: its tab (its section's tab row
     /// when it isn't showing), then its thread or the message.
     private func follow(_ f: Follow) {
-        if let s = f.section {
-            model.setChosen([s])
-        } else if !client.tabs().contains(where: { $0.id == f.channel }) {
+        if f.section == nil, !client.tabs().contains(where: { $0.id == f.channel }) {
             model.say("that channel isn't in your sidebar")
             return
         }
+        // Before the tab row changes, so this tab and its row are still there.
         remember(Place(tab: f.channel, root: f.root))
+        if let s = f.section { model.setChosen([s]) }
         selected = f.channel
         if let root = f.root {
             show(f.channel, Route(channel: f.channel, root: root, focus: f.id))
@@ -255,7 +255,8 @@ struct Home: View {
         let route = s == Needs.id ? nil : threads[s]
         let tab = client.tabs().first { $0.id == s }
         let here = Place(tab: s, root: route?.root, route: route,
-                         section: tab?.section, label: tab?.label ?? "a channel")
+                         sections: client.sections().filter(\.chosen).map(\.id),
+                         label: tab?.label ?? "a channel")
         guard here != to, jumps.last != here else { return }
         jumps.append(here)
         if jumps.count > 30 { jumps.removeFirst() }
@@ -267,11 +268,11 @@ struct Home: View {
         let p = jumps[jumps.count - n]
         if p.tab != Needs.id, !client.tabs().contains(where: { $0.id == p.tab }) {
             // A link moved the tab row to another section: bring it back.
-            guard let sec = p.section else {
+            guard !p.sections.isEmpty else {
                 model.say("that channel isn't in your tab row now")
                 return
             }
-            model.setChosen([sec])
+            model.setChosen(p.sections)
         }
         jumps.removeLast(n)
         selected = p.tab
