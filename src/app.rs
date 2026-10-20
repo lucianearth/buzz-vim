@@ -780,9 +780,12 @@ impl App {
 
     fn pick_box(&mut self, n: Node) {
         self.routing_node = n;
-        // A sample on show follows to the new box.
+        // A sample on show follows to the new box, unless it's empty.
         if self.routing_sample.is_some() {
             self.routing_sample = Some(0);
+            if self.routing_picked(&self.routing_decisions()).is_none() {
+                self.routing_sample = None;
+            }
         }
         self.routing_why = None;
     }
@@ -883,9 +886,10 @@ impl App {
             KeyCode::Char('g') | KeyCode::Home => self.step_box(-99, false),
             KeyCode::Char('G') | KeyCode::End => self.step_box(99, false),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if self.routing_sample.is_some() {
+                if self.routing_picked(&self.routing_decisions()).is_some() {
                     self.routing_why = Some(0);
                 } else {
+                    self.routing_sample = None;
                     self.sample_box();
                 }
             }
@@ -1704,6 +1708,10 @@ impl App {
             return;
         }
         if self.routing_view && !ctrl && self.key_routing(k) {
+            return;
+        }
+        // ^d ^u would page the channel under the routing view.
+        if self.routing_view && ctrl && matches!(k.code, KeyCode::Char('d') | KeyCode::Char('u')) {
             return;
         }
         // ^d ^u page tab 0's rows, not the channel under it.

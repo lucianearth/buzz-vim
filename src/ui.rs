@@ -1833,6 +1833,12 @@ fn draw_routing(f: &mut Frame, app: &mut App, area: Rect) {
     if let (Some(_), Some(d)) = (app.routing_why, &picked) {
         return draw_why(f, app, area, d);
     }
+    // The sample aged out of the window (or its box emptied): back to the
+    // diagram, so the keys act on what's drawn.
+    if picked.is_none() {
+        app.routing_sample = None;
+        app.routing_why = None;
+    }
     let win = app.routing_window;
     let flow = routing::flow(&ds, now, win);
     let [title, rule, body] = Layout::vertical([
@@ -1936,7 +1942,13 @@ fn draw_routing(f: &mut Frame, app: &mut App, area: Rect) {
         };
         lines.extend(flow_chips(lead, bands, " · ", width).0);
     }
-    let diagram_h = (lines.len() as u16 + 1).min(body.height);
+    // A sample keeps its rows on a short screen; the diagram clips first.
+    let room = if picked.is_some() {
+        body.height.saturating_sub(10)
+    } else {
+        body.height
+    };
+    let diagram_h = (lines.len() as u16 + 1).min(room);
     for (row, col, w, n) in hits.into_iter().filter(|h| h.0 < diagram_h) {
         app.hits.push((
             Rect {
@@ -2142,7 +2154,8 @@ fn draw_why(f: &mut Frame, app: &mut App, area: Rect, d: &crate::routing::Decisi
                 rec.push(Span::styled(format!("{kind} "), theme::faint()));
                 let text = short_id(id);
                 if let Some(url) = &st.link {
-                    let col = (5 + kind.width() + 1) as u16;
+                    // After "  │   " and the kind.
+                    let col = (6 + kind.width() + 1) as u16;
                     links.push((lines.len() as u16, col, text.width() as u16, url.clone(), i));
                     rec.push(Span::styled(text, theme::link()));
                 } else {
@@ -4129,6 +4142,17 @@ mod tests {
             assert!(s.contains(want), "{want}\n{s}");
         }
         assert_eq!(app.links.len(), 2, "the stop message and the ping link");
+        // Each link sits on its id.
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        for l in &app.links {
+            let on: String = (l.rect.x..l.rect.right())
+                .map(|x| buf[(x, l.rect.y)].symbol().to_string())
+                .collect();
+            let id = l.url.split("id=").nth(1).unwrap_or("");
+            assert!(id.starts_with(&on) && on.len() == 8, "{on} {}", l.url);
+        }
         // ⏎ on the last step opens the ping in its thread.
         for _ in 0..9 {
             key(&mut app, KeyCode::Char('j'));
@@ -4147,6 +4171,27 @@ mod tests {
         assert!(app.routing_sample.is_none() && app.routing_view);
         key(&mut app, KeyCode::Esc);
         assert!(!app.routing_view);
+        // A sample follows j to an empty box by closing, and ⏎ there
+        // samples nothing rather than opening a Why with nothing in it.
+        key(&mut app, KeyCode::Char('w'));
+        app.routing_node = crate::routing::Node::Claude(crate::routing::Check::NeedsOwner);
+        key(&mut app, KeyCode::Enter);
+        assert!(app.routing_sample.is_some());
+        key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.routing_node.label(), "not a question");
+        assert!(app.routing_sample.is_none());
+        key(&mut app, KeyCode::Enter);
+        assert!(app.routing_sample.is_none() && app.routing_why.is_none());
+        // ^d doesn't page the channel underneath.
+        let sel = app.selected.clone();
+        app.on_term(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('d'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+        ));
+        assert_eq!(app.selected, sel);
+        key(&mut app, KeyCode::Esc);
         // Opening another view closes it.
         key(&mut app, KeyCode::Char('w'));
         key(&mut app, KeyCode::Char('0'));
