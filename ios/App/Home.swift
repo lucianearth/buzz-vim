@@ -361,6 +361,14 @@ struct Header: View {
                 }
                 .onChange(of: selected) { _, now in
                     withAnimation { proxy.scrollTo(now, anchor: .center) }
+                    // The last chip widens as it turns bold after the scroll
+                    // was measured, which clipped its right edge: scroll again
+                    // once it has laid out.
+                    if now == Routing.id {
+                        DispatchQueue.main.async {
+                            withAnimation { proxy.scrollTo(Routing.id, anchor: .trailing) }
+                        }
+                    }
                 }
                 // On launch the restored tab may be off to the right.
                 .onAppear { proxy.scrollTo(selected, anchor: .center) }
