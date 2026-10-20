@@ -63,6 +63,8 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("[ ]", "narrower / wider (or drag the right edge)", false),
             ("a", "agents", true),
             ("c", "checklist: items, evidence, details", true),
+            ("w", "routing: how each stop was routed", false),
+            ("t ⏎ s o", "routing: window, sample, another, thread", false),
             (
                 "Q ^q",
                 "ask #quick; again in the box: + this channel",
