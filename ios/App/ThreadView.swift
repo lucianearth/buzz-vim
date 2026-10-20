@@ -2,11 +2,12 @@ import OSLog
 import SwiftUI
 
 /// A thread, flat: the root, then the replies oldest first. It sits in
-/// its channel's tab, under the tab row; the floating arrow bottom left
-/// goes back to the channel.
+/// its channel's tab, under the tab row, with a bar on top that says where
+/// you are; tapping the bar goes back to the channel.
 struct ThreadView: View {
     let client: Client
     let route: Route
+    let channelName: String
     /// Its tab is the one on screen (a neighbour page may be built early).
     let active: Bool
     let back: () -> Void
@@ -23,6 +24,7 @@ struct ThreadView: View {
         let _ = model.version
         let tl = client.thread(channel: route.channel, root: route.root)
         VStack(spacing: 0) {
+            ThreadBar(channel: channelName, root: tl.messages.first { $0.id == route.root }, back: back)
             GeometryReader { geo in
             ScrollViewReader { proxy in
                 ScrollView {
@@ -48,8 +50,8 @@ struct ThreadView: View {
                     .frame(minHeight: geo.size.height, alignment: .top)
                     .background(FlingStop(fling: fling))
                 }
-                // Opened on a reply by the bell key: hold the top, so the
-                // keyboard coming up doesn't push the reply off screen.
+                // Opened on a reply by the bell key: hold the top, so a
+                // keyboard the user brings up doesn't push the reply off screen.
                 .defaultScrollAnchor(route.focus == nil ? .bottom : .top)
                 .defaultScrollAnchor(route.focus == nil ? .bottom : .top, for: .sizeChanges)
                 .scrollPosition($position, anchor: .top)
@@ -61,28 +63,15 @@ struct ThreadView: View {
                         withAnimation(.easeOut(duration: 0.25)) { position.scrollTo(edge: top ? .top : .bottom) }
                     }
                 }
-                .overlay(alignment: .bottomLeading) {
-                    VStack(alignment: .leading, spacing: 0) {
-                        BellButton()
-                        Button(action: back) {
-                            Image(systemName: "arrow.left")
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundStyle(theme.text)
-                                .frame(width: 38, height: 38)
-                                .background(theme.idle, in: Circle())
-                                .overlay(Circle().stroke(theme.rule, lineWidth: 1))
-                        }
-                        .padding(.leading, 14)
-                        .padding(.bottom, 10)
-                    }
-                }
+                .overlay(alignment: .bottomLeading) { BellButton() }
+                .overlay(alignment: .bottom) { JumpChip() }
                 .onChange(of: tl.messages.last?.id) { _, _ in
                     // Opened on a reply by the bell key: stay on it.
                     guard route.focus == nil else { return }
                     withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("end", anchor: .bottom) }
                 }
                 // The bell key: the first new reply at the top, once it has
-                // loaded, and again after the push and keyboard settle.
+                // loaded, and again after the push settles.
                 .onAppear { land(tl) }
                 .onChange(of: tl.messages.count) { _, _ in land(tl) }
             }
@@ -117,5 +106,51 @@ struct ThreadView: View {
         for delay in [0.05, 0.35, 0.7] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { position.scrollTo(id: f, anchor: .top) }
         }
+    }
+}
+
+/// The bar over a thread: ‹ #channel › the root's first line. It drops
+/// down as the thread opens; a tap goes back to the channel.
+private struct ThreadBar: View {
+    let channel: String
+    let root: Message?
+    let back: () -> Void
+    @Environment(\.theme) private var theme
+    @State private var shown = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "chevron.left")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(theme.accent)
+            Text(channel)
+                .foregroundStyle(theme.text)
+                .layoutPriority(1)
+            Text("›")
+                .foregroundStyle(theme.faint)
+            Text(firstLine)
+                .foregroundStyle(theme.muted)
+        }
+        .font(.small)
+        .lineLimit(1)
+        .padding(.horizontal, 22)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(theme.card)
+        .overlay(alignment: .bottom) { Rectangle().fill(theme.rule).frame(height: 1) }
+        .contentShape(Rectangle())
+        .onTapGesture(perform: back)
+        .offset(y: shown ? 0 : -12)
+        .opacity(shown ? 1 : 0)
+        .onAppear { withAnimation(.easeOut(duration: 0.2).delay(0.1)) { shown = true } }
+    }
+
+    private var firstLine: String {
+        guard let m = root else { return "thread" }
+        for case let .text(t) in m.segments {
+            let line = t.split(whereSeparator: \.isNewline).first { !$0.allSatisfy(\.isWhitespace) }
+            if let line { return line.trimmingCharacters(in: .whitespaces) }
+        }
+        return m.media.isEmpty ? "thread" : "attachment"
     }
 }

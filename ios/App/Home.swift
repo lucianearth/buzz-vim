@@ -10,10 +10,21 @@ struct Route: Hashable {
     var focus: String? = nil
 }
 
-/// Tab moves for the keyboard bar, from wherever the compose box is.
+/// Where a jump left from: a tab and the thread open in it.
+struct Place: Equatable {
+    let tab: String
+    let root: String?
+}
+
+/// Tab moves for the keyboard bar, from wherever the compose box is, and
+/// the jump chain for the ↰ chip.
 struct Nav {
     var step: (Int) -> Void = { _ in }
     var bell: () -> Void = {}
+    /// Where each jump left from, the last one first, as names.
+    var jumps: [String] = []
+    /// Back `n` jumps.
+    var back: (Int) -> Void = { _ in }
 }
 
 private struct NavKey: EnvironmentKey {
@@ -49,6 +60,9 @@ struct Home: View {
     @State private var switcher = false
     /// The Q sheet, while it's up.
     @State private var quick: QuickBox?
+    /// Where links, bell landings and Needs you rows jumped from, oldest
+    /// first; the ↰ chip walks back along it.
+    @State private var jumps: [Place] = []
 
     var body: some View {
         let _ = model.version
@@ -76,7 +90,7 @@ struct Home: View {
                         .containerRelativeFrame([.horizontal, .vertical])
                         .id(Needs.id)
                         ForEach(tabs, id: \.id) { t in
-                            page(t.id)
+                            page(t.id, t.label)
                                 .containerRelativeFrame([.horizontal, .vertical])
                                 .id(t.id)
                         }
@@ -102,7 +116,8 @@ struct Home: View {
             }
         }
         .sensoryFeedback(.impact, trigger: switcher) { _, now in now }
-        .environment(\.nav, Nav(step: step, bell: bell))
+        .environment(\.nav, Nav(step: step, bell: bell,
+                                 jumps: jumps.reversed().map { name($0, tabs) }, back: jumpBack))
         .onAppear {
             model.follow = follow
             settle(tabs)
@@ -174,18 +189,18 @@ struct Home: View {
 
     /// The bell key: the newest activity in this tab, read or not; a
     /// thread opens on its first new reply. The same place again until
-    /// something newer arrives. Never leaves the tab.
+    /// something newer arrives. Never leaves the tab, and leaves the
+    /// keyboard down.
     private func bell() {
         guard let s = selected, let j = client.bell(channel: s) else { return }
         land(s, j)
     }
 
     private func land(_ channel: String, _ j: Jump) {
+        remember(Place(tab: channel, root: j.root))
         if let root = j.root {
-            model.focusKey = "\(channel)/\(root)"
             show(channel, Route(channel: channel, root: root, focus: j.id))
         } else {
-            model.focusKey = channel
             show(channel, nil)
             model.scrollTarget = (channel, j.id)
         }
@@ -215,6 +230,7 @@ struct Home: View {
             model.say("that channel isn't in your sidebar")
             return
         }
+        remember(Place(tab: f.channel, root: f.root))
         selected = f.channel
         if let root = f.root {
             show(f.channel, Route(channel: f.channel, root: root, focus: f.id))
@@ -224,6 +240,37 @@ struct Home: View {
         }
     }
 
+    /// Before a jump to `to`: where we are now, unless that's the same place.
+    private func remember(_ to: Place) {
+        guard let s = selected else { return }
+        let here = Place(tab: s, root: s == Needs.id ? nil : threads[s]?.root)
+        guard here != to, jumps.last != here else { return }
+        jumps.append(here)
+        if jumps.count > 30 { jumps.removeFirst() }
+    }
+
+    /// The ↰ chip: back `n` jumps, to that tab and the thread it had open.
+    private func jumpBack(_ n: Int) {
+        guard n > 0, n <= jumps.count else { return }
+        let p = jumps[jumps.count - n]
+        jumps.removeLast(n)
+        guard p.tab == Needs.id || client.tabs().contains(where: { $0.id == p.tab }) else {
+            model.say("that channel isn't in your tab row now")
+            return
+        }
+        selected = p.tab
+        if p.tab != Needs.id {
+            show(p.tab, p.root.map { Route(channel: p.tab, root: $0) })
+        }
+    }
+
+    /// A place in the ↰ chip's chain.
+    private func name(_ p: Place, _ tabs: [ChannelTab]) -> String {
+        if p.tab == Needs.id { return "⚑ needs you" }
+        let ch = tabs.first { $0.id == p.tab }?.label ?? "a channel"
+        return p.root == nil ? ch : "\(ch) › thread"
+    }
+
     /// Key-row moves only, so the keyboard is up: jump, no page slide.
     private func go(_ id: String) {
         selected = id
@@ -231,7 +278,7 @@ struct Home: View {
 
     /// A tab's page: its open thread over its channel. The channel stays
     /// underneath, so going back finds it where it was.
-    private func page(_ id: String) -> some View {
+    private func page(_ id: String, _ label: String) -> some View {
         ZStack {
             let thread = threads[id]
             ChannelView(client: client, channel: id) { root in
@@ -240,7 +287,7 @@ struct Home: View {
             .opacity(thread == nil ? 1 : 0)
             .allowsHitTesting(thread == nil)
             if let r = thread {
-                ThreadView(client: client, route: r, active: id == selected) { show(id, nil) }
+                ThreadView(client: client, route: r, channelName: label, active: id == selected) { show(id, nil) }
                     .id(r)
                     .transition(.move(edge: .trailing))
             }
@@ -251,7 +298,7 @@ struct Home: View {
     /// Open a thread in a tab, or close it (nil), and remember it.
     private func show(_ channel: String, _ r: Route?) {
         // The page underneath stays in the window: its box mustn't keep
-        // the keyboard. A bell landing claims it back after.
+        // the keyboard.
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
         withAnimation(.easeOut(duration: 0.2)) { threads[channel] = r }
         UserDefaults.standard.set(threads.mapValues(\.root), forKey: "threads")
