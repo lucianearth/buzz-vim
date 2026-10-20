@@ -26,8 +26,7 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
 - `i` write, `Esc` back to normal, `⏎` send, `⇧⏎` (or `⌥⏎`, `^j`) new line
 - `j` `k` move, `1`–`9` jump to a tab, `H` `L` or `⇥` cycle tabs (tab 0 included)
 - `0` is tab 0, **Needs you**, pinned first (it can't be moved, closed or archived). *Needs an answer*: channels
-  the watcher marks stalled, waiting on lucian or waiting on release (the row opens its ping), parked checklist
-  items with their question (the driving list's only, five a channel and then one "+N more"), a contested
+  the watcher marks stalled, waiting on lucian or waiting on release (the row opens its ping), a contested
   channel whose lists run ("two lists claim this channel; pick a driver"), and people's @mentions and DMs to the operator (`owner`) that he hasn't answered.
   *FYI*: bots' @mentions of him the watcher didn't flag. One row each (channel, who, one line, age), oldest
   first. `⏎` opens the row at its message, `r` answers it in a box that posts into that row's thread. A row
@@ -43,10 +42,10 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
 - `a` the agents screen: who is working, where, and their last tool calls. A tab spins while an agent
   works in that channel, and a thread shows `taskbot thinking` while an agent answers in it
 - `c` the channel's checklist (the operator loop's records, kinds 30470-30472, read-only here: agents write
-  them with `buzz checklist`). Items in order with open / done / parked, the release flag and evidence, and
-  the picked item's details, evidence links and parked question beside them. Above a channel's messages a
+  them with `buzz checklist`). Items in order with open / done, the release flag and evidence, and
+  the picked item's details and evidence links beside them. There is no parking: a legacy parked item reads as open work. Above a channel's messages a
   status line shows its mode (ideating / running), the watcher's state (working, stalled, waiting on lucian,
-  waiting on release, with a link to its ping), open / done / parked counts and agent crashes today. A channel
+  waiting on release, with a link to its ping), open / done counts and agent crashes today. A channel
   where two or more lists claim the checklist and the owner hasn't picked a driver shows `contested` with
   their creators, and no list until he does
 - `Q` (or `^q`, which also works while writing) asks a quick question: a box that posts a new top-level message
@@ -72,7 +71,7 @@ The iPhone app (`ios/`, on the same core through `ffi/`) has the same tab 0: a �
 tab row with the Needs-an-answer count as its badge, the same rows (tap one to open it, Reply to answer it in
 its thread), and ⚑ N on every channel's status line. It posts a local notification for each new watcher
 row its sync sees (stalled, waiting on lucian, waiting on release), once per row, and only for rows that
-began after the phone started watching. People's @mentions and DMs, parked items and FYI wait in tab 0
+began after the phone started watching. People's @mentions and DMs and FYI wait in tab 0
 without one. That works while the app runs.
 
 Q is the button at the top right, beside the online line. It opens the same Q as the terminal's (the same

@@ -29,7 +29,7 @@ struct LoopLine: View {
                 Text(watchText(w))
                     .foregroundStyle(status.needsYou ? theme.bright : theme.muted)
             }
-            if status.open + status.done + status.parked > 0 {
+            if status.open + status.done > 0 {
                 Text(counts).foregroundStyle(theme.muted)
             }
             if status.crashesToday > 0 {
@@ -47,7 +47,6 @@ struct LoopLine: View {
 
     private var counts: String {
         var s = "\(status.open) open · \(status.done) done"
-        if status.parked > 0 { s += " · \(status.parked) parked" }
         return s
     }
 
@@ -61,7 +60,7 @@ struct LoopLine: View {
 }
 
 /// A channel's checklist, read-only: agents write it with `buzz checklist`.
-/// Tap an item for its details, evidence and parked question.
+/// Tap an item for its details and evidence.
 struct ChecklistView: View {
     let client: Client
     let channel: String
@@ -149,11 +148,6 @@ struct ChecklistView: View {
             Text("by \(it.creator)")
                 .font(.small)
                 .foregroundStyle(theme.muted)
-            if let q = it.parkedQuestion {
-                Text("? \(q)")
-                    .font(.text)
-                    .foregroundStyle(theme.bright)
-            }
             if !it.evidence.isEmpty {
                 Text("evidence").font(.small).foregroundStyle(theme.faint)
                 ForEach(Array(it.evidence.enumerated()), id: \.offset) { _, e in
@@ -182,14 +176,12 @@ struct ChecklistView: View {
         switch s {
         case .open: return "○"
         case .done: return "✓"
-        case .parked: return "‖"
         }
     }
 
     private func flags(_ it: ChecklistItem) -> String {
         var f: [String] = []
         if it.release { f.append("release") }
-        if it.status == .parked { f.append("parked") }
         if it.missingEvidence { f.append("⚠ no evidence") }
         return f.joined(separator: " · ")
     }

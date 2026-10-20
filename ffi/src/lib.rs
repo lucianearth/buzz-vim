@@ -325,7 +325,6 @@ pub fn new_read_id() -> String {
 pub enum ItemStatus {
     Open,
     Done,
-    Parked,
 }
 
 /// One evidence entry; `link` when it can open (a message, a URL).
@@ -349,7 +348,6 @@ pub struct ChecklistItem {
     pub evidence: Vec<Evidence>,
     /// Done with no evidence: the spec requires some.
     pub missing_evidence: bool,
-    pub parked_question: Option<String>,
     pub creator: String,
     pub updated_at: u64,
 }
@@ -379,7 +377,6 @@ pub struct LoopStatus {
     pub ping_link: Option<String>,
     pub open: u32,
     pub done: u32,
-    pub parked: u32,
     pub crashes_today: u32,
     /// Two or more lists claim the channel and no list shows until the
     /// owner picks a driver: "contested: name, name". None otherwise.
@@ -400,7 +397,7 @@ pub struct NeedRow {
     /// Stable while the row stands for the same thing: notifications go by it.
     pub key: String,
     pub section: NeedSection,
-    /// "waiting on lucian", "stalled", "parked", "contested", "mention",
+    /// "waiting on lucian", "stalled", "contested", "mention",
     /// "dm", "bot".
     pub kind: String,
     /// The watcher flagged it: the only rows that notify (push and local).
@@ -845,9 +842,9 @@ impl Client {
             .map(|i| ChecklistItem {
                 missing_evidence: i.missing_evidence(),
                 status: match i.status {
-                    checklist::Status::Open => ItemStatus::Open,
+                    // No parking (lucian 2026-10-20): a legacy parked item is open.
+                    checklist::Status::Open | checklist::Status::Parked => ItemStatus::Open,
                     checklist::Status::Done => ItemStatus::Done,
-                    checklist::Status::Parked => ItemStatus::Parked,
                 },
                 evidence: i
                     .evidence
@@ -863,7 +860,6 @@ impl Client {
                 details: i.details,
                 release: i.release,
                 standing: i.standing,
-                parked_question: i.parked_question,
                 updated_at: i.updated_at,
             })
             .collect();
@@ -902,7 +898,6 @@ impl Client {
             ping_link: s.ping_link,
             open: s.open as u32,
             done: s.done as u32,
-            parked: s.parked as u32,
             crashes_today: s.crashes_today as u32,
             contested: (!s.contested.is_empty()).then(|| {
                 let names: Vec<String> = s.contested.iter().map(|c| e.store.name_of(c)).collect();
