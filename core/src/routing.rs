@@ -119,9 +119,9 @@ impl Node {
             Node::Outcome(Outcome::NoAction) => "no action",
             Node::Outcome(Outcome::Nudge) => "nudge the driver",
             Node::Outcome(Outcome::Ping) => "ping you",
-            Node::Jev(Stream::Other) | Node::Claude(Check::Other) | Node::Outcome(Outcome::Other) => {
-                "other"
-            }
+            Node::Jev(Stream::Other)
+            | Node::Claude(Check::Other)
+            | Node::Outcome(Outcome::Other) => "other",
         }
     }
 
@@ -392,7 +392,8 @@ impl Flow {
 }
 
 fn in_window(d: &Decision, now: u64, w: Window) -> bool {
-    d.at + w.secs() >= now
+    // `at` is whatever the record says: a huge one mustn't overflow.
+    d.at.saturating_add(w.secs()) >= now
 }
 
 /// The diagram for the decisions within `w` of `now`.
@@ -471,7 +472,7 @@ struct DecisionJson {
     #[serde(deserialize_with = "lenient")]
     outcome: String,
     #[serde(deserialize_with = "lenient")]
-    posts: Vec<String>,
+    posts: Vec<Value>,
     #[serde(deserialize_with = "lenient")]
     state: Option<String>,
     #[serde(deserialize_with = "lenient")]
@@ -541,8 +542,13 @@ impl Logs {
                     jev: j.jev.filter(|s| !s.is_empty()),
                     model: j.model.filter(|s| !s.is_empty()),
                     outcome: j.outcome,
-                    posts: j.posts,
-                    state: j.state,
+                    // One bad entry drops itself, not the list.
+                    posts: j
+                        .posts
+                        .into_iter()
+                        .filter_map(|p| p.as_str().filter(|s| !s.is_empty()).map(String::from))
+                        .collect(),
+                    state: j.state.filter(|s| !s.is_empty()),
                     reason: j.reason,
                 }
             })
@@ -558,7 +564,8 @@ impl Logs {
         true
     }
 
-    /// Every channel's decisions from the newest log a watcher signed.
+    /// Every channel's decisions from the newest log a watcher signed,
+    /// oldest first.
     pub fn decisions(&self, watchers: &[String]) -> Vec<Decision> {
         let mut out = vec![];
         for slot in self.channels.values() {
@@ -573,6 +580,644 @@ impl Logs {
                 out.extend(l.decisions.iter().cloned());
             }
         }
+        // Stable, so one log's same-second entries keep their order.
+        out.sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.channel.cmp(&b.channel)));
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checklist::{Checklists, Trust, WatchState};
+    use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+    use serde_json::json;
+
+    const CH: &str = "2130646b-d6c8-4ec3-93e3-36f77bee1a37";
+    const NOW: u64 = 1_792_460_000;
+
+    fn hex(k: &Keys) -> String {
+        k.public_key().to_hex()
+    }
+
+    /// An event with these tags, as written.
+    fn ev(keys: &Keys, kind: u16, tags: &[[&str; 2]], at: u64, content: &str) -> Event {
+        EventBuilder::new(Kind::Custom(kind), content)
+            .tags(tags.iter().map(|t| Tag::parse(*t).unwrap()))
+            .custom_created_at(Timestamp::from(at))
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    fn envelope(ty: &str, d: &str) -> Vec<[String; 2]> {
+        [
+            ["d", d],
+            ["h", CH],
+            ["t", TAG],
+            ["channel", CH],
+            ["checklist-type", ty],
+        ]
+        .map(|[a, b]| [a.to_string(), b.to_string()])
+        .to_vec()
+    }
+
+    fn with(tags: &[[String; 2]]) -> Vec<[&str; 2]> {
+        tags.iter().map(|[a, b]| [a.as_str(), b.as_str()]).collect()
+    }
+
+    fn routing_d() -> String {
+        format!("{TAG}/{TYPE}/{CH}")
+    }
+
+    /// A valid routing log in CH with these decisions.
+    fn log(keys: &Keys, at: u64, decisions: Value) -> Event {
+        let content = json!({"v": 1, "decisions": decisions}).to_string();
+        ev(
+            keys,
+            KIND_WATCH,
+            &with(&envelope(TYPE, &routing_d())),
+            at,
+            &content,
+        )
+    }
+
+    fn dec(at: u64, stage: &str, jev: Option<&str>, model: Option<&str>, outcome: &str) -> Value {
+        json!({"at": at, "thread": "root1", "stop": format!("stop{at}"), "trigger": "idle",
+            "stage": stage, "jev": jev, "model": model, "outcome": outcome,
+            "posts": if outcome == "none" { vec![] } else { vec![format!("post{at}")] },
+            "state": "working", "reason": "r"})
+    }
+
+    fn logs_with(w: &Keys, ds: Value) -> Vec<Decision> {
+        let mut l = Logs::default();
+        assert!(l.apply(&log(w, NOW, ds)));
+        l.decisions(&[hex(w)])
+    }
+
+    #[test]
+    fn envelope_must_be_exact() {
+        let w = Keys::generate();
+        assert_eq!(channel_of(&log(&w, NOW, json!([]))), Some(CH));
+        let good = envelope(TYPE, &routing_d());
+        let bad = |i: usize, v: &str| {
+            let mut t = good.clone();
+            t[i][1] = v.to_string();
+            ev(&w, KIND_WATCH, &with(&t), NOW, "{}")
+        };
+        // d: wrong prefix, type, channel, extra or missing segment, case.
+        for d in [
+            format!("x/{TYPE}/{CH}"),
+            format!("{TAG}/watch/{CH}"),
+            format!("{TAG}/{TYPE}/other"),
+            format!("{TAG}/{TYPE}/{CH}/extra"),
+            format!("{TAG}/{TYPE}"),
+            format!("{TAG}/{TYPE}/{}", CH.to_uppercase()),
+        ] {
+            assert_eq!(channel_of(&bad(0, &d)), None, "{d}");
+        }
+        assert_eq!(channel_of(&bad(1, "")), None, "empty h");
+        assert_eq!(channel_of(&bad(2, "other-tag")), None, "t");
+        assert_eq!(channel_of(&bad(3, "elsewhere")), None, "channel != h");
+        assert_eq!(channel_of(&bad(4, "watch")), None, "checklist-type");
+        // Wrong kind, or a tag missing.
+        let wrong_kind = ev(&w, 30471, &with(&good), NOW, "{}");
+        assert_eq!(channel_of(&wrong_kind), None);
+        for i in 0..good.len() {
+            let mut t = good.clone();
+            t.remove(i);
+            assert_eq!(
+                channel_of(&ev(&w, KIND_WATCH, &with(&t), NOW, "{}")),
+                None,
+                "without {}",
+                good[i][0]
+            );
+        }
+        let mut l = Logs::default();
+        assert!(!l.apply(&bad(4, "watch")));
+        assert!(l.decisions(&[hex(&w)]).is_empty());
+    }
+
+    /// A routing record never reads as a watch record, and a watch record
+    /// never reads as routing, both kind 30472 in the same channel.
+    #[test]
+    fn routing_and_watch_records_never_cross() {
+        let w = Keys::generate();
+        let mut s = Checklists::new(Trust {
+            owner: hex(&Keys::generate()),
+            watchers: vec![hex(&w)],
+        });
+        // A routing log whose content even looks like a watch record.
+        let content = json!({"v": 1, "state": "stalled", "decisions": [dec(NOW, "judged",
+            Some("reported_done"), None, "nudge")]});
+        let r = ev(
+            &w,
+            KIND_WATCH,
+            &with(&envelope(TYPE, &routing_d())),
+            NOW,
+            &content.to_string(),
+        );
+        assert!(s.apply(&r));
+        assert!(s.watch(CH).is_none(), "routing read as watch");
+        assert_eq!(s.decisions().len(), 1);
+        // A watch record whose content looks like a routing log.
+        let wd = format!("{TAG}/watch/{CH}");
+        let wc = json!({"v": 1, "state": "stalled", "decisions": [dec(NOW, "judged", None, None, "ping")]});
+        let wr = ev(
+            &w,
+            KIND_WATCH,
+            &with(&envelope("watch", &wd)),
+            NOW + 1,
+            &wc.to_string(),
+        );
+        assert_eq!(channel_of(&wr), None);
+        assert!(s.apply(&wr));
+        assert_eq!(s.watch(CH).unwrap().state, WatchState::Stalled);
+        let ds = s.decisions();
+        assert_eq!(ds.len(), 1, "watch read as routing");
+        assert_eq!(ds[0].outcome, "nudge");
+        // Each decision carries the channel's watch record.
+        assert_eq!(ds[0].watch.as_deref(), Some(wr.id.to_hex().as_str()));
+        // The mixes: routing type with the watch d, watch type with the
+        // routing d. Neither reader takes them.
+        for (ty, d) in [(TYPE, wd.clone()), ("watch", routing_d())] {
+            let e = ev(&w, KIND_WATCH, &with(&envelope(ty, &d)), NOW + 5, "{}");
+            assert!(!s.apply(&e), "{ty} {d}");
+        }
+        assert_eq!(s.watch(CH).unwrap().event_id, wr.id.to_hex());
+        assert_eq!(s.decisions().len(), 1);
+    }
+
+    #[test]
+    fn only_watcher_signed_logs_count() {
+        let (w, fake) = (Keys::generate(), Keys::generate());
+        let mut l = Logs::default();
+        let one = json!([dec(NOW, "judged", Some("reported_done"), None, "nudge")]);
+        assert!(l.apply(&log(&w, NOW, one)));
+        // Newer, but not the watcher's: stored, never counted.
+        let many = Value::Array(vec![dec(NOW, "not_running", None, None, "none"); 3]);
+        assert!(l.apply(&log(&fake, NOW + 10, many)));
+        assert_eq!(l.decisions(&[hex(&w)]).len(), 1);
+        assert_eq!(l.decisions(&[hex(&fake)]).len(), 3);
+        assert!(l.decisions(&[]).is_empty());
+        // Two watcher keys: the newer log wins.
+        assert_eq!(l.decisions(&[hex(&w), hex(&fake)]).len(), 3);
+    }
+
+    #[test]
+    fn the_newest_version_replaces_the_log() {
+        let w = Keys::generate();
+        let mut l = Logs::default();
+        let v1 = log(
+            &w,
+            NOW,
+            json!([dec(NOW - 5, "not_running", None, None, "none")]),
+        );
+        let v2 = log(
+            &w,
+            NOW + 1,
+            json!([
+                dec(NOW - 5, "not_running", None, None, "none"),
+                dec(NOW, "judged", Some("cut_off"), None, "nudge")
+            ]),
+        );
+        assert!(l.apply(&v2));
+        // Older arrives late, and a replay of the same version: ignored.
+        assert!(!l.apply(&v1));
+        assert!(!l.apply(&v2));
+        let ds = l.decisions(&[hex(&w)]);
+        assert_eq!(ds.len(), 2, "replaced, not appended");
+        assert!(ds.iter().all(|d| d.record == v2.id.to_hex()));
+        // Same second: the lower id wins (NIP-01).
+        let a = log(&w, NOW + 2, json!([dec(NOW, "judged", None, None, "ping")]));
+        let b = log(&w, NOW + 2, json!([dec(NOW, "judged", None, None, "none")]));
+        let (lo, hi) = if a.id.to_hex() < b.id.to_hex() {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        assert!(l.apply(&hi));
+        assert!(l.apply(&lo));
+        assert!(!l.apply(&hi));
+        assert_eq!(l.decisions(&[hex(&w)])[0].record, lo.id.to_hex());
+    }
+
+    #[test]
+    fn parsing_is_lenient() {
+        let w = Keys::generate();
+        let mut l = Logs::default();
+        // Not JSON, not an object, decisions not a list: an empty log that
+        // still replaces the older one.
+        for (i, c) in ["not json", "[1,2]", r#"{"decisions": "x"}"#]
+            .iter()
+            .enumerate()
+        {
+            let e = ev(
+                &w,
+                KIND_WATCH,
+                &with(&envelope(TYPE, &routing_d())),
+                NOW + i as u64,
+                c,
+            );
+            assert!(l.apply(&e), "{c}");
+            assert!(l.decisions(&[hex(&w)]).is_empty(), "{c}");
+        }
+        let ds = logs_with(
+            &w,
+            json!([
+                "not an object",
+                {"at": "soon", "stage": 7, "jev": ["x"], "outcome": "nudge",
+                 "posts": ["p1", 5, "", null, "p2"], "thread": "", "stop": null,
+                 "state": "", "reason": {"long": true}, "extra": 1},
+                {"at": NOW, "stage": "judged", "jev": "asks_decision", "model": "needs_owner",
+                 "outcome": "ping", "posts": "p3"}
+            ]),
+        );
+        assert_eq!(ds.len(), 2, "a non-object entry drops itself only");
+        let d = ds.iter().find(|d| d.outcome == "nudge").unwrap();
+        assert_eq!((d.at, d.stage.as_str(), d.jev.as_deref()), (0, "", None));
+        assert_eq!(d.posts, ["p1", "p2"]);
+        assert_eq!((d.thread.as_deref(), d.stop.as_deref()), (None, None));
+        assert_eq!((d.state.as_deref(), d.reason.as_str()), (None, ""));
+        assert_eq!(d.channel, CH);
+        let p = ds.iter().find(|d| d.outcome == "ping").unwrap();
+        assert!(p.posts.is_empty());
+        assert_eq!(p.model.as_deref(), Some("needs_owner"));
+        // A wild `at` neither panics nor falls out of every window.
+        let mut big = p.clone();
+        big.at = u64::MAX;
+        assert_eq!(flow(&[big], NOW, Window::Hour).count(Node::Seen), 1);
+    }
+
+    #[test]
+    fn unknown_labels_go_to_other() {
+        let d = |stage: &str, jev: Option<&str>, model: Option<&str>, out: &str| Decision {
+            channel: CH.into(),
+            record: "r".into(),
+            watch: None,
+            at: NOW,
+            thread: None,
+            stop: None,
+            trigger: "idle".into(),
+            stage: stage.into(),
+            jev: jev.map(String::from),
+            model: model.map(String::from),
+            outcome: out.into(),
+            posts: vec![],
+            state: None,
+            reason: String::new(),
+        };
+        use Node::*;
+        assert_eq!(
+            d("judged", Some("new_label"), None, "nudge").path(),
+            [
+                Seen,
+                Running,
+                Jev(Stream::Other),
+                Outcome(super::Outcome::Nudge)
+            ]
+        );
+        assert_eq!(
+            d("judged", None, None, "none").path()[2],
+            Jev(Stream::Other),
+            "judged with no label"
+        );
+        assert_eq!(
+            d("judged", Some("needs_access"), Some("maybe"), "ping").path()[3],
+            Claude(Check::Other)
+        );
+        assert_eq!(
+            d("judged", Some("needs_access"), None, "ping").path()[3],
+            Claude(Check::Other),
+            "asks always reaches the check"
+        );
+        assert_eq!(
+            *d("judged", Some("reported_done"), None, "escalate")
+                .path()
+                .last()
+                .unwrap(),
+            Outcome(super::Outcome::Other)
+        );
+        // "other" boxes show only when something is in them.
+        let f = flow(
+            &[d("judged", Some("reported_done"), None, "nudge")],
+            NOW,
+            Window::Day,
+        );
+        assert!(!f.nodes().iter().any(|n| n.label() == "other"));
+        let f = flow(&[d("judged", Some("zzz"), None, "boom")], NOW, Window::Day);
+        assert!(f.nodes().contains(&Jev(Stream::Other)));
+        assert!(f.nodes().contains(&Outcome(super::Outcome::Other)));
+        assert!(!f.nodes().contains(&Claude(Check::Other)));
+        // Keys round-trip and are unique.
+        for n in Node::ALL {
+            assert_eq!(Node::from_key(&n.key()), Some(n), "{}", n.key());
+        }
+    }
+
+    #[test]
+    fn no_op_stages_skip_to_the_outcome() {
+        let w = Keys::generate();
+        use Node::*;
+        for (stage, running) in [
+            ("not_running", false),
+            ("contested_idle", false),
+            ("not_work_thread", true),
+            ("turn_started", true),
+            ("stopped_running", true),
+            ("thread_moved", true),
+        ] {
+            let ds = logs_with(
+                &w,
+                json!([dec(
+                    NOW,
+                    stage,
+                    Some("asks_decision"),
+                    Some("needs_owner"),
+                    "none"
+                )]),
+            );
+            let want = if running {
+                vec![Seen, Running, Outcome(super::Outcome::NoAction)]
+            } else {
+                vec![Seen, Outcome(super::Outcome::NoAction)]
+            };
+            assert_eq!(ds[0].path(), want, "{stage}");
+        }
+        let ds = logs_with(
+            &w,
+            json!([dec(
+                NOW,
+                "judged",
+                Some("asks_decision"),
+                Some("needs_owner"),
+                "ping"
+            )]),
+        );
+        assert_eq!(
+            ds[0].path(),
+            [
+                Seen,
+                Running,
+                Jev(Stream::Asks),
+                Claude(Check::NeedsOwner),
+                Outcome(super::Outcome::Ping)
+            ]
+        );
+        // Only "asks something" reaches the Claude check.
+        for jev in [
+            "will_continue",
+            "cut_off",
+            "waiting_on_agent",
+            "reported_done",
+        ] {
+            let ds = logs_with(
+                &w,
+                json!([dec(NOW, "judged", Some(jev), Some("needs_owner"), "nudge")]),
+            );
+            assert!(
+                !ds[0].path().iter().any(|n| matches!(n, Claude(_))),
+                "{jev}"
+            );
+        }
+    }
+
+    /// The mock's mix: 6 not running, 2 asks (1 ping, 1 agent decides ->
+    /// nudge), 3 keep going, 1 finished, 1 turn started.
+    fn mix() -> Value {
+        json!([
+            dec(NOW - 100, "not_running", None, None, "none"),
+            dec(NOW - 100, "not_running", None, None, "none"),
+            dec(NOW - 100, "contested_idle", None, None, "none"),
+            dec(NOW - 7200, "not_running", None, None, "none"),
+            dec(NOW - 7200, "not_running", None, None, "none"),
+            dec(NOW - 3 * 86_400, "not_running", None, None, "none"),
+            dec(
+                NOW - 60,
+                "judged",
+                Some("asks_decision"),
+                Some("needs_owner"),
+                "ping"
+            ),
+            dec(
+                NOW - 50,
+                "judged",
+                Some("needs_access"),
+                Some("agent_decides"),
+                "nudge"
+            ),
+            dec(NOW - 40, "judged", Some("will_continue"), None, "nudge"),
+            dec(NOW - 30, "judged", Some("cut_off"), None, "nudge"),
+            dec(NOW - 9000, "judged", Some("cut_off"), None, "nudge"),
+            dec(NOW - 20, "judged", Some("reported_done"), None, "none"),
+            dec(NOW - 10, "turn_started", None, None, "none"),
+        ])
+    }
+
+    #[test]
+    fn flow_counts_and_edges() {
+        let w = Keys::generate();
+        let ds = logs_with(&w, mix());
+        let f = flow(&ds, NOW, Window::Week);
+        use super::Outcome as O;
+        use Node::*;
+        let c = |n| f.count(n);
+        assert_eq!((c(Seen), c(Running)), (13, 7));
+        assert_eq!(
+            [
+                c(Jev(Stream::KeepsGoing)),
+                c(Jev(Stream::WaitingOnBot)),
+                c(Jev(Stream::Finished)),
+                c(Jev(Stream::Asks))
+            ],
+            [3, 0, 1, 2]
+        );
+        assert_eq!(
+            [
+                c(Claude(Check::AgentDecides)),
+                c(Claude(Check::NeedsOwner)),
+                c(Claude(Check::NotAQuestion))
+            ],
+            [1, 1, 0]
+        );
+        assert_eq!(
+            [
+                c(Outcome(O::NoAction)),
+                c(Outcome(O::Nudge)),
+                c(Outcome(O::Ping))
+            ],
+            [8, 4, 1]
+        );
+        // Every decision ends in exactly one outcome.
+        assert_eq!(f.layers[4].total(), c(Seen));
+        assert_eq!(f.layers.len(), 5);
+        assert_eq!(f.layers[2].name, "jev");
+        let e = |from, to| {
+            f.edges
+                .iter()
+                .find(|e| e.from == from && e.to == to)
+                .map_or(0, |e| e.count)
+        };
+        assert_eq!(e(Seen, Running), 7);
+        assert_eq!(e(Seen, Outcome(O::NoAction)), 6, "no-ops skip the layers");
+        assert_eq!(e(Running, Outcome(O::NoAction)), 1, "turn started");
+        assert_eq!(e(Running, Jev(Stream::KeepsGoing)), 3);
+        assert_eq!(e(Jev(Stream::KeepsGoing), Outcome(O::Nudge)), 3);
+        assert_eq!(e(Jev(Stream::Asks), Claude(Check::NeedsOwner)), 1);
+        assert_eq!(e(Claude(Check::NeedsOwner), Outcome(O::Ping)), 1);
+        assert_eq!(e(Claude(Check::AgentDecides), Outcome(O::Nudge)), 1);
+        assert_eq!(e(Jev(Stream::Finished), Outcome(O::NoAction)), 1);
+        // Out of each box goes what came in (no box loses or gains).
+        for n in f.nodes().into_iter().filter(|n| n.layer() < 4) {
+            let out: usize = f
+                .edges
+                .iter()
+                .filter(|e| e.from == n)
+                .map(|e| e.count)
+                .sum();
+            assert_eq!(out, c(n), "{}", n.label());
+        }
+        // Edges come in node order.
+        let keys: Vec<_> = f.edges.iter().map(|e| (e.from, e.to)).collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted);
+        // Tab order: every box drawn, top to bottom.
+        assert_eq!(f.nodes()[0], Seen);
+        assert_eq!(*f.nodes().last().unwrap(), Outcome(O::Ping));
+    }
+
+    #[test]
+    fn the_window_filters() {
+        let w = Keys::generate();
+        let ds = logs_with(&w, mix());
+        let seen = |win| flow(&ds, NOW, win).count(Node::Seen);
+        assert_eq!(
+            (seen(Window::Hour), seen(Window::Day), seen(Window::Week)),
+            (9, 12, 13)
+        );
+        assert_eq!(
+            flow(&ds, NOW + 8 * 86_400, Window::Week).count(Node::Seen),
+            0
+        );
+        // The edge of the window counts.
+        let at = |a| logs_with(&w, json!([dec(a, "not_running", None, None, "none")]));
+        assert_eq!(
+            flow(&at(NOW - 3600), NOW, Window::Hour).count(Node::Seen),
+            1
+        );
+        assert_eq!(
+            flow(&at(NOW - 3601), NOW, Window::Hour).count(Node::Seen),
+            0
+        );
+        assert_eq!(Window::ALL.map(Window::label), ["1h", "24h", "7d"]);
+    }
+
+    #[test]
+    fn sample_cycles_newest_first() {
+        let w = Keys::generate();
+        let ds = logs_with(&w, mix());
+        let kg = Node::Jev(Stream::KeepsGoing);
+        let ats: Vec<u64> = (0..4)
+            .map(|n| sample(&ds, NOW, Window::Week, kg, n).unwrap().at)
+            .collect();
+        assert_eq!(
+            ats,
+            [NOW - 30, NOW - 40, NOW - 9000, NOW - 30],
+            "round again"
+        );
+        // The window bounds what's sampled.
+        let ats: Vec<u64> = (0..3)
+            .map(|n| sample(&ds, NOW, Window::Hour, kg, n).unwrap().at)
+            .collect();
+        assert_eq!(ats, [NOW - 30, NOW - 40, NOW - 30]);
+        assert!(sample(&ds, NOW, Window::Week, Node::Jev(Stream::WaitingOnBot), 0).is_none());
+        let p = sample(
+            &ds,
+            NOW,
+            Window::Hour,
+            Node::Outcome(super::Outcome::Ping),
+            7,
+        )
+        .unwrap();
+        assert_eq!(p.jev.as_deref(), Some("asks_decision"));
+        assert!(sample(&[], NOW, Window::Week, Node::Seen, 0).is_none());
+    }
+
+    #[test]
+    fn why_walks_the_path_with_its_records() {
+        let w = Keys::generate();
+        let mut ds = logs_with(
+            &w,
+            json!([{"at": NOW, "thread": "root1", "stop": "stop1", "trigger": "idle",
+                "stage": "judged", "jev": "asks_decision", "model": "needs_owner",
+                "outcome": "ping", "posts": ["ping1"], "state": "waiting_on_lucian",
+                "reason": "staging write, release step"}]),
+        );
+        ds[0].watch = Some("watch1".into());
+        let d = &ds[0];
+        let s = why(d);
+        let titles: Vec<_> = s.iter().map(|s| s.title).collect();
+        assert_eq!(
+            titles,
+            [
+                "watcher saw it",
+                "checklist",
+                "jev",
+                "claude check",
+                "result"
+            ]
+        );
+        let link = |id: &str| format!("buzz://message?channel={CH}&id={id}&thread=root1");
+        assert_eq!(
+            (s[0].label.as_str(), s[0].event.as_deref()),
+            ("agent stopped", Some("stop1"))
+        );
+        assert_eq!(s[0].link.as_deref(), Some(link("stop1").as_str()));
+        assert_eq!(
+            (s[1].label.as_str(), s[1].event.as_deref()),
+            ("list running", Some("watch1"))
+        );
+        assert_eq!(
+            (s[2].label.as_str(), s[2].detail.as_str()),
+            ("asks something", "asks_decision")
+        );
+        assert_eq!(s[2].event.as_deref(), Some(d.record.as_str()));
+        assert_eq!(
+            (s[3].label.as_str(), s[3].detail.as_str()),
+            ("needs you", "staging write, release step")
+        );
+        assert_eq!(
+            (s[4].label.as_str(), s[4].detail.as_str()),
+            ("ping you", "waiting on lucian")
+        );
+        assert_eq!(s[4].event.as_deref(), Some("ping1"));
+        assert_eq!(s[4].link.as_deref(), Some(link("ping1").as_str()));
+        assert_eq!(d.link().as_deref(), Some(link("stop1").as_str()));
+        // A no-op: what the watcher saw, why nothing ran, the result (the
+        // routing record, nothing posted), with the reason.
+        let n = logs_with(
+            &w,
+            json!([{"at": NOW, "thread": null, "stop": null, "trigger": "recheck",
+                "stage": "not_running", "outcome": "none", "reason": "list ideating"}]),
+        );
+        let s = why(&n[0]);
+        assert_eq!(
+            s.iter().map(|s| s.title).collect::<Vec<_>>(),
+            ["watcher saw it", "checklist", "result"]
+        );
+        assert_eq!(
+            (s[0].label.as_str(), s[0].event.as_deref()),
+            ("recheck", None)
+        );
+        assert_eq!(s[1].label, "list not running");
+        assert_eq!(
+            (s[2].label.as_str(), s[2].detail.as_str()),
+            ("no action", "list ideating")
+        );
+        assert_eq!(
+            (s[2].event.as_deref(), s[2].link.as_deref()),
+            (Some(n[0].record.as_str()), None)
+        );
+        assert_eq!(n[0].link(), None);
     }
 }
