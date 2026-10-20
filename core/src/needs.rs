@@ -3,8 +3,7 @@
 //! rows and nothing is a local flag.
 //!
 //! Needs an answer: channels the watcher says wait on him (stalled, waiting
-//! on lucian, waiting on release), parked items with their question (the
-//! driving list's only, at most `PARKED_MAX` a channel), a contested
+//! on lucian, waiting on release), a contested
 //! channel whose lists run, and people's @mentions and DMs he hasn't
 //! answered. FYI: bots' @mentions of
 //! him the watcher didn't flag. A message row clears once he posts in its
@@ -13,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use crate::checklist::{Checklists, Status, WatchState};
+use crate::checklist::{Checklists, WatchState};
 use crate::model::{Message, Store};
 use crate::telemetry::Agents;
 
@@ -32,8 +31,6 @@ pub enum Section {
 pub enum Reason {
     /// The watcher's state for the channel.
     Watch(WatchState),
-    /// A parked checklist item.
-    Parked,
     /// Two or more lists claim the channel and one runs: the owner picks a
     /// driver. Their creators.
     Contested(Vec<String>),
@@ -82,7 +79,6 @@ impl Row {
     pub fn label(&self) -> String {
         match &self.reason {
             Reason::Watch(s) => s.label(),
-            Reason::Parked => "parked".into(),
             Reason::Contested(_) => "contested".into(),
             Reason::Mention => "mention".into(),
             Reason::Dm => "dm".into(),
@@ -198,10 +194,21 @@ pub fn rows(
     for channel in lists.channels() {
         let header = lists.header(channel);
         let watch = lists.watch(channel);
+        // The go message is often a reply in a thread, not a root: open the
+        // thread it sits in, or the row lands on a one-message "thread".
+        let root_of = |id: String| {
+            store
+                .channels
+                .get(channel)
+                .and_then(|c| c.messages.get(&id))
+                .and_then(|m| m.root.clone())
+                .unwrap_or(id)
+        };
         let thread = watch
             .as_ref()
             .and_then(|w| w.thread.clone())
-            .or_else(|| header.as_ref().and_then(|h| h.go.clone()));
+            .or_else(|| header.as_ref().and_then(|h| h.go.clone()))
+            .map(root_of);
         if let Some(w) = watch.as_ref().filter(|w| w.state.needs_you()) {
             let ping = w
                 .ping
@@ -274,51 +281,6 @@ pub fn rows(
                 key: format!("contested:{channel}:{}", driver.contested.join(",")),
             });
         }
-        // The driving list's parked items (the reader drops everyone
-        // else's), oldest first, at most PARKED_MAX and then one row for
-        // the rest.
-        let mut parked: Vec<_> = lists
-            .items(channel)
-            .into_iter()
-            .filter(|it| it.status == Status::Parked)
-            .collect();
-        parked.sort_by(|a, b| (a.updated_at, &a.id).cmp(&(b.updated_at, &b.id)));
-        let rest = parked.split_off(parked.len().min(PARKED_MAX));
-        for it in parked {
-            out.push(Row {
-                section: Section::Answer,
-                reason: Reason::Parked,
-                channel: channel.to_string(),
-                who: it.creator.clone(),
-                text: it
-                    .parked_question
-                    .as_deref()
-                    .map(one_line)
-                    .unwrap_or_else(|| one_line(&it.text)),
-                at: it.updated_at,
-                message: None,
-                thread: thread.clone(),
-                // Stable across edits that leave the question as it was.
-                key: format!(
-                    "item:{channel}:{}:{}",
-                    it.id,
-                    it.parked_question.as_deref().unwrap_or_default()
-                ),
-            });
-        }
-        if let Some(first) = rest.first() {
-            out.push(Row {
-                section: Section::Answer,
-                reason: Reason::Parked,
-                channel: channel.to_string(),
-                who: first.creator.clone(),
-                text: format!("+{} more parked (c: the checklist)", rest.len()),
-                at: first.updated_at,
-                message: None,
-                thread: thread.clone(),
-                key: format!("item:{channel}:more"),
-            });
-        }
     }
     let since = now.saturating_sub(HORIZON);
     for (id, ch) in &store.channels {
@@ -376,9 +338,6 @@ pub fn rows(
 
 /// FYI rows kept: the newest ones.
 pub const FYI_MAX: usize = 20;
-
-/// Parked rows a channel gets before the rest fold into one "+N more".
-pub const PARKED_MAX: usize = 5;
 
 /// How many rows need an answer: the "⚑ N".
 pub fn answer_count(rows: &[Row]) -> usize {
@@ -671,7 +630,30 @@ mod tests {
     }
 
     #[test]
-    fn watcher_asks_and_parked_items_until_they_move() {
+    fn a_watch_row_opens_the_thread_the_go_reply_sits_in() {
+        let mut w = World::new();
+        let (op, bot) = (w.op.clone(), w.bot.clone());
+        let bk = World::pk(&bot);
+        let root = w.post(&op, CH, "how's it look?", None, None, NOW - 4000);
+        // The go is a reply in that thread, as it is when the operator says
+        // go mid-conversation.
+        let go = w.post(&op, CH, "yeah start a list", None, Some(&root), NOW - 3000);
+        w.record(
+            &bot,
+            30471,
+            format!("buzz-checklist/header/{CH}/{bk}"),
+            NOW - 2900,
+            serde_json::json!({"title": "t", "mode": "running", "go": go}),
+        );
+        // A watch record that names no thread: the row falls back to the go.
+        w.watch("stalled", NOW - 2800, None, None);
+        let r = w.rows();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].thread.as_deref(), Some(root.as_str()));
+    }
+
+    #[test]
+    fn watcher_asks_until_they_move() {
         let mut w = World::new();
         let (op, bot) = (w.op.clone(), w.bot.clone());
         let bk = World::pk(&bot);
@@ -701,8 +683,6 @@ mod tests {
             NOW - 5000,
             serde_json::json!({"title": "t", "mode": "running", "go": root}),
         );
-        w.record(&bot, 30470, format!("buzz-checklist/item/{CH}/{bk}/000000a1"), NOW - 650,
-            serde_json::json!({"text": "migrate relay", "status": "parked", "parked_question": "tonight or nightly?\nmore"}));
         w.record(
             &bot,
             30470,
@@ -712,35 +692,21 @@ mod tests {
         );
         w.watch("waiting_on_lucian", NOW - 600, Some(&ping), Some(&root));
         let r = w.rows();
-        // Parked item (older) then the watch row; the ping and the agent's
-        // mention in that thread aren't rows of their own.
+        // The watch row only; the ping and the agent's mention in that
+        // thread aren't rows of their own.
         assert_eq!(
             keys(&r),
-            [
-                (Section::Answer, "parked".to_string()),
-                (Section::Answer, "waiting on lucian".into()),
-            ]
+            [(Section::Answer, "waiting on lucian".to_string())]
         );
-        assert_eq!(r[0].text, "tonight or nightly?");
+        assert_eq!(r[0].text, "waiting on lucian: which relay image?");
+        assert_eq!(r[0].message.as_deref(), Some(ping.as_str()));
         assert_eq!(r[0].who, bk);
         assert_eq!(r[0].thread.as_deref(), Some(root.as_str()));
-        assert_eq!(r[1].text, "waiting on lucian: which relay image?");
-        assert_eq!(r[1].message.as_deref(), Some(ping.as_str()));
-        assert_eq!(r[1].who, bk);
-        // The jump goes oldest first and comes round.
+        // The jump comes round to the same row.
         let first = next_answer(&r, None).unwrap();
         assert_eq!(first.key, r[0].key);
-        assert_eq!(next_answer(&r, Some(&first.key)).unwrap().key, r[1].key);
-        assert_eq!(next_answer(&r, Some(&r[1].key)).unwrap().key, r[0].key);
-        // The item moves: its row goes. The watcher moves on: so does that.
-        w.record(
-            &bot,
-            30470,
-            format!("buzz-checklist/item/{CH}/{bk}/000000a1"),
-            NOW - 10,
-            serde_json::json!({"text": "migrate relay", "status": "open"}),
-        );
-        assert_eq!(w.rows().len(), 1);
+        assert_eq!(next_answer(&r, Some(&first.key)).unwrap().key, r[0].key);
+        // The watcher moves on: its row goes.
         w.watch("working", NOW - 5, None, Some(&root));
         let r = w.rows();
         // With no ask out, the agent's mention is plain FYI.
@@ -773,7 +739,7 @@ mod tests {
         };
         watch(&mut w, NOW - 600);
         let before: Vec<String> = w.rows().iter().map(|r| r.key.clone()).collect();
-        assert_eq!(before.len(), 2);
+        assert_eq!(before.len(), 1, "a legacy parked item makes no row");
         // A nudge bump and a details edit: same asks, same keys.
         watch(&mut w, NOW - 300);
         w.record(&bot, 30470, format!("buzz-checklist/item/{CH}/{bk}/000000a1"), NOW - 290,
@@ -785,7 +751,7 @@ mod tests {
         );
         // No thread anywhere: a top-level answer in the channel clears the watch row.
         w.post(&op, CH, "nightly", None, None, NOW - 100);
-        assert_eq!(keys(&w.rows()), [(Section::Answer, "parked".to_string())]);
+        assert!(w.rows().is_empty());
     }
 
     #[test]
@@ -843,13 +809,13 @@ mod tests {
         assert!(w.rows().is_empty());
     }
 
-    /// Forged parked items (another member's, at its own address or the
-    /// driver's) make no rows; the driver's own fold past PARKED_MAX.
+    /// No parking (lucian 2026-10-20): the driver's legacy parked item is
+    /// open work, not a question for the operator.
     #[test]
-    fn parked_rows_come_from_the_driver_only_and_are_capped() {
+    fn a_legacy_parked_item_makes_no_row() {
         let mut w = World::new();
-        let (bot, human) = (w.bot.clone(), w.human.clone());
-        let (bk, hk) = (World::pk(&bot), World::pk(&human));
+        let bot = w.bot.clone();
+        let bk = World::pk(&bot);
         w.record(
             &bot,
             30471,
@@ -857,34 +823,14 @@ mod tests {
             NOW - 5000,
             serde_json::json!({"title": "t", "mode": "running"}),
         );
-        let parked =
-            serde_json::json!({"text": "x", "status": "parked", "parked_question": "forged?"});
-        for i in 0..50u64 {
-            w.record(
-                &human,
-                30470,
-                format!("buzz-checklist/item/{CH}/{hk}/{i:08x}"),
-                NOW - 100,
-                parked.clone(),
-            );
-            w.record(
-                &human,
-                30470,
-                format!("buzz-checklist/item/{CH}/{bk}/{i:08x}"),
-                NOW - 100,
-                parked.clone(),
-            );
-        }
+        w.record(
+            &bot,
+            30470,
+            format!("buzz-checklist/item/{CH}/{bk}/000000c1"),
+            NOW - 900,
+            serde_json::json!({"text": "q", "status": "parked", "parked_question": "which?"}),
+        );
         assert!(w.rows().is_empty());
-        for i in 0..(PARKED_MAX as u64 + 3) {
-            w.record(&bot, 30470, format!("buzz-checklist/item/{CH}/{bk}/{:08x}", 100 + i), NOW - 900 + i,
-                serde_json::json!({"text": "q", "status": "parked", "parked_question": format!("q{i}")}));
-        }
-        let r = w.rows();
-        assert_eq!(answer_count(&r), PARKED_MAX + 1);
-        let texts: Vec<&str> = r.iter().map(|r| r.text.as_str()).collect();
-        assert_eq!(texts[..PARKED_MAX], ["q0", "q1", "q2", "q3", "q4"]);
-        assert_eq!(texts[PARKED_MAX], "+3 more parked (c: the checklist)");
     }
 
     /// Two lists claim a channel: one "Needs an answer" row while one runs,

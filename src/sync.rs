@@ -655,6 +655,10 @@ impl Sync {
                     app.say(format!("couldn't open {url}: {e}"));
                 }
             }
+            Action::Copy(text) => match crate::clip::copy(&text) {
+                Ok(()) => app.say(format!("copied {} lines", text.lines().count().max(1))),
+                Err(e) => app.say(format!("couldn't copy: {e}")),
+            },
             Action::ReadAttachment(path) => self.spawn(async move {
                 let label = path.as_ref().map(|p| p.display().to_string());
                 let result = tokio::task::spawn_blocking(move || match path {

@@ -157,6 +157,14 @@ pub fn dropped_paths(paste: &str) -> Vec<PathBuf> {
     }
 }
 
+/// `f` on a code block: its text onto the system clipboard.
+pub fn copy(text: &str) -> Result<()> {
+    arboard::Clipboard::new()
+        .context("no clipboard available")?
+        .set_text(text)?;
+    Ok(())
+}
+
 /// Ctrl+V. Order: copied files (Finder), then image data (screenshots),
 /// then text that is a path.
 /// `BUZZ_VIM_CLIPBOARD_FILE` stands in for the system clipboard in tests,

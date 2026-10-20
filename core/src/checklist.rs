@@ -330,7 +330,6 @@ pub struct Summary {
     pub mode: Option<Mode>,
     pub open: usize,
     pub done: usize,
-    pub parked: usize,
     pub watch: Option<Watch>,
     /// `buzz://` link to the ping, when one is out.
     pub ping_link: Option<String>,
@@ -345,7 +344,7 @@ impl Summary {
     pub fn is_empty(&self) -> bool {
         self.mode.is_none()
             && self.contested.is_empty()
-            && self.open + self.done + self.parked == 0
+            && self.open + self.done == 0
             && self.watch.is_none()
             && self.crashes_today == 0
     }
@@ -684,9 +683,9 @@ impl Checklists {
                 .map(|h| h.title.clone())
                 .filter(|t| !t.is_empty()),
             mode: header.map(|h| h.mode),
-            open: count(Status::Open),
+            // No parking (lucian 2026-10-20): a legacy parked item is open work.
+            open: count(Status::Open) + count(Status::Parked),
             done: count(Status::Done),
-            parked: count(Status::Parked),
             watch,
             ping_link,
             crashes_today: self.crashes_since(channel, today),
@@ -1107,7 +1106,11 @@ mod tests {
         s.note_message(CH, "m2", 1001, "⚠ Agent process crashed: signal 9");
         s.note_message(CH, "m3", 1002, "all good");
         let sum = s.summary(CH, today);
-        assert_eq!((sum.open, sum.done, sum.parked), (2, 1, 1));
+        assert_eq!(
+            (sum.open, sum.done),
+            (3, 1),
+            "a legacy parked item counts as open"
+        );
         assert_eq!(sum.mode, Some(Mode::Running));
         assert_eq!(sum.title.as_deref(), Some("operator loop"));
         assert!(sum.contested.is_empty());

@@ -17,6 +17,7 @@ use crate::draft::Draft;
 use crate::keys::Mode;
 use crate::live::ConnState;
 use crate::media::Media;
+use crate::mention;
 use crate::model::Store;
 use crate::needs::{self, Row};
 use crate::readstate::{self, ReadState};
@@ -115,6 +116,8 @@ pub enum Action {
     },
     /// Hand a URL to the OS (browser, Buzz Desktop).
     OpenUrl(String),
+    /// Put text on the system clipboard.
+    Copy(String),
     /// Download images and open them in the OS viewer (Preview), all in
     /// one window, showing `current` first.
     OpenImages {
@@ -758,6 +761,10 @@ impl App {
 
     pub fn follow(&mut self, url: &str) {
         use crate::links::Target;
+        if let Some(text) = url.strip_prefix(crate::links::COPY) {
+            self.actions.push(Action::Copy(text.to_string()));
+            return;
+        }
         match crate::links::target(url) {
             Target::Message {
                 channel,
@@ -1114,36 +1121,31 @@ impl App {
         self.prefill = Some(self.draft_ref().text.clone());
     }
 
-    /// Candidates for the `@query` being typed: channel members first.
+    /// Candidates for the `@query` being typed: the thread's and channel's
+    /// people first, then our agents (mentioning one who isn't here adds
+    /// them on send). Names already mentioned in the draft are left out.
     pub fn mention_candidates(&self) -> Vec<(String, String)> {
         let Some((_, q)) = self.draft_ref().mention_query() else {
             return vec![];
         };
         let q = q.to_lowercase();
-        let ch = match (&self.thread, self.focus) {
-            (Some((c, _)), Pane::Thread) => Some(c.as_str()),
-            _ => self.current(),
+        let (ch, root) = match (&self.thread, self.focus) {
+            (Some((c, r)), Pane::Thread) => (Some(c.as_str()), Some(r.as_str())),
+            _ => (self.current(), None),
         };
-        // Our agents too: mentioning one who isn't here adds them on send.
-        let ch = ch.and_then(|c| self.store.channels.get(c));
-        let mut members: Vec<String> = ch.map(|c| c.members.clone()).unwrap_or_default();
-        if ch.is_some_and(|c| !c.is_dm) {
-            members.extend(self.agents.owned_keys().cloned());
-        }
-        members.sort();
-        members.dedup();
-        let mut out: Vec<(String, String)> = members
-            .iter()
-            .filter(|pk| **pk != self.store.me && !self.archived.contains(*pk))
-            .filter_map(|pk| {
-                self.store
-                    .profiles
-                    .get(pk)
-                    .map(|p| (p.name.clone(), pk.clone()))
-            })
-            .filter(|(n, _)| !n.is_empty() && n.to_lowercase().contains(&q))
-            .collect();
-        out.sort_by_key(|(n, _)| (!n.to_lowercase().starts_with(&q), n.to_lowercase()));
+        let Some(ch) = ch else {
+            return vec![];
+        };
+        let mut skip = self.archived.clone();
+        skip.extend(self.draft_ref().mention_pubkeys());
+        let mut out: Vec<(String, String)> =
+            mention::candidates(&self.store, &self.agents, ch, root, &skip)
+                .into_iter()
+                .map(|(pk, n)| (n, pk))
+                .filter(|(n, _)| n.to_lowercase().contains(&q))
+                .collect();
+        // Stable: within prefix matches, the order above holds.
+        out.sort_by_key(|(n, _)| !n.to_lowercase().starts_with(&q));
         out.truncate(6);
         out
     }
@@ -1639,7 +1641,7 @@ impl App {
             KeyCode::Backspace => self.back(),
             KeyCode::Char('f') => {
                 if self.links.is_empty() {
-                    self.say("no links on screen");
+                    self.say("no links or code on screen");
                 } else {
                     self.hint_typed.clear();
                     self.mode = Mode::Hint;
@@ -2423,6 +2425,11 @@ mod tests {
         // Desktop and web links go to the OS.
         app.follow("buzz://pr?id=1");
         assert!(matches!(app.actions.last(), Some(Action::OpenUrl(u)) if u == "buzz://pr?id=1"));
+        // A code block copies its text.
+        app.follow("copy:let x = 1;\nlet y = 2;");
+        assert!(
+            matches!(app.actions.last(), Some(Action::Copy(t)) if t == "let x = 1;\nlet y = 2;")
+        );
     }
 
     #[test]

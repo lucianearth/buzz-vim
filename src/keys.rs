@@ -58,7 +58,7 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("s", "sections", false),
             ("o", "image", true),
             ("O", "images in Preview (a thread: all of them)", false),
-            ("f", "follow link", true),
+            ("f", "follow link, copy code", true),
             ("⌫ ^o", "back to where a link took you from", false),
             ("[ ]", "narrower / wider (or drag the right edge)", false),
             ("a", "agents", true),
@@ -137,7 +137,7 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
         ],
         Mode::Help => &[("esc ?", "close", true)],
         Mode::Hint => &[
-            ("letters", "follow that link", true),
+            ("letters", "follow that link, copy that code", true),
             ("esc", "cancel", true),
         ],
     }

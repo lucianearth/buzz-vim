@@ -1243,7 +1243,7 @@ fn draw_status(f: &mut Frame, app: &mut App, row: Rect, channel: &str, hint: boo
             spans.push(Span::styled(label, theme::key()));
         }
     }
-    let total = sum.open + sum.done + sum.parked;
+    let total = sum.open + sum.done;
     if total > 0 {
         spans.push(sep());
         spans.push(Span::styled(format!("{} open", sum.open), theme::text()));
@@ -1251,12 +1251,6 @@ fn draw_status(f: &mut Frame, app: &mut App, row: Rect, channel: &str, hint: boo
             format!(" · {} done", sum.done),
             theme::muted(),
         ));
-        if sum.parked > 0 {
-            spans.push(Span::styled(
-                format!(" · {} parked", sum.parked),
-                theme::muted(),
-            ));
-        }
     }
     if sum.crashes_today > 0 {
         spans.push(sep());
@@ -1286,7 +1280,7 @@ fn draw_status(f: &mut Frame, app: &mut App, row: Rect, channel: &str, hint: boo
 }
 
 /// The checklist pane (`c`): the channel's items in order, the picked
-/// one's details, evidence and parked question beside or under them.
+/// one's details and evidence beside or under them.
 fn draw_checklist(f: &mut Frame, app: &mut App, area: Rect) {
     use crate::checklist::Status;
     let Some(channel) = app.current().map(str::to_string) else {
@@ -1372,16 +1366,13 @@ fn draw_checklist(f: &mut Frame, app: &mut App, area: Rect) {
     let mut lines = vec![];
     for (i, it) in items.iter().enumerate().skip(first).take(rows) {
         let (mark, st) = match it.status {
-            Status::Open => ("○", theme::text()),
+            // No parking (lucian 2026-10-20): a legacy parked item is open.
+            Status::Open | Status::Parked => ("○", theme::text()),
             Status::Done => ("✓", theme::muted()),
-            Status::Parked => ("‖", theme::muted()),
         };
         let mut tail = String::new();
         if it.release {
             tail.push_str("  release");
-        }
-        if it.status == Status::Parked {
-            tail.push_str("  parked");
         }
         if it.missing_evidence() {
             tail.push_str("  ⚠ no evidence");
@@ -1416,7 +1407,14 @@ fn draw_checklist(f: &mut Frame, app: &mut App, area: Rect) {
     for l in wrap_plain(&it.text, w) {
         d.push(Line::styled(format!(" {l}"), theme::bright()));
     }
-    let mut meta = vec![it.status.label().to_string()];
+    let mut meta = vec![
+        if it.status == Status::Done {
+            "done"
+        } else {
+            "open"
+        }
+        .to_string(),
+    ];
     if it.release {
         meta.push("release: needs lucian".into());
     }
@@ -1435,12 +1433,6 @@ fn draw_checklist(f: &mut Frame, app: &mut App, area: Rect) {
         format!(" {}", meta.join(" · ")),
         theme::muted(),
     ));
-    if let Some(q) = &it.parked_question {
-        d.push(Line::raw(""));
-        for l in wrap_plain(&format!("? {q}"), w) {
-            d.push(Line::styled(format!(" {l}"), theme::bright()));
-        }
-    }
     // Evidence: msg and url entries are links (click, or f).
     let mut ev_links = vec![];
     if !it.evidence.is_empty() {
@@ -1720,7 +1712,6 @@ fn draw_needs(f: &mut Frame, app: &mut App, area: Rect) {
         let mark = match &r.reason {
             Reason::Watch(crate::checklist::WatchState::Stalled) => "⚠",
             Reason::Watch(_) => "⚑",
-            Reason::Parked => "‖",
             Reason::Contested(_) => "⚑",
             Reason::Mention => "@",
             Reason::Dm => "✉",
@@ -2524,6 +2515,13 @@ pub fn render_markdown_links(
     let mut r = Rendered::default();
     let mut out = vec![];
     let mut in_fence = false;
+    // The open block's first row and its raw lines, to copy with `f`.
+    let mut block: Option<(usize, Vec<&str>)> = None;
+    let copy = |r: &mut Rendered, (row, lines): (usize, Vec<&str>)| {
+        r.at.push((row, 0, 1, r.urls.len()));
+        r.urls
+            .push(format!("{}{}", crate::links::COPY, lines.join("\n")));
+    };
     let code_line = |out: &mut Vec<Line<'static>>, raw: &str| {
         let raw = crate::draft::expand_tabs(raw);
         for chunk in wrap_plain(&raw, width.saturating_sub(2)) {
@@ -2538,10 +2536,16 @@ pub fn render_markdown_links(
         if let Some(fence) = t.strip_prefix("```") {
             // ```one-liner``` on a single line.
             if !in_fence && fence.len() > 3 && fence.ends_with("```") {
-                code_line(&mut out, fence.trim_end_matches('`'));
+                let code = fence.trim_end_matches('`');
+                copy(&mut r, (out.len(), vec![code]));
+                code_line(&mut out, code);
                 continue;
             }
             in_fence = !in_fence;
+            match block.take() {
+                Some(b) => copy(&mut r, b),
+                None => block = Some((out.len(), vec![])),
+            }
             // The language tag, if any, labels the top of the block.
             if in_fence && !fence.trim().is_empty() {
                 out.push(Line::from(Span::styled(
@@ -2552,6 +2556,9 @@ pub fn render_markdown_links(
             continue;
         }
         if in_fence {
+            if let Some((_, lines)) = &mut block {
+                lines.push(raw);
+            }
             code_line(&mut out, raw);
             continue;
         }
@@ -2594,6 +2601,10 @@ pub fn render_markdown_links(
             }
             out.push(Line::from(s));
         }
+    }
+    // A fence left open runs to the end of the message.
+    if let Some(b) = block.take() {
+        copy(&mut r, b);
     }
     r.lines = out;
     r
@@ -2993,12 +3004,12 @@ mod tests {
             (
                 "a5",
                 "Migrate the prod relay to the patched image",
-                "parked",
+                "open",
                 true,
                 None,
                 vec![],
                 "Needs the relay patch from R0.",
-                "Restart prod relay tonight or wait for the nightly?",
+                "",
             ),
             (
                 "a6",
@@ -3105,7 +3116,7 @@ mod tests {
         assert!(s.contains("RUNNING"), "{s}");
         assert!(s.contains("waiting on lucian 25m"), "{s}");
         assert!(
-            s.contains("ping ↗") && s.contains("3 open · 2 done · 1 parked"),
+            s.contains("ping ↗") && s.contains("4 open · 2 done") && !s.contains("parked"),
             "{s}"
         );
         assert!(
@@ -3128,13 +3139,12 @@ mod tests {
         // Standing first item on top, wrap-up last, release flag shown.
         let first = s.find("Reconcile the list").unwrap();
         let last = s.find("Wrap-up: voiceover").unwrap();
-        assert!(first < last && s.contains("release  parked"), "{s}");
+        assert!(first < last && s.contains("  release"), "{s}");
         // Details of the picked item, its evidence linked.
         for _ in 0..4 {
             app.on_term(crossterm::event::Event::Key(KeyCode::Char('j').into()));
         }
         let s = screen_text(&mut app, 120, 34);
-        assert!(s.contains("? Restart prod relay tonight"), "{s}");
         assert!(
             s.contains("release: needs lucian") && s.contains("by taskbot"),
             "{s}"
@@ -3215,18 +3225,17 @@ mod tests {
         // A channel with no list still shows the count.
         app.on_term(crossterm::event::Event::Key(KeyCode::Char('2').into()));
         let s = screen_text(&mut app, 120, 34);
-        assert!(s.contains("⚑ 3  need you · 0 to see · ! next"), "{s}");
-        assert!(s.contains("0 ⚑ needs you 3"), "{s}");
+        assert!(s.contains("⚑ 2  need you · 0 to see · ! next"), "{s}");
+        assert!(s.contains("0 ⚑ needs you 2"), "{s}");
         app.on_term(crossterm::event::Event::Key(KeyCode::Char('0').into()));
         let s = screen_text(&mut app, 120, 34);
         assert!(
-            s.contains("needs an answer (3)") && s.contains("FYI (1)"),
+            s.contains("needs an answer (2)") && s.contains("FYI (1)"),
             "{s}"
         );
         let at = |t: &str| s.find(t).unwrap_or_else(|| panic!("{t}: {s}"));
-        // Oldest first: alice an hour ago, the parked item, the watcher's ask.
-        assert!(at("can you review the beacon PR?") < at("Restart prod relay tonight"));
-        assert!(at("Restart prod relay tonight") < at("waiting on lucian"));
+        // Oldest first: alice an hour ago, then the watcher's ask.
+        assert!(at("can you review the beacon PR?") < at("waiting on lucian"));
         assert!(
             at("waiting on lucian") < at("FYI (1)") && at("FYI (1)") < at("deployed beacon v2")
         );
@@ -3270,22 +3279,14 @@ mod tests {
         app.store.channel_mut("c2").messages.insert(m.id.clone(), m);
         let s = screen_text(&mut app, 120, 34);
         assert!(
-            s.contains("needs an answer (2)") && !s.contains("can you review the beacon"),
+            s.contains("needs an answer (1)") && !s.contains("can you review the beacon"),
             "{s}"
         );
-        // ! goes oldest first: the parked item's thread, then the ping in it.
+        // ! goes to the watcher's ping, in its thread.
         app.on_term(crossterm::event::Event::Key(KeyCode::Char('!').into()));
         assert_eq!(app.thread, Some((ch.to_string(), "5dbdf585".to_string())));
-        assert!(
-            app.status
-                .as_ref()
-                .unwrap()
-                .0
-                .starts_with("⚑ 1/2  taskbot: Restart prod relay")
-        );
-        app.on_term(crossterm::event::Event::Key(KeyCode::Char('!').into()));
         assert_eq!(app.thread_selected.as_deref(), Some("c0ffee01"));
-        assert!(app.status.as_ref().unwrap().0.starts_with("⚑ 2/2"));
+        assert!(app.status.as_ref().unwrap().0.starts_with("⚑ 1/1"));
         // H from the first channel tab comes round to tab 0.
         app.on_term(crossterm::event::Event::Key(KeyCode::Char('1').into()));
         app.on_term(crossterm::event::Event::Key(KeyCode::Char('H').into()));
@@ -3303,7 +3304,7 @@ mod tests {
         let mut app = loop_fixture();
         app.channels_loaded = true;
         app.on_term(crossterm::event::Event::Key(KeyCode::Char('Q').into()));
-        for c in "why is the relay item parked?".chars() {
+        for c in "why is the relay item waiting?".chars() {
             app.on_term(crossterm::event::Event::Key(KeyCode::Char(c).into()));
         }
         let s = screen_text(&mut app, 120, 34);
@@ -3351,10 +3352,10 @@ mod tests {
         for _ in 0..3 {
             key(&mut app, KeyCode::Char('j').into());
         }
-        shot(&mut app, "loop-checklist-parked");
+        shot(&mut app, "loop-checklist-release");
         key(&mut app, KeyCode::Esc.into());
         key(&mut app, KeyCode::Char('Q').into());
-        for c in "why is the relay item parked?".chars() {
+        for c in "why is the relay item waiting?".chars() {
             key(&mut app, KeyCode::Char(c).into());
         }
         shot(&mut app, "loop-q");
@@ -3941,6 +3942,25 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn code_blocks_are_hinted_with_their_text() {
+        let r = render_markdown_links(
+            "see:\n```rust\nlet x = 1;\n\tlet y = 2;\n```\n```ls -la```\n```\nopen",
+            30,
+            &[],
+            &|_| None,
+        );
+        let copies: Vec<(usize, &str)> =
+            r.at.iter()
+                .map(|&(row, _, _, k)| (row, r.urls[k].strip_prefix("copy:").unwrap()))
+                .collect();
+        // Rows: "see:", the rust label, two code lines, the one-liner, "open".
+        assert_eq!(
+            copies,
+            vec![(1, "let x = 1;\n\tlet y = 2;"), (4, "ls -la"), (5, "open")]
+        );
     }
 
     #[test]
