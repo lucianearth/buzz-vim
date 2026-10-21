@@ -39,6 +39,8 @@ const MAX_ROWS: u16 = 4000;
 const OK: f32 = 145.0;
 const PARTIAL: f32 = 75.0;
 const DEAD: f32 = 25.0;
+/// OKLab hue for data that carries no status: cyan.
+const DATA: f32 = 215.0;
 
 fn status_style(s: &str) -> Style {
     let hue = match s {
@@ -217,8 +219,9 @@ fn render_tile(t: &Tile, picked: bool, r: Rect, buf: &mut Buffer) {
 /// with the baseline ticked, and the last 14 days.
 fn render_gauge(g: &Gauge, r: Rect, buf: &mut Buffer) {
     let tone = tone_style(g.tone);
+    // A plain delta draws its bar in the data cyan, never a status color.
     let bar_color = match g.tone {
-        Tone::Plain => series_style(0),
+        Tone::Plain => Style::new().fg(theme::ink(DATA, 19)),
         _ => tone,
     };
     let block = tile_block(
@@ -1754,6 +1757,18 @@ mod tests {
             assert_eq!(fg("-36%"), tone_style(Tone::Flag).fg.unwrap());
             assert_ne!(fg("-36%"), tone_style(Tone::Better).fg.unwrap());
             assert_eq!(fg("+1pt"), tone_style(Tone::Plain).fg.unwrap());
+            // A plain delta's bar wears no status color.
+            let (x, y) = find(&buf, "42%  vs 41%").unwrap();
+            let bar = buf[(x, y + 1)].fg;
+            for t in [Tone::Better, Tone::Flag, Tone::Page] {
+                assert_ne!(
+                    bar,
+                    tone_style(t).fg.unwrap(),
+                    "{w}: plain bar colored {t:?}"
+                );
+            }
+            let (x, y) = find(&buf, "55k  vs 75k").unwrap();
+            assert_eq!(buf[(x, y + 1)].fg, tone_style(Tone::Better).fg.unwrap());
             // Tile borders take the status color.
             let border = |title: &str| {
                 let (x, y) = find(&buf, title).unwrap();
