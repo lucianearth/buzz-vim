@@ -2111,8 +2111,11 @@ fn draw_routing(f: &mut Frame, app: &mut App, area: Rect) {
         ));
     }
     lines.push(Line::from(legend));
-    if let Some(note) = p.retired_note() {
-        lines.push(Line::styled(format!("  {note}"), theme::faint()));
+    for part in p.not_counted() {
+        lines.push(Line::styled(
+            format!("  Not counted: {part}."),
+            theme::faint(),
+        ));
     }
 
     // A sample keeps its rows on a short screen; the diagram scrolls to
@@ -4132,6 +4135,20 @@ mod tests {
                 "not the work thread of a running channel; no action",
             ));
         }
+        // The flat-channel rule: a newer message in another thread, which
+        // is judged and counted itself. Footer only, never "Jev: other".
+        for i in 0..3 {
+            l1.push(d(
+                now - 2400 - i * 60,
+                "",
+                "newer_elsewhere",
+                None,
+                None,
+                "none",
+                &[],
+                "the channel's newest message is in another thread; no action here",
+            ));
+        }
         for i in 0..4 {
             l2.push(d(
                 now - 7200 - i * 900,
@@ -4304,6 +4321,11 @@ mod tests {
             s.contains("Not counted: 2 decisions from a retired rule"),
             "{s}"
         );
+        assert!(
+            s.contains("3 stops with a newer message in another thread"),
+            "{s}"
+        );
+        assert!(!s.contains("Jev: other"), "{s}");
         // A click picks a card's outcome line, a second click samples it.
         let hit = app
             .hits
