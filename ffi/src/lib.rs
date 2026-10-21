@@ -356,6 +356,10 @@ pub struct ChecklistItem {
     pub missing_evidence: bool,
     pub creator: String,
     pub updated_at: u64,
+    /// Done items: when ticked (unix seconds), and that time for the row:
+    /// "15:20", "yesterday 22:10", "Oct 19". Empty for open items.
+    pub done_at: Option<u64>,
+    pub done_label: String,
 }
 
 /// A channel's checklist, read-only (agents write it with `buzz checklist`).
@@ -837,9 +841,11 @@ impl Client {
         }
     }
 
-    /// A channel's checklist: header and items in list order.
+    /// A channel's checklist: header, open items in list order, then done
+    /// items, the latest tick first.
     pub fn checklist(&self, channel: String) -> Checklist {
         let e = self.engine.lock().unwrap();
+        let t = now();
         let h = e.checklists.header(&channel);
         let items = e
             .checklists
@@ -867,6 +873,11 @@ impl Client {
                 release: i.release,
                 standing: i.standing,
                 updated_at: i.updated_at,
+                done_label: i
+                    .done_at
+                    .map(|d| checklist::done_label(d, t))
+                    .unwrap_or_default(),
+                done_at: i.done_at,
             })
             .collect();
         Checklist {
@@ -2810,6 +2821,9 @@ mod tests {
         assert_eq!(list.resume, "agent/x");
         let it = &list.items[0];
         assert!(it.status == ItemStatus::Done && !it.missing_evidence);
+        // No done_at in the record: the version's time stands in.
+        assert_eq!(it.done_at, Some(now() - 10));
+        assert!(!it.done_label.is_empty());
         assert!(
             it.evidence[0]
                 .link
