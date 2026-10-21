@@ -628,8 +628,9 @@ impl Checklists {
     }
 
     /// Open items in list order (the standing first item, then by `order`,
-    /// then the standing last item), then done items, the latest tick
-    /// first (lucian 2026-10-21: done ones sink, newest finish on top).
+    /// release items after the rest, then the standing last item), then
+    /// done items, the latest tick first (lucian 2026-10-21: done ones
+    /// sink, newest finish on top; release items sit at the bottom).
     pub fn items(&self, channel: &str) -> Vec<Item> {
         let Some(recs) = self.channels.get(channel) else {
             return vec![];
@@ -669,7 +670,8 @@ impl Checklists {
             .collect();
         let rank = |i: &Item| match i.standing.as_deref() {
             Some("first") => 0,
-            Some("last") => 2,
+            Some("last") => 3,
+            _ if i.release => 2,
             _ => 1,
         };
         let done = |i: &Item| i.status == Status::Done;
@@ -1000,10 +1002,19 @@ mod tests {
             "00000005",
             serde_json::json!({"text": "no evidence", "status": "done", "release": true, "order": 4}),
         );
+        put(
+            &mut s,
+            "00000006",
+            serde_json::json!({"text": "ship", "status": "open", "release": true, "order": 1}),
+        );
         let texts: Vec<String> = s.items(CH).into_iter().map(|i| i.text).collect();
-        // Done ones sink below the standing last item; same tick time: list order.
-        assert_eq!(texts, ["reconcile", "b", "wrap-up", "a", "no evidence"]);
-        let last = &s.items(CH)[4];
+        // Open release items go after the rest, before the standing last
+        // one. Done ones sink below it; same tick time: list order.
+        assert_eq!(
+            texts,
+            ["reconcile", "b", "ship", "wrap-up", "a", "no evidence"]
+        );
+        let last = &s.items(CH)[5];
         assert!(last.release && last.missing_evidence());
     }
 

@@ -1378,10 +1378,9 @@ fn draw_checklist(f: &mut Frame, app: &mut App, area: Rect) {
             Status::Open | Status::Parked => ("○", theme::text()),
             Status::Done => ("✓", theme::muted()),
         };
+        // The release marker leads the line (lucian 2026-10-21).
+        let lead = if it.release { "release " } else { "" };
         let mut tail = String::new();
-        if it.release {
-            tail.push_str("  release");
-        }
         if it.missing_evidence() {
             tail.push_str("  ⚠ no evidence");
         }
@@ -1391,10 +1390,18 @@ fn draw_checklist(f: &mut Frame, app: &mut App, area: Rect) {
         if !done_at.is_empty() {
             tail.push_str(&format!("  {done_at}"));
         }
-        let room = (list.width as usize).saturating_sub(tail.width() + 5);
+        let room = (list.width as usize).saturating_sub(tail.width() + lead.width() + 5);
         let row_style = if i == cur { theme::tab_active() } else { st };
         lines.push(Line::from(vec![
             Span::styled(format!(" {mark} "), row_style),
+            Span::styled(
+                lead,
+                match (i == cur, it.status) {
+                    (true, _) => row_style,
+                    (false, Status::Done) => theme::faint(),
+                    _ => theme::bright(),
+                },
+            ),
             Span::styled(clip(&it.text, room), row_style),
             Span::styled(tail, if i == cur { row_style } else { theme::faint() }),
         ]));
@@ -3735,15 +3742,16 @@ mod tests {
             s.contains("›  checklist") && s.contains("Operator loop: buzz-vim"),
             "{s}"
         );
-        // Open items in list order, wrap-up last of them, release flag
-        // shown; then the done ones, the latest tick first, each with its
-        // time (the done standing first item sinks too).
+        // Open items in list order, the release one leading with its
+        // marker just above the wrap-up; then the done ones, the latest
+        // tick first, each with its time (the done standing first item
+        // sinks too).
         let at = |t: &str| s.find(t).unwrap();
         assert!(
-            at("Status line per channel") < at("Wrap-up: voiceover")
+            at("Status line per channel") < at("○ release Migrate the prod relay")
+                && at("○ release Migrate the prod relay") < at("Wrap-up: voiceover")
                 && at("Wrap-up: voiceover") < at("Checklist pane per channel")
-                && at("Checklist pane per channel") < at("Reconcile the list")
-                && s.contains("  release"),
+                && at("Checklist pane per channel") < at("Reconcile the list"),
             "{s}"
         );
         let now = crate::sync::now();
@@ -4109,7 +4117,7 @@ mod tests {
         let mut l2 = vec![];
         for i in 0..18 {
             l1.push(d(
-                now - 3000 - i * 600,
+                now - 2950 - i * 600,
                 "",
                 "not_running",
                 None,
