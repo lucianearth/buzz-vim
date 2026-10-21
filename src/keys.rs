@@ -67,7 +67,7 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("w", "routing: how each stop was routed", false),
             ("t ⏎ s o", "routing: window, sample, another, thread", false),
             (
-                "Q ^q",
+                "q Q ^q",
                 "ask #quick; again in the box: + this channel",
                 false,
             ),
@@ -81,7 +81,7 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("^d ^u", "half page down / up", false),
             ("^v", "paste image or file", false),
             ("R", "reload sections", false),
-            ("q", "quit", false),
+            ("^c", "quit", false),
             ("mouse", "click to pick, wheel scrolls", false),
         ],
         Mode::Insert => &[

@@ -1732,7 +1732,6 @@ impl App {
         }
         let n = self.tabs.len();
         match k.code {
-            KeyCode::Char('q') => self.actions.push(Action::Quit),
             // Tab 0 is Needs you; the channels are 1 to 9.
             KeyCode::Char('0') => self.open_needs(),
             KeyCode::Char(c @ '1'..='9') => self.switch_tab(c as usize - '1' as usize),
@@ -1790,7 +1789,7 @@ impl App {
                 self.agents_view = false;
                 self.checklist_cursor = 0;
             }
-            KeyCode::Char('Q') => self.quick(),
+            KeyCode::Char('q') | KeyCode::Char('Q') => self.quick(),
             KeyCode::Char('w') => self.open_routing(),
             KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
@@ -2456,8 +2455,10 @@ mod tests {
         app.store.profiles.entry("tb".into()).or_default().name = "taskbot".into();
         app.on_key(KeyEvent::from(KeyCode::Char('0')));
         assert!(app.needs_view);
-        app.on_key(KeyEvent::from(KeyCode::Char('Q')));
+        // Lower-case q opens the box too; it no longer quits.
+        app.on_key(KeyEvent::from(KeyCode::Char('q')));
         assert_eq!(app.mode, Mode::Quick);
+        assert!(!app.actions.iter().any(|a| matches!(a, Action::Quit)));
         app.on_key(KeyEvent::from(KeyCode::Char('x')));
         app.on_key(ctrl_q);
         assert!(!app.quick_include);

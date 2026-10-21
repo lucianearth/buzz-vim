@@ -48,7 +48,7 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
   waiting on release, with a link to its ping), open / done counts and agent crashes today. A channel
   where two or more lists claim the checklist and the owner hasn't picked a driver shows `contested` with
   their creators, and no list until he does
-- `Q` (or `^q`, which also works while writing) asks a quick question: a box that posts a new top-level message
+- `q` or `Q` (or `^q`, which also works while writing) asks a quick question: a box that posts a new top-level message
   in #quick, starting with `[Q]` and @mentioning taskbot. Press `^q` again in the box to add the channel you're
   in (its name, id, link and latest 30 messages' ids) so taskbot can read it; again takes it off. A DM or
   private channel never goes along. `Esc` keeps
@@ -63,7 +63,7 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
   leave it). Links marked 🐝 (pr, issue, repo) open in Buzz Desktop, and web links in your browser.
   `⌫` or `^o` goes back to where you were, as many steps as you followed.
   Code blocks get a chip too: picking one copies the code.
-- `o` open the selected image full screen (`←` `→` page through the images, `Esc` closes), `q` quit
+- `o` open the selected image full screen (`←` `→` page through the images, `Esc` closes), `^c` quit
 
 ## iPhone
 
