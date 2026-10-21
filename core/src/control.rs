@@ -483,6 +483,8 @@ impl Series {
 pub enum Unit {
     Tokens,
     Pct,
+    /// A plain count (runs, problems, events, notes).
+    Count,
 }
 
 /// A trend chart: x = day, one series per entry.
@@ -527,6 +529,18 @@ pub const HOOKS_TRENDS: &[Trend] = &[
         &[("weighted_spend_tokens", "input-eq")],
     ),
 ];
+
+/// The 2026-10-19 report's flag: a recommended reset this far off its
+/// threshold is flagged, and a hooks metric this much worse than its
+/// baseline is drawn as a flag.
+pub const FLAG_PCT: f64 = 20.0;
+/// A hooks metric this much worse than its baseline is drawn as a page.
+pub const PAGE_PCT: f64 = 50.0;
+/// Days in an overview sparkline, today included.
+pub const SPARK_DAYS: usize = 14;
+/// The topics producers write (aei `wiki/architecture/control-notes.md`).
+/// They always get a tile, dim until their first note.
+pub const KNOWN_TOPICS: &[&str] = &["hooks", "upgrade", "converge", "fleet-audit"];
 
 /// The days a chart spans: every day from the source's first note in the
 /// topic to its last, gaps included.
@@ -664,6 +678,376 @@ pub fn short_tokens(v: f64) -> String {
     } else {
         format!("{v:.0}")
     }
+}
+
+// ---------- the overview ----------
+
+/// A topic's state on the overview: no note (dim), ok (green), warn
+/// (amber), page (red). Ordered so the worst is the max.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Health {
+    NoNote,
+    Ok,
+    Warn,
+    Page,
+}
+
+/// What a note says about its topic. The details' `status` decides
+/// (hooks/1 ok partial dead, converge/1 applied clean running held failed,
+/// fleet-audit/1 ok partial failed, upgrade/1's events); a status this
+/// doesn't know is a warn, and an open request is at least a warn.
+pub fn note_health(board: &Board, note: &Note) -> Health {
+    let open = note.is_request() && board.status(note).status.as_deref() == Some("open");
+    let base = match &note.details {
+        Err(_) => Health::Warn,
+        Ok(d) => match d["status"].as_str() {
+            None => Health::Ok,
+            Some(
+                "ok" | "clean" | "applied" | "running" | "rolled" | "followup_done" | "notice"
+                | "declined" | "dropped" | "closed",
+            ) => Health::Ok,
+            Some(
+                "dead" | "failed" | "fail" | "page" | "stage_failed" | "apply_failed"
+                | "rolled_back" | "followup_failed",
+            ) => Health::Page,
+            Some(_) => Health::Warn,
+        },
+    };
+    if open { base.max(Health::Warn) } else { base }
+}
+
+/// The number a topic's sparkline draws, one per day.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyMetric {
+    /// The details key; None counts the day's notes.
+    pub key: Option<&'static str>,
+    pub label: &'static str,
+    pub unit: Unit,
+    /// Sources on one day: the mean (a rate) or the sum (a count).
+    pub mean: bool,
+}
+
+/// Each schema's key metric: hooks cost per useful call; converge held
+/// runs (the runs that wait on a human); fleet-audit problems; upgrade has
+/// no one number, so its events. Anything else: notes that day.
+pub fn key_metric(schema: Option<&str>) -> KeyMetric {
+    let (key, label, unit, mean) = match schema {
+        Some("hooks/1") => (
+            Some("cost_per_useful_call_tokens"),
+            "cost/call",
+            Unit::Tokens,
+            true,
+        ),
+        Some("converge/1") => (Some("held_n"), "held", Unit::Count, false),
+        Some("fleet-audit/1") => (Some("problems_n"), "problems", Unit::Count, false),
+        Some("upgrade/1") => (Some("events_n"), "events", Unit::Count, false),
+        _ => (None, "notes", Unit::Count, false),
+    };
+    KeyMetric {
+        key,
+        label,
+        unit,
+        mean,
+    }
+}
+
+/// One topic's tile on the overview.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tile {
+    pub topic: String,
+    pub health: Health,
+    /// The first line of the worst note on the newest day, or "no note".
+    pub line: String,
+    pub latest_day: Option<String>,
+    pub sources: Vec<String>,
+    pub metric: KeyMetric,
+    /// SPARK_DAYS values, oldest first, ending today; None = no value.
+    pub spark: Vec<Option<f64>>,
+    /// Requests still open in this topic.
+    pub open: usize,
+}
+
+/// A summary's first line as a one-liner: no markdown heading or emphasis.
+pub fn one_liner(summary: &str) -> String {
+    let l = summary
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    l.trim_start_matches('#')
+        .trim()
+        .replace("**", "")
+        .replace('`', "")
+}
+
+/// The days ending `today`, `n` of them, oldest first.
+pub fn days_ending(today: &str, n: usize) -> Vec<String> {
+    let Ok(end) = chrono::NaiveDate::parse_from_str(today, "%Y-%m-%d") else {
+        return vec![];
+    };
+    let start = end - chrono::Days::new(n.saturating_sub(1) as u64);
+    day_range(&start.format("%Y-%m-%d").to_string(), today)
+}
+
+impl Board {
+    /// The overview's tiles: the known topics in their order, then any
+    /// other topic by name. `today` ends the sparklines (YYYY-MM-DD).
+    pub fn tiles(&self, today: &str) -> Vec<Tile> {
+        let latest = self.latest();
+        let mut names: Vec<String> = KNOWN_TOPICS.iter().map(|s| s.to_string()).collect();
+        let others: BTreeSet<&str> = latest
+            .iter()
+            .map(|n| n.topic.as_str())
+            .filter(|t| !KNOWN_TOPICS.contains(t))
+            .collect();
+        names.extend(others.into_iter().map(str::to_string));
+        let window = days_ending(today, SPARK_DAYS);
+        names
+            .into_iter()
+            .map(|topic| {
+                let notes: Vec<&Note> = latest
+                    .iter()
+                    .copied()
+                    .filter(|n| n.topic == topic)
+                    .collect();
+                let latest_day = notes.iter().filter_map(|n| n.day.clone()).max();
+                let mut newest: Vec<&Note> = notes
+                    .iter()
+                    .copied()
+                    .filter(|n| n.day == latest_day)
+                    .collect();
+                newest.sort_by(|a, b| a.source.cmp(&b.source));
+                // The worst note speaks for the day; the first source on a tie.
+                let worst = newest
+                    .iter()
+                    .copied()
+                    .rev()
+                    .max_by_key(|n| note_health(self, n));
+                let health = worst.map_or(Health::NoNote, |n| note_health(self, n));
+                let line = worst.map_or_else(|| "no note".to_string(), |n| one_liner(&n.summary));
+                let schema = worst.and_then(|n| n.schema.as_deref());
+                let metric = key_metric(schema);
+                let spark = window
+                    .iter()
+                    .map(|d| {
+                        let day: Vec<&Note> = notes
+                            .iter()
+                            .copied()
+                            .filter(|n| n.day.as_deref() == Some(d.as_str()))
+                            .collect();
+                        let Some(key) = metric.key else {
+                            return (!day.is_empty()).then_some(day.len() as f64);
+                        };
+                        let vals: Vec<f64> = day
+                            .iter()
+                            .filter_map(|n| n.details.as_ref().ok()?[key].as_f64())
+                            .collect();
+                        if vals.is_empty() {
+                            return None;
+                        }
+                        let sum: f64 = vals.iter().sum();
+                        Some(if metric.mean {
+                            sum / vals.len() as f64
+                        } else {
+                            sum
+                        })
+                    })
+                    .collect();
+                let sources: BTreeSet<String> =
+                    newest.iter().filter_map(|n| n.source.clone()).collect();
+                let open = self
+                    .open_requests()
+                    .iter()
+                    .filter(|n| n.topic == topic)
+                    .count();
+                Tile {
+                    topic,
+                    health,
+                    line,
+                    latest_day,
+                    sources: sources.into_iter().collect(),
+                    metric,
+                    spark,
+                    open,
+                }
+            })
+            .collect()
+    }
+
+    /// Requests still open, newest first. Every request note counts, not
+    /// only the newest per day and source: a request isn't a day's report.
+    pub fn open_requests(&self) -> Vec<&Note> {
+        let mut v: Vec<&Note> = self
+            .notes
+            .values()
+            .filter(|n| n.is_request() && self.status(n).status.as_deref() == Some("open"))
+            .collect();
+        v.sort_by(|a, b| (b.created_at, &b.id).cmp(&(a.created_at, &a.id)));
+        v
+    }
+
+    /// The newest hooks/1 note (newest day, then newest written).
+    pub fn newest_hooks(&self) -> Option<&Note> {
+        self.latest()
+            .into_iter()
+            .filter(|n| n.schema.as_deref() == Some("hooks/1") && n.details.is_ok())
+            .max_by(|a, b| (&a.day, a.created_at, &a.id).cmp(&(&b.day, b.created_at, &b.id)))
+    }
+}
+
+/// How a delta reads: plain, better than the baseline (green), a flag
+/// (amber) or a page (red). A flag is never green.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tone {
+    Plain,
+    Better,
+    Flag,
+    Page,
+}
+
+/// The tone of `value` against `baseline` where lower is better (every
+/// hooks/1 metric). `flagged` is the report's own flag when it has one
+/// (agent types); otherwise worse by more than FLAG_PCT is a flag and by
+/// more than PAGE_PCT a page.
+pub fn delta_tone(value: f64, baseline: Option<f64>, flagged: Option<bool>) -> Tone {
+    let Some(b) = baseline.filter(|b| *b != 0.0) else {
+        return if flagged == Some(true) {
+            Tone::Flag
+        } else {
+            Tone::Plain
+        };
+    };
+    let rel = (value - b) / b.abs() * 100.0;
+    match flagged {
+        Some(true) => Tone::Flag,
+        Some(false) if rel < 0.0 => Tone::Better,
+        Some(false) => Tone::Plain,
+        None if rel > PAGE_PCT => Tone::Page,
+        None if rel > FLAG_PCT => Tone::Flag,
+        None if rel < 0.0 => Tone::Better,
+        None => Tone::Plain,
+    }
+}
+
+/// The delta as people read it: percent off the baseline, or points for a
+/// percentage.
+pub fn delta_label(value: f64, baseline: f64, unit: Unit) -> String {
+    match unit {
+        Unit::Pct => format!("{:+.0}pt", value - baseline),
+        _ if baseline == 0.0 => String::new(),
+        _ => format!("{:+.0}%", (value - baseline) / baseline.abs() * 100.0),
+    }
+}
+
+/// A hooks metric as a gauge: value, baseline, delta tone and the last
+/// SPARK_DAYS days of it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Gauge {
+    pub title: String,
+    pub value: f64,
+    pub baseline: Option<f64>,
+    pub unit: Unit,
+    /// A side note, e.g. the sample size.
+    pub aside: Option<String>,
+    pub tone: Tone,
+    pub spark: Vec<Option<f64>>,
+}
+
+/// The hooks/1 gauges, in reading order: (title, key, unit, sample-size key).
+pub const HOOKS_GAUGES: &[(&str, &str, Unit, Option<&str>)] = &[
+    (
+        "peak subagent",
+        "peak_context_subagent_tokens",
+        Unit::Tokens,
+        None,
+    ),
+    ("peak main", "peak_context_main_tokens", Unit::Tokens, None),
+    ("spend >300k", "share_spend_above_300k_pct", Unit::Pct, None),
+    (
+        "ramp after handoff",
+        "ramp_after_handoff_median_tokens",
+        Unit::Tokens,
+        Some("ramp_after_handoff_n"),
+    ),
+    (
+        "cost / useful call",
+        "cost_per_useful_call_tokens",
+        Unit::Tokens,
+        None,
+    ),
+];
+
+/// The gauges for `current` (a hooks/1 note): the flat metrics against
+/// their baselines, then each agent type's recommended reset against its
+/// threshold. Sparklines end on the note's day, same source.
+pub fn hooks_gauges(board: &Board, current: &Note) -> Vec<Gauge> {
+    let Ok(d) = current.details.as_ref() else {
+        return vec![];
+    };
+    let by_day: HashMap<String, &Value> = board
+        .latest()
+        .into_iter()
+        .filter(|n| {
+            n.topic == current.topic
+                && n.source == current.source
+                && n.schema.as_deref() == Some("hooks/1")
+        })
+        .filter_map(|n| Some((n.day.clone()?, n.details.as_ref().ok()?)))
+        .collect();
+    let window = days_ending(current.day.as_deref().unwrap_or(""), SPARK_DAYS);
+    let spark = |f: &dyn Fn(&Value) -> Option<f64>| -> Vec<Option<f64>> {
+        window
+            .iter()
+            .map(|day| by_day.get(day).and_then(|v| f(v)))
+            .collect()
+    };
+    let mut out = vec![];
+    for (title, key, unit, n) in HOOKS_GAUGES {
+        let Some(value) = d[*key].as_f64() else {
+            continue;
+        };
+        let baseline = d["baseline"][*key].as_f64();
+        out.push(Gauge {
+            title: title.to_string(),
+            value,
+            baseline,
+            unit: *unit,
+            aside: n.and_then(|k| d[k].as_u64()).map(|n| format!("n={n}")),
+            tone: delta_tone(value, baseline, None),
+            spark: spark(&|v| v[*key].as_f64()),
+        });
+    }
+    let whole = |v: &Value, t: &str| -> Option<Value> {
+        v["agent_types"]
+            .as_array()?
+            .iter()
+            .find(|r| r["repo"].is_null() && r["agent_type"].as_str() == Some(t))
+            .cloned()
+    };
+    let types: Vec<String> = d["agent_types"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r["repo"].is_null())
+        .filter_map(|r| r["agent_type"].as_str().map(str::to_string))
+        .collect();
+    for t in types {
+        let Some(r) = whole(d, &t) else { continue };
+        let Some(value) = r["recommended"].as_f64() else {
+            continue;
+        };
+        let baseline = r["threshold"].as_f64();
+        out.push(Gauge {
+            title: format!("{t} reset"),
+            value,
+            baseline,
+            unit: Unit::Tokens,
+            aside: r["n"].as_u64().map(|n| format!("n={n}")),
+            tone: delta_tone(value, baseline, Some(r["flagged"].as_bool() == Some(true))),
+            spark: spark(&|v| whole(v, &t)?["recommended"].as_f64()),
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1047,6 +1431,186 @@ mod tests {
             .clone();
         let (days, _) = hooks_charts(&b, "build-box", &cur);
         assert_eq!(days, vec!["2026-10-20".to_string()]);
+    }
+
+    #[test]
+    fn tiles_health_one_liner_and_sparkline() {
+        let k = Keys::generate();
+        let mut b = Board::new(CH);
+        // hooks: two sources on the newest day, one dead: the dead one speaks.
+        b.apply(&note(&k, "2026-10-19", "build-box", 1, &details(1), &[]));
+        let mut dead = details(2);
+        dead["status"] = json!("dead");
+        dead["cost_per_useful_call_tokens"] = json!(60000);
+        b.apply(&note(&k, "2026-10-21", "mac", 1, &dead, &[]));
+        b.apply(&note(&k, "2026-10-21", "build-box", 1, &details(3), &[]));
+        // converge held: a warn, held_n as its metric.
+        let conv = format!(
+            "**Converge** held: buzz_relay drift\n\n{DETAILS_FENCE}\n{}\n```",
+            json!({"status": "held", "held_n": 2})
+        );
+        b.apply(&ev(
+            &k,
+            9,
+            &conv,
+            &[
+                &["h", CH],
+                &[TAG_TOPIC, "converge"],
+                &[TAG_SCHEMA, "converge/1"],
+                &[TAG_DAY, "2026-10-20"],
+                &[TAG_SOURCE, "infra-box"],
+            ],
+            5,
+        ));
+        // A topic nobody planned for.
+        b.apply(&ev(
+            &k,
+            9,
+            "routing fine",
+            &[
+                &["h", CH],
+                &[TAG_TOPIC, "routing"],
+                &[TAG_DAY, "2026-10-21"],
+                &[TAG_SOURCE, "x"],
+            ],
+            5,
+        ));
+        let t = b.tiles("2026-10-21");
+        let names: Vec<&str> = t.iter().map(|t| t.topic.as_str()).collect();
+        assert_eq!(
+            names,
+            ["hooks", "upgrade", "converge", "fleet-audit", "routing"]
+        );
+        let hooks = &t[0];
+        assert_eq!(hooks.health, Health::Page);
+        assert_eq!(hooks.line, "Summary for 2026-10-21.");
+        assert_eq!(
+            hooks.sources,
+            vec!["build-box".to_string(), "mac".to_string()]
+        );
+        assert_eq!(hooks.metric.key, Some("cost_per_useful_call_tokens"));
+        assert_eq!(hooks.spark.len(), SPARK_DAYS);
+        // Oldest first, ending today; a day without a note is None, two
+        // sources' rates are averaged.
+        assert_eq!(hooks.spark[13], Some((60000.0 + 55100.0) / 2.0));
+        assert_eq!(hooks.spark[12], None);
+        assert_eq!(hooks.spark[11], Some(55100.0));
+        assert_eq!(t[1].health, Health::NoNote);
+        assert_eq!(t[1].line, "no note");
+        assert!(t[1].spark.iter().all(Option::is_none));
+        assert_eq!(t[2].health, Health::Warn);
+        assert_eq!(t[2].line, "Converge held: buzz_relay drift");
+        assert_eq!(t[2].spark[12], Some(2.0));
+        // No details at all: a warn, counted by notes.
+        assert_eq!(t[4].health, Health::Warn);
+        assert_eq!(t[4].metric.key, None);
+        assert_eq!(t[4].spark[13], Some(1.0));
+        // Older than the window: off the sparkline.
+        assert!(b.tiles("2026-11-30")[0].spark.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn open_requests_newest_first_and_closed_ones_drop() {
+        let k = Keys::generate();
+        let mut b = Board::new(CH);
+        let req = |day: &str, at: u64| {
+            note(
+                &k,
+                day,
+                "build-box",
+                at,
+                &details(1),
+                &[&[TAG_ACTION, "approve", "👍"], &[TAG_STATUS, "open"]],
+            )
+        };
+        let a = req("2026-10-20", 10);
+        let c = req("2026-10-21", 20);
+        b.apply(&a);
+        b.apply(&c);
+        let ids: Vec<String> = b.open_requests().iter().map(|n| n.id.clone()).collect();
+        assert_eq!(ids, vec![c.id.to_hex(), a.id.to_hex()]);
+        assert_eq!(b.tiles("2026-10-21")[0].open, 2);
+        assert_eq!(
+            b.tiles("2026-10-21")[0].health,
+            Health::Warn,
+            "open request"
+        );
+        let cid = c.id.to_hex();
+        b.apply(&ev(
+            &k,
+            9,
+            "done",
+            &[
+                &["h", CH],
+                &["e", &cid, "", "root"],
+                &[TAG_STATUS, "closed", "approve"],
+            ],
+            30,
+        ));
+        assert_eq!(b.open_requests().len(), 1);
+    }
+
+    #[test]
+    fn delta_tones_never_green_for_a_flag() {
+        assert_eq!(delta_tone(55100.0, Some(75200.0), None), Tone::Better);
+        assert_eq!(delta_tone(42.0, Some(41.0), None), Tone::Plain);
+        assert_eq!(delta_tone(767000.0, Some(612000.0), None), Tone::Flag);
+        assert_eq!(delta_tone(1000.0, Some(600.0), None), Tone::Page);
+        // The report flagged it: amber though it is lower.
+        assert_eq!(delta_tone(161000.0, Some(250000.0), Some(true)), Tone::Flag);
+        assert_eq!(
+            delta_tone(240000.0, Some(250000.0), Some(false)),
+            Tone::Better
+        );
+        assert_eq!(delta_tone(5.0, None, None), Tone::Plain);
+        assert_eq!(delta_label(767000.0, 612000.0, Unit::Tokens), "+25%");
+        assert_eq!(delta_label(42.0, 41.0, Unit::Pct), "+1pt");
+        assert_eq!(delta_label(161000.0, 250000.0, Unit::Tokens), "-36%");
+    }
+
+    #[test]
+    fn hooks_gauges_from_the_seed_shape() {
+        let k = Keys::generate();
+        let mut b = Board::new(CH);
+        b.apply(&note(
+            &k,
+            "2026-10-20",
+            "build-box",
+            1,
+            &details(700000),
+            &[],
+        ));
+        b.apply(&note(
+            &k,
+            "2026-10-21",
+            "build-box",
+            1,
+            &details(767000),
+            &[],
+        ));
+        let cur = b.newest_hooks().unwrap().clone();
+        assert_eq!(cur.day.as_deref(), Some("2026-10-21"));
+        let g = hooks_gauges(&b, &cur);
+        let titles: Vec<&str> = g.iter().map(|g| g.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "peak subagent",
+                "peak main",
+                "spend >300k",
+                "ramp after handoff",
+                "cost / useful call",
+                "builder reset"
+            ]
+        );
+        assert_eq!(g[0].value, 767000.0);
+        assert_eq!(g[0].baseline, Some(612000.0));
+        assert_eq!(g[0].tone, Tone::Flag);
+        assert_eq!(g[0].spark[12..], [Some(700000.0), Some(767000.0)]);
+        assert_eq!(g[4].tone, Tone::Better);
+        assert_eq!(g[5].baseline, Some(250000.0));
+        assert_eq!(g[5].tone, Tone::Flag);
+        assert_eq!(g[5].spark[13], Some(161000.0));
     }
 
     #[test]
