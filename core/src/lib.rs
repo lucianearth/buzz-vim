@@ -23,5 +23,6 @@ pub mod readstate;
 pub mod relay;
 pub mod routing;
 pub mod sections;
+pub mod subscription;
 pub mod telemetry;
 pub mod unread;

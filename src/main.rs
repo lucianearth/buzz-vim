@@ -17,7 +17,7 @@ mod ui;
 
 use buzz_vim_core::{
     checklist, control, draft, links, live, log, mention, model, needs, quick, readstate, relay,
-    routing, sections, telemetry, unread,
+    routing, sections, subscription, telemetry, unread,
 };
 
 use std::sync::Arc;
@@ -142,6 +142,10 @@ async fn run(
     });
     app.loop_ = cfg.loop_.clone();
     app.control = control::Board::new(&cfg.loop_.control_channel);
+    app.subscriptions = subscription::Subscriptions::new(subscription::Trust {
+        operators: cfg.loop_.sub_operators.clone(),
+        publishers: cfg.loop_.sub_publishers.clone(),
+    });
     let saved = state::load(&relay.base, &app.store.me);
     app.chosen = saved.chosen.clone();
     app.read_width = saved.read_width;
@@ -152,6 +156,7 @@ async fn run(
         app.read = readstate::ReadState::new(saved.read_slot.clone(), saved.read_client.clone());
     }
     sync.start();
+    sync.load_subscriptions(app.subscriptions.filters());
     sync.want_profiles([app.store.me.clone()]);
 
     let mut input = EventStream::new();
@@ -382,6 +387,19 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
                 }
             }
         }
+        Msg::SubscriptionSet {
+            event,
+            label,
+            result,
+        } => match result {
+            Ok(()) => {
+                app.subscriptions.apply(&event);
+                app.say(format!(
+                    "{label}: takes effect at each session's next start"
+                ));
+            }
+            Err(e) => app.say(format!("subscription not set: {e}")),
+        },
         Msg::Voted {
             event,
             label,

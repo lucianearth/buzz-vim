@@ -24,6 +24,7 @@ use crate::needs::{self, Row};
 use crate::readstate::{self, ReadState};
 use crate::routing::{self, Decision, Lane, Pick, Window};
 use crate::sections::Section;
+use crate::subscription::{self, Subscriptions};
 use crate::telemetry::Agents;
 use crate::unread::{self, Next};
 
@@ -153,6 +154,11 @@ pub enum Action {
     React {
         target: String,
         emoji: String,
+        label: String,
+    },
+    /// `B`: sign and publish the subscription map (`label` says what changed).
+    SetSubscription {
+        map: subscription::Map,
         label: String,
     },
     SaveState,
@@ -303,6 +309,12 @@ pub struct App {
     /// The action asked about (y/n) before voting, and the request it is on.
     pub control_vote: Option<usize>,
     pub control_vote_on: Option<String>,
+    /// Which Claude subscription each channel's agents spend (`B`).
+    pub subscriptions: Subscriptions,
+    /// The `B` picker: on the default for every channel (else this one),
+    /// and its row (0 = follow the default / each agent's owner).
+    pub sub_all: bool,
+    pub sub_cursor: usize,
     /// Today for the overview's sparklines (YYYY-MM-DD); None = the UTC
     /// date now. Tests pin it.
     pub control_today: Option<String>,
@@ -400,6 +412,9 @@ impl App {
             control_max_scroll: 0,
             control_vote: None,
             control_vote_on: None,
+            subscriptions: Subscriptions::default(),
+            sub_all: false,
+            sub_cursor: 0,
             control_today: None,
         }
     }
@@ -1930,6 +1945,7 @@ impl App {
                 }
                 _ => {}
             },
+            Mode::Subscription => self.key_subscription(k),
             Mode::Archive => match k.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.archive(),
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
@@ -2130,6 +2146,7 @@ impl App {
             KeyCode::Char('q') | KeyCode::Char('Q') => self.quick(),
             KeyCode::Char('w') => self.open_routing(),
             KeyCode::Char('C') => self.open_control(),
+            KeyCode::Char('B') => self.open_subscription(),
             KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
             KeyCode::Char('d') | KeyCode::PageDown => self.move_cursor(self.page.max(1) as isize),
@@ -2315,6 +2332,102 @@ impl App {
         if next != at {
             self.show_image(next);
         }
+    }
+
+    /// `B` in a channel: the subscription picker, on what it uses now.
+    fn open_subscription(&mut self) {
+        let Some(channel) = self.current().map(str::to_string) else {
+            return self.say("open a channel first");
+        };
+        self.sub_all = false;
+        self.sub_cursor = self.sub_row_of(&channel);
+        self.mode = Mode::Subscription;
+    }
+
+    /// The picker's rows after the first: the people the box offers.
+    pub fn sub_people(&self) -> Vec<subscription::Person> {
+        self.subscriptions.people().to_vec()
+    }
+
+    /// The row for what's set now, in the picker's current scope.
+    fn sub_row_of(&self, channel: &str) -> usize {
+        let m = self.subscriptions.map();
+        let set = if self.sub_all {
+            m.and_then(|m| m.default.clone())
+        } else {
+            m.and_then(|m| m.channels.get(channel).cloned())
+        };
+        set.and_then(|p| self.sub_people().iter().position(|x| x.id == p))
+            .map_or(0, |i| i + 1)
+    }
+
+    fn key_subscription(&mut self, k: KeyEvent) {
+        let n = self.sub_people().len() + 1;
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('B') => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.sub_cursor = (self.sub_cursor + 1).min(n - 1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => self.sub_cursor = self.sub_cursor.saturating_sub(1),
+            KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Char('h')
+            | KeyCode::Char('l')
+            | KeyCode::Left
+            | KeyCode::Right => {
+                self.sub_all = !self.sub_all;
+                if let Some(c) = self.current().map(str::to_string) {
+                    self.sub_cursor = self.sub_row_of(&c);
+                }
+            }
+            KeyCode::Enter => self.choose_subscription(),
+            _ => {}
+        }
+    }
+
+    /// ⏎ in the picker: the new map, signed and published by sync. Only an
+    /// operator's record counts, so anyone else is told rather than sent.
+    fn choose_subscription(&mut self) {
+        let Some(channel) = self.current().map(str::to_string) else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        if !self.subscriptions.is_operator(&self.store.me) {
+            return self
+                .say("only an operator's pick counts (subscription_operators); nothing sent");
+        }
+        let person = self
+            .sub_cursor
+            .checked_sub(1)
+            .and_then(|i| self.sub_people().get(i).map(|p| p.id.clone()));
+        let who = person.as_deref().map(|p| self.subscriptions.label(p));
+        let name = self
+            .store
+            .channels
+            .get(&channel)
+            .map_or_else(|| channel.chars().take(8).collect(), |c| c.name.clone());
+        let (map, label) = if self.sub_all {
+            (
+                self.subscriptions.with_default(person.as_deref()),
+                format!(
+                    "default subscription: {}",
+                    who.unwrap_or_else(|| "each agent's owner".into())
+                ),
+            )
+        } else {
+            (
+                self.subscriptions.with_channel(&channel, person.as_deref()),
+                format!(
+                    "#{name} subscription: {}",
+                    who.unwrap_or_else(|| "the default".into())
+                ),
+            )
+        };
+        self.mode = Mode::Normal;
+        if self.subscriptions.map() == Some(&map) {
+            return self.say(format!("{label} (already)"));
+        }
+        self.actions.push(Action::SetSubscription { map, label });
     }
 
     fn key_sections(&mut self, k: KeyEvent) {

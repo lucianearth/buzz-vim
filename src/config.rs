@@ -37,6 +37,20 @@ struct File {
     /// The channel the Control view (`C`) reads, by id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     control_channel: Option<String>,
+    /// `B`: whose subscription records count (default: `owner`), and who
+    /// publishes the people to pick from (default: the box's poster key).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "watcher_keys"
+    )]
+    subscription_operators: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "watcher_keys"
+    )]
+    subscription_publishers: Vec<String>,
 }
 
 pub struct Config {
@@ -58,6 +72,10 @@ pub struct Loop {
     pub quick_channel: String,
     pub quick_agent: String,
     pub control_channel: String,
+    /// `B`: `subscription_operators` / `BUZZ_VIM_SUB_OPERATORS` (default: the
+    /// owner) and `subscription_publishers` / `BUZZ_VIM_SUB_PUBLISHERS`.
+    pub sub_operators: Vec<String>,
+    pub sub_publishers: Vec<String>,
 }
 
 impl Default for Loop {
@@ -71,6 +89,8 @@ impl Default for Loop {
             quick_channel: crate::quick::CHANNEL.to_string(),
             quick_agent: crate::quick::AGENT.to_string(),
             control_channel: crate::control::DEFAULT_CHANNEL.to_string(),
+            sub_operators: vec![crate::checklist::DEFAULT_OWNER.to_string()],
+            sub_publishers: vec![crate::subscription::PUBLISHER.to_string()],
         }
     }
 }
@@ -107,12 +127,34 @@ fn env(k: &str) -> Option<String> {
     std::env::var(k).ok().filter(|s| !s.trim().is_empty())
 }
 
+fn keys_env(k: &str) -> Option<Vec<String>> {
+    env(k).map(|s| {
+        s.split(',')
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .collect()
+    })
+}
+
 fn loop_settings(file: &File) -> Loop {
     let d = Loop::default();
+    let owner = env("BUZZ_VIM_OWNER")
+        .or(file.owner.clone())
+        .unwrap_or(d.owner);
     Loop {
-        owner: env("BUZZ_VIM_OWNER")
-            .or(file.owner.clone())
-            .unwrap_or(d.owner),
+        sub_operators: keys_env("BUZZ_VIM_SUB_OPERATORS")
+            .or_else(|| {
+                (!file.subscription_operators.is_empty())
+                    .then(|| file.subscription_operators.clone())
+            })
+            .unwrap_or_else(|| vec![owner.clone()]),
+        sub_publishers: keys_env("BUZZ_VIM_SUB_PUBLISHERS")
+            .or_else(|| {
+                (!file.subscription_publishers.is_empty())
+                    .then(|| file.subscription_publishers.clone())
+            })
+            .unwrap_or(d.sub_publishers),
+        owner,
         watchers: env("BUZZ_VIM_WATCHER")
             .map(|s| s.split(',').map(|k| k.trim().to_string()).collect())
             .or_else(|| (!file.watcher.is_empty()).then(|| file.watcher.clone()))

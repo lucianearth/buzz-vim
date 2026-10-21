@@ -76,6 +76,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             | Mode::Quick
             | Mode::Reply
             | Mode::Vote
+            | Mode::Subscription
     ) || (app.mode == Mode::Insert && !app.mention_candidates().is_empty());
     for (rect, key) in images.into_iter().filter(|_| !overlay) {
         if let Some(p) = app.media.encoded.get(&key) {
@@ -92,8 +93,108 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Quick => draw_quick(f, app, area),
         Mode::Reply => draw_reply(f, app, area),
         Mode::Vote => draw_vote(f, app, area),
+        Mode::Subscription => draw_subscription(f, app, area),
         _ => {}
     }
+}
+
+/// `B`: whose Claude subscription this channel's agents spend. Two
+/// scopes (this channel / the default for all), one list: follow the
+/// default (or each agent's owner), then the people the box offers.
+fn draw_subscription(f: &mut Frame, app: &mut App, area: Rect) {
+    let Some(channel) = app.current().map(str::to_string) else {
+        return;
+    };
+    let name = app
+        .store
+        .channels
+        .get(&channel)
+        .map_or_else(|| channel.chars().take(8).collect(), channel_label);
+    let people = app.sub_people();
+    let subs = &app.subscriptions;
+    let map = subs.map();
+    let legend = crate::keys::legend(Mode::Subscription);
+    let h = (people.len() as u16 + legend.len() as u16 + 10).clamp(14, area.height.max(14));
+    let r = centered(area, 64, h);
+    clear(f, r);
+    let block = Block::bordered()
+        .border_style(theme::text())
+        .title(Span::styled(" Claude subscription ", theme::bright()));
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    let tab = |on: bool, s: String| {
+        Span::styled(
+            format!(" {s} "),
+            if on {
+                theme::tab_active()
+            } else {
+                theme::tab_idle()
+            },
+        )
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::raw(" "),
+            tab(!app.sub_all, name.clone()),
+            Span::raw(" "),
+            tab(app.sub_all, "default for all".into()),
+        ]),
+        Line::raw(""),
+    ];
+    let now = if app.sub_all {
+        map.and_then(|m| m.default.clone())
+    } else {
+        map.and_then(|m| m.channels.get(&channel).cloned())
+    };
+    let default_who = map
+        .and_then(|m| m.default.as_deref())
+        .map_or_else(|| "each agent's owner".to_string(), |p| subs.label(p));
+    let first = if app.sub_all {
+        "each agent's owner".to_string()
+    } else {
+        format!("follow the default ({default_who})")
+    };
+    let mut rows = vec![(first, None::<String>)];
+    rows.extend(
+        people
+            .iter()
+            .map(|p| (format!("{}  {}", p.label, p.id), Some(p.id.clone()))),
+    );
+    for (i, (text, id)) in rows.iter().enumerate() {
+        let mark = if *id == now { "●" } else { " " };
+        let st = if i == app.sub_cursor {
+            theme::tab_active()
+        } else {
+            theme::text()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {mark} "), theme::bright()),
+            Span::styled(format!("{text} "), st),
+        ]));
+    }
+    if people.is_empty() {
+        lines.push(Line::styled(
+            "   no people published yet (the box lists them each minute)",
+            theme::faint(),
+        ));
+    }
+    lines.push(Line::raw(""));
+    let note = if !subs.is_operator(&app.store.me) {
+        " you are not an operator: your pick would not count".to_string()
+    } else if map.is_none() {
+        " nothing set from here yet: the dashboard's map applies".to_string()
+    } else {
+        " takes effect at each session's next start".to_string()
+    };
+    lines.push(Line::styled(note, theme::faint()));
+    for (i, (k, what, _)) in legend.iter().enumerate() {
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(format!(" {k} "), theme::chip(theme::nth(i))),
+            Span::styled(format!("  {what}"), theme::muted()),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// The y/n box before a vote goes out.
@@ -1237,6 +1338,21 @@ fn draw_status(f: &mut Frame, app: &mut App, row: Rect, channel: &str, hint: boo
         .checklists
         .summary(channel, crate::checklist::local_midnight(now));
     let flags = crate::needs::answer_count(&app.needs);
+    // The channel's Claude subscription (`B`), at the right end.
+    if row.height > 0 {
+        if let Some(s) = app.subscriptions.status(channel) {
+            let label = format!("{s}{} ", if hint { "  B" } else { "" });
+            let w = (label.width() as u16).min(row.width);
+            f.render_widget(
+                Paragraph::new(Line::styled(label, theme::muted())),
+                Rect {
+                    x: row.right() - w,
+                    width: w,
+                    ..row
+                },
+            );
+        }
+    }
     if row.height == 0 || (sum.is_empty() && flags == 0) {
         return;
     }
@@ -5217,5 +5333,127 @@ mod tests {
         assert_eq!(text(&ticks), vec!["run a `b` c now"]);
         let lone = render_markdown("it's a ` tick", 40, &[]);
         assert_eq!(text(&lone), vec!["it's a ` tick"]);
+    }
+
+    /// `B` in a channel: the picker lists follow-the-default and the
+    /// people the box published; ⏎ as an operator asks sync to publish the
+    /// map with this channel's pick; the status line shows what it uses.
+    /// A non-operator's record never shows, and they can't send one.
+    #[test]
+    fn b_picks_this_channels_subscription() {
+        use crate::subscription::{D_MAP, D_PEOPLE, Subscriptions, Trust};
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+        let me = Keys::generate();
+        let box_key = Keys::generate();
+        let stranger = Keys::generate();
+        let mut app = App::new(me.public_key().to_hex(), None);
+        let ch = "5e8e98d5-b696-49e2-8c6c-c0bc8faa831a";
+        app.store.channel_mut(ch).name = "flow-jamming".into();
+        app.store.channel_mut(ch).loaded = true;
+        app.tabs = vec![ch.into()];
+        app.subscriptions = Subscriptions::new(Trust {
+            operators: vec![me.public_key().to_hex()],
+            publishers: vec![box_key.public_key().to_hex()],
+        });
+        let rec = |k: &Keys, d: &str, c: serde_json::Value, at: u64| {
+            EventBuilder::new(Kind::from(30078u16), c.to_string())
+                .tags([Tag::parse(["d", d]).unwrap()])
+                .custom_created_at(Timestamp::from(at))
+                .sign_with_keys(k)
+                .unwrap()
+        };
+        app.subscriptions.apply(&rec(
+            &box_key,
+            D_PEOPLE,
+            serde_json::json!({"people": [{"id": "kevin", "label": "Kevin"}, {"id": "lucian", "label": "Lucian"}]}),
+            10,
+        ));
+        app.subscriptions.apply(&rec(
+            &me,
+            D_MAP,
+            serde_json::json!({"default": "lucian"}),
+            20,
+        ));
+        // A channel member signing a newer map changes nothing.
+        assert!(!app.subscriptions.apply(&rec(
+            &stranger,
+            D_MAP,
+            serde_json::json!({"channels": {ch: "kevin"}}),
+            30
+        )));
+        let s = screen_text(&mut app, 100, 20);
+        assert!(s.contains("sub Lucian (default)"), "{s}");
+
+        app.on_term(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::from(KeyCode::Char('B')),
+        ));
+        assert_eq!(app.mode, Mode::Subscription);
+        let s = screen_text(&mut app, 100, 30);
+        assert!(s.contains("follow the default (Lucian)"), "{s}");
+        assert!(s.contains("Kevin  kevin"), "{s}");
+        app.on_term(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::from(KeyCode::Char('j')),
+        ));
+        app.on_term(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::from(KeyCode::Enter),
+        ));
+        assert_eq!(app.mode, Mode::Normal);
+        let Some(crate::app::Action::SetSubscription { map, label }) = app.actions.pop() else {
+            panic!("no SetSubscription: {:?}", app.actions.len());
+        };
+        assert_eq!(map.channels.get(ch).map(String::as_str), Some("kevin"));
+        assert_eq!(map.default.as_deref(), Some("lucian"), "the default stays");
+        assert!(
+            label.contains("#flow-jamming") && label.contains("Kevin"),
+            "{label}"
+        );
+
+        // What sync does on success: the signed record, applied.
+        let ev = crate::subscription::builder(&map)
+            .unwrap()
+            .custom_created_at(Timestamp::from(40))
+            .sign_with_keys(&me)
+            .unwrap();
+        assert!(app.subscriptions.apply(&ev));
+        let s = screen_text(&mut app, 100, 20);
+        assert!(s.contains("sub Kevin "), "{s}");
+
+        // Tab: the default for all; row 0 is each agent's owner.
+        app.on_term(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::from(KeyCode::Char('B')),
+        ));
+        app.on_term(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::from(KeyCode::Tab),
+        ));
+        assert!(app.sub_all);
+        assert_eq!(app.sub_cursor, 2, "on the current default, lucian");
+        app.on_term(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::from(KeyCode::Char('k')),
+        ));
+        app.on_term(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::from(KeyCode::Char('k')),
+        ));
+        app.on_term(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::from(KeyCode::Enter),
+        ));
+        let Some(crate::app::Action::SetSubscription { map, .. }) = app.actions.pop() else {
+            panic!("no SetSubscription for the default");
+        };
+        assert_eq!(map.default, None);
+        assert_eq!(map.channels.get(ch).map(String::as_str), Some("kevin"));
+
+        // Not an operator: told, nothing sent.
+        app.subscriptions.trust.operators = vec![stranger.public_key().to_hex()];
+        app.on_term(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::from(KeyCode::Char('B')),
+        ));
+        app.on_term(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::from(KeyCode::Enter),
+        ));
+        assert!(
+            !app.actions
+                .iter()
+                .any(|a| matches!(a, crate::app::Action::SetSubscription { .. }))
+        );
     }
 }

@@ -19,6 +19,7 @@ use crate::needs;
 use crate::readstate::{self, ReadState};
 use crate::relay::{BlobDescriptor, Relay};
 use crate::sections::{self, Lanes};
+use crate::subscription::{self, Subscriptions};
 use crate::unread;
 
 pub enum Msg {
@@ -102,6 +103,12 @@ pub enum Msg {
     Control {
         channel: String,
         result: anyhow::Result<(Vec<Event>, Vec<String>)>,
+    },
+    /// The subscription map went out (`B`), or didn't.
+    SubscriptionSet {
+        event: Box<Event>,
+        label: String,
+        result: anyhow::Result<()>,
     },
     /// A vote went out, or didn't.
     Voted {
@@ -220,6 +227,26 @@ impl Sync {
                     .unwrap_or_default(),
             )
         });
+    }
+
+    /// The subscription map and the people to pick from, and their live
+    /// tail (another device, or the box publishing a new list).
+    pub fn load_subscriptions(&mut self, filters: Vec<Value>) {
+        let at = now();
+        let _ = self.live.send(Cmd::Sub {
+            id: "subscription".into(),
+            filters: filters
+                .iter()
+                .map(|f| {
+                    let mut f = f.clone();
+                    f["since"] = json!(at);
+                    f["limit"] = json!(0);
+                    f
+                })
+                .collect(),
+        });
+        let r = self.relay.clone();
+        self.spawn(async move { Msg::Events(r.query(&filters).await.unwrap_or_default()) });
     }
 
     pub fn load_channels(&self) {
@@ -733,6 +760,7 @@ impl Sync {
                 emoji,
                 label,
             } => self.react(app, target, emoji, label),
+            Action::SetSubscription { map, label } => self.set_subscription(app, map, label),
             Action::SendQuick {
                 channel,
                 content,
@@ -953,6 +981,24 @@ impl Sync {
         };
         let r = self.relay.clone();
         self.spawn(async move { Msg::Did(r.publish(&ev).await.map(|_| label.to_string())) });
+    }
+
+    /// `B`: the whole map, signed; shown once the relay has it.
+    fn set_subscription(&mut self, app: &mut App, map: subscription::Map, label: String) {
+        let ev = match subscription::builder(&map).and_then(|b| self.relay.sign(b)) {
+            Ok(ev) => ev,
+            Err(e) => return app.say(format!("couldn't sign: {e}")),
+        };
+        app.say(format!("{label}…"));
+        let r = self.relay.clone();
+        self.spawn(async move {
+            let result = r.publish(&ev).await;
+            Msg::SubscriptionSet {
+                event: Box::new(ev),
+                label,
+                result,
+            }
+        });
     }
 
     /// A vote on a control request: the action's emoji as a reaction.
@@ -1227,6 +1273,10 @@ pub fn fold(app: &mut App, sync: &mut Sync, ev: &Event, live_channel: bool) -> V
         }
         20001 => {
             app.agents.presence(&ev.pubkey.to_hex(), &ev.content);
+            return vec![];
+        }
+        30078 if Subscriptions::is_record(ev) => {
+            app.subscriptions.apply(ev);
             return vec![];
         }
         30078 if readstate::is_read_state(ev) => {
