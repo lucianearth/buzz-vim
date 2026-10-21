@@ -156,9 +156,10 @@ pub enum Action {
         emoji: String,
         label: String,
     },
-    /// `B`: sign and publish the subscription map (`label` says what changed).
+    /// `B`: re-read the map from the relay, apply the edit to the newest,
+    /// sign and publish (`label` says what changed).
     SetSubscription {
-        map: subscription::Map,
+        edit: subscription::Edit,
         label: String,
     },
     SaveState,
@@ -2344,9 +2345,25 @@ impl App {
         self.mode = Mode::Subscription;
     }
 
-    /// The picker's rows after the first: the people the box offers.
+    /// The picker's rows after the first: the people the box offers, then
+    /// anyone picked now (this channel or the default) whom it doesn't, so
+    /// the cursor can sit on the current pick and ⏎ keeps it.
     pub fn sub_people(&self) -> Vec<subscription::Person> {
-        self.subscriptions.people().to_vec()
+        let mut out = self.subscriptions.people().to_vec();
+        let m = self.subscriptions.map();
+        let here = self
+            .current()
+            .and_then(|c| m.and_then(|m| m.channels.get(c).cloned()));
+        let default = m.and_then(|m| m.default.clone());
+        for id in [here, default].into_iter().flatten() {
+            if !out.iter().any(|p| p.id == id) {
+                out.push(subscription::Person {
+                    label: format!("{id} (not offered)"),
+                    id,
+                });
+            }
+        }
+        out
     }
 
     /// The row for what's set now, in the picker's current scope.
@@ -2393,22 +2410,29 @@ impl App {
             return;
         };
         if !self.subscriptions.is_operator(&self.store.me) {
+            self.mode = Mode::Normal;
             return self
                 .say("only an operator's pick counts (subscription_operators); nothing sent");
+        }
+        let people = self.sub_people();
+        if self.sub_cursor > people.len() {
+            // The list shrank under the cursor: never read that as "clear".
+            self.sub_cursor = people.len();
+            return self.say("the list changed; pick again");
         }
         let person = self
             .sub_cursor
             .checked_sub(1)
-            .and_then(|i| self.sub_people().get(i).map(|p| p.id.clone()));
+            .and_then(|i| people.get(i).map(|p| p.id.clone()));
         let who = person.as_deref().map(|p| self.subscriptions.label(p));
         let name = self
             .store
             .channels
             .get(&channel)
             .map_or_else(|| channel.chars().take(8).collect(), |c| c.name.clone());
-        let (map, label) = if self.sub_all {
+        let (edit, label) = if self.sub_all {
             (
-                self.subscriptions.with_default(person.as_deref()),
+                subscription::Edit::Default(person.clone()),
                 format!(
                     "default subscription: {}",
                     who.unwrap_or_else(|| "each agent's owner".into())
@@ -2416,7 +2440,7 @@ impl App {
             )
         } else {
             (
-                self.subscriptions.with_channel(&channel, person.as_deref()),
+                subscription::Edit::Channel(channel.clone(), person.clone()),
                 format!(
                     "#{name} subscription: {}",
                     who.unwrap_or_else(|| "the default".into())
@@ -2424,10 +2448,9 @@ impl App {
             )
         };
         self.mode = Mode::Normal;
-        if self.subscriptions.map() == Some(&map) {
-            return self.say(format!("{label} (already)"));
-        }
-        self.actions.push(Action::SetSubscription { map, label });
+        // Whether it changes anything is decided against the relay's newest
+        // map at publish time (sync), not this possibly stale copy.
+        self.actions.push(Action::SetSubscription { edit, label });
     }
 
     fn key_sections(&mut self, k: KeyEvent) {

@@ -60,6 +60,12 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
   and ramp by repo; any other schema shows its JSON. A request shows its actions as `1`–`9` with votes and
   status: pressing one asks, then sends that reaction as your vote (only approvers', when it names any).
   `r` reloads. The channel is `control_channel` (`BUZZ_VIM_CONTROL_CHANNEL`), default #control
+- `B` in a channel picks whose Claude subscription its agents spend: this channel, or (`Tab`) the default
+  for every channel. Rows are "follow the default" (or each agent's owner) and the people the box offers;
+  a pick the box no longer offers stays listed as "not offered". `⏎` reads the newest map from the relay,
+  applies the change, signs it and publishes it (kind 30078 `d=buzz-subscription`); the aei reconciler
+  takes it from an operator's key only and it applies at each session's next start. The status line's
+  right end shows `sub <person>` or `sub <person> (default)`
 - `q` or `Q` (or `^q`, which also works while writing) asks a quick question: a box that posts a new top-level message
   in #quick, starting with `[Q]` and @mentioning taskbot. Press `^q` again in the box to add the channel you're
   in (its name, id, link and latest 30 messages' ids) so taskbot can read it; again takes it off. A DM or
@@ -121,6 +127,9 @@ In `buzz-vim/config.json` (or the env var):
   another type is ignored with a warning, and the default used.
 - `control_channel` (`BUZZ_VIM_CONTROL_CHANNEL`): the channel id the Control view (`C`) reads, default
   #control (`ee7289a1-…`).
+- `subscription_operators` (`BUZZ_VIM_SUB_OPERATORS`, comma separated): whose `B` map counts, default
+  the owner. `subscription_publishers` (`BUZZ_VIM_SUB_PUBLISHERS`): who may publish the people list,
+  default the box's poster key (`f708a2af…`).
 - `quick_channel` (`BUZZ_VIM_QUICK_CHANNEL`), default `quick`, and `quick_agent` (`BUZZ_VIM_QUICK_AGENT`),
   default `taskbot`: where Q posts and who it @mentions.
 

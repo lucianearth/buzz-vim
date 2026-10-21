@@ -104,6 +104,12 @@ pub enum Msg {
         channel: String,
         result: anyhow::Result<(Vec<Event>, Vec<String>)>,
     },
+    /// `B`, step 1: the relay's newest map (or why not), and the edit.
+    SubscriptionFetched {
+        edit: subscription::Edit,
+        label: String,
+        result: anyhow::Result<Vec<Event>>,
+    },
     /// The subscription map went out (`B`), or didn't.
     SubscriptionSet {
         event: Box<Event>,
@@ -246,7 +252,12 @@ impl Sync {
                 .collect(),
         });
         let r = self.relay.clone();
-        self.spawn(async move { Msg::Events(r.query(&filters).await.unwrap_or_default()) });
+        self.spawn(async move {
+            match r.query(&filters).await {
+                Ok(evs) => Msg::Events(evs),
+                Err(e) => Msg::Did(Err(e.context("couldn't load the subscription map"))),
+            }
+        });
     }
 
     pub fn load_channels(&self) {
@@ -760,7 +771,7 @@ impl Sync {
                 emoji,
                 label,
             } => self.react(app, target, emoji, label),
-            Action::SetSubscription { map, label } => self.set_subscription(app, map, label),
+            Action::SetSubscription { edit, label } => self.fetch_subscription(app, edit, label),
             Action::SendQuick {
                 channel,
                 content,
@@ -983,13 +994,32 @@ impl Sync {
         self.spawn(async move { Msg::Did(r.publish(&ev).await.map(|_| label.to_string())) });
     }
 
-    /// `B`: the whole map, signed; shown once the relay has it.
-    fn set_subscription(&mut self, app: &mut App, map: subscription::Map, label: String) {
-        let ev = match subscription::builder(&map).and_then(|b| self.relay.sign(b)) {
+    /// `B`, step 1: the map is a read-modify-write of one record, so read
+    /// the relay's newest first; a copy loaded at start (or missed while
+    /// disconnected) would drop picks made elsewhere.
+    fn fetch_subscription(&mut self, app: &mut App, edit: subscription::Edit, label: String) {
+        app.say(format!("{label}…"));
+        let r = self.relay.clone();
+        let filters = app.subscriptions.filters();
+        self.spawn(async move {
+            let result = r.query(&filters).await;
+            Msg::SubscriptionFetched {
+                edit,
+                label,
+                result,
+            }
+        });
+    }
+
+    /// `B`, step 2: the newest map with the edit, signed, shown at once (so
+    /// a second edit builds on it) and published; undone if the relay refuses.
+    pub fn set_subscription(&mut self, app: &mut App, map: subscription::Map, label: String) {
+        let at = app.subscriptions.next_at(now());
+        let ev = match subscription::builder(&map, at).and_then(|b| self.relay.sign(b)) {
             Ok(ev) => ev,
             Err(e) => return app.say(format!("couldn't sign: {e}")),
         };
-        app.say(format!("{label}…"));
+        app.subscriptions.apply_ours(&ev);
         let r = self.relay.clone();
         self.spawn(async move {
             let result = r.publish(&ev).await;

@@ -51,6 +51,20 @@ impl Default for Trust {
 pub struct Map {
     pub default: Option<String>,
     pub channels: BTreeMap<String, String>,
+    /// What this client could not read (top-level fields it doesn't know,
+    /// channel entries it can't parse), written back as found, so an edit
+    /// here never deletes another writer's data.
+    pub kept: serde_json::Map<String, Value>,
+    pub kept_channels: serde_json::Map<String, Value>,
+}
+
+/// One change from the picker, applied to the newest map at publish time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Edit {
+    /// A channel's own pick (None: follow the default).
+    Channel(String, Option<String>),
+    /// The default for every channel (None: each agent's owner).
+    Default(Option<String>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,6 +93,8 @@ struct Rec<T> {
 pub struct Subscriptions {
     pub trust: Trust,
     map: Option<Rec<Map>>,
+    /// The map before our own unacked record, to go back to if it fails.
+    before_ours: Option<(String, Option<Rec<Map>>)>,
     people: Option<Rec<Vec<Person>>>,
 }
 
@@ -117,19 +133,30 @@ fn read_map(ev: &Event) -> Map {
         .and_then(Value::as_str)
         .filter(|s| is_person(s))
         .map(str::to_string);
-    let channels = o
-        .get("channels")
-        .and_then(Value::as_object)
-        .map(|m| {
-            m.iter()
-                .filter_map(|(c, p)| {
-                    let p = p.as_str()?;
-                    (is_uuid(c) && is_person(p)).then(|| (c.clone(), p.to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    Map { default, channels }
+    let mut channels = BTreeMap::new();
+    let mut kept_channels = serde_json::Map::new();
+    if let Some(m) = o.get("channels").and_then(Value::as_object) {
+        for (c, p) in m {
+            match p.as_str() {
+                Some(p) if is_uuid(c) && is_person(p) => {
+                    channels.insert(c.clone(), p.to_string());
+                }
+                _ => {
+                    kept_channels.insert(c.clone(), p.clone());
+                }
+            }
+        }
+    }
+    let kept = o
+        .into_iter()
+        .filter(|(k, _)| !matches!(k.as_str(), "v" | "default" | "channels"))
+        .collect();
+    Map {
+        default,
+        channels,
+        kept,
+        kept_channels,
+    }
 }
 
 fn read_people(ev: &Event) -> Vec<Person> {
@@ -273,39 +300,87 @@ impl Subscriptions {
     /// The current map with one channel's pick changed (None: follow the
     /// default). Starts from the newest known map, so other picks stay.
     pub fn with_channel(&self, channel: &str, person: Option<&str>) -> Map {
-        let mut m = self.map().cloned().unwrap_or_default();
-        match person {
-            Some(p) => {
-                m.channels.insert(channel.to_string(), p.to_string());
-            }
-            None => {
-                m.channels.remove(channel);
-            }
-        }
-        m
+        self.edited(&Edit::Channel(
+            channel.to_string(),
+            person.map(str::to_string),
+        ))
     }
 
     /// The current map with a new default (None: each agent's owner).
     pub fn with_default(&self, person: Option<&str>) -> Map {
+        self.edited(&Edit::Default(person.map(str::to_string)))
+    }
+
+    /// The newest known map with one edit applied.
+    pub fn edited(&self, edit: &Edit) -> Map {
         let mut m = self.map().cloned().unwrap_or_default();
-        m.default = person.map(str::to_string);
+        match edit {
+            Edit::Channel(c, Some(p)) => {
+                m.kept_channels.remove(c);
+                m.channels.insert(c.clone(), p.clone());
+            }
+            Edit::Channel(c, None) => {
+                m.kept_channels.remove(c);
+                m.channels.remove(c);
+            }
+            Edit::Default(p) => m.default = p.clone(),
+        }
         m
+    }
+
+    /// The created_at for our next record: now, but always after the map
+    /// held, so it wins even against a clock ahead of ours or a second
+    /// edit within the same second.
+    pub fn next_at(&self, now: u64) -> u64 {
+        self.map.as_ref().map_or(now, |r| now.max(r.at + 1))
+    }
+
+    /// Our own record, just signed: shown at once so the next edit builds
+    /// on it, and remembered so `retract` can undo it if the relay refuses.
+    pub fn apply_ours(&mut self, ev: &Event) -> bool {
+        let before = self.map.clone();
+        let shown = self.apply(ev);
+        if shown {
+            self.before_ours = Some((ev.id.to_hex(), before));
+        }
+        shown
+    }
+
+    /// The relay refused our record: back to the map before it, unless
+    /// something newer arrived meanwhile.
+    pub fn retract(&mut self, id: &str) {
+        if let Some((ours, before)) = self.before_ours.take() {
+            if ours == id && self.map.as_ref().is_some_and(|r| r.id == id) {
+                self.map = before;
+            } else if ours != id {
+                self.before_ours = Some((ours, before));
+            }
+        }
     }
 }
 
-/// The record for a map, ready to sign.
-pub fn builder(m: &Map) -> anyhow::Result<EventBuilder> {
-    let content = json!({
-        "v": 1,
-        "default": m.default.clone().unwrap_or_default(),
-        "channels": m.channels,
-    });
+/// The record for a map, dated `at` (see `Subscriptions::next_at`), ready
+/// to sign. What this client could not read goes back as it was found.
+pub fn builder(m: &Map, at: u64) -> anyhow::Result<EventBuilder> {
+    let mut channels = m.kept_channels.clone();
+    for (c, p) in &m.channels {
+        channels.insert(c.clone(), json!(p));
+    }
+    let mut content = m.kept.clone();
+    content.insert("v".into(), json!(1));
+    content.insert(
+        "default".into(),
+        json!(m.default.clone().unwrap_or_default()),
+    );
+    content.insert("channels".into(), Value::Object(channels));
     Ok(
-        EventBuilder::new(Kind::from(KIND), content.to_string()).tags([
-            Tag::parse(["d", D_MAP])?,
-            Tag::parse(["t", "buzz-subscription"])?,
-            Tag::parse(["alt", "Which Claude subscription each channel's agents use"])?,
-        ]),
+        EventBuilder::new(Kind::from(KIND), Value::Object(content).to_string())
+            .tags([
+                Tag::parse(["d", D_MAP])?,
+                Tag::parse(["t", "buzz-subscription"])?,
+                Tag::parse(["alt", "Which Claude subscription each channel's agents use"])?,
+            ])
+            .custom_created_at(nostr::Timestamp::from(at)),
     )
 }
 
@@ -446,15 +521,94 @@ mod tests {
         assert_eq!(m.default.as_deref(), Some("kevin"));
         let m = s.with_default(None);
         assert_eq!(m.channels.len(), 2);
-        let ev = builder(&s.with_channel(OPS, Some("carol")))
+        let ev = builder(&s.with_channel(OPS, Some("carol")), 200)
             .unwrap()
-            .custom_created_at(Timestamp::from(200))
             .sign_with_keys(&op)
             .unwrap();
         assert_eq!(tag(&ev, "d"), Some(D_MAP));
         assert!(s.apply(&ev));
         assert_eq!(s.status(OPS).unwrap(), "sub carol");
         assert_eq!(s.status(DEV).unwrap(), "sub alice");
+    }
+
+    /// Two picks before the first is acked: the second builds on the
+    /// first (shown at sign time), and is dated after it even in the same
+    /// second, so neither is lost.
+    #[test]
+    fn a_second_edit_before_the_ack_keeps_the_first() {
+        let (op, _, _, mut s) = setup();
+        s.apply(&rec(&op, D_MAP, json!({"default": "kevin"}), 100));
+        let at1 = s.next_at(100);
+        assert_eq!(at1, 101, "after the held record even at the same second");
+        let e1 = builder(
+            &s.edited(&Edit::Channel(DEV.into(), Some("alice".into()))),
+            at1,
+        )
+        .unwrap()
+        .sign_with_keys(&op)
+        .unwrap();
+        assert!(s.apply_ours(&e1));
+        let at2 = s.next_at(101);
+        assert_eq!(at2, 102);
+        let m2 = s.edited(&Edit::Channel(OPS.into(), Some("bob".into())));
+        assert_eq!(m2.channels.get(DEV).map(String::as_str), Some("alice"));
+        assert_eq!(m2.channels.get(OPS).map(String::as_str), Some("bob"));
+        assert_eq!(m2.default.as_deref(), Some("kevin"));
+        // A clock behind the held record still dates ours after it.
+        assert_eq!(s.next_at(50), 102);
+    }
+
+    /// The relay refuses ours: back to the map before it.
+    #[test]
+    fn a_refused_record_is_retracted() {
+        let (op, _, _, mut s) = setup();
+        s.apply(&rec(&op, D_MAP, json!({"default": "kevin"}), 100));
+        let ev = builder(&s.edited(&Edit::Default(Some("alice".into()))), 101)
+            .unwrap()
+            .sign_with_keys(&op)
+            .unwrap();
+        assert!(s.apply_ours(&ev));
+        assert_eq!(s.map().unwrap().default.as_deref(), Some("alice"));
+        s.retract(&ev.id.to_hex());
+        assert_eq!(s.map().unwrap().default.as_deref(), Some("kevin"));
+        // A first-ever record that fails leaves no map at all.
+        let (op, _, _, mut s) = setup();
+        let ev = builder(&s.edited(&Edit::Default(Some("alice".into()))), 5)
+            .unwrap()
+            .sign_with_keys(&op)
+            .unwrap();
+        s.apply_ours(&ev);
+        s.retract(&ev.id.to_hex());
+        assert!(s.map().is_none());
+    }
+
+    /// What this client can't read is written back as found.
+    #[test]
+    fn an_edit_keeps_what_it_could_not_read() {
+        let (op, _, _, mut s) = setup();
+        let upper = "5E8E98D5-B696-49E2-8C6C-C0BC8FAA831A";
+        s.apply(&rec(
+            &op,
+            D_MAP,
+            json!({"v": 1, "default": "kevin", "note": {"x": 1},
+                   "channels": {DEV: "alice", upper: "bob", OPS: 7}}),
+            100,
+        ));
+        assert_eq!(s.map().unwrap().channels.len(), 1, "shown leniently");
+        let m = s.edited(&Edit::Default(None));
+        let ev = builder(&m, 101).unwrap().sign_with_keys(&op).unwrap();
+        let c: Value = serde_json::from_str(&ev.content).unwrap();
+        assert_eq!(c["note"], json!({"x": 1}));
+        assert_eq!(c["channels"][upper], json!("bob"));
+        assert_eq!(c["channels"][OPS], json!(7));
+        assert_eq!(c["channels"][DEV], json!("alice"));
+        assert_eq!(c["default"], json!(""));
+        assert_eq!(c["v"], json!(1));
+        // Setting a channel this client couldn't read replaces the raw entry.
+        let m = s.edited(&Edit::Channel(OPS.into(), Some("carol".into())));
+        let ev = builder(&m, 102).unwrap().sign_with_keys(&op).unwrap();
+        let c: Value = serde_json::from_str(&ev.content).unwrap();
+        assert_eq!(c["channels"][OPS], json!("carol"));
     }
 
     #[test]

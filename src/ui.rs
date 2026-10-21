@@ -1338,10 +1338,12 @@ fn draw_status(f: &mut Frame, app: &mut App, row: Rect, channel: &str, hint: boo
         .checklists
         .summary(channel, crate::checklist::local_midnight(now));
     let flags = crate::needs::answer_count(&app.needs);
-    // The channel's Claude subscription (`B`), at the right end.
+    // The channel's Claude subscription (`B`), at the right end; the
+    // summary gets the rest of the row so it never writes over it.
+    let mut row = row;
     if row.height > 0 {
         if let Some(s) = app.subscriptions.status(channel) {
-            let label = format!("{s}{} ", if hint { "  B" } else { "" });
+            let label = format!("  {s}{} ", if hint { "  B" } else { "" });
             let w = (label.width() as u16).min(row.width);
             f.render_widget(
                 Paragraph::new(Line::styled(label, theme::muted())),
@@ -1351,6 +1353,7 @@ fn draw_status(f: &mut Frame, app: &mut App, row: Rect, channel: &str, hint: boo
                     ..row
                 },
             );
+            row.width -= w;
         }
     }
     if row.height == 0 || (sum.is_empty() && flags == 0) {
@@ -3878,6 +3881,31 @@ mod tests {
         );
     }
 
+    /// The subscription label and a long checklist summary share the
+    /// status line: the summary is cut short, never written over the label.
+    #[test]
+    fn status_line_keeps_the_subscription_label_beside_the_summary() {
+        use crate::subscription::{D_MAP, Subscriptions, Trust};
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let mut app = loop_fixture();
+        let op = Keys::generate();
+        app.subscriptions = Subscriptions::new(Trust {
+            operators: vec![op.public_key().to_hex()],
+            publishers: vec![],
+        });
+        let ev = EventBuilder::new(Kind::from(30078u16), r#"{"default":"kevin"}"#)
+            .tags([Tag::parse(["d", D_MAP]).unwrap()])
+            .sign_with_keys(&op)
+            .unwrap();
+        assert!(app.subscriptions.apply(&ev));
+        let s = screen_text(&mut app, 80, 34);
+        let row = s
+            .lines()
+            .find(|l| l.contains("RUNNING"))
+            .unwrap_or_else(|| panic!("{s}"));
+        assert!(row.contains("sub kevin (default)"), "{row}");
+    }
+
     #[test]
     fn status_line_and_checklist_pane_show_the_loop() {
         let mut app = loop_fixture();
@@ -5398,9 +5426,10 @@ mod tests {
             crossterm::event::KeyEvent::from(KeyCode::Enter),
         ));
         assert_eq!(app.mode, Mode::Normal);
-        let Some(crate::app::Action::SetSubscription { map, label }) = app.actions.pop() else {
+        let Some(crate::app::Action::SetSubscription { edit, label }) = app.actions.pop() else {
             panic!("no SetSubscription: {:?}", app.actions.len());
         };
+        let map = app.subscriptions.edited(&edit);
         assert_eq!(map.channels.get(ch).map(String::as_str), Some("kevin"));
         assert_eq!(map.default.as_deref(), Some("lucian"), "the default stays");
         assert!(
@@ -5409,9 +5438,8 @@ mod tests {
         );
 
         // What sync does on success: the signed record, applied.
-        let ev = crate::subscription::builder(&map)
+        let ev = crate::subscription::builder(&map, 40)
             .unwrap()
-            .custom_created_at(Timestamp::from(40))
             .sign_with_keys(&me)
             .unwrap();
         assert!(app.subscriptions.apply(&ev));
@@ -5436,9 +5464,10 @@ mod tests {
         app.on_term(crossterm::event::Event::Key(
             crossterm::event::KeyEvent::from(KeyCode::Enter),
         ));
-        let Some(crate::app::Action::SetSubscription { map, .. }) = app.actions.pop() else {
+        let Some(crate::app::Action::SetSubscription { edit, .. }) = app.actions.pop() else {
             panic!("no SetSubscription for the default");
         };
+        let map = app.subscriptions.edited(&edit);
         assert_eq!(map.default, None);
         assert_eq!(map.channels.get(ch).map(String::as_str), Some("kevin"));
 
@@ -5455,5 +5484,82 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, crate::app::Action::SetSubscription { .. }))
         );
+        assert_eq!(app.mode, Mode::Normal, "told, and the picker closes");
+    }
+
+    /// A pick the box no longer offers is shown and kept, not cleared by
+    /// ⏎; a list that shrinks under the cursor is never read as "clear".
+    #[test]
+    fn b_keeps_a_pick_that_is_not_offered() {
+        use crate::subscription::{D_MAP, D_PEOPLE, Edit, Subscriptions, Trust};
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+        let me = Keys::generate();
+        let box_key = Keys::generate();
+        let mut app = App::new(me.public_key().to_hex(), None);
+        let ch = "5e8e98d5-b696-49e2-8c6c-c0bc8faa831a";
+        app.store.channel_mut(ch).name = "flow-jamming".into();
+        app.store.channel_mut(ch).loaded = true;
+        app.tabs = vec![ch.into()];
+        app.subscriptions = Subscriptions::new(Trust {
+            operators: vec![me.public_key().to_hex()],
+            publishers: vec![box_key.public_key().to_hex()],
+        });
+        let rec = |k: &Keys, d: &str, c: serde_json::Value, at: u64| {
+            EventBuilder::new(Kind::from(30078u16), c.to_string())
+                .tags([Tag::parse(["d", d]).unwrap()])
+                .custom_created_at(Timestamp::from(at))
+                .sign_with_keys(k)
+                .unwrap()
+        };
+        let people = |ids: &[&str], at| {
+            rec(
+                &box_key,
+                D_PEOPLE,
+                serde_json::json!({"people": ids.iter().map(|i| serde_json::json!({"id": i})).collect::<Vec<_>>()}),
+                at,
+            )
+        };
+        app.subscriptions.apply(&people(&["kevin"], 10));
+        app.subscriptions.apply(&rec(
+            &me,
+            D_MAP,
+            serde_json::json!({"channels": {ch: "alice"}}),
+            20,
+        ));
+        let key = |app: &mut App, c| {
+            app.on_term(crossterm::event::Event::Key(
+                crossterm::event::KeyEvent::from(c),
+            ))
+        };
+        key(&mut app, KeyCode::Char('B'));
+        let s = screen_text(&mut app, 100, 30);
+        assert!(s.contains("alice (not offered)"), "{s}");
+        assert_eq!(
+            app.sub_cursor, 2,
+            "on alice, after follow-the-default and kevin"
+        );
+        key(&mut app, KeyCode::Enter);
+        let Some(crate::app::Action::SetSubscription { edit, .. }) = app.actions.pop() else {
+            panic!("no SetSubscription");
+        };
+        assert_eq!(
+            edit,
+            Edit::Channel(ch.into(), Some("alice".into())),
+            "kept, not cleared"
+        );
+
+        // The list shrinks while the cursor is on its last row.
+        app.subscriptions
+            .apply(&rec(&me, D_MAP, serde_json::json!({}), 30));
+        app.subscriptions.apply(&people(&["kevin", "lucian"], 40));
+        key(&mut app, KeyCode::Char('B'));
+        key(&mut app, KeyCode::Char('j'));
+        key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.sub_cursor, 2);
+        app.subscriptions.apply(&people(&["kevin"], 50));
+        key(&mut app, KeyCode::Enter);
+        assert!(app.actions.is_empty(), "nothing sent");
+        assert_eq!(app.mode, Mode::Subscription, "still picking");
+        assert_eq!(app.sub_cursor, 1);
     }
 }
