@@ -1365,6 +1365,12 @@ fn draw_checklist(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let rows = list.height as usize;
     let first = cur.saturating_sub(rows.saturating_sub(1));
+    let now = crate::sync::now();
+    let done_label = |it: &crate::checklist::Item| {
+        it.done_at
+            .map(|t| crate::checklist::done_label(t, now))
+            .unwrap_or_default()
+    };
     let mut lines = vec![];
     for (i, it) in items.iter().enumerate().skip(first).take(rows) {
         let (mark, st) = match it.status {
@@ -1378,6 +1384,12 @@ fn draw_checklist(f: &mut Frame, app: &mut App, area: Rect) {
         }
         if it.missing_evidence() {
             tail.push_str("  ⚠ no evidence");
+        }
+        // Done items sink below the open ones, newest tick first; each
+        // shows when it was ticked (lucian 2026-10-21).
+        let done_at = done_label(it);
+        if !done_at.is_empty() {
+            tail.push_str(&format!("  {done_at}"));
         }
         let room = (list.width as usize).saturating_sub(tail.width() + 5);
         let row_style = if i == cur { theme::tab_active() } else { st };
@@ -1409,14 +1421,11 @@ fn draw_checklist(f: &mut Frame, app: &mut App, area: Rect) {
     for l in wrap_plain(&it.text, w) {
         d.push(Line::styled(format!(" {l}"), theme::bright()));
     }
-    let mut meta = vec![
-        if it.status == Status::Done {
-            "done"
-        } else {
-            "open"
-        }
-        .to_string(),
-    ];
+    let mut meta = vec![if it.status == Status::Done {
+        format!("done {}", done_label(it))
+    } else {
+        "open".to_string()
+    }];
     if it.release {
         meta.push("release: needs lucian".into());
     }
@@ -3556,12 +3565,26 @@ mod tests {
             s.contains("›  checklist") && s.contains("Operator loop: buzz-vim"),
             "{s}"
         );
-        // Standing first item on top, wrap-up last, release flag shown.
-        let first = s.find("Reconcile the list").unwrap();
-        let last = s.find("Wrap-up: voiceover").unwrap();
-        assert!(first < last && s.contains("  release"), "{s}");
+        // Open items in list order, wrap-up last of them, release flag
+        // shown; then the done ones, the latest tick first, each with its
+        // time (the done standing first item sinks too).
+        let at = |t: &str| s.find(t).unwrap();
+        assert!(
+            at("Status line per channel") < at("Wrap-up: voiceover")
+                && at("Wrap-up: voiceover") < at("Checklist pane per channel")
+                && at("Checklist pane per channel") < at("Reconcile the list")
+                && s.contains("  release"),
+            "{s}"
+        );
+        let now = crate::sync::now();
+        let ticked = crate::checklist::done_label(now - 1999, now);
+        let row = s
+            .lines()
+            .find(|l| l.contains("Checklist pane per"))
+            .unwrap();
+        assert!(row.contains(&ticked), "{s}");
         // Details of the picked item, its evidence linked.
-        for _ in 0..4 {
+        for _ in 0..2 {
             app.on_term(crossterm::event::Event::Key(KeyCode::Char('j').into()));
         }
         let s = screen_text(&mut app, 120, 34);
@@ -3569,10 +3592,10 @@ mod tests {
             s.contains("release: needs lucian") && s.contains("by taskbot"),
             "{s}"
         );
-        app.on_term(crossterm::event::Event::Key(KeyCode::Char('k').into()));
-        app.on_term(crossterm::event::Event::Key(KeyCode::Char('k').into()));
-        app.on_term(crossterm::event::Event::Key(KeyCode::Char('k').into()));
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('j').into()));
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('j').into()));
         let s = screen_text(&mut app, 120, 34);
+        assert!(s.contains(&format!("done {ticked}")), "{s}");
         assert!(
             s.contains("commit:873d8c3") && s.contains("details on select"),
             "{s}"
