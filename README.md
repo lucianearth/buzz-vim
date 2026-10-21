@@ -92,6 +92,14 @@ taskbot. Tap the Q chip in the sheet to add the channel you're in, unless it is 
 name, id, link, open thread and latest 30 messages' ids); tap it again to take that off. Closing the sheet keeps the text. Send lands you in
 the new thread in #quick, where the answer comes.
 
+The control chip, last in the tab row after routing, is the terminal's Control view (`C`) in the same
+ops-cockpit style, from the same core: the open requests on top in an amber card with a button per declared
+action (a tap reacts with that action's emoji, which is the vote; a dim button says why you can't vote it),
+a tile per topic (status color and glyph, the worst note's line, a 14-day sparkline of the topic's key
+metric), the newest hooks note's gauges (value, baseline, delta in its tone, 14 days) and its seats. A tile
+opens the topic's days, a day its note (the hooks note has its status by day, gauges, trend charts and
+tables; any other schema shows its details as JSON). Pull down to read #control again.
+
 Closed, it gets real pushes through upstream Buzz's push (`buzz-push-v1`): the phone enrolls its APNs token
 with the push gateway (`Push.gateway` in `ios/App/Push.swift`, App Attest), delegates to the relay's push
 key, and publishes a lease (kind 30350, encrypted to the relay) for one thing only: the watcher's messages

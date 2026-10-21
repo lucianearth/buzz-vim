@@ -319,6 +319,13 @@ pub fn ink(key: String, level: u8, light: bool) -> Rgb {
     palette::ink(palette::hue(&key), level, light).into()
 }
 
+/// Step `level` at an OKLab `hue` in degrees: the Control view's status
+/// colors, the same hues the terminal's Control tab uses.
+#[uniffi::export]
+pub fn hue_ink(hue: f32, level: u8, light: bool) -> Rgb {
+    palette::ink(hue, level, light).into()
+}
+
 /// The pubkey (hex) for an nsec or hex secret, or why it isn't one.
 #[uniffi::export]
 pub fn pubkey_for(secret: String) -> Result<String, BuzzError> {

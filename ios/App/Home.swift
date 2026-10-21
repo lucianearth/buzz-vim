@@ -48,7 +48,7 @@ extension EnvironmentValues {
 }
 
 /// Tabs across the top, Needs you (tab 0) first, then one channel per
-/// page, then Routing last: swipe sideways between them,
+/// page, then Routing and Control last: swipe sideways between them,
 /// tap a message for its thread (it opens in the tab, which remembers it;
 /// swipes still change tabs), pull the header down for the agents,
 /// hold a tab or the status line for the switcher
@@ -104,12 +104,18 @@ struct Home: View {
                                     .containerRelativeFrame([.horizontal, .vertical])
                                     .id(t.id)
                             }
-                            // Routing last, always.
+                            // Routing, then Control, last always.
                             RoutingView(client: client) { link in
                                 if let f = client.follow(url: link) { follow(f) }
                             }
                             .containerRelativeFrame([.horizontal, .vertical])
                             .id(Routing.id)
+                            // Control after it, the very last.
+                            ControlView(client: client) { link in
+                                if let f = client.follow(url: link) { follow(f) }
+                            }
+                            .containerRelativeFrame([.horizontal, .vertical])
+                            .id(Control.id)
                         }
                         .scrollTargetLayout()
                     }
@@ -201,8 +207,8 @@ struct Home: View {
     /// thread if it has one. The keyboard stays up on a channel tab.
     private func step(_ by: Int) {
         // Tab 0 (Needs you) sits before the first channel in the ring,
-        // Routing after the last.
-        let ring = [Needs.id] + client.tabs().map(\.id) + [Routing.id]
+        // Routing and Control after the last.
+        let ring = [Needs.id] + client.tabs().map(\.id) + [Routing.id, Control.id]
         let i = ring.firstIndex { $0 == selected } ?? 0
         let id = ring[((i + by) % ring.count + ring.count) % ring.count]
         if channelPage(id) != nil {
@@ -307,6 +313,7 @@ struct Home: View {
     private func name(_ p: Place, _ tabs: [ChannelTab]) -> String {
         if p.tab == Needs.id { return "⚑ needs you" }
         if p.tab == Routing.id { return "routing" }
+        if p.tab == Control.id { return "control" }
         let ch = tabs.first { $0.id == p.tab }?.label ?? p.label
         return p.root == nil ? ch : "\(ch) › thread"
     }
@@ -431,6 +438,9 @@ struct Header: View {
                         routingChip
                             .id(Routing.id)
                             .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { selected = Routing.id } }
+                        controlChip
+                            .id(Control.id)
+                            .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { selected = Control.id } }
                     }
                     .padding(.horizontal, 22)
                     .coordinateSpace(.named("tabrow"))
@@ -444,18 +454,18 @@ struct Header: View {
                     // The last chip widens as it turns bold after the scroll
                     // was measured, which clipped its right edge: scroll again
                     // once it has laid out.
-                    if now == Routing.id {
+                    if now == Control.id {
                         DispatchQueue.main.async {
-                            withAnimation { proxy.scrollTo(Routing.id, anchor: .trailing) }
+                            withAnimation { proxy.scrollTo(Control.id, anchor: .trailing) }
                         }
                     }
                 }
                 // On launch the restored tab may be off to the right.
                 .onAppear {
                     proxy.scrollTo(selected, anchor: .center)
-                    // Same late widening when the app opens on Routing.
-                    if selected == Routing.id {
-                        DispatchQueue.main.async { proxy.scrollTo(Routing.id, anchor: .trailing) }
+                    // Same late widening when the app opens on Control.
+                    if selected == Control.id {
+                        DispatchQueue.main.async { proxy.scrollTo(Control.id, anchor: .trailing) }
                     }
                 }
                 .onChange(of: tabs.count) { _, _ in
@@ -522,6 +532,9 @@ struct Header: View {
             Circle()
                 .fill(selected == Routing.id ? theme.chipOn : theme.rule)
                 .frame(width: 7, height: 7)
+            Circle()
+                .fill(selected == Control.id ? theme.chipOn : theme.rule)
+                .frame(width: 7, height: 7)
         }
         .frame(maxWidth: .infinity)
     }
@@ -548,10 +561,22 @@ struct Header: View {
         .background(on ? theme.chipOn : theme.chipOff, in: RoundedRectangle(cornerRadius: 10))
     }
 
-    /// The Routing page's chip, last in the row.
+    /// The Routing page's chip, before Control's.
     private var routingChip: some View {
         let on = selected == Routing.id
         return Text("routing")
+            .font(on ? .chipOn : .chip)
+            .lineLimit(1)
+            .foregroundStyle(on ? theme.onAccent : theme.muted)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 11)
+            .background(on ? theme.chipOn : theme.chipOff, in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    /// The Control page's chip, after Routing's: the last in the row.
+    private var controlChip: some View {
+        let on = selected == Control.id
+        return Text("control")
             .font(on ? .chipOn : .chip)
             .lineLimit(1)
             .foregroundStyle(on ? theme.onAccent : theme.muted)
