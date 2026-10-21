@@ -1,5 +1,8 @@
-//! The Control view (`C`): #control's notes. Topics with their newest day,
-//! a topic's days, and one note: its summary, images, request (actions,
+//! The Control view (`C`): #control's notes, styled as an ops cockpit
+//! (lucian's pick B, 2026-10-21). The overview is a strip of open requests
+//! with their vote keys, a tile per topic (status color, one-liner,
+//! 14-day sparkline of its key metric) and the newest hooks note's gauges
+//! (value, baseline, delta). Behind a tile: the topic's days, and one note: its summary, images, request (actions,
 //! votes, status), and its details. hooks/1 details get trend charts with
 //! the baseline as a reference line and the seat / agent-type tables; any
 //! other schema shows its JSON.
@@ -11,10 +14,12 @@
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Widget};
+use ratatui::widgets::{
+    Axis, Block, BorderType, Borders, Chart, Dataset, GraphType, Paragraph, Widget,
+};
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
@@ -23,7 +28,7 @@ use super::{
     time_label,
 };
 use crate::app::App;
-use crate::control::{self, Note, Unit};
+use crate::control::{self, Gauge, Health, Note, Tile, Tone, Unit};
 use crate::media::Slot;
 use crate::theme;
 
@@ -55,7 +60,366 @@ fn value_label(v: f64, unit: Unit) -> String {
     match unit {
         Unit::Tokens => control::short_tokens(v),
         Unit::Pct => format!("{v:.0}%"),
+        Unit::Count if v.fract() == 0.0 => format!("{v:.0}"),
+        Unit::Count => format!("{v:.1}"),
     }
+}
+
+/// Every chart's y labels take this many columns, right-aligned, so the
+/// plot areas of charts in one column line up (ratatui sizes the axis
+/// gutter from the widest label). Fits "157.1M".
+const Y_LABEL_W: usize = 6;
+/// A topic tile is at least this wide; fewer per row on a narrow screen.
+const TILE_MIN: u16 = 25;
+const TILE_ROWS: u16 = 5;
+/// A gauge tile is at least this wide.
+const GAUGE_MIN: u16 = 38;
+const GAUGE_ROWS: u16 = 5;
+
+/// A status color: ok green, warn amber, page red, no note dim.
+pub(super) fn health_color(h: Health) -> Color {
+    match h {
+        Health::Ok => theme::ink(OK, 19),
+        Health::Warn => theme::ink(PARTIAL, 19),
+        Health::Page => theme::ink(DEAD, 19),
+        Health::NoNote => theme::gray(9),
+    }
+}
+
+fn health_glyph(h: Health) -> &'static str {
+    match h {
+        Health::Ok => "✓",
+        Health::Warn => "▲",
+        Health::Page => "✗",
+        Health::NoNote => "·",
+    }
+}
+
+/// A delta's color: green better, amber a flag, red a page.
+pub(super) fn tone_style(t: Tone) -> Style {
+    match t {
+        Tone::Better => Style::new().fg(theme::ink(OK, 19)),
+        Tone::Flag => Style::new().fg(theme::ink(PARTIAL, 19)),
+        Tone::Page => Style::new().fg(theme::ink(DEAD, 19)),
+        Tone::Plain => theme::text(),
+    }
+    .add_modifier(Modifier::BOLD)
+}
+
+/// `s` cut at a word so it fits `w` columns: a number is never cut.
+fn fit_words(s: &str, w: usize) -> String {
+    if s.width() <= w {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    for word in s.split(' ') {
+        let next = if out.is_empty() {
+            word.to_string()
+        } else {
+            format!("{out} {word}")
+        };
+        if next.width() + 1 > w {
+            break;
+        }
+        out = next;
+    }
+    if out.is_empty() {
+        return clip(s, w);
+    }
+    out + "…"
+}
+
+/// A block-character sparkline, `cell` columns per day; a day without a
+/// value is a dim dot.
+fn sparkline(vals: &[Option<f64>], cell: usize, style: Style) -> Vec<Span<'static>> {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let max = vals.iter().flatten().fold(0.0f64, |a, b| a.max(*b));
+    vals.iter()
+        .map(|v| match v {
+            Some(v) => {
+                let i = if max <= 0.0 {
+                    0
+                } else {
+                    ((v / max) * 7.0).round().clamp(0.0, 7.0) as usize
+                };
+                Span::styled(BARS[i].to_string().repeat(cell), style)
+            }
+            None => Span::styled(format!("{:<cell$}", "·"), theme::faint()),
+        })
+        .collect()
+}
+
+fn width_of(spans: &[Span]) -> usize {
+    spans.iter().map(|s| s.content.width()).sum()
+}
+
+/// Lay `n` tiles of at least `min` columns across `w`: (per row, width).
+fn grid(n: usize, w: u16, min: u16) -> (u16, u16) {
+    let per = (w / min).max(1).min(n.max(1) as u16);
+    (per, w / per)
+}
+
+fn tile_block(title: Line<'static>, color: Color, picked: bool) -> Block<'static> {
+    let b = Block::new()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(color))
+        .title(title);
+    if picked {
+        b.border_type(BorderType::Thick)
+    } else {
+        b
+    }
+}
+
+/// One topic's tile: the status in the border, a one-liner, the sparkline
+/// with its newest value, and the day and sources.
+fn render_tile(t: &Tile, picked: bool, r: Rect, buf: &mut Buffer) {
+    let color = health_color(t.health);
+    let mut title = vec![Span::styled(
+        format!(" {} {} ", health_glyph(t.health), t.topic),
+        Style::new().fg(color).add_modifier(Modifier::BOLD),
+    )];
+    if t.open > 0 {
+        title.push(Span::styled(format!(" {} open ", t.open), theme::badge()));
+    }
+    let block = tile_block(Line::from(title), color, picked);
+    let inner = block.inner(r);
+    block.render(r, buf);
+    let w = inner.width as usize;
+    let line_style = if t.health == Health::NoNote {
+        theme::faint()
+    } else {
+        Style::new().fg(color)
+    };
+    let mut lines = vec![Line::styled(fit_words(&t.line, w), line_style)];
+    let mut spark = sparkline(&t.spark, 1, Style::new().fg(color));
+    if let Some(v) = t.spark.iter().rev().flatten().next() {
+        let v = value_label(*v, t.metric.unit);
+        let label = format!(" {}", t.metric.label);
+        if width_of(&spark) + 1 + v.width() <= w {
+            spark.push(Span::styled(format!(" {v}"), theme::bright()));
+            if width_of(&spark) + label.width() <= w {
+                spark.push(Span::styled(label, theme::faint()));
+            }
+        }
+    }
+    lines.push(Line::from(spark));
+    let day = t
+        .latest_day
+        .as_deref()
+        .map(|d| format!("{} · {}", d.get(5..).unwrap_or(d), t.sources.join(", ")))
+        .unwrap_or_else(|| "no note yet".into());
+    lines.push(Line::styled(fit_words(&day, w), theme::faint()));
+    Paragraph::new(lines).render(inner, buf);
+}
+
+/// A hooks gauge: value vs baseline with the delta at the right, a bar
+/// with the baseline ticked, and the last 14 days.
+fn render_gauge(g: &Gauge, r: Rect, buf: &mut Buffer) {
+    let tone = tone_style(g.tone);
+    let bar_color = match g.tone {
+        Tone::Plain => series_style(0),
+        _ => tone,
+    };
+    let block = tile_block(
+        Line::styled(
+            format!(" {} ", g.title.to_uppercase()),
+            bar_color.add_modifier(Modifier::BOLD),
+        ),
+        theme::gray(7),
+        false,
+    );
+    let inner = block.inner(r);
+    block.render(r, buf);
+    let w = inner.width as usize;
+    // Value and delta always; then the baseline and aside while they fit.
+    let delta = g
+        .baseline
+        .map(|b| control::delta_label(g.value, b, g.unit))
+        .unwrap_or_default();
+    let mut left = vec![Span::styled(value_label(g.value, g.unit), theme::bright())];
+    let room = |l: &[Span], extra: &str| width_of(l) + extra.width() + 1 + delta.width() <= w;
+    if let Some(b) = g.baseline {
+        let vs = format!("  vs {}", value_label(b, g.unit));
+        if room(&left, &vs) {
+            left.push(Span::styled(vs, theme::muted()));
+        }
+    }
+    if let Some(a) = &g.aside {
+        let a = format!("  {a}");
+        if room(&left, &a) {
+            left.push(Span::styled(a, theme::faint()));
+        }
+    }
+    let gap = w.saturating_sub(width_of(&left) + delta.width());
+    left.push(Span::raw(" ".repeat(gap)));
+    left.push(Span::styled(delta, tone));
+    // The bar: 0 to 1.25 x the larger of value and baseline.
+    let top = g
+        .value
+        .max(g.baseline.unwrap_or(0.0))
+        .max(f64::MIN_POSITIVE)
+        * 1.25;
+    let cell = |v: f64| ((v / top) * w as f64).round().clamp(0.0, w as f64) as usize;
+    let fill = cell(g.value);
+    let tick = g.baseline.map(|b| cell(b).min(w.saturating_sub(1)));
+    let bar: Vec<Span> = (0..w)
+        .map(|i| match (i < fill, Some(i) == tick) {
+            (_, true) => Span::styled("┃", theme::bright()),
+            (true, _) => Span::styled("█", bar_color),
+            (false, _) => Span::styled("░", theme::faint()),
+        })
+        .collect();
+    let cellw = (w / g.spark.len().max(1)).max(1);
+    let spark = sparkline(&g.spark, cellw, bar_color);
+    Paragraph::new(vec![Line::from(left), Line::from(bar), Line::from(spark)]).render(inner, buf);
+}
+
+/// Gauges in a grid of at least GAUGE_MIN columns each: the rows that fit
+/// in `max_rows` lines, and how many lines they took.
+fn render_gauges(gs: &[Gauge], area: Rect, max_rows: u16, buf: &mut Buffer) -> u16 {
+    let (per, gw) = grid(gs.len(), area.width, GAUGE_MIN);
+    let rows = (gs.len() as u16).div_ceil(per).min(max_rows / GAUGE_ROWS);
+    for (i, g) in gs.iter().enumerate() {
+        let (row, col) = (i as u16 / per, i as u16 % per);
+        if row >= rows {
+            break;
+        }
+        let r = Rect::new(area.x + col * gw, area.y + row * GAUGE_ROWS, gw, GAUGE_ROWS);
+        render_gauge(g, r, buf);
+    }
+    rows * GAUGE_ROWS
+}
+
+/// "2h", "3d": how long ago `at` was.
+fn age(at: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let s = now.saturating_sub(at);
+    match s {
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    }
+}
+
+/// The open requests: two lines each (what, then its vote keys, votes,
+/// status, approvers and age), dropping the tail parts that don't fit.
+fn request_strip(app: &App, ids: &[String], all: usize, w: usize) -> Vec<Line<'static>> {
+    let mut out = vec![];
+    for (i, id) in ids.iter().enumerate() {
+        let Some(n) = app.control.note(id) else {
+            continue;
+        };
+        let picked = app.control_cursor == i;
+        let mark = if picked {
+            Span::styled("▌", theme::bright())
+        } else {
+            Span::raw(" ")
+        };
+        let mut head = vec![
+            mark.clone(),
+            Span::styled(n.topic.clone(), theme::bright()),
+            Span::styled(
+                format!(
+                    "  {}  {}  ",
+                    n.day.as_deref().unwrap_or("?"),
+                    n.source.as_deref().unwrap_or("?")
+                ),
+                theme::muted(),
+            ),
+        ];
+        let rest = w.saturating_sub(width_of(&head));
+        head.push(Span::styled(
+            fit_words(&control::one_liner(&n.summary), rest),
+            theme::text(),
+        ));
+        let mut keys = vec![mark, Span::raw(" ")];
+        for (k, t) in app.control.votes(n).iter().enumerate() {
+            let votes = t.voters.len();
+            keys.push(Span::styled(format!(" {} ", k + 1), theme::key()));
+            keys.push(Span::styled(
+                format!(" {} {} ", t.action.name, t.action.emoji),
+                theme::tab_idle(),
+            ));
+            keys.push(Span::styled(format!(" {votes}  "), theme::text()));
+        }
+        let st = app.control.status(n).status.unwrap_or_else(|| "?".into());
+        let mut tail = vec![Span::styled(
+            format!(" {st} "),
+            status_style(if st == "open" { "partial" } else { "ok" }),
+        )];
+        if !n.approvers.is_empty() {
+            let names: Vec<String> = n.approvers.iter().map(|p| app.store.name_of(p)).collect();
+            tail.push(Span::styled(
+                format!("  approver {}", names.join(", ")),
+                theme::muted(),
+            ));
+        }
+        tail.push(Span::styled(
+            format!("  age {}", age(n.created_at)),
+            theme::faint(),
+        ));
+        for s in tail {
+            if width_of(&keys) + s.content.width() <= w {
+                keys.push(s);
+            }
+        }
+        let style = if picked {
+            Style::new().bg(theme::gray(3))
+        } else {
+            Style::new()
+        };
+        out.push(Line::from(head).style(style));
+        out.push(Line::from(keys).style(style));
+    }
+    if all > ids.len() {
+        out.push(Line::styled(
+            format!(" +{} more open: on their topic tiles", all - ids.len()),
+            theme::faint(),
+        ));
+    }
+    out
+}
+
+/// The newest hooks note's seats as dots, and its day and window.
+fn seats_line(n: &Note, w: usize) -> Line<'static> {
+    let d = n.details.as_ref().ok();
+    let mut spans = vec![Span::styled(" seats ", theme::muted())];
+    for s in d.and_then(|d| d["seats"].as_array()).into_iter().flatten() {
+        let h = match s["status"].as_str() {
+            Some("ok") => Health::Ok,
+            Some("dead") => Health::Page,
+            _ => Health::NoNote,
+        };
+        spans.push(Span::styled(
+            format!(" {} ", text(&s["seat"])),
+            theme::text(),
+        ));
+        spans.push(Span::styled("●", Style::new().fg(health_color(h))));
+    }
+    let tail = [
+        format!(
+            "   │ hooks {} {}",
+            n.day.as_deref().and_then(|d| d.get(5..)).unwrap_or("?"),
+            n.source.as_deref().unwrap_or("?")
+        ),
+        d.map(|d| {
+            format!(
+                "   │ window {} .. {}",
+                text(&d["window_since"]),
+                text(&d["window_until"])
+            )
+        })
+        .unwrap_or_default(),
+    ];
+    for t in tail {
+        if width_of(&spans) + t.width() <= w {
+            spans.push(Span::styled(t, theme::faint()));
+        }
+    }
+    Line::from(spans)
 }
 
 /// Draw the view. Images on a note go into `images`, as in a timeline.
@@ -75,11 +439,12 @@ pub(super) fn draw_control(
             n.source.as_deref().unwrap_or("?")
         ),
         (Some(t), None) => t.clone(),
-        (None, None) => "topics".into(),
+        (None, None) => "overview".into(),
     };
     let keys = match (&topic, &note) {
         (_, Some(n)) if n.is_request() => "j k scroll  1-9 vote  o images  r reload",
         (_, Some(_)) => "j k scroll  o images  r reload",
+        (None, None) => "j k ⏎ open  1-9 vote  r reload",
         _ => "j k ⏎ pick  r reload",
     };
     let area = breadcrumb(f, app, area, "control", &leaf, Some(keys.to_string()));
@@ -92,7 +457,7 @@ pub(super) fn draw_control(
     match (topic, note) {
         (_, Some(n)) => draw_note(f, app, area, &n, images),
         (Some(t), None) => draw_days(f, app, area, &t),
-        (None, None) => draw_topics(f, app, area),
+        (None, None) => draw_overview(f, app, area),
     }
 }
 
@@ -112,43 +477,80 @@ fn list_line(cells: Vec<Span<'static>>, picked: bool) -> Line<'static> {
     }
 }
 
-fn draw_topics(f: &mut Frame, app: &mut App, area: Rect) {
-    let rows = app.control.topics();
-    if rows.is_empty() {
-        let msg = format!(
-            "no control notes in the last {} days. producers write them with buzz control publish",
-            control::DAYS_BACK
+/// The overview: open requests on top, a tile per topic, then the newest
+/// hooks note's gauges and seats, each part while it fits.
+fn draw_overview(f: &mut Frame, app: &mut App, area: Rect) {
+    let (reqs, topics) = app.control_overview();
+    let tiles = app.control.tiles(&app.control_day());
+    let rows = reqs.len() + topics.len();
+    app.control_cursor = app.control_cursor.min(rows.saturating_sub(1));
+    let body = pad(area);
+    let (w, bottom) = (body.width, body.bottom());
+    let mut y = body.y;
+    let buf = f.buffer_mut();
+    // The requests strip.
+    let all = app.control.open_requests().len();
+    if reqs.is_empty() {
+        let msg = if app.control.note_ids().is_empty() {
+            format!(
+                " no control notes in the last {} days. producers write them with buzz control publish",
+                control::DAYS_BACK
+            )
+        } else {
+            " no open requests".into()
+        };
+        buf.set_line(body.x, y, &Line::styled(msg, theme::faint()), w);
+        y += 2;
+    } else {
+        let amber = health_color(Health::Warn);
+        let block = tile_block(
+            Line::styled(
+                format!(" ▲ OPEN REQUESTS {all} "),
+                Style::new().fg(amber).add_modifier(Modifier::BOLD),
+            ),
+            amber,
+            false,
         );
-        return draw_empty(f, app, area, &msg);
+        let lines = request_strip(app, &reqs, all, w.saturating_sub(2) as usize);
+        let h = (lines.len() as u16 + 2).min(bottom.saturating_sub(y));
+        let r = Rect::new(body.x, y, w, h);
+        let inner = block.inner(r);
+        block.render(r, buf);
+        Paragraph::new(lines).render(inner, buf);
+        y += h;
     }
-    app.control_cursor = app.control_cursor.min(rows.len() - 1);
-    let tw = rows
-        .iter()
-        .map(|r| r.topic.width())
-        .max()
-        .unwrap_or(5)
-        .max(5);
-    let mut lines = vec![Line::styled(
-        format!("  {}  latest day   days  sources", pad_to("topic", tw)),
-        theme::faint(),
-    )];
-    for (i, r) in rows.iter().enumerate() {
-        let mut cells = vec![
-            Span::styled(pad_to(&r.topic, tw), theme::bright()),
-            Span::raw("  "),
-            Span::styled(pad_to(&r.latest_day, 11), theme::text()),
-            Span::raw("  "),
-            Span::styled(pad_to(&r.days.to_string(), 4), theme::muted()),
-            Span::raw("  "),
-            Span::styled(r.sources.join(", "), theme::muted()),
-        ];
-        if r.open > 0 {
-            cells.push(Span::raw("  "));
-            cells.push(Span::styled(format!(" {} open ", r.open), theme::badge()));
+    // A tile per topic.
+    let (per, tw) = grid(tiles.len(), w, TILE_MIN);
+    for (i, t) in tiles.iter().enumerate() {
+        let (row, col) = (i as u16 / per, i as u16 % per);
+        let ty = y + row * TILE_ROWS;
+        if ty + TILE_ROWS > bottom {
+            break;
         }
-        lines.push(list_line(cells, i == app.control_cursor));
+        let picked = app.control_cursor == reqs.len() + i;
+        render_tile(
+            t,
+            picked,
+            Rect::new(body.x + col * tw, ty, tw, TILE_ROWS),
+            buf,
+        );
     }
-    f.render_widget(Paragraph::new(lines), pad(area));
+    y += (tiles.len() as u16).div_ceil(per) * TILE_ROWS;
+    // The newest hooks note's gauges, then its seats.
+    let Some(h) = app.control.newest_hooks().cloned() else {
+        return;
+    };
+    if y + 1 + GAUGE_ROWS > bottom {
+        return;
+    }
+    let gauges = control::hooks_gauges(&app.control, &h);
+    let room = bottom.saturating_sub(y + 1);
+    let used = render_gauges(&gauges, Rect::new(body.x, y, w, room), room, buf);
+    y += used;
+    if y < bottom {
+        let l = seats_line(&h, w as usize);
+        f.buffer_mut().set_line(body.x, y, &l, w);
+    }
 }
 
 fn pad(area: Rect) -> Rect {
@@ -222,6 +624,8 @@ enum Piece {
     Lines(Vec<Line<'static>>),
     /// Trend charts, side by side when there's room: (days, charts).
     Charts(Vec<String>, Vec<control::Chart>),
+    /// hooks gauges, as on the overview.
+    Gauges(Vec<Gauge>),
     /// An image: url, (w, h) if known.
     Image(String, Option<(u32, u32)>),
 }
@@ -300,6 +704,7 @@ fn draw_note(
             let source = n.source.clone().unwrap_or_default();
             let strip = control::hooks_status_strip(&app.control, &source, n);
             pieces.push(Piece::Lines(strip_lines(&strip)));
+            pieces.push(Piece::Gauges(control::hooks_gauges(&app.control, n)));
             let (days, charts) = control::hooks_charts(&app.control, &source, n);
             pieces.push(Piece::Charts(days, charts));
             pieces.push(Piece::Lines(hooks_tables(d, inner)));
@@ -329,6 +734,9 @@ fn draw_note(
         match p {
             Piece::Lines(l) => l.len().min(MAX_ROWS as usize) as u16,
             Piece::Charts(_, c) => (c.len() as u16).div_ceil(cols) * CHART_ROWS + 1,
+            Piece::Gauges(g) => {
+                (g.len() as u16).div_ceil(grid(g.len(), w, GAUGE_MIN).0) * GAUGE_ROWS + 1
+            }
             Piece::Image(_, dim) => {
                 crate::media::thumb_rows(*dim, THUMB_COLS.min(w), THUMB_MAX_ROWS) + 1
             }
@@ -355,6 +763,9 @@ fn draw_note(
         let r = Rect::new(0, y, w, h);
         match p {
             Piece::Lines(l) => Paragraph::new(l.clone()).render(r, &mut buf),
+            Piece::Gauges(g) => {
+                render_gauges(g, r, h, &mut buf);
+            }
             Piece::Charts(days, charts) => {
                 let cw = w / cols;
                 for (i, c) in charts.iter().enumerate() {
@@ -530,23 +941,34 @@ fn render_chart(c: &control::Chart, days: &[String], r: Rect, buf: &mut Buffer) 
         }
     }
     let ymax = if ymax <= 0.0 { 1.0 } else { ymax * 1.15 };
-    let mut title = vec![Span::styled(format!(" {} ", c.title), theme::bright())];
-    for (i, s) in c.series.iter().enumerate() {
-        let last = s.points.iter().rev().flatten().next();
-        title.push(Span::styled(format!(" ━ {}", s.label), series_style(i)));
-        if let Some(v) = last {
-            title.push(Span::styled(
-                format!(" {}", value_label(*v, c.unit)),
-                theme::text(),
-            ));
+    // The title with values and baselines; on a narrow chart the baselines
+    // go, then the values, so a number is never cut.
+    let title_at = |level: u8| {
+        let mut title = vec![Span::styled(format!(" {} ", c.title), theme::bright())];
+        for (i, s) in c.series.iter().enumerate() {
+            let last = s.points.iter().rev().flatten().next();
+            title.push(Span::styled(format!(" ━ {}", s.label), series_style(i)));
+            if let Some(v) = last.filter(|_| level >= 1) {
+                title.push(Span::styled(
+                    format!(" {}", value_label(*v, c.unit)),
+                    theme::text(),
+                ));
+            }
+            if let Some(b) = s.baseline.filter(|_| level >= 2) {
+                title.push(Span::styled(
+                    format!(" vs {}", value_label(b, c.unit)),
+                    theme::faint(),
+                ));
+            }
         }
-        if let Some(b) = s.baseline {
-            title.push(Span::styled(
-                format!(" vs {}", value_label(b, c.unit)),
-                theme::faint(),
-            ));
-        }
-    }
+        title
+    };
+    let fits = |t: &[Span]| width_of(t) + 2 <= r.width as usize;
+    let title = [2, 1, 0]
+        .map(title_at)
+        .into_iter()
+        .find(|t| fits(t))
+        .unwrap_or_else(|| title_at(0));
     // Owned data first; the datasets borrow it.
     let segs: Vec<Vec<Vec<(f64, f64)>>> = c.series.iter().map(|s| s.segments()).collect();
     // A baseline is dashed (a dot every few columns), so it never reads as
@@ -619,11 +1041,10 @@ fn render_chart(c: &control::Chart, days: &[String], r: Rect, buf: &mut Buffer) 
         .y_axis(
             Axis::default()
                 .bounds([0.0, ymax])
-                .labels(vec![
-                    "0".to_string(),
-                    value_label(ymax / 2.0, c.unit),
-                    value_label(ymax, c.unit),
-                ])
+                .labels(
+                    [0.0, ymax / 2.0, ymax]
+                        .map(|v| format!("{:>Y_LABEL_W$}", value_label(v, c.unit))),
+                )
                 .style(theme::faint()),
         );
     chart.render(
@@ -910,6 +1331,7 @@ mod tests {
         let me = Keys::generate();
         let mut app = App::new(me.public_key().to_hex(), None);
         app.control.loaded = true;
+        app.control_today = Some("2026-10-21".into());
         let k = Keys::generate();
         app.control.apply(&note(
             &k,
@@ -957,6 +1379,8 @@ mod tests {
             s.contains("hooks") && s.contains("2026-10-21") && s.contains("1 open"),
             "{s}"
         );
+        // The request strip comes first; the hooks tile is next.
+        key(&mut app, KeyCode::Char('j'));
         key(&mut app, KeyCode::Enter);
         let s = screen(&mut app, 120, 40);
         assert!(s.contains("2026-10-19") && s.contains(" dead "), "{s}");
@@ -982,6 +1406,8 @@ mod tests {
         key(&mut app, KeyCode::Char('h'));
         assert!(app.control_note.is_none() && app.control_topic.is_some());
         key(&mut app, KeyCode::Esc);
+        // Back on the tile it came from.
+        assert_eq!(app.control_cursor, 1);
         key(&mut app, KeyCode::Esc);
         assert!(!app.control_view);
     }
@@ -989,7 +1415,12 @@ mod tests {
     #[test]
     fn a_dead_seat_row_is_highlighted() {
         let (mut app, _) = fixture();
-        for c in [KeyCode::Char('C'), KeyCode::Enter, KeyCode::Enter] {
+        for c in [
+            KeyCode::Char('C'),
+            KeyCode::Char('j'),
+            KeyCode::Enter,
+            KeyCode::Enter,
+        ] {
             key(&mut app, c);
         }
         let mut term =
@@ -1013,8 +1444,7 @@ mod tests {
     fn unknown_schema_shows_json_and_a_request_votes() {
         let (mut app, me) = fixture();
         key(&mut app, KeyCode::Char('C'));
-        key(&mut app, KeyCode::Char('j'));
-        key(&mut app, KeyCode::Enter);
+        // The strip's request opens straight onto its note.
         key(&mut app, KeyCode::Enter);
         let s = screen(&mut app, 120, 40);
         for want in [
@@ -1081,8 +1511,8 @@ mod tests {
             ],
         ));
         key(&mut app, KeyCode::Char('C'));
-        // hooks, routing, upgrade
-        key(&mut app, KeyCode::Char('j'));
+        // Two requests, then hooks upgrade converge fleet-audit routing.
+        key(&mut app, KeyCode::Char('G'));
         key(&mut app, KeyCode::Enter);
         key(&mut app, KeyCode::Enter);
         let s = screen(&mut app, 120, 40);
@@ -1210,6 +1640,191 @@ mod tests {
         assert!(!app.control_view);
     }
 
+    /// Each line of a screen with its cells' styles, for color checks.
+    fn cells(app: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| super::super::draw(f, app)).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    /// Where `needle` starts on screen: (x, y) in cells.
+    fn find(buf: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
+        let a = buf.area;
+        for y in 0..a.height {
+            let syms: Vec<&str> = (0..a.width).map(|x| buf[(x, y)].symbol()).collect();
+            for x in 0..a.width as usize {
+                let mut got = String::new();
+                for s in &syms[x..] {
+                    got.push_str(s);
+                    if got.len() >= needle.len() {
+                        break;
+                    }
+                }
+                if got.starts_with(needle) {
+                    return Some((x as u16, y));
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn overview_tiles_reflow_at_80_and_140_without_cutting_numbers() {
+        for (w, per_row) in [(80u16, 3usize), (140, 4)] {
+            let (mut app, _) = fixture();
+            key(&mut app, KeyCode::Char('C'));
+            let s = screen(&mut app, w, 50);
+            for want in [
+                "OPEN REQUESTS 1",
+                "upgrade  2026-10-21  build-box",
+                " 1 ",
+                " approve 👍 ",
+                " hold ⏳ ",
+                "✗ hooks",
+                "▲ upgrade",
+                "· converge",
+                "· fleet-audit",
+                "PEAK SUBAGENT",
+                "767k  vs 612k",
+                "604k  vs 432k",
+                "42%  vs 41%",
+                "108k  vs 79k",
+                "55k  vs 75k",
+                "161k  vs 250k",
+                "+25%",
+                "-27%",
+                "-36%",
+                "seats  taskbot ● ghostbot ●",
+            ] {
+                assert!(s.contains(want), "{w} cols: missing {want:?}\n{s}");
+            }
+            // Tiles per row: the topic tiles' titles on one line.
+            let titles = ["✗ hooks", "▲ upgrade", "· converge", "· fleet-audit"];
+            let line = s.lines().find(|l| l.contains("✗ hooks")).unwrap();
+            let n = titles.iter().filter(|t| line.contains(*t)).count();
+            assert_eq!(n, per_row, "{w} cols:\n{s}");
+            // Nothing is cut mid-number, and every tile closes inside the body.
+            for l in s.lines() {
+                let cs: Vec<char> = l.chars().collect();
+                assert!(
+                    !cs.windows(2).any(|p| p[0].is_ascii_digit() && p[1] == '…'),
+                    "{w} cols: a number cut: {l}"
+                );
+            }
+            let buf = cells(&mut app, w, 50);
+            for y in 0..50 {
+                for x in w - 2..w {
+                    let c = buf[(x, y)].symbol();
+                    assert!(
+                        !["┐", "┘", "┓", "┛"].contains(&c),
+                        "{w} cols: a tile runs to the edge at row {y}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn delta_and_status_colors() {
+        use super::{health_color, tone_style};
+        use crate::control::{Health, Tone};
+        for w in [80u16, 140] {
+            let (mut app, _) = fixture();
+            // A metric far worse than its baseline pages.
+            let k = Keys::generate();
+            let mut d = hooks(767000, "dead");
+            d["peak_context_main_tokens"] = json!(1_000_000);
+            app.control
+                .apply(&note(&k, "hooks", "hooks/1", "2026-10-22", &d, vec![]));
+            app.control_today = Some("2026-10-22".into());
+            key(&mut app, KeyCode::Char('C'));
+            let buf = cells(&mut app, w, 50);
+            let fg = |needle: &str| {
+                let (x, y) = find(&buf, needle).unwrap_or_else(|| panic!("{w}: no {needle:?}"));
+                buf[(x, y)].fg
+            };
+            assert_eq!(fg("+25%"), tone_style(Tone::Flag).fg.unwrap(), "flag amber");
+            assert_eq!(fg("+131%"), tone_style(Tone::Page).fg.unwrap(), "page red");
+            assert_eq!(
+                fg("-27%"),
+                tone_style(Tone::Better).fg.unwrap(),
+                "better green"
+            );
+            // Lower than its threshold but flagged: amber, never green.
+            assert_eq!(fg("-36%"), tone_style(Tone::Flag).fg.unwrap());
+            assert_ne!(fg("-36%"), tone_style(Tone::Better).fg.unwrap());
+            assert_eq!(fg("+1pt"), tone_style(Tone::Plain).fg.unwrap());
+            // Tile borders take the status color.
+            let border = |title: &str| {
+                let (x, y) = find(&buf, title).unwrap();
+                buf[(x - 2, y)].fg
+            };
+            assert_eq!(border("✗ hooks"), health_color(Health::Page));
+            assert_eq!(border("▲ upgrade"), health_color(Health::Warn));
+            assert_eq!(border("· converge"), health_color(Health::NoNote));
+        }
+    }
+
+    #[test]
+    fn a_digit_on_the_overview_votes_the_strip_request() {
+        let (mut app, _) = fixture();
+        key(&mut app, KeyCode::Char('C'));
+        // On a tile: the only open request is the one asked about.
+        key(&mut app, KeyCode::Char('j'));
+        key(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.mode, Mode::Vote);
+        let s = screen(&mut app, 100, 40);
+        assert!(s.contains("Vote approve 👍"), "{s}");
+        assert!(s.contains("upgrade › 2026-10-21 build-box"), "{s}");
+        app.actions.clear();
+        key(&mut app, KeyCode::Char('y'));
+        let sent = app.actions.iter().find_map(|a| match a {
+            Action::React { target, emoji, .. } => Some((target.clone(), emoji.clone())),
+            _ => None,
+        });
+        let id = app.control.open_requests()[0].id.clone();
+        assert_eq!(sent, Some((id, "👍".to_string())));
+        // Enter on the strip opens the request; back is the overview.
+        key(&mut app, KeyCode::Char('g'));
+        key(&mut app, KeyCode::Enter);
+        assert!(app.control_note.is_some() && app.control_topic.is_none());
+        key(&mut app, KeyCode::Char('h'));
+        assert!(app.control_note.is_none() && app.control_view);
+    }
+
+    #[test]
+    fn chart_plot_areas_line_up() {
+        let (mut app, _) = fixture();
+        for c in [
+            KeyCode::Char('C'),
+            KeyCode::Char('j'),
+            KeyCode::Enter,
+            KeyCode::Enter,
+        ] {
+            key(&mut app, c);
+        }
+        let s = screen(&mut app, 140, 160);
+        let from = s.find("Peak context").unwrap();
+        let s = &s[from..];
+        // Each chart's x axis corner: one column per chart column, however
+        // wide its y labels ("0%" next to "180.7M").
+        let mut corners: Vec<usize> = s
+            .lines()
+            .flat_map(|l| {
+                l.chars()
+                    .enumerate()
+                    .filter(|(_, c)| *c == '└')
+                    .map(|(i, _)| i)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let n = corners.len();
+        corners.sort();
+        corners.dedup();
+        assert!(n >= 6, "{s}");
+        assert_eq!(corners.len(), 2, "{corners:?}\n{s}");
+    }
+
     /// The Control view's screens as plain text (BUZZ_VIM_SHOT=<dir>).
     #[test]
     fn shot_control() {
@@ -1218,11 +1833,15 @@ mod tests {
         };
         let (mut app, _) = fixture();
         key(&mut app, KeyCode::Char('C'));
-        std::fs::write(
-            format!("{dir}/control-topics.txt"),
-            screen(&mut app, 120, 40),
-        )
-        .unwrap();
+        for (w, h) in [(80, 40), (140, 45)] {
+            std::fs::write(
+                format!("{dir}/control-overview-{w}.txt"),
+                screen(&mut app, w, h),
+            )
+            .unwrap();
+        }
+        // Down to the hooks tile (past the one request).
+        key(&mut app, KeyCode::Char('j'));
         key(&mut app, KeyCode::Enter);
         std::fs::write(format!("{dir}/control-days.txt"), screen(&mut app, 120, 40)).unwrap();
         key(&mut app, KeyCode::Enter);

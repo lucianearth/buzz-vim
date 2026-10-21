@@ -300,8 +300,12 @@ pub struct App {
     pub control_scroll: usize,
     /// Tallest scroll from the last draw.
     pub control_max_scroll: usize,
-    /// The action asked about (y/n) before voting.
+    /// The action asked about (y/n) before voting, and the request it is on.
     pub control_vote: Option<usize>,
+    pub control_vote_on: Option<String>,
+    /// Today for the overview's sparklines (YYYY-MM-DD); None = the UTC
+    /// date now. Tests pin it.
+    pub control_today: Option<String>,
 }
 
 impl App {
@@ -392,6 +396,8 @@ impl App {
             control_scroll: 0,
             control_max_scroll: 0,
             control_vote: None,
+            control_vote_on: None,
+            control_today: None,
         }
     }
 
@@ -809,10 +815,40 @@ impl App {
             .and_then(|id| self.control.note(id))
     }
 
-    /// Rows of the list on screen: topics, or the open topic's days.
+    /// The day the overview's sparklines end on.
+    pub fn control_day(&self) -> String {
+        self.control_today
+            .clone()
+            .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string())
+    }
+
+    /// The overview's picks, top to bottom: the open requests in the strip
+    /// (ids), then the topic tiles (names).
+    pub fn control_overview(&self) -> (Vec<String>, Vec<String>) {
+        let reqs = self
+            .control
+            .open_requests()
+            .iter()
+            .take(crate::control::STRIP_MAX)
+            .map(|n| n.id.clone())
+            .collect();
+        let tiles = self
+            .control
+            .tiles(&self.control_day())
+            .into_iter()
+            .map(|t| t.topic)
+            .collect();
+        (reqs, tiles)
+    }
+
+    /// Rows of the list on screen: the overview's picks, or the open
+    /// topic's days.
     fn control_rows(&self) -> usize {
         match &self.control_topic {
-            None => self.control.topics().len(),
+            None => {
+                let (r, t) = self.control_overview();
+                r.len() + t.len()
+            }
             Some(t) => self.control.days(t).len(),
         }
     }
@@ -821,8 +857,13 @@ impl App {
         let i = self.control_cursor;
         match self.control_topic.clone() {
             None => {
-                if let Some(t) = self.control.topics().get(i) {
-                    self.control_topic = Some(t.topic.clone());
+                let (reqs, tiles) = self.control_overview();
+                if let Some(id) = reqs.get(i) {
+                    // Straight to the request; back returns here.
+                    self.control_note = Some(id.clone());
+                    self.control_scroll = 0;
+                } else if let Some(t) = tiles.get(i - reqs.len()) {
+                    self.control_topic = Some(t.clone());
                     self.control_cursor = 0;
                 }
             }
@@ -840,26 +881,30 @@ impl App {
             return;
         }
         if let Some(t) = self.control_topic.take() {
-            // Back on the topic it came from.
-            self.control_cursor = self
-                .control
-                .topics()
-                .iter()
-                .position(|r| r.topic == t)
-                .unwrap_or(0);
+            // Back on the tile it came from.
+            let (reqs, tiles) = self.control_overview();
+            self.control_cursor = reqs.len() + tiles.iter().position(|r| *r == t).unwrap_or(0);
             return;
         }
         self.control_view = false;
     }
 
+    /// The request a vote is asked about.
+    pub fn control_vote_note(&self) -> Option<&crate::control::Note> {
+        self.control_vote_on
+            .as_deref()
+            .and_then(|id| self.control.note(id))
+    }
+
     /// A digit on a request: ask before voting that action, or say why not.
-    fn ask_vote(&mut self, action: usize) {
-        let Some(n) = self.control_open_note() else {
+    fn ask_vote(&mut self, id: &str, action: usize) {
+        let Some(n) = self.control.note(id) else {
             return;
         };
         match self.control.can_vote(n, action, &self.store.me) {
             Ok(()) => {
                 self.control_vote = Some(action);
+                self.control_vote_on = Some(id.to_string());
                 self.mode = Mode::Vote;
             }
             Err(why) => self.say(format!("can't vote: {why}")),
@@ -871,7 +916,11 @@ impl App {
         let Some(i) = self.control_vote.take() else {
             return;
         };
-        let Some(n) = self.control_open_note() else {
+        let Some(n) = self
+            .control_vote_on
+            .take()
+            .and_then(|id| self.control.note(&id))
+        else {
             return;
         };
         let Some(a) = n.actions.get(i) else { return };
@@ -917,11 +966,29 @@ impl App {
                 self.say("reloading #control");
             }
             KeyCode::Char(c @ '1'..='9') if on_note => {
-                let has = self.control_open_note().is_some_and(|n| n.is_request());
-                if !has {
+                let Some(id) = self
+                    .control_open_note()
+                    .filter(|n| n.is_request())
+                    .map(|n| n.id.clone())
+                else {
                     return false;
-                }
-                self.ask_vote(c as usize - '1' as usize);
+                };
+                self.ask_vote(&id, c as usize - '1' as usize);
+            }
+            // On the overview a digit votes the request picked, or the only
+            // one; with none open it leaves for the tab, as elsewhere.
+            KeyCode::Char(c @ '1'..='9') if self.control_topic.is_none() => {
+                let (reqs, _) = self.control_overview();
+                let id = match reqs.get(self.control_cursor) {
+                    Some(id) => id.clone(),
+                    None if reqs.len() == 1 => reqs[0].clone(),
+                    None if reqs.is_empty() => return false,
+                    None => {
+                        self.say("pick a request with j k first");
+                        return true;
+                    }
+                };
+                self.ask_vote(&id, c as usize - '1' as usize);
             }
             KeyCode::Char('o') if on_note => self.control_images(),
             KeyCode::Char('j') | KeyCode::Down if on_note => {
@@ -1850,6 +1917,7 @@ impl App {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.send_vote(),
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
                     self.control_vote = None;
+                    self.control_vote_on = None;
                     self.mode = Mode::Normal;
                     self.say("no vote sent");
                 }

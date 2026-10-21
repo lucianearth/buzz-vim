@@ -98,7 +98,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
 /// The y/n box before a vote goes out.
 fn draw_vote(f: &mut Frame, app: &mut App, area: Rect) {
-    let Some(n) = app.control_open_note() else {
+    let Some(n) = app.control_vote_note() else {
         return;
     };
     let Some(a) = app.control_vote.and_then(|i| n.actions.get(i)) else {

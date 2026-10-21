@@ -536,6 +536,8 @@ pub const HOOKS_TRENDS: &[Trend] = &[
 pub const FLAG_PCT: f64 = 20.0;
 /// A hooks metric this much worse than its baseline is drawn as a page.
 pub const PAGE_PCT: f64 = 50.0;
+/// Open requests the overview's strip shows (and j k can pick).
+pub const STRIP_MAX: usize = 3;
 /// Days in an overview sparkline, today included.
 pub const SPARK_DAYS: usize = 14;
 /// The topics producers write (aei `wiki/architecture/control-notes.md`).
