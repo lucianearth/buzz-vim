@@ -37,8 +37,9 @@ struct File {
     /// The channel the Control view (`C`) reads, by id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     control_channel: Option<String>,
-    /// `B`: whose subscription records count (default: `owner`), and who
-    /// publishes the people to pick from (default: the box's poster key).
+    /// `B`: whose subscription records count (default: lucian, as the aei
+    /// reconciler), and who publishes the people to pick from (default:
+    /// the box's poster key). 64 lowercase hex each.
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
@@ -72,8 +73,9 @@ pub struct Loop {
     pub quick_channel: String,
     pub quick_agent: String,
     pub control_channel: String,
-    /// `B`: `subscription_operators` / `BUZZ_VIM_SUB_OPERATORS` (default: the
-    /// owner) and `subscription_publishers` / `BUZZ_VIM_SUB_PUBLISHERS`.
+    /// `B`: `subscription_operators` / `BUZZ_VIM_SUB_OPERATORS` (default:
+    /// lucian, as the aei reconciler) and `subscription_publishers` /
+    /// `BUZZ_VIM_SUB_PUBLISHERS`.
     pub sub_operators: Vec<String>,
     pub sub_publishers: Vec<String>,
 }
@@ -136,24 +138,59 @@ fn keys_env(k: &str) -> Option<Vec<String>> {
     })
 }
 
+/// A pubkey as the relay and the aei reconciler write it: 64 lowercase hex.
+fn is_hex_key(k: &str) -> bool {
+    k.len() == 64 && k.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// `B`'s signers: the env list, else config.json's, else `default`. A key
+/// that isn't 64 lowercase hex is dropped and said; none left is the default.
+fn sub_keys(
+    what: &str,
+    env: Option<Vec<String>>,
+    file: &[String],
+    default: Vec<String>,
+) -> Vec<String> {
+    let Some(given) = env.or_else(|| (!file.is_empty()).then(|| file.to_vec())) else {
+        return default;
+    };
+    let (ok, bad): (Vec<String>, Vec<String>) = given.into_iter().partition(|k| is_hex_key(k));
+    if !bad.is_empty() {
+        let msg = format!(
+            "config: {what}: ignoring {} (not 64 lowercase hex){}",
+            bad.join(", "),
+            if ok.is_empty() {
+                "; using the default"
+            } else {
+                ""
+            }
+        );
+        eprintln!("buzz-vim: {msg}");
+        crate::log::line(msg);
+    }
+    if ok.is_empty() { default } else { ok }
+}
+
 fn loop_settings(file: &File) -> Loop {
     let d = Loop::default();
     let owner = env("BUZZ_VIM_OWNER")
         .or(file.owner.clone())
         .unwrap_or(d.owner);
     Loop {
-        sub_operators: keys_env("BUZZ_VIM_SUB_OPERATORS")
-            .or_else(|| {
-                (!file.subscription_operators.is_empty())
-                    .then(|| file.subscription_operators.clone())
-            })
-            .unwrap_or_else(|| vec![owner.clone()]),
-        sub_publishers: keys_env("BUZZ_VIM_SUB_PUBLISHERS")
-            .or_else(|| {
-                (!file.subscription_publishers.is_empty())
-                    .then(|| file.subscription_publishers.clone())
-            })
-            .unwrap_or(d.sub_publishers),
+        // Not `owner`: the reconciler's default signer is lucian, and the
+        // two must agree on whose map counts.
+        sub_operators: sub_keys(
+            "subscription_operators",
+            keys_env("BUZZ_VIM_SUB_OPERATORS"),
+            &file.subscription_operators,
+            d.sub_operators,
+        ),
+        sub_publishers: sub_keys(
+            "subscription_publishers",
+            keys_env("BUZZ_VIM_SUB_PUBLISHERS"),
+            &file.subscription_publishers,
+            d.sub_publishers,
+        ),
         owner,
         watchers: env("BUZZ_VIM_WATCHER")
             .map(|s| s.split(',').map(|k| k.trim().to_string()).collect())
@@ -312,6 +349,47 @@ mod tests {
             ..File::default()
         };
         assert_eq!(loop_settings(&set).watchers, vec!["abc".to_string()]);
+    }
+
+    /// `B`'s operators default to lucian (the reconciler's default), not
+    /// `owner`, and only 64 lowercase hex keys count.
+    #[test]
+    fn subscription_operators_default_to_lucian_and_must_be_hex() {
+        const LUCIAN: &str = "5c017fc7a0525e163d44fae1b4e853ad236e690c4f607fd2c603088d854bc36a";
+        let me = "ab".repeat(32);
+        if env("BUZZ_VIM_SUB_OPERATORS").is_none() && env("BUZZ_VIM_OWNER").is_none() {
+            let f = File {
+                owner: Some(me.clone()),
+                ..File::default()
+            };
+            let l = loop_settings(&f);
+            assert_eq!(l.owner, me);
+            assert_eq!(l.sub_operators, vec![LUCIAN.to_string()]);
+        }
+        let d = || vec![LUCIAN.to_string()];
+        assert_eq!(sub_keys("x", None, &[], d()), d());
+        assert_eq!(
+            sub_keys("x", None, std::slice::from_ref(&me), d()),
+            vec![me.clone()]
+        );
+        // Env wins over the file.
+        let cd = "cd".repeat(32);
+        assert_eq!(
+            sub_keys("x", Some(vec![cd.clone()]), std::slice::from_ref(&me), d()),
+            vec![cd.clone()]
+        );
+        // Uppercase, short, npub: dropped; none left is the default.
+        let bad = vec![
+            me.to_uppercase(),
+            "abc".to_string(),
+            "npub1xyz".to_string(),
+            format!("{me}0"),
+        ];
+        assert_eq!(sub_keys("x", None, &bad, d()), d());
+        let mut mixed = bad.clone();
+        mixed.push(cd.clone());
+        assert_eq!(sub_keys("x", Some(mixed), &[], d()), vec![cd]);
+        assert!(is_hex_key(LUCIAN));
     }
 
     /// A `watcher` of the wrong type mustn't lose the file: a string is

@@ -128,8 +128,9 @@ In `buzz-vim/config.json` (or the env var):
 - `control_channel` (`BUZZ_VIM_CONTROL_CHANNEL`): the channel id the Control view (`C`) reads, default
   #control (`ee7289a1-…`).
 - `subscription_operators` (`BUZZ_VIM_SUB_OPERATORS`, comma separated): whose `B` map counts, default
-  the owner. `subscription_publishers` (`BUZZ_VIM_SUB_PUBLISHERS`): who may publish the people list,
-  default the box's poster key (`f708a2af…`).
+  lucian (`5c017fc7…`), the same default as the box's reconciler. `subscription_publishers`
+  (`BUZZ_VIM_SUB_PUBLISHERS`): who may publish the people list, default the box's poster key
+  (`f708a2af…`). Keys are 64 lowercase hex; any other value is ignored with a warning.
 - `quick_channel` (`BUZZ_VIM_QUICK_CHANNEL`), default `quick`, and `quick_agent` (`BUZZ_VIM_QUICK_AGENT`),
   default `taskbot`: where Q posts and who it @mentions.
 

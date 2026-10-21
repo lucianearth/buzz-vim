@@ -1014,7 +1014,10 @@ impl Sync {
     /// `B`, step 2: the newest map with the edit, signed, shown at once (so
     /// a second edit builds on it) and published; undone if the relay refuses.
     pub fn set_subscription(&mut self, app: &mut App, map: subscription::Map, label: String) {
-        let at = app.subscriptions.next_at(now());
+        let at = match app.subscriptions.next_at(now()) {
+            Ok(at) => at,
+            Err(why) => return app.say(format!("subscription not set: {why}; nothing sent")),
+        };
         let ev = match subscription::builder(&map, at).and_then(|b| self.relay.sign(b)) {
             Ok(ev) => ev,
             Err(e) => return app.say(format!("couldn't sign: {e}")),
@@ -1022,7 +1025,8 @@ impl Sync {
         app.subscriptions.apply_ours(&ev);
         let r = self.relay.clone();
         self.spawn(async move {
-            let result = r.publish(&ev).await;
+            // A new id the relay calls a duplicate was dropped, not stored.
+            let result = r.publish_new(&ev).await;
             Msg::SubscriptionSet {
                 event: Box::new(ev),
                 label,

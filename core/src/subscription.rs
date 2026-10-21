@@ -66,6 +66,24 @@ pub struct Map {
     /// A `default` this client can't read, written back unless replaced.
     pub kept_default: Option<Value>,
     pub kept_channels: serde_json::Map<String, Value>,
+    /// The record's `"v"` as found (None: absent). Only 1 is written; a map
+    /// of another version is not overwritten (`check_version`).
+    pub v: Option<Value>,
+}
+
+/// The version this client writes.
+pub const VERSION: u64 = 1;
+
+/// Whether this client may write `m` back: its `"v"` is absent or 1. A
+/// newer version may mean something this client can't keep.
+pub fn check_version(m: &Map) -> Result<(), String> {
+    match &m.v {
+        None => Ok(()),
+        Some(v) if v.as_u64() == Some(VERSION) => Ok(()),
+        Some(v) => Err(format!(
+            "the map is version {v}, which this client doesn't write (only {VERSION}); update buzz-vim"
+        )),
+    }
 }
 
 /// One change from the picker, applied to the newest map at publish time.
@@ -141,6 +159,7 @@ fn object(ev: &Event) -> serde_json::Map<String, Value> {
 /// entry is dropped, the rest stands.
 fn read_map(ev: &Event) -> Map {
     let o = object(ev);
+    let o_v = o.get("v").cloned();
     let default = o
         .get("default")
         .and_then(Value::as_str)
@@ -175,6 +194,10 @@ fn read_map(ev: &Event) -> Map {
         kept,
         kept_default,
         kept_channels,
+        v: match o_v {
+            Some(Value::Null) | None => None,
+            Some(v) => Some(v),
+        },
     }
 }
 
@@ -367,9 +390,18 @@ impl Subscriptions {
 
     /// The created_at for our next record: now, but always after the map
     /// held, so it wins even against a clock ahead of ours or a second
-    /// edit within the same second.
-    pub fn next_at(&self, now: u64) -> u64 {
-        self.map.as_ref().map_or(now, |r| now.max(r.at + 1))
+    /// edit within the same second. Refused when that would date ours more
+    /// than MAX_SKEW ahead: every reader would skip it.
+    pub fn next_at(&self, now: u64) -> Result<u64, String> {
+        let at = self.map.as_ref().map_or(now, |r| now.max(r.at + 1));
+        if at > now + MAX_SKEW {
+            return Err(format!(
+                "the map held is dated {}s ahead of this clock, so ours would be skipped as from the future; check the clocks, or wait {}s",
+                at - 1 - now,
+                at - now - MAX_SKEW
+            ));
+        }
+        Ok(at)
     }
 
     /// Our own record, just signed: shown at once so the next edit builds
@@ -409,12 +441,13 @@ impl Subscriptions {
 /// The record for a map, dated `at` (see `Subscriptions::next_at`), ready
 /// to sign. What this client could not read goes back as it was found.
 pub fn builder(m: &Map, at: u64) -> anyhow::Result<EventBuilder> {
+    check_version(m).map_err(anyhow::Error::msg)?;
     let mut channels = m.kept_channels.clone();
     for (c, p) in &m.channels {
         channels.insert(c.clone(), json!(p));
     }
     let mut content = m.kept.clone();
-    content.insert("v".into(), json!(1));
+    content.insert("v".into(), json!(VERSION));
     content.insert(
         "default".into(),
         match (&m.default, &m.kept_default) {
@@ -589,7 +622,7 @@ mod tests {
     fn a_second_edit_before_the_ack_keeps_the_first() {
         let (op, _, _, mut s) = setup();
         s.apply(&rec(&op, D_MAP, json!({"default": "kevin"}), 100));
-        let at1 = s.next_at(100);
+        let at1 = s.next_at(100).unwrap();
         assert_eq!(at1, 101, "after the held record even at the same second");
         let e1 = builder(
             &s.edited(&Edit::Channel(DEV.into(), Some("alice".into()))),
@@ -599,14 +632,14 @@ mod tests {
         .sign_with_keys(&op)
         .unwrap();
         assert!(s.apply_ours(&e1));
-        let at2 = s.next_at(101);
+        let at2 = s.next_at(101).unwrap();
         assert_eq!(at2, 102);
         let m2 = s.edited(&Edit::Channel(OPS.into(), Some("bob".into())));
         assert_eq!(m2.channels.get(DEV).map(String::as_str), Some("alice"));
         assert_eq!(m2.channels.get(OPS).map(String::as_str), Some("bob"));
         assert_eq!(m2.default.as_deref(), Some("kevin"));
         // A clock behind the held record still dates ours after it.
-        assert_eq!(s.next_at(50), 102);
+        assert_eq!(s.next_at(50).unwrap(), 102);
     }
 
     /// The relay refuses ours: back to the map before it.
@@ -661,7 +694,7 @@ mod tests {
         assert!(m.channels.is_empty(), "{m:?}");
         assert_eq!(m.default.as_deref(), Some("kevin"));
         assert_eq!(
-            s.next_at(100),
+            s.next_at(100).unwrap(),
             101,
             "dated after what the relay holds again"
         );
@@ -713,6 +746,62 @@ mod tests {
         assert!(!s.apply(&rec(&op, D_MAP, json!({"default": "mallory"}), now + 3600)));
         assert!(s.map().is_none());
         assert!(s.apply(&rec(&op, D_MAP, json!({"default": "kevin"}), now + 60)));
+    }
+
+    /// A held record dated exactly at the skip line (now + MAX_SKEW) is
+    /// shown, but ours would have to be dated past it and be skipped by
+    /// every reader: refused, not sent. One second inside it, ours lands
+    /// on the line and stands.
+    #[test]
+    fn ours_is_never_dated_past_the_skip_line() {
+        let (op, _, _, mut s) = setup();
+        let now = unix_now();
+        assert!(s.apply(&rec(
+            &op,
+            D_MAP,
+            json!({"default": "kevin"}),
+            now + MAX_SKEW
+        )));
+        let err = s.next_at(now).unwrap_err();
+        assert!(err.contains(&format!("{MAX_SKEW}s ahead")), "{err}");
+        assert!(err.contains("wait 1s"), "{err}");
+        let (op, _, _, mut s) = setup();
+        assert!(s.apply(&rec(
+            &op,
+            D_MAP,
+            json!({"default": "kevin"}),
+            now + MAX_SKEW - 1
+        )));
+        assert_eq!(s.next_at(now), Ok(now + MAX_SKEW));
+    }
+
+    /// A newer version's map is not written over as version 1.
+    #[test]
+    fn a_newer_version_is_not_overwritten() {
+        let (op, _, _, mut s) = setup();
+        s.apply(&rec(
+            &op,
+            D_MAP,
+            json!({"v": 2, "default": "kevin", "channels": {}}),
+            100,
+        ));
+        let m = s.with_channel(DEV, Some("alice"));
+        assert_eq!(m.v, Some(json!(2)));
+        let err = builder(&m, 101).unwrap_err().to_string();
+        assert!(err.contains("version 2"), "{err}");
+        assert!(check_version(&m).is_err());
+        // Version 1, or none, is written as 1.
+        for content in [
+            json!({"v": 1, "default": "kevin"}),
+            json!({"default": "kevin"}),
+        ] {
+            let (op, _, _, mut s) = setup();
+            s.apply(&rec(&op, D_MAP, content, 100));
+            let m = s.with_channel(DEV, Some("alice"));
+            let ev = builder(&m, 101).unwrap().sign_with_keys(&op).unwrap();
+            let v: Value = serde_json::from_str(&ev.content).unwrap();
+            assert_eq!(v["v"], 1);
+        }
     }
 
     /// An unreadable default is written back unless the edit sets one.

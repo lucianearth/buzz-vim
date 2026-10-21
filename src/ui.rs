@@ -179,14 +179,31 @@ fn draw_subscription(f: &mut Frame, app: &mut App, area: Rect) {
         ));
     }
     lines.push(Line::raw(""));
-    let note = if !subs.is_operator(&app.store.me) {
-        " you are not an operator: your pick would not count".to_string()
+    if !subs.is_operator(&app.store.me) {
+        lines.push(Line::styled(
+            " you are not an operator: your pick would not count",
+            theme::faint(),
+        ));
     } else if map.is_none() {
-        " nothing set from here yet: the dashboard's map applies".to_string()
+        // C5: the first relay record replaces the dashboard's whole map.
+        lines.push(Line::styled(
+            " the first pick here replaces the dashboard's whole map:",
+            theme::bright(),
+        ));
+        lines.push(Line::styled(
+            if app.sub_confirm {
+                " every dashboard pick goes. ⏎ again to publish, Esc not"
+            } else {
+                " every dashboard pick goes (⏎ asks once more)"
+            },
+            theme::bright(),
+        ));
     } else {
-        " takes effect at each session's next start".to_string()
-    };
-    lines.push(Line::styled(note, theme::faint()));
+        lines.push(Line::styled(
+            " takes effect at each session's next start",
+            theme::faint(),
+        ));
+    }
     for (i, (k, what, _)) in legend.iter().enumerate() {
         lines.push(Line::from(vec![
             Span::raw(" "),
@@ -5487,6 +5504,107 @@ mod tests {
         assert_eq!(app.mode, Mode::Normal, "told, and the picker closes");
     }
 
+    /// With no relay map yet, the picker warns that the first pick
+    /// replaces the dashboard's whole map, and one ⏎ sends nothing.
+    #[test]
+    fn b_warns_before_the_first_publish_replaces_the_dashboard_map() {
+        use crate::subscription::{Subscriptions, Trust};
+        let me = nostr::Keys::generate();
+        let mut app = App::new(me.public_key().to_hex(), None);
+        let ch = "5e8e98d5-b696-49e2-8c6c-c0bc8faa831a";
+        app.store.channel_mut(ch).name = "flow-jamming".into();
+        app.store.channel_mut(ch).loaded = true;
+        app.tabs = vec![ch.into()];
+        app.subscriptions = Subscriptions::new(Trust {
+            operators: vec![me.public_key().to_hex()],
+            publishers: vec![],
+        });
+        let key = |app: &mut App, c| {
+            app.on_term(crossterm::event::Event::Key(
+                crossterm::event::KeyEvent::from(c),
+            ))
+        };
+        let sent = |app: &App| {
+            app.actions
+                .iter()
+                .any(|a| matches!(a, crate::app::Action::SetSubscription { .. }))
+        };
+        key(&mut app, KeyCode::Char('B'));
+        let s = screen_text(&mut app, 100, 30);
+        assert!(
+            s.contains("the first pick here replaces the dashboard's whole map"),
+            "{s}"
+        );
+        // ⏎ on the marked "follow the default" row: asked, not sent.
+        key(&mut app, KeyCode::Enter);
+        assert!(!sent(&app), "one ⏎ sends nothing");
+        assert_eq!(app.mode, Mode::Subscription);
+        let said = app.status.as_ref().map(|s| s.0.clone()).unwrap_or_default();
+        assert!(said.contains("⏎ again to publish"), "{said}");
+        let s = screen_text(&mut app, 100, 30);
+        assert!(s.contains("⏎ again to publish"), "{s}");
+        // Moving takes the confirmation back.
+        key(&mut app, KeyCode::Char('j'));
+        key(&mut app, KeyCode::Char('k'));
+        key(&mut app, KeyCode::Enter);
+        assert!(!sent(&app), "asked again after a move");
+        key(&mut app, KeyCode::Enter);
+        assert!(sent(&app), "the second ⏎ publishes");
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    /// The relay answered "duplicate:" to our new record (a newer one,
+    /// from another device or a clock ahead, dominates it): not stored, so
+    /// the record shown goes and the user is told.
+    #[test]
+    fn b_a_dropped_record_is_taken_back_and_said() {
+        use crate::subscription::{D_MAP, Edit, Subscriptions, Trust};
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+        let me = Keys::generate();
+        let mut app = App::new(me.public_key().to_hex(), None);
+        let ch = "5e8e98d5-b696-49e2-8c6c-c0bc8faa831a";
+        app.subscriptions = Subscriptions::new(Trust {
+            operators: vec![me.public_key().to_hex()],
+            publishers: vec![],
+        });
+        let held = EventBuilder::new(Kind::from(30078u16), r#"{"default":"kevin"}"#)
+            .tags([Tag::parse(["d", D_MAP]).unwrap()])
+            .custom_created_at(Timestamp::from(100))
+            .sign_with_keys(&me)
+            .unwrap();
+        let map = app
+            .subscription_fetched(
+                Ok(vec![held]),
+                &Edit::Channel(ch.into(), Some("alice".into())),
+                "x",
+            )
+            .unwrap();
+        let ours = crate::subscription::builder(&map, app.subscriptions.next_at(100).unwrap())
+            .unwrap()
+            .sign_with_keys(&me)
+            .unwrap();
+        app.subscriptions.apply_ours(&ours);
+        assert_eq!(app.subscriptions.status(ch).as_deref(), Some("sub alice"));
+        // The error publish_new returns for that answer.
+        app.subscription_set(
+            &ours.id.to_hex(),
+            "#flow-jamming subscription: alice",
+            Err(anyhow::anyhow!(
+                "the relay kept a newer record and dropped this one (duplicate: superseded)"
+            )),
+        );
+        assert_eq!(
+            app.subscriptions.status(ch).as_deref(),
+            Some("sub kevin (default)")
+        );
+        let said = app.status.as_ref().map(|s| s.0.clone()).unwrap_or_default();
+        assert!(
+            said.starts_with("subscription not set:") && said.contains("dropped"),
+            "{said}"
+        );
+        assert!(!said.contains("takes effect"), "{said}");
+    }
+
     /// A pick the box no longer offers is shown and kept, not cleared by
     /// ⏎; a list that shrinks under the cursor is never read as "clear".
     #[test]
@@ -5632,7 +5750,7 @@ mod tests {
                 .is_none(),
             "no change: nothing to send"
         );
-        let ours = crate::subscription::builder(&map, app.subscriptions.next_at(100))
+        let ours = crate::subscription::builder(&map, app.subscriptions.next_at(100).unwrap())
             .unwrap()
             .sign_with_keys(&me)
             .unwrap();

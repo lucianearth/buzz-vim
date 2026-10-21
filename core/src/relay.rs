@@ -221,6 +221,23 @@ impl Relay {
 
     /// Submit a signed event (`POST /events`). Errors when the relay rejects it.
     pub async fn publish(&self, event: &Event) -> Result<()> {
+        self.submit(event).await.map(|_| ())
+    }
+
+    /// Submit a newly signed replaceable event that must be stored. The
+    /// relay answers `accepted: true, "duplicate: …"` for one it dominates
+    /// (an older created_at, or the same second and a higher id) without
+    /// storing it; for an id never sent before that means not stored.
+    pub async fn publish_new(&self, event: &Event) -> Result<()> {
+        let message = self.submit(event).await?;
+        if is_duplicate(&message) {
+            bail!("the relay kept a newer record and dropped this one ({message})");
+        }
+        Ok(())
+    }
+
+    /// `publish`, returning the relay's message.
+    async fn submit(&self, event: &Event) -> Result<String> {
         let url = format!("{}/events", self.base);
         let body = event.as_json().into_bytes();
         let auth = self.nip98("POST", &url, Some(&body))?;
@@ -241,15 +258,16 @@ impl Relay {
         if !s.is_success() {
             bail!("relay rejected event ({s}): {t}");
         }
-        if let Ok(v) = serde_json::from_str::<Value>(&t) {
-            if v.get("accepted").and_then(Value::as_bool) == Some(false) {
-                bail!(
-                    "relay rejected event: {}",
-                    v.get("message").and_then(Value::as_str).unwrap_or("")
-                );
-            }
+        let v = serde_json::from_str::<Value>(&t).unwrap_or_default();
+        let message = v
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if v.get("accepted").and_then(Value::as_bool) == Some(false) {
+            bail!("relay rejected event: {message}");
         }
-        Ok(())
+        Ok(message)
     }
 
     fn blossom_auth(&self, verb: &str, sha256: Option<&str>, server_url: &str) -> Result<String> {
@@ -455,8 +473,71 @@ fn same_origin(a: &str, b: &str) -> bool {
     matches!((origin(a), origin(b)), (Some(x), Some(y)) if x == y)
 }
 
+/// The relay's "accepted but not stored" answer (buzz-cli's own rule).
+fn is_duplicate(message: &str) -> bool {
+    message == "duplicate" || message.starts_with("duplicate:")
+}
+
 #[cfg(test)]
 mod tests {
+    /// A relay that answers every request with `body` (HTTP 200).
+    async fn answering(body: &'static str) -> super::Relay {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = l.accept().await {
+                let mut buf = vec![0u8; 1 << 16];
+                let _ = c.read(&mut buf).await;
+                let r = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = c.write_all(r.as_bytes()).await;
+            }
+        });
+        super::Relay::new(
+            &format!("http://127.0.0.1:{port}"),
+            nostr::Keys::generate(),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn signed(r: &super::Relay) -> nostr::Event {
+        r.sign(nostr::EventBuilder::new(nostr::Kind::from(30078u16), "{}"))
+            .unwrap()
+    }
+
+    /// A dominated replaceable event: accepted, "duplicate:", not stored.
+    #[tokio::test]
+    async fn a_duplicate_answer_to_a_new_record_is_not_stored() {
+        let r = answering(r#"{"event_id":"x","accepted":true,"message":"duplicate: superseded"}"#)
+            .await;
+        let ev = signed(&r);
+        let err = r.publish_new(&ev).await.unwrap_err().to_string();
+        assert!(
+            err.contains("dropped") && err.contains("duplicate: superseded"),
+            "{err}"
+        );
+        // A plain publish (a resend is fine) still takes it as sent.
+        assert!(r.publish(&ev).await.is_ok());
+        let r = answering(r#"{"accepted":true,"message":"duplicate"}"#).await;
+        assert!(r.publish_new(&signed(&r)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_stored_record_and_a_refusal() {
+        let r = answering(r#"{"event_id":"x","accepted":true,"message":""}"#).await;
+        assert!(r.publish_new(&signed(&r)).await.is_ok());
+        let r = answering(r#"{"accepted":false,"message":"blocked: no"}"#).await;
+        let err = r.publish_new(&signed(&r)).await.unwrap_err().to_string();
+        assert!(err.contains("relay rejected event: blocked: no"), "{err}");
+        // "duplicate" inside another message is not the duplicate answer.
+        let r = answering(r#"{"accepted":true,"message":"stored; not a duplicate:"}"#).await;
+        assert!(r.publish_new(&signed(&r)).await.is_ok());
+    }
+
     /// A refused download takes the claimed name back out of the folder.
     #[tokio::test]
     async fn refused_download_leaves_nothing() {

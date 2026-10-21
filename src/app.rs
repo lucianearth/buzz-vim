@@ -322,6 +322,9 @@ pub struct App {
     /// The row under the cursor as last drawn from (None: none yet; Some(None):
     /// follow the default). ⏎ refuses if the rows moved under it since.
     pub sub_expect: Option<Option<String>>,
+    /// ⏎ was pressed once with no relay map yet: the next ⏎ publishes the
+    /// first record, which replaces the dashboard's whole map.
+    pub sub_confirm: bool,
     /// Today for the overview's sparklines (YYYY-MM-DD); None = the UTC
     /// date now. Tests pin it.
     pub control_today: Option<String>,
@@ -424,6 +427,7 @@ impl App {
             sub_all: false,
             sub_cursor: 0,
             sub_expect: None,
+            sub_confirm: false,
             control_today: None,
         }
     }
@@ -2382,6 +2386,7 @@ impl App {
             return self.say("open a channel first");
         };
         self.sub_all = false;
+        self.sub_confirm = false;
         self.sub_cursor = self.sub_row_of(&channel);
         self.sub_expect = self.sub_row_id(self.sub_cursor);
         self.mode = Mode::Subscription;
@@ -2431,6 +2436,10 @@ impl App {
 
     fn key_subscription(&mut self, k: KeyEvent) {
         let n = self.sub_people().len() + 1;
+        // Any key but ⏎ takes back a pending "⏎ again".
+        if k.code != KeyCode::Enter {
+            self.sub_confirm = false;
+        }
         match k.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('B') => self.mode = Mode::Normal,
             KeyCode::Char('j') | KeyCode::Down => {
@@ -2474,6 +2483,15 @@ impl App {
             self.sub_expect = self.sub_row_id(self.sub_cursor);
             return self.say("the list changed; pick again");
         };
+        // No relay map yet: this record replaces the dashboard's whole map
+        // at the next reconcile. Asked once more, never sent on one ⏎.
+        if self.subscriptions.map().is_none() && !self.sub_confirm {
+            self.sub_confirm = true;
+            return self.say(
+                "the first pick replaces the dashboard's whole map (every dashboard pick goes); ⏎ again to publish",
+            );
+        }
+        self.sub_confirm = false;
         let who = person.as_deref().map(|p| self.subscriptions.label(p));
         let name = self
             .store
@@ -2524,6 +2542,10 @@ impl App {
             self.subscriptions.apply(ev);
         }
         let map = self.subscriptions.edited(edit);
+        if let Err(why) = subscription::check_version(&map) {
+            self.say(format!("subscription not set: {why}; nothing sent"));
+            return None;
+        }
         if self.subscriptions.map() == Some(&map) {
             self.say(format!("{label} (already)"));
             return None;
@@ -2541,8 +2563,10 @@ impl App {
                 ))
             }
             Err(e) => {
+                // Refused, or dropped as older than the relay's newest: the
+                // record shown goes, and B again builds on what is stored.
                 self.subscriptions.retract(id);
-                self.say(format!("subscription not set: {e}"))
+                self.say(format!("subscription not set: {e}; pick again"))
             }
         }
     }
