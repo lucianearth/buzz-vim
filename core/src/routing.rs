@@ -461,15 +461,16 @@ pub fn sample(ds: &[Decision], now: u64, w: Window, node: Node, n: usize) -> Opt
 //
 // One trunk of stops, one coloured strip per exit stream ("lane"), each
 // strip peeling off at the check that settles it into its card. The checks
-// run top to bottom: is the list running, is the agent mid-turn, what kind
-// of stop Jev says it is, and (asks only) who Claude says should answer.
+// run top to bottom: is the list running, did the watcher settle it before
+// asking Jev, what kind of stop Jev says it is, and (asks only) who Claude
+// says should answer.
 
 /// Where a stop leaves the trunk: one strip and one card each, in trunk
 /// order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Lane {
     NotRunning,
-    MidTurn,
+    BeforeJev,
     KeepsGoing,
     Finished,
     WaitingOnBot,
@@ -477,12 +478,13 @@ pub enum Lane {
     NotAQuestion,
     AgentDecides,
     NeedsYou,
+    NoVerdict,
 }
 
 impl Lane {
-    pub const ALL: [Lane; 9] = [
+    pub const ALL: [Lane; 10] = [
         Lane::NotRunning,
-        Lane::MidTurn,
+        Lane::BeforeJev,
         Lane::KeepsGoing,
         Lane::Finished,
         Lane::WaitingOnBot,
@@ -490,13 +492,14 @@ impl Lane {
         Lane::NotAQuestion,
         Lane::AgentDecides,
         Lane::NeedsYou,
+        Lane::NoVerdict,
     ];
 
     /// A stable name for the apps to hand back.
     pub fn key(self) -> &'static str {
         match self {
             Lane::NotRunning => "not_running",
-            Lane::MidTurn => "mid_turn",
+            Lane::BeforeJev => "before_jev",
             Lane::KeepsGoing => "keeps_going",
             Lane::Finished => "finished",
             Lane::WaitingOnBot => "waiting_on_a_bot",
@@ -504,6 +507,7 @@ impl Lane {
             Lane::NotAQuestion => "not_a_question",
             Lane::AgentDecides => "agent_decides",
             Lane::NeedsYou => "needs_you",
+            Lane::NoVerdict => "no_verdict",
         }
     }
 
@@ -515,7 +519,7 @@ impl Lane {
     pub fn title(self) -> &'static str {
         match self {
             Lane::NotRunning => "List not running",
-            Lane::MidTurn => "Agent still mid-turn",
+            Lane::BeforeJev => "Settled before Jev",
             Lane::KeepsGoing => "Jev: keeps going",
             Lane::Finished => "Jev: finished",
             Lane::WaitingOnBot => "Jev: waiting on a bot",
@@ -523,6 +527,7 @@ impl Lane {
             Lane::NotAQuestion => "Claude: not a question",
             Lane::AgentDecides => "Claude: agent decides",
             Lane::NeedsYou => "Claude: needs you",
+            Lane::NoVerdict => "Jev: asks something, no Claude verdict",
         }
     }
 
@@ -530,7 +535,7 @@ impl Lane {
     pub fn why(self) -> &'static str {
         match self {
             Lane::NotRunning => "nobody said go; the watcher stays out",
-            Lane::MidTurn => "a turn was still running",
+            Lane::BeforeJev => "the watcher acted without asking Jev",
             Lane::KeepsGoing => "said it would continue, then stopped",
             Lane::Finished => "reported done with items still open",
             Lane::WaitingOnBot => "waiting on another bot's answer",
@@ -538,6 +543,7 @@ impl Lane {
             Lane::NotAQuestion => "Jev heard an ask, Claude didn't",
             Lane::AgentDecides => "the list already answers it",
             Lane::NeedsYou => "new decision, merge, money, access",
+            Lane::NoVerdict => "Jev heard an ask; Claude gave nothing usable",
         }
     }
 
@@ -554,17 +560,21 @@ impl Lane {
 /// The stream a decision leaves by. None for the retired "other thread"
 /// rule (`not_work_thread`), which no count includes.
 ///
-/// A judged stop Jev never labelled was a turn still running (or a
-/// long-turn status ask); a turn that started or a thread that moved while
-/// judging is the same. The list stopping while judging is "not running".
-/// Anything this build doesn't know goes in "Jev: other".
+/// A judged stop Jev never labelled was settled before Jev was asked: a
+/// turn still running, the long-turn status ask, the 4 h pause after 3
+/// nudges, nothing to judge, or an owner or bot message left unanswered
+/// (stall-judge.py `decide`, the returns before `jev(...)`). A turn that
+/// started or a thread that moved while judging lands there too; the card's
+/// sub-lines say which (`said`). The list stopping while judging is "not
+/// running". An ask with no usable Claude verdict has its own card; any
+/// other label this build doesn't know goes in "Jev: other".
 pub fn lane(d: &Decision) -> Option<Lane> {
     Some(match d.stage.as_str() {
         "not_work_thread" => return None,
         "not_running" | "contested_idle" | "stopped_running" => Lane::NotRunning,
-        "turn_started" | "thread_moved" => Lane::MidTurn,
+        "turn_started" | "thread_moved" => Lane::BeforeJev,
         "judged" => match d.jev.as_deref() {
-            None => Lane::MidTurn,
+            None => Lane::BeforeJev,
             Some(j) => match stream(Some(j)) {
                 Stream::KeepsGoing => Lane::KeepsGoing,
                 Stream::Finished => Lane::Finished,
@@ -574,7 +584,7 @@ pub fn lane(d: &Decision) -> Option<Lane> {
                     Check::NotAQuestion => Lane::NotAQuestion,
                     Check::AgentDecides => Lane::AgentDecides,
                     Check::NeedsOwner => Lane::NeedsYou,
-                    Check::Other => Lane::JevOther,
+                    Check::Other => Lane::NoVerdict,
                 },
             },
         },
@@ -645,24 +655,82 @@ enum Said {
     CarryOn,
     /// "3 nudges without a tick; quiet until …"
     Stuck,
+    /// "driver ⏳: still blocked; quiet until …"
+    Hourglass,
     /// "long turn since …; status asked"
     StatusAsked,
-    /// "a turn is running in this channel"
+    /// "long turn already asked about, or no agent in the thread"
+    StatusAlready,
+    /// "a turn is running in this channel" (also the contested one)
     TurnRunning,
+    /// "a turn started while judging; posting nothing"
+    TurnStarted,
+    /// "the thread moved while judging; posting nothing"
+    ThreadMoved,
+    /// "lucian's message has no reply"
+    OwnerUnanswered,
+    /// "macbot's message has no reply"
+    BotUnanswered,
+    /// "last word is not an agent's; nothing to judge"
+    NothingToJudge,
+    /// "channel bot members unknown; rechecking"
+    MembersUnknown,
     Plain,
 }
 
+/// stall-judge.py's `OWNER_NAME` (its default; the env can rename it).
+const OWNER_NAME: &str = "lucian";
+
+/// The reason strings are stall-judge.py's (`decide`, `run`'s `route`).
 fn said(reason: &str) -> Said {
     if reason.starts_with("real ask pinged") {
         Said::CarryOn
     } else if reason.contains("nudges without a tick") {
         Said::Stuck
+    } else if reason.starts_with("driver ⏳") {
+        Said::Hourglass
+    } else if reason.starts_with("long turn already") {
+        Said::StatusAlready
     } else if reason.starts_with("long turn") {
         Said::StatusAsked
-    } else if reason.starts_with("a turn is running") {
+    } else if reason.contains("a turn is running") {
         Said::TurnRunning
+    } else if reason.starts_with("a turn started") {
+        Said::TurnStarted
+    } else if reason.starts_with("the thread moved") {
+        Said::ThreadMoved
+    } else if let Some(i) = reason.find("'s message has no reply") {
+        // "no open items; macbot's message has no reply" names its bot last.
+        let who = reason[..i].rsplit("; ").next().unwrap_or("");
+        if who == OWNER_NAME {
+            Said::OwnerUnanswered
+        } else {
+            Said::BotUnanswered
+        }
+    } else if reason.contains("nothing to judge") {
+        Said::NothingToJudge
+    } else if reason.starts_with("channel bot members unknown") {
+        Said::MembersUnknown
     } else {
         Said::Plain
+    }
+}
+
+/// Why a stop was settled before Jev was asked, whatever the outcome.
+fn before_jev(s: Said) -> &'static str {
+    match s {
+        Said::TurnRunning => "a turn was still running",
+        Said::TurnStarted => "a turn started while judging",
+        Said::ThreadMoved => "the thread moved while judging",
+        Said::StatusAsked => "long turn: asked for a status update",
+        Said::StatusAlready => "long turn: status already asked",
+        Said::Stuck => "3 nudges, nothing ticked: 4 h pause",
+        Said::Hourglass => "driver still blocked (⏳): 4 h pause",
+        Said::OwnerUnanswered => "lucian's message had no reply",
+        Said::BotUnanswered => "another bot answered, nothing happened",
+        Said::NothingToJudge => "nothing to judge",
+        Said::MembersUnknown => "bot members not known yet: looking again",
+        Said::CarryOn | Said::Plain => "",
     }
 }
 
@@ -671,6 +739,7 @@ fn said(reason: &str) -> Said {
 fn note(lane: Lane, o: Outcome, s: Said) -> &'static str {
     use {Lane as L, Outcome as O, Said as S};
     match (lane, o, s) {
+        (L::BeforeJev, _, s) => before_jev(s),
         (_, O::Ping, S::CarryOn) => "agent also told to park it and carry on with other items",
         (L::NeedsYou, O::Ping, S::Stuck) => {
             "agent was at 3 nudges, nothing ticked, so no message, 4 h pause"
@@ -680,8 +749,6 @@ fn note(lane: Lane, o: Outcome, s: Said) -> &'static str {
         (_, O::Nudge, S::CarryOn) => {
             "repeats of an ask you'd already had: no second ping; told to carry on"
         }
-        (_, O::Nudge, S::StatusAsked) => "long turn: asked for a status update",
-        (_, O::NoAction, S::TurnRunning) | (L::MidTurn, O::NoAction, _) => "left alone",
         (L::AgentDecides, O::Nudge, _) => "told to decide it and carry on",
         (_, O::Nudge, _) => "told to carry on with the list",
         _ => "",
@@ -712,7 +779,7 @@ pub struct Card {
 /// One check down the trunk, with the cards that peel off at it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Gate {
-    /// "46 running. Is the agent mid-turn?": the stops still on the trunk
+    /// "46 running. Settled before Jev?": the stops still on the trunk
     /// folded into the question.
     pub caption: String,
     /// "waiting on a bot 0 · other 0 (not drawn)".
@@ -828,7 +895,7 @@ impl Pick {
 /// and what the stops still on the trunk are called after it.
 const GATES: [(&str, &[Lane], &str); 4] = [
     ("Is the list running?", &[Lane::NotRunning], "running"),
-    ("Is the agent mid-turn?", &[Lane::MidTurn], "really stopped"),
+    ("Settled before Jev?", &[Lane::BeforeJev], "sent to Jev"),
     (
         "Jev: what kind of stop?",
         &[
@@ -841,18 +908,28 @@ const GATES: [(&str, &[Lane], &str); 4] = [
     ),
     (
         "Claude: who should answer?",
-        &[Lane::NotAQuestion, Lane::AgentDecides, Lane::NeedsYou],
+        &[
+            Lane::NotAQuestion,
+            Lane::AgentDecides,
+            Lane::NeedsYou,
+            Lane::NoVerdict,
+        ],
         "",
     ),
 ];
 
 /// Categorical slots in exit order, handed out to the lanes drawn (adjacent
-/// strips stay apart for colour-blind eyes). Two spares for the rare day
-/// "waiting on a bot" and "other" both show.
-pub const PALETTE: [&str; 9] = [
+/// strips stay apart for colour-blind eyes). Spares for the rare day
+/// "waiting on a bot", "other" and "no Claude verdict" show.
+pub const PALETTE: [&str; 10] = [
     "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#8a6d3b",
-    "#3a8fa3",
+    "#3a8fa3", "#b0457a",
 ];
+
+/// "1 stop", "2 stops".
+pub fn stops(n: usize) -> String {
+    format!("{n} stop{}", if n == 1 { "" } else { "s" })
+}
 
 fn rgb(hex: &str) -> (u8, u8, u8) {
     let h = hex.trim_start_matches('#');
@@ -1910,7 +1987,7 @@ mod tests {
             lanes,
             [
                 (L::NotRunning, 67),
-                (L::MidTurn, 8),
+                (L::BeforeJev, 8),
                 (L::KeepsGoing, 6),
                 (L::Finished, 1),
                 (L::NotAQuestion, 17),
@@ -1923,8 +2000,8 @@ mod tests {
             caps,
             [
                 "Is the list running?",
-                "46 running. Is the agent mid-turn?",
-                "38 really stopped. Jev: what kind of stop?",
+                "46 running. Settled before Jev?",
+                "38 sent to Jev. Jev: what kind of stop?",
                 "31 asks something. Claude: who should answer?"
             ]
         );
@@ -1964,10 +2041,10 @@ mod tests {
         use super::Outcome as O;
         assert_eq!(lines(L::NotRunning), [(O::NoAction, 67, vec![])]);
         assert_eq!(
-            lines(L::MidTurn),
+            lines(L::BeforeJev),
             [
                 (O::Nudge, 1, s(&["long turn: asked for a status update"])),
-                (O::NoAction, 7, s(&["left alone"]))
+                (O::NoAction, 7, s(&["a turn was still running"]))
             ]
         );
         assert_eq!(
@@ -2040,15 +2117,15 @@ mod tests {
             ),
             None
         );
-        // Judged with no Jev label: the agent was still mid-turn.
-        assert_eq!(l("judged", None, None), Some(L::MidTurn));
-        assert_eq!(l("judged", None, Some("needs_owner")), Some(L::MidTurn));
+        // Judged with no Jev label: settled before Jev was asked.
+        assert_eq!(l("judged", None, None), Some(L::BeforeJev));
+        assert_eq!(l("judged", None, Some("needs_owner")), Some(L::BeforeJev));
         for (stage, want) in [
             ("not_running", L::NotRunning),
             ("contested_idle", L::NotRunning),
             ("stopped_running", L::NotRunning),
-            ("turn_started", L::MidTurn),
-            ("thread_moved", L::MidTurn),
+            ("turn_started", L::BeforeJev),
+            ("thread_moved", L::BeforeJev),
             ("", L::JevOther),
             ("brand_new_stage", L::JevOther),
         ] {
@@ -2076,8 +2153,8 @@ mod tests {
                 (Some("not_a_question"), L::NotAQuestion),
                 (Some("agent_decides"), L::AgentDecides),
                 (Some("needs_owner"), L::NeedsYou),
-                (Some("maybe"), L::JevOther),
-                (None, L::JevOther),
+                (Some("maybe"), L::NoVerdict),
+                (None, L::NoVerdict),
             ] {
                 assert_eq!(l("judged", Some(jev), model), Some(want), "{jev} {model:?}");
             }
@@ -2085,6 +2162,158 @@ mod tests {
         for k in Lane::ALL {
             assert_eq!(Lane::from_key(k.key()), Some(k));
         }
+        // An ask with no usable Claude verdict says so, not "a label this
+        // build doesn't know".
+        assert_eq!(
+            L::NoVerdict.title(),
+            "Jev: asks something, no Claude verdict"
+        );
+        assert!(!L::NoVerdict.why().contains("doesn't know"));
+    }
+
+    #[test]
+    fn an_unanswered_owner_nudge_is_not_a_running_turn() {
+        // judgebot on 403be6ec: stall-judge writes `judged` with no Jev for an
+        // owner_unanswered nudge; it must not read "a turn was still running".
+        let ds = vec![decided(
+            "judged",
+            None,
+            None,
+            "nudge",
+            "lucian's message has no reply",
+        )];
+        let p = pipeline(&ds, NOW, Window::Day);
+        let gate = p
+            .gates
+            .iter()
+            .find(|g| g.cards.iter().any(|c| c.lane == Lane::BeforeJev))
+            .unwrap();
+        assert_eq!(gate.caption, "1 running. Settled before Jev?");
+        assert!(p.gates.iter().all(|g| !g.caption.contains("mid-turn")));
+        let card = &gate.cards[0];
+        assert_eq!(card.lane.title(), "Settled before Jev");
+        assert_eq!(card.lane.why(), "the watcher acted without asking Jev");
+        assert_eq!(card.lines.len(), 1);
+        assert_eq!(
+            (card.lines[0].outcome, card.lines[0].count),
+            (Outcome::Nudge, 1)
+        );
+        assert_eq!(card.lines[0].notes, ["lucian's message had no reply"]);
+        assert!(
+            card.lines
+                .iter()
+                .flat_map(|l| &l.notes)
+                .all(|n| !n.contains("turn was still running"))
+        );
+    }
+
+    #[test]
+    fn settled_before_jev_splits_by_reason() {
+        // The reasons stall-judge.py's `decide` writes before it asks Jev.
+        let mut ds = vec![];
+        let mut add = |k: usize, stage: &str, outcome: &str, reason: &str| {
+            ds.extend(std::iter::repeat_n(
+                decided(stage, None, None, outcome, reason),
+                k,
+            ))
+        };
+        add(3, "judged", "nudge", "lucian's message has no reply");
+        add(2, "judged", "nudge", "macbot's message has no reply");
+        add(
+            1,
+            "judged",
+            "nudge",
+            "long turn since 04:18 UTC; status asked",
+        );
+        add(4, "judged", "none", "a turn is running in this channel");
+        add(
+            2,
+            "judged",
+            "none",
+            "backing off until 11:10 UTC after 3 nudges without a tick",
+        );
+        add(
+            1,
+            "judged",
+            "none",
+            "last word is not an agent's; nothing to judge",
+        );
+        add(
+            1,
+            "turn_started",
+            "none",
+            "a turn started while judging; posting nothing",
+        );
+        add(
+            1,
+            "judged",
+            "none",
+            "long turn already asked about, or no agent in the thread",
+        );
+        add(
+            1,
+            "judged",
+            "ping",
+            "3 nudges without a tick; quiet until 11:10 UTC",
+        );
+        add(
+            1,
+            "judged",
+            "none",
+            "no open items; macbot's message has no reply",
+        );
+        let p = pipeline(&ds, NOW, Window::Day);
+        let c = p.cards().next().unwrap();
+        assert_eq!((c.lane, c.count), (Lane::BeforeJev, 17));
+        let got: Vec<(Outcome, usize, Vec<&str>)> = c
+            .lines
+            .iter()
+            .map(|l| {
+                (
+                    l.outcome,
+                    l.count,
+                    l.notes.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    Outcome::Ping,
+                    1,
+                    vec!["3 nudges, nothing ticked: 4 h pause"]
+                ),
+                (
+                    Outcome::Nudge,
+                    6,
+                    vec![
+                        "1: long turn: asked for a status update",
+                        "3: lucian's message had no reply",
+                        "2: another bot answered, nothing happened",
+                    ]
+                ),
+                (
+                    Outcome::NoAction,
+                    10,
+                    vec![
+                        "2: 3 nudges, nothing ticked: 4 h pause",
+                        "1: long turn: status already asked",
+                        "4: a turn was still running",
+                        "1: a turn started while judging",
+                        "1: another bot answered, nothing happened",
+                        "1: nothing to judge",
+                    ]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn stop_counts_are_singular_at_one() {
+        assert_eq!(stops(0), "0 stops");
+        assert_eq!(stops(1), "1 stop");
+        assert_eq!(stops(2), "2 stops");
     }
 
     #[test]

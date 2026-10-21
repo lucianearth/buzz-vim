@@ -243,16 +243,20 @@ private struct Totals: View {
         let total = CGFloat(max(pipe.total, 1))
         let shown = pipe.outcomes.filter { $0.count > 0 }
         VStack(alignment: .leading, spacing: 8) {
-            Text("All \(pipe.total) stops ended as")
+            Text("All \(pipe.total) \(pipe.total == 1 ? "stop" : "stops") ended as")
                 .font(.name)
                 .foregroundStyle(theme.bright)
             GeometryReader { geo in
-                let room = geo.size.width - CGFloat(max(shown.count - 1, 0)) * 2
+                // Each segment gets a 2pt floor and a share of what is left,
+                // so the segments always sum to the bar's width.
+                let room = max(0, geo.size.width - CGFloat(max(shown.count - 1, 0)) * 2)
+                let minW = min(2, room / CGFloat(max(shown.count, 1)))
+                let spare = room - minW * CGFloat(shown.count)
                 HStack(spacing: 2) {
                     ForEach(shown, id: \.outcome) { o in
                         Rectangle()
                             .fill(hexColor(o.color))
-                            .frame(width: max(2, room * CGFloat(o.count) / total))
+                            .frame(width: minW + spare * CGFloat(o.count) / total)
                     }
                 }
             }
@@ -285,7 +289,7 @@ private struct PipelineDiagram: View {
                     .frame(minWidth: s.trunkWidth, minHeight: 44, alignment: .leading)
                     .background(hexColor("#4a5568"), in: RoundedRectangle(cornerRadius: 6))
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("stops seen").font(.textBold).foregroundStyle(theme.bright)
+                    Text(pipe.total == 1 ? "stop seen" : "stops seen").font(.textBold).foregroundStyle(theme.bright)
                     Text("each time an agent went quiet").font(.tiny).foregroundStyle(theme.muted)
                 }
             }

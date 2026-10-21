@@ -3000,8 +3000,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "Is the list running?",
-                "1 running. Is the agent mid-turn?",
-                "1 really stopped. Jev: what kind of stop?",
+                "1 running. Settled before Jev?",
+                "1 sent to Jev. Jev: what kind of stop?",
                 "1 asks something. Claude: who should answer?"
             ]
         );

@@ -1854,7 +1854,7 @@ fn draw_routing(f: &mut Frame, app: &mut App, area: Rect) {
         t.push(Span::styled(format!(" {} ", w.label()), st));
     }
     t.push(Span::styled(
-        format!("   {} stops in {}", p.total, win.label()),
+        format!("   {} in {}", routing::stops(p.total), win.label()),
         theme::muted(),
     ));
     let keys = if app.routing_sample.is_some() {
@@ -1934,7 +1934,14 @@ fn draw_routing(f: &mut Frame, app: &mut App, area: Rect) {
                 format!("  {} ", p.total),
                 theme::bright().add_modifier(Modifier::BOLD),
             ),
-            Span::styled("stops seen", theme::bright()),
+            Span::styled(
+                if p.total == 1 {
+                    "stop seen"
+                } else {
+                    "stops seen"
+                },
+                theme::bright(),
+            ),
             Span::styled(" · each time an agent went quiet", theme::faint()),
         ]),
     ];
@@ -2062,7 +2069,7 @@ fn draw_routing(f: &mut Frame, app: &mut App, area: Rect) {
     let total = p.total.max(1);
     let bar_w = width.saturating_sub(4).min(60);
     lines.push(Line::from(Span::styled(
-        format!("  All {} stops ended as", p.total),
+        format!("  All {} ended as", routing::stops(p.total)),
         theme::bright().add_modifier(Modifier::BOLD),
     )));
     let mut bar = vec![Span::raw("  ")];
@@ -4245,10 +4252,11 @@ mod tests {
             "┗━━━━━━━━━━ 18 → ▌▶ List not running",
             "▌nobody said go; the watcher stays out",
             "▌● — no action 18",
-            "13 running. Is the agent mid-turn?",
-            " 4 → ▌Agent still mid-turn",
-            "▌    left alone",
-            "9 really stopped. Jev: what kind of stop?",
+            "13 running. Settled before Jev?",
+            " 4 → ▌Settled before Jev",
+            "▌the watcher acted without asking Jev",
+            "▌    a turn started while judging",
+            "9 sent to Jev. Jev: what kind of stop?",
             "other 0 (not drawn)",
             " 5 → ▌Jev: keeps going",
             "▌● ↻ nudged agent 5",
@@ -4316,7 +4324,8 @@ mod tests {
             "{s}"
         );
         key(&mut app, KeyCode::Char('t'));
-        assert!(screen_text(&mut app, 120, 40).contains("stops in 1h"));
+        let s = screen_text(&mut app, 120, 40);
+        assert!(s.contains("11 stops in 1h"), "{s}");
         key(&mut app, KeyCode::Char('t'));
         assert_eq!(app.routing_window, crate::routing::Window::Day);
         // ⇥ walks each card, then its outcome lines: 5 is "keeps going ·

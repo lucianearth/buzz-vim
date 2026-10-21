@@ -63,7 +63,7 @@ pub struct RouteCard {
 /// One check down the trunk with the cards that peel off at it.
 #[derive(uniffi::Record, Clone)]
 pub struct RouteGate {
-    /// "46 running. Is the agent mid-turn?"
+    /// "46 running. Settled before Jev?"
     pub caption: String,
     /// "waiting on a bot 0 · other 0 (not drawn)".
     pub zeros: Option<String>,
