@@ -124,6 +124,13 @@ struct ChecklistView: View {
             HStack(alignment: .firstTextBaseline, spacing: 10) {
                 Text(mark(it.status))
                     .foregroundStyle(it.status == .open ? theme.text : theme.muted)
+                // The release marker leads the line (lucian 2026-10-21).
+                if it.release {
+                    Text("release")
+                        .font(.small)
+                        .foregroundStyle(it.status == .done ? theme.faint : theme.bright)
+                        .fixedSize()
+                }
                 Text(it.text)
                     .foregroundStyle(it.status == .done ? theme.muted : theme.text)
                 Spacer(minLength: 0)
@@ -189,10 +196,7 @@ struct ChecklistView: View {
     }
 
     private func flags(_ it: ChecklistItem) -> String {
-        var f: [String] = []
-        if it.release { f.append("release") }
-        if it.missingEvidence { f.append("⚠ no evidence") }
-        return f.joined(separator: " · ")
+        it.missingEvidence ? "⚠ no evidence" : ""
     }
 
     private func markdown(_ s: String) -> AttributedString {
