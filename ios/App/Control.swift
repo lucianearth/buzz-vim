@@ -145,6 +145,7 @@ extension Theme {
     func status(_ s: String?) -> Color {
         switch s {
         case "ok", "applied", "clean", "closed": return ok
+        case "superseded": return faint
         case "dead", "failed", "unreadable": return page
         case nil: return faint
         default: return warn

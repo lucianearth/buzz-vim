@@ -310,6 +310,9 @@ pub struct App {
     /// The action asked about (y/n) before voting, and the request it is on.
     pub control_vote: Option<usize>,
     pub control_vote_on: Option<String>,
+    /// Requests whose vote is on its way to the relay: no second one (a
+    /// double tap) until it answers.
+    pub control_sending: std::collections::BTreeSet<String>,
     /// Which Claude subscription each channel's agents spend (`B`).
     pub subscriptions: Subscriptions,
     /// The `B` picker: on the default for every channel (else this one),
@@ -416,6 +419,7 @@ impl App {
             control_max_scroll: 0,
             control_vote: None,
             control_vote_on: None,
+            control_sending: Default::default(),
             subscriptions: Subscriptions::default(),
             sub_all: false,
             sub_cursor: 0,
@@ -919,12 +923,44 @@ impl App {
             .and_then(|id| self.control.note(id))
     }
 
+    /// Whether `me` may vote `action` on `n` now: the board's rule, and no
+    /// vote of ours on it still in flight.
+    pub fn can_vote(&self, n: &crate::control::Note, action: usize) -> Result<(), String> {
+        self.control.can_vote(n, action, &self.store.me)?;
+        if self.control_sending.contains(&n.id) {
+            return Err("your vote on this request is still being sent".into());
+        }
+        Ok(())
+    }
+
+    /// The relay's answer to a vote: counted, or said why not; either way
+    /// the request takes votes again (if the board allows).
+    pub fn control_voted(&mut self, ev: &nostr::Event, label: &str, result: anyhow::Result<()>) {
+        if let Some(target) = ev
+            .tags
+            .iter()
+            .map(|t| t.as_slice())
+            .filter(|t| t.first().is_some_and(|n| n == "e"))
+            .filter_map(|t| t.get(1))
+            .last()
+        {
+            self.control_sending.remove(target);
+        }
+        match result {
+            Ok(()) => {
+                self.control.apply(ev);
+                self.say(format!("voted {label} {}", ev.content));
+            }
+            Err(e) => self.say(format!("vote not sent: {e}")),
+        }
+    }
+
     /// A digit on a request: ask before voting that action, or say why not.
     fn ask_vote(&mut self, id: &str, action: usize) {
         let Some(n) = self.control.note(id) else {
             return;
         };
-        match self.control.can_vote(n, action, &self.store.me) {
+        match self.can_vote(n, action) {
             Ok(()) => {
                 self.control_vote = Some(action);
                 self.control_vote_on = Some(id.to_string());
@@ -948,9 +984,10 @@ impl App {
         };
         let Some(a) = n.actions.get(i) else { return };
         // Asked again: the request may have closed while the box was up.
-        if let Err(why) = self.control.can_vote(n, i, &self.store.me) {
+        if let Err(why) = self.can_vote(n, i) {
             return self.say(format!("can't vote: {why}"));
         }
+        self.control_sending.insert(n.id.clone());
         self.actions.push(Action::React {
             target: n.id.clone(),
             emoji: a.emoji.clone(),

@@ -112,14 +112,25 @@ pub fn split_content(content: &str) -> (String, Result<Value, String>) {
     (summary, details)
 }
 
-/// A reaction as a vote: no U+FE0F, no skin tones, and empty is `+` (NIP-25).
+/// A reaction as a vote, exactly as aei's `cmd_poll` reads it (its jq
+/// `norm`): U+FE0F and the skin tones U+1F3FB..U+1F3FF dropped, nothing
+/// else. No trimming and no NIP-25 `""` -> `+`, so the tab never counts a
+/// reaction the box ignores.
 pub fn normalize_reaction(content: &str) -> String {
-    let s: String = content
-        .trim()
+    content
         .chars()
         .filter(|c| *c != '\u{FE0F}' && !('\u{1F3FB}'..='\u{1F3FF}').contains(c))
-        .collect();
-    if s.is_empty() { "+".into() } else { s }
+        .collect()
+}
+
+/// The reactions `cmd_poll` also takes for an action, besides its own
+/// emoji: ✅ and +1 approve, ❌ declines.
+pub fn aliases(action: &str) -> &'static [&'static str] {
+    match action {
+        "approve" => &["\u{2705}", "+1"],
+        "decline" => &["\u{274C}"],
+        _ => &[],
+    }
 }
 
 /// The thread root a kind 9 replies into, if it is a reply.
@@ -181,7 +192,8 @@ struct Reply {
 pub struct Status {
     pub status: Option<String>,
     pub outcome: Option<String>,
-    /// The reply that set it; None = the note's own tag.
+    /// The reply that set it, or the newer note that superseded it; None =
+    /// the note's own tag.
     pub by_event: Option<String>,
 }
 
@@ -333,18 +345,20 @@ impl Board {
         v
     }
 
-    /// Who voted for each declared action: kind-7s whose emoji matches,
-    /// from approvers only when the note names any. One vote per pubkey.
+    /// Who voted for each declared action: kind-7s whose emoji matches (or
+    /// one of `cmd_poll`'s aliases for it), from approvers only when the
+    /// note names any. One vote per pubkey.
     pub fn votes(&self, note: &Note) -> Vec<Tally> {
         let rs = self.reactions.get(&note.id);
         note.actions
             .iter()
             .map(|a| {
                 let want = normalize_reaction(&a.emoji);
+                let also = aliases(&a.name);
                 let voters: BTreeSet<String> = rs
                     .into_iter()
                     .flat_map(|m| m.values())
-                    .filter(|r| r.emoji == want)
+                    .filter(|r| r.emoji == want || also.contains(&r.emoji.as_str()))
                     .filter(|r| note.approvers.is_empty() || note.approvers.contains(&r.by))
                     .map(|r| r.by.clone())
                     .collect();
@@ -370,12 +384,44 @@ impl Board {
         out
     }
 
+    /// Take back a reaction folded in before the relay answered (a vote
+    /// sent at once), when the relay refused it.
+    pub fn forget_reaction(&mut self, ev: &Event) -> bool {
+        let Some(target) = tag_rows(ev, "e").filter_map(|s| s.get(1)).last() else {
+            return false;
+        };
+        self.reactions
+            .get_mut(target)
+            .is_some_and(|m| m.remove(&ev.id.to_hex()).is_some())
+    }
+
     pub fn reply_count(&self, note: &Note) -> usize {
         self.replies.get(&note.id).map_or(0, Vec::len)
     }
 
-    /// The newest `control-status` reply by the author or an approver wins
-    /// over the note's own tag.
+    /// The newer note for a request's topic, day and source, if any: the
+    /// one that counts now (`latest`). The box acts only on its newest
+    /// request (aei `cmd_poll` reads one `alert_event_id`, and each event of
+    /// the day republishes the day's note), so an older one is superseded.
+    pub fn superseded_by(&self, note: &Note) -> Option<&Note> {
+        let (Some(d), Some(s)) = (note.day.as_deref(), note.source.as_deref()) else {
+            return None;
+        };
+        self.notes
+            .values()
+            .filter(|n| {
+                n.topic == note.topic
+                    && n.day.as_deref() == Some(d)
+                    && n.source.as_deref() == Some(s)
+                    && (n.created_at, &n.id) > (note.created_at, &note.id)
+            })
+            .max_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)))
+    }
+
+    /// A request's status: a `closed` reply by the author or an approver,
+    /// else `superseded` (with the newer note as `by_event`) once a newer
+    /// note for its topic, day and source exists, else the newest
+    /// `control-status` reply, else the note's own tag.
     pub fn status(&self, note: &Note) -> Status {
         let newest = self
             .replies
@@ -385,6 +431,20 @@ impl Board {
             .filter(|r| r.by == note.author || note.approvers.contains(&r.by))
             .filter(|r| r.status.is_some())
             .max_by(|a, b| a.at.cmp(&b.at).then_with(|| a.id.cmp(&b.id)));
+        let closed = newest.is_some_and(|r| {
+            r.status
+                .as_ref()
+                .is_some_and(|(s, _)| s.as_str() == "closed")
+        });
+        if note.is_request() && !closed {
+            if let Some(n) = self.superseded_by(note) {
+                return Status {
+                    status: Some("superseded".into()),
+                    outcome: None,
+                    by_event: Some(n.id.clone()),
+                };
+            }
+        }
         match newest {
             Some(r) => {
                 let (s, o) = r.status.clone().unwrap_or_default();
@@ -404,28 +464,35 @@ impl Board {
 
     /// Whether `me` may vote `action` on `note`, and why not.
     pub fn can_vote(&self, note: &Note, action: usize, me: &str) -> Result<(), String> {
-        let Some(a) = note.actions.get(action) else {
+        if note.actions.get(action).is_none() {
             return Err(if note.actions.is_empty() {
                 "not a request: this note declares no actions".into()
             } else {
                 format!("this request has {} actions", note.actions.len())
             });
-        };
+        }
         let st = self.status(note);
-        if st.status.as_deref() == Some("closed") {
-            let o = st.outcome.map(|o| format!(" ({o})")).unwrap_or_default();
-            return Err(format!("the request is closed{o}"));
+        match st.status.as_deref() {
+            None | Some("open") => {}
+            Some("closed") => {
+                let o = st.outcome.map(|o| format!(" ({o})")).unwrap_or_default();
+                return Err(format!("the request is closed{o}"));
+            }
+            Some("superseded") => {
+                return Err(
+                    "superseded: a newer note for this day and source replaced this request".into(),
+                );
+            }
+            Some(other) => return Err(format!("the request is {other}")),
         }
         let me = me.to_ascii_lowercase();
         if !note.approvers.is_empty() && !note.approvers.contains(&me) {
             return Err("only the note's approvers can vote on it".into());
         }
-        if self
-            .votes(note)
-            .iter()
-            .any(|t| t.action == *a && t.voters.contains(&me))
-        {
-            return Err(format!("you already voted {}", a.name));
+        // One vote per request: approve then decline would drop the offer
+        // (`cmd_poll` checks decline first).
+        if let Some(t) = self.votes(note).iter().find(|t| t.voters.contains(&me)) {
+            return Err(format!("you already voted {}", t.action.name));
         }
         Ok(())
     }
@@ -929,8 +996,9 @@ impl Board {
             .collect()
     }
 
-    /// Requests still open, newest first. Every request note counts, not
-    /// only the newest per day and source: a request isn't a day's report.
+    /// Requests still open, newest first: only while each is the newest
+    /// note for its topic, day and source (an older one is superseded), so
+    /// a request from an earlier day stays open until closed or replaced.
     pub fn open_requests(&self) -> Vec<&Note> {
         let mut v: Vec<&Note> = self
             .notes
@@ -1389,12 +1457,16 @@ mod tests {
         assert_eq!(v[0].action.name, "approve");
         assert_eq!(v[0].voters, vec![lp.clone()], "one vote per pubkey");
         assert!(v[1].voters.is_empty());
-        assert_eq!(v[2].voters, vec![lp.clone()], "empty reaction is +");
+        // cmd_poll reads "" as "", not NIP-25's +.
+        assert!(v[2].voters.is_empty(), "empty reaction is not +");
         assert_eq!(b.reaction_counts(&n)["👍"], 3);
-        // Who may vote, and why not.
-        assert!(b.can_vote(&n, 1, &lp).is_ok());
+        // Who may vote, and why not: one vote per request, any action.
         assert_eq!(
             b.can_vote(&n, 0, &lp).unwrap_err(),
+            "you already voted approve"
+        );
+        assert_eq!(
+            b.can_vote(&n, 1, &lp).unwrap_err(),
             "you already voted approve"
         );
         assert!(
@@ -1608,6 +1680,208 @@ mod tests {
         b.apply(&note(&k, "2026-10-22", "build-box", 40, &details(1), &[]));
         let t = &b.tiles("2026-10-22")[0];
         assert_eq!((t.open, t.health), (1, Health::Warn));
+    }
+
+    /// aei `cmd_poll`'s rows (upgrade/buzz-upgrade.sh on main ac37313): for
+    /// a request declaring approve=👍 decline=👎 with one approver, whether
+    /// each reaction's content counts as (approve, decline). cmd_poll's jq
+    /// `norm` drops U+FE0F and U+1F3FB..U+1F3FF and nothing else; approve
+    /// also takes ✅ and +1, decline ❌. The expected column was checked by
+    /// running cmd_poll's own jq on these rows.
+    #[test]
+    fn votes_count_exactly_what_cmd_poll_counts() {
+        let rows: &[(&str, bool, bool)] = &[
+            ("👍", true, false),
+            ("👍🏻", true, false),
+            ("👍🏽", true, false),
+            ("👍🏿", true, false),
+            ("👍\u{FE0F}", true, false),
+            ("👍🏽\u{FE0F}", true, false),
+            ("✅", true, false),
+            ("✅\u{FE0F}", true, false),
+            ("+1", true, false),
+            ("👎", false, true),
+            ("👎🏾", false, true),
+            ("👎\u{FE0F}", false, true),
+            ("❌", false, true),
+            ("❌\u{FE0F}", false, true),
+            // Not trimmed, not NIP-25's +, no other lookalikes.
+            (" 👍", false, false),
+            ("👍\n", false, false),
+            (" 👍\n", false, false),
+            ("+1 ", false, false),
+            ("+", false, false),
+            ("", false, false),
+            ("-", false, false),
+            ("✔️", false, false),
+            ("☑️", false, false),
+            ("✖️", false, false),
+            ("❎", false, false),
+            ("👍👍", false, false),
+            ("thumbsup", false, false),
+            ("🚀", false, false),
+        ];
+        let author = Keys::generate();
+        let lucian = Keys::generate();
+        for (i, (content, approve, decline)) in rows.iter().enumerate() {
+            let mut b = Board::new(CH);
+            let e = note(
+                &author,
+                "2026-10-21",
+                "build-box",
+                1,
+                &details(1),
+                &[
+                    &[TAG_ACTION, "approve", "👍"],
+                    &[TAG_ACTION, "decline", "👎"],
+                    &[TAG_APPROVER, &lucian.public_key().to_hex()],
+                    &[TAG_STATUS, "open"],
+                ],
+            );
+            b.apply(&e);
+            let id = e.id.to_hex();
+            b.apply(&ev(&lucian, 7, content, &[&["e", &id]], 2 + i as u64));
+            let n = b.note(&id).unwrap().clone();
+            let v = b.votes(&n);
+            let got = (!v[0].voters.is_empty(), !v[1].voters.is_empty());
+            assert_eq!(got, (*approve, *decline), "row {i}: {content:?}");
+        }
+    }
+
+    #[test]
+    fn a_vote_for_one_action_blocks_the_others() {
+        let author = Keys::generate();
+        let lucian = Keys::generate();
+        let lp = lucian.public_key().to_hex();
+        let mut b = Board::new(CH);
+        let e = note(
+            &author,
+            "2026-10-21",
+            "build-box",
+            1,
+            &details(1),
+            &[
+                &[TAG_ACTION, "approve", "👍"],
+                &[TAG_ACTION, "decline", "👎"],
+                &[TAG_APPROVER, &lp],
+                &[TAG_STATUS, "open"],
+            ],
+        );
+        b.apply(&e);
+        let id = e.id.to_hex();
+        let n = b.note(&id).unwrap().clone();
+        assert!(b.can_vote(&n, 0, &lp).is_ok());
+        assert!(b.can_vote(&n, 1, &lp).is_ok());
+        // ✅ from another client is an approve: no decline after it.
+        let v = ev(&lucian, 7, "✅", &[&["e", &id]], 2);
+        b.apply(&v);
+        assert_eq!(
+            b.can_vote(&n, 1, &lp).unwrap_err(),
+            "you already voted approve"
+        );
+        assert_eq!(
+            b.can_vote(&n, 0, &lp).unwrap_err(),
+            "you already voted approve"
+        );
+    }
+
+    #[test]
+    fn a_refused_vote_is_forgotten() {
+        let author = Keys::generate();
+        let lucian = Keys::generate();
+        let lp = lucian.public_key().to_hex();
+        let mut b = Board::new(CH);
+        let e = note(
+            &author,
+            "2026-10-21",
+            "build-box",
+            1,
+            &details(1),
+            &[&[TAG_ACTION, "approve", "👍"], &[TAG_APPROVER, &lp]],
+        );
+        b.apply(&e);
+        let id = e.id.to_hex();
+        let v = ev(&lucian, 7, "👍", &[&["e", &id]], 2);
+        b.apply(&v);
+        let n = b.note(&id).unwrap().clone();
+        assert!(b.can_vote(&n, 0, &lp).is_err());
+        // Taken back (the relay refused it): the request is free again.
+        assert!(b.forget_reaction(&v));
+        assert!(!b.forget_reaction(&v));
+        assert!(b.can_vote(&n, 0, &lp).is_ok());
+        assert!(b.votes(&n)[0].voters.is_empty());
+    }
+
+    #[test]
+    fn a_newer_note_for_the_day_and_source_supersedes_a_request() {
+        let k = Keys::generate();
+        let lucian = Keys::generate();
+        let lp = lucian.public_key().to_hex();
+        let mut b = Board::new(CH);
+        let req = |day: &str, source: &str, at: u64| {
+            note(
+                &k,
+                day,
+                source,
+                at,
+                &details(1),
+                &[
+                    &[TAG_ACTION, "approve", "👍"],
+                    &[TAG_APPROVER, &lp],
+                    &[TAG_STATUS, "open"],
+                ],
+            )
+        };
+        let old = req("2026-10-21", "build-box", 10);
+        let new = req("2026-10-21", "build-box", 20);
+        let other_source = req("2026-10-21", "mac", 5);
+        let other_day = req("2026-10-20", "build-box", 5);
+        for e in [&old, &new, &other_source, &other_day] {
+            b.apply(e);
+        }
+        let ids: Vec<String> = b.open_requests().iter().map(|n| n.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                new.id.to_hex(),
+                other_source.id.to_hex(),
+                other_day.id.to_hex()
+            ]
+        );
+        let o = b.note(&old.id.to_hex()).unwrap().clone();
+        let st = b.status(&o);
+        assert_eq!(st.status.as_deref(), Some("superseded"));
+        assert_eq!(st.by_event, Some(new.id.to_hex()));
+        assert!(
+            b.can_vote(&o, 0, &lp)
+                .unwrap_err()
+                .starts_with("superseded")
+        );
+        assert!(
+            b.can_vote(b.note(&new.id.to_hex()).unwrap(), 0, &lp)
+                .is_ok()
+        );
+        // A plain report later that day (aei republishes the day's note on
+        // each event, a decline or a roll) supersedes the request too.
+        let n = b.note(&new.id.to_hex()).unwrap().clone();
+        b.apply(&note(&k, "2026-10-21", "build-box", 30, &details(1), &[]));
+        assert_eq!(b.status(&n).status.as_deref(), Some("superseded"));
+        let ids: Vec<String> = b.open_requests().iter().map(|n| n.id.clone()).collect();
+        assert_eq!(ids, vec![other_source.id.to_hex(), other_day.id.to_hex()]);
+        assert_eq!(b.tiles("2026-10-21")[0].open, 2);
+        // An explicit close still reads as closed, not superseded.
+        b.apply(&ev(
+            &k,
+            9,
+            "done",
+            &[
+                &["h", CH],
+                &["e", &o.id, "", "root"],
+                &[TAG_STATUS, "closed", "decline"],
+            ],
+            40,
+        ));
+        assert_eq!(b.status(&o).status.as_deref(), Some("closed"));
     }
 
     #[test]

@@ -885,7 +885,7 @@ fn request_lines(app: &App, n: &Note) -> Vec<Line<'static>> {
         out.push(Line::from(l));
     }
     let can: Vec<usize> = (0..n.actions.len())
-        .filter(|i| app.control.can_vote(n, *i, &app.store.me).is_ok())
+        .filter(|i| app.can_vote(n, *i).is_ok())
         .collect();
     let hint = if !can.is_empty() {
         let keys: Vec<String> = can.iter().map(|i| (i + 1).to_string()).collect();
@@ -894,11 +894,7 @@ fn request_lines(app: &App, n: &Note) -> Vec<Line<'static>> {
             theme::bright(),
         )
     } else {
-        let why = app
-            .control
-            .can_vote(n, 0, &app.store.me)
-            .err()
-            .unwrap_or_default();
+        let why = app.can_vote(n, 0).err().unwrap_or_default();
         Line::styled(format!("you can't vote: {why}"), theme::faint())
     };
     out.push(hint);
@@ -1801,6 +1797,41 @@ mod tests {
         assert!(app.control_note.is_some() && app.control_topic.is_none());
         key(&mut app, KeyCode::Char('h'));
         assert!(app.control_note.is_none() && app.control_view);
+    }
+
+    #[test]
+    fn a_second_vote_waits_for_the_relay() {
+        let (mut app, _) = fixture();
+        key(&mut app, KeyCode::Char('C'));
+        key(&mut app, KeyCode::Char('j'));
+        key(&mut app, KeyCode::Char('1'));
+        key(&mut app, KeyCode::Char('y'));
+        let sent = |app: &App| {
+            app.actions
+                .iter()
+                .filter(|a| matches!(a, Action::React { .. }))
+                .count()
+        };
+        assert_eq!(sent(&app), 1);
+        // Pressed again before the relay answered: no box, nothing sent.
+        key(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(sent(&app), 1);
+        let said = app.status.as_ref().map(|s| s.0.clone()).unwrap_or_default();
+        assert!(
+            said.contains("your vote on this request is still being sent"),
+            "{said}"
+        );
+        // The relay refused it: the request takes a vote again.
+        let id = app.control.open_requests()[0].id.clone();
+        let keys = nostr::Keys::generate();
+        let v = nostr::EventBuilder::new(nostr::Kind::Reaction, "👍")
+            .tags([nostr::Tag::parse(["e", id.as_str()]).unwrap()])
+            .sign_with_keys(&keys)
+            .unwrap();
+        app.control_voted(&v, "approve", Err(anyhow::anyhow!("relay rejected: no")));
+        key(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.mode, Mode::Vote);
     }
 
     #[test]

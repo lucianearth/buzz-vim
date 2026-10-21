@@ -405,13 +405,7 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
             event,
             label,
             result,
-        } => match result {
-            Ok(()) => {
-                app.control.apply(&event);
-                app.say(format!("voted {label} {}", event.content));
-            }
-            Err(e) => app.say(format!("vote not sent: {e}")),
-        },
+        } => app.control_voted(&event, &label, result),
         Msg::QuickSent { id, result, text } => match result {
             Ok(()) => {
                 let agent = app.loop_.quick_agent.clone();

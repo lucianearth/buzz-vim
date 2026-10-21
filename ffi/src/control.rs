@@ -111,7 +111,8 @@ pub struct ControlRequest {
     pub source: String,
     /// The summary's first line.
     pub line: String,
-    /// "open", "closed", or "?" when it has none.
+    /// "open", "closed", "superseded" (a newer note for its day and source
+    /// replaced it; not votable), or "?" when it has none.
     pub status: String,
     pub outcome: Option<String>,
     pub actions: Vec<ControlAction>,
@@ -785,6 +786,9 @@ impl Engine {
         let ev = buzz_sdk::build_reaction(id, &a.emoji)
             .map_err(anyhow::Error::from)
             .and_then(|b| self.relay.sign(b))?;
+        // Counted at once, so a second tap is refused (one vote per
+        // request) and the buttons dim; taken back if the relay refuses.
+        self.control.apply(&ev);
         let r = self.relay.clone();
         let label = a.name;
         self.spawn(async move {
@@ -804,7 +808,10 @@ impl Engine {
                 self.control.apply(ev);
                 self.notices.push(format!("voted {label} {}", ev.content));
             }
-            Err(e) => self.notices.push(format!("vote not sent: {e}")),
+            Err(e) => {
+                self.control.forget_reaction(ev);
+                self.notices.push(format!("vote not sent: {e}"))
+            }
         }
     }
 }
@@ -1037,7 +1044,11 @@ mod tests {
             r.actions[0].blocked.as_deref(),
             Some("you already voted approve")
         );
-        assert_eq!(r.actions[1].blocked, None);
+        // One vote per request: the other button is off too.
+        assert_eq!(
+            r.actions[1].blocked.as_deref(),
+            Some("you already voted approve")
+        );
         assert_eq!(o.more_requests, 0);
 
         // Someone who isn't an approver sees why the buttons won't vote.
@@ -1293,6 +1304,57 @@ mod tests {
             e.notices.last().map(String::as_str),
             Some("vote not sent: relay rejected: no")
         );
+    }
+
+    #[test]
+    fn a_second_tap_sends_nothing_and_a_refusal_frees_the_buttons() {
+        let mut e = crate::tests::engine();
+        let me = e.me();
+        let bot = Keys::generate();
+        let req = note_ev(
+            &bot,
+            "upgrade",
+            "upgrade/1",
+            TODAY,
+            "build-box",
+            NOW,
+            &json!({"status": "offered"}),
+            &[
+                vec![TAG_ACTION, "approve", "👍"],
+                vec![TAG_ACTION, "decline", "👎"],
+                vec![TAG_APPROVER, me.as_str()],
+                vec![TAG_STATUS, "open"],
+            ],
+        );
+        e.on_control_live(&req);
+        let id = req.id.to_hex();
+        assert!(e.vote(&id, 0).is_ok());
+        // Before the relay answers: a double tap, or the decline beside it,
+        // is refused, and both buttons say so.
+        assert!(
+            matches!(e.vote(&id, 0), Err(BuzzError::Failed(m)) if m == "you already voted approve")
+        );
+        assert!(
+            matches!(e.vote(&id, 1), Err(BuzzError::Failed(m)) if m == "you already voted approve")
+        );
+        let o = overview(&e.control, &me, &name, TODAY, NOW);
+        let r = o.requests.iter().find(|r| r.id == id).unwrap();
+        assert!(r.actions.iter().all(|a| a.blocked.is_some()));
+        assert_eq!((r.actions[0].votes, r.actions[0].mine), (1, true));
+        // The relay refused it: the count and the buttons come back.
+        let v = e
+            .relay
+            .sign(buzz_sdk::build_reaction(req.id, "👍").unwrap())
+            .unwrap();
+        e.on_voted(
+            &v,
+            "approve".into(),
+            Err(anyhow::anyhow!("relay rejected: no")),
+        );
+        let o = overview(&e.control, &me, &name, TODAY, NOW);
+        let r = o.requests.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(r.actions[0].votes, 0);
+        assert!(r.actions.iter().all(|a| a.blocked.is_none()));
     }
 
     #[test]

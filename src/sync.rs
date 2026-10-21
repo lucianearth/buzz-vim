@@ -1034,6 +1034,7 @@ impl Sync {
     /// A vote on a control request: the action's emoji as a reaction.
     fn react(&mut self, app: &mut App, target: String, emoji: String, label: String) {
         let Ok(id) = EventId::from_hex(&target) else {
+            app.control_sending.remove(&target);
             return;
         };
         let ev = match buzz_sdk::build_reaction(id, &emoji)
@@ -1041,7 +1042,10 @@ impl Sync {
             .and_then(|b| self.relay.sign(b))
         {
             Ok(ev) => ev,
-            Err(e) => return app.say(format!("couldn't vote: {e}")),
+            Err(e) => {
+                app.control_sending.remove(&target);
+                return app.say(format!("couldn't vote: {e}"));
+            }
         };
         app.say(format!("voting {label} {emoji}…"));
         let r = self.relay.clone();
