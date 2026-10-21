@@ -409,11 +409,18 @@ fn in_window(d: &Decision, now: u64, w: Window) -> bool {
     d.at.saturating_add(w.secs()) >= now
 }
 
+/// Within `w` of `now`, and counted: the stops [`lane`] leaves out
+/// (`not_work_thread`, `newer_elsewhere`) are in no diagram, sample or total,
+/// so the diagram agrees with [`pipeline`].
+fn counted(d: &Decision, now: u64, w: Window) -> bool {
+    in_window(d, now, w) && lane(d).is_some()
+}
+
 /// The diagram for the decisions within `w` of `now`.
 pub fn flow(ds: &[Decision], now: u64, w: Window) -> Flow {
     let mut counts: HashMap<Node, usize> = HashMap::new();
     let mut edges: BTreeMap<(Node, Node), usize> = BTreeMap::new();
-    for d in ds.iter().filter(|d| in_window(d, now, w)) {
+    for d in ds.iter().filter(|d| counted(d, now, w)) {
         let p = d.path();
         for n in &p {
             *counts.entry(*n).or_default() += 1;
@@ -449,7 +456,7 @@ pub fn flow(ds: &[Decision], now: u64, w: Window) -> Flow {
 pub fn sample(ds: &[Decision], now: u64, w: Window, node: Node, n: usize) -> Option<&Decision> {
     let mut hits: Vec<&Decision> = ds
         .iter()
-        .filter(|d| in_window(d, now, w) && d.path().contains(&node))
+        .filter(|d| counted(d, now, w) && d.path().contains(&node))
         .collect();
     if hits.is_empty() {
         return None;
@@ -2419,6 +2426,33 @@ mod tests {
                 vec!["a turn started while judging: posted nothing".to_string()]
             )]
         );
+    }
+
+    #[test]
+    fn flow_leaves_out_what_the_pipeline_does_not_count() {
+        // Review 2026-10-21: flow() still put not_work_thread and
+        // newer_elsewhere stops in "stops seen", "list running" and an
+        // outcome, so the diagram's total disagreed with the pipeline's.
+        let mut ds = prod_mix();
+        let before = flow(&ds, NOW, Window::Day);
+        ds.extend(std::iter::repeat_n(
+            decided("newer_elsewhere", None, None, "none", "x"),
+            4,
+        ));
+        ds.extend(std::iter::repeat_n(
+            decided("not_work_thread", None, None, "none", "y"),
+            3,
+        ));
+        let f = flow(&ds, NOW, Window::Day);
+        assert_eq!(f, before);
+        assert_eq!(f.count(Node::Seen), pipeline(&ds, NOW, Window::Day).total);
+        // Nor does a sample draw one.
+        let only = [
+            decided("newer_elsewhere", None, None, "none", "x"),
+            decided("not_work_thread", None, None, "none", "y"),
+        ];
+        assert_eq!(flow(&only, NOW, Window::Day).count(Node::Seen), 0);
+        assert!(sample(&only, NOW, Window::Day, Node::Seen, 0).is_none());
     }
 
     #[test]
