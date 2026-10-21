@@ -44,8 +44,8 @@ impl Mode {
 pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
     match mode {
         Mode::Normal => &[
-            ("j k ↑↓", "move", true),
-            ("n", "latest message (into its thread)", true),
+            ("j k ↑↓", "move", false),
+            ("n", "latest", true),
             ("0", "needs you", false),
             ("1-9", "tab", false),
             ("!", "next ⚑, oldest first", false),
@@ -58,7 +58,7 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("s", "sections", false),
             ("o", "image", true),
             ("O", "images in Preview (a thread: all of them)", false),
-            ("f", "follow link", true),
+            ("f", "links", true),
             ("f", "copy a code block", false),
             ("⌫ ^o", "back to where a link took you from", false),
             ("[ ]", "narrower / wider (or drag the right edge)", false),
