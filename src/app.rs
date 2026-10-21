@@ -316,6 +316,9 @@ pub struct App {
     /// and its row (0 = follow the default / each agent's owner).
     pub sub_all: bool,
     pub sub_cursor: usize,
+    /// The row under the cursor as last drawn from (None: none yet; Some(None):
+    /// follow the default). ⏎ refuses if the rows moved under it since.
+    pub sub_expect: Option<Option<String>>,
     /// Today for the overview's sparklines (YYYY-MM-DD); None = the UTC
     /// date now. Tests pin it.
     pub control_today: Option<String>,
@@ -416,6 +419,7 @@ impl App {
             subscriptions: Subscriptions::default(),
             sub_all: false,
             sub_cursor: 0,
+            sub_expect: None,
             control_today: None,
         }
     }
@@ -2342,6 +2346,7 @@ impl App {
         };
         self.sub_all = false;
         self.sub_cursor = self.sub_row_of(&channel);
+        self.sub_expect = self.sub_row_id(self.sub_cursor);
         self.mode = Mode::Subscription;
     }
 
@@ -2364,6 +2369,15 @@ impl App {
             }
         }
         out
+    }
+
+    /// What a picker row stands for: Some(None) follow the default (or the
+    /// owner), Some(Some(id)) a person, None past the end.
+    pub fn sub_row_id(&self, row: usize) -> Option<Option<String>> {
+        match row.checked_sub(1) {
+            None => Some(None),
+            Some(i) => self.sub_people().get(i).map(|p| Some(p.id.clone())),
+        }
     }
 
     /// The row for what's set now, in the picker's current scope.
@@ -2397,9 +2411,10 @@ impl App {
                     self.sub_cursor = self.sub_row_of(&c);
                 }
             }
-            KeyCode::Enter => self.choose_subscription(),
-            _ => {}
+            KeyCode::Enter => return self.choose_subscription(),
+            _ => return,
         }
+        self.sub_expect = self.sub_row_id(self.sub_cursor);
     }
 
     /// ⏎ in the picker: the new map, signed and published by sync. Only an
@@ -2414,16 +2429,14 @@ impl App {
             return self
                 .say("only an operator's pick counts (subscription_operators); nothing sent");
         }
-        let people = self.sub_people();
-        if self.sub_cursor > people.len() {
-            // The list shrank under the cursor: never read that as "clear".
-            self.sub_cursor = people.len();
+        // The rows can move under the cursor (a newer map, a new people
+        // list): send only what was under it, never a neighbour or "clear".
+        let row = self.sub_row_id(self.sub_cursor);
+        let Some(person) = row.clone().filter(|_| row == self.sub_expect) else {
+            self.sub_cursor = self.sub_cursor.min(self.sub_people().len());
+            self.sub_expect = self.sub_row_id(self.sub_cursor);
             return self.say("the list changed; pick again");
-        }
-        let person = self
-            .sub_cursor
-            .checked_sub(1)
-            .and_then(|i| people.get(i).map(|p| p.id.clone()));
+        };
         let who = person.as_deref().map(|p| self.subscriptions.label(p));
         let name = self
             .store
@@ -2451,6 +2464,50 @@ impl App {
         // Whether it changes anything is decided against the relay's newest
         // map at publish time (sync), not this possibly stale copy.
         self.actions.push(Action::SetSubscription { edit, label });
+    }
+
+    /// `B`, after the relay's newest map came back: fold it, apply the edit;
+    /// the map to sign, or None when it changes nothing (said so).
+    pub fn subscription_fetched(
+        &mut self,
+        result: anyhow::Result<Vec<nostr::Event>>,
+        edit: &subscription::Edit,
+        label: &str,
+    ) -> Option<subscription::Map> {
+        let evs = match result {
+            Ok(evs) => evs,
+            Err(e) => {
+                self.say(format!(
+                    "subscription not set: couldn't read the current map ({e}); nothing sent"
+                ));
+                return None;
+            }
+        };
+        for ev in &evs {
+            self.subscriptions.apply(ev);
+        }
+        let map = self.subscriptions.edited(edit);
+        if self.subscriptions.map() == Some(&map) {
+            self.say(format!("{label} (already)"));
+            return None;
+        }
+        Some(map)
+    }
+
+    /// `B`, the relay's answer to our record.
+    pub fn subscription_set(&mut self, id: &str, label: &str, result: anyhow::Result<()>) {
+        match result {
+            Ok(()) => {
+                self.subscriptions.ack(id);
+                self.say(format!(
+                    "{label}: takes effect at each session's next start"
+                ))
+            }
+            Err(e) => {
+                self.subscriptions.retract(id);
+                self.say(format!("subscription not set: {e}"))
+            }
+        }
     }
 
     fn key_sections(&mut self, k: KeyEvent) {

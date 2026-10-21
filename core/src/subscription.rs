@@ -26,6 +26,14 @@ pub const KIND: u16 = 30078;
 pub const D_MAP: &str = "buzz-subscription";
 pub const D_PEOPLE: &str = "buzz-subscription/people";
 /// chip / opsbot: the key the aei reconciler publishes the people with.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// How far ahead of this clock a record may be dated (the reconciler's rule).
+pub const MAX_SKEW: u64 = 600;
 pub const PUBLISHER: &str = "f708a2af2c0b6f64abb2dffbdc9b1f1e43a7d166a583bce5ce19f83afdd95e6a";
 
 /// Whose records count.
@@ -55,6 +63,8 @@ pub struct Map {
     /// channel entries it can't parse), written back as found, so an edit
     /// here never deletes another writer's data.
     pub kept: serde_json::Map<String, Value>,
+    /// A `default` this client can't read, written back unless replaced.
+    pub kept_default: Option<Value>,
     pub kept_channels: serde_json::Map<String, Value>,
 }
 
@@ -92,9 +102,12 @@ struct Rec<T> {
 #[derive(Clone, Debug, Default)]
 pub struct Subscriptions {
     pub trust: Trust,
+    /// The map shown: the newest known, our unacked records included.
     map: Option<Rec<Map>>,
-    /// The map before our own unacked record, to go back to if it fails.
-    before_ours: Option<(String, Option<Rec<Map>>)>,
+    /// The newest map the relay is known to hold (read from it, or acked).
+    confirmed: Option<Rec<Map>>,
+    /// Our records signed but not yet acked, oldest first.
+    pending: Vec<Rec<Map>>,
     people: Option<Rec<Vec<Person>>>,
 }
 
@@ -147,6 +160,11 @@ fn read_map(ev: &Event) -> Map {
             }
         }
     }
+    let kept_default = match o.get("default") {
+        None | Some(Value::Null) => None,
+        Some(v) if default.is_none() && v != &json!("") => Some(v.clone()),
+        Some(_) => None,
+    };
     let kept = o
         .into_iter()
         .filter(|(k, _)| !matches!(k.as_str(), "v" | "default" | "channels"))
@@ -155,6 +173,7 @@ fn read_map(ev: &Event) -> Map {
         default,
         channels,
         kept,
+        kept_default,
         kept_channels,
     }
 }
@@ -207,9 +226,18 @@ impl Subscriptions {
         self.trust.operators.iter().any(|o| o == pubkey)
     }
 
-    /// Fold one event. True when it is now the record shown.
+    /// Fold one event from the relay. True when it is now the record shown.
     pub fn apply(&mut self, ev: &Event) -> bool {
+        self.fold(ev, false)
+    }
+
+    fn fold(&mut self, ev: &Event, ours: bool) -> bool {
         if !Self::is_record(ev) {
+            return false;
+        }
+        // Dated more than MAX_SKEW ahead: skipped, as the aei reconciler
+        // does, so one bad clock can't outrank (and ratchet) every later pick.
+        if ev.created_at.as_secs() > unix_now() + MAX_SKEW {
             return false;
         }
         let signer = ev.pubkey.to_hex();
@@ -230,12 +258,18 @@ impl Subscriptions {
             })
         };
         if map {
+            let rec = Rec {
+                at,
+                id: id.clone(),
+                value: read_map(ev),
+            };
+            if ours {
+                self.pending.push(rec.clone());
+            } else if replaces(self.confirmed.as_ref().map(|r| (r.at, r.id.as_str()))) {
+                self.confirmed = Some(rec.clone());
+            }
             if replaces(self.map.as_ref().map(|r| (r.at, r.id.as_str()))) {
-                self.map = Some(Rec {
-                    at,
-                    id,
-                    value: read_map(ev),
-                });
+                self.map = Some(rec);
                 return true;
             }
         } else if replaces(self.people.as_ref().map(|r| (r.at, r.id.as_str()))) {
@@ -323,7 +357,10 @@ impl Subscriptions {
                 m.kept_channels.remove(c);
                 m.channels.remove(c);
             }
-            Edit::Default(p) => m.default = p.clone(),
+            Edit::Default(p) => {
+                m.kept_default = None;
+                m.default = p.clone();
+            }
         }
         m
     }
@@ -336,25 +373,35 @@ impl Subscriptions {
     }
 
     /// Our own record, just signed: shown at once so the next edit builds
-    /// on it, and remembered so `retract` can undo it if the relay refuses.
+    /// on it, and held as pending until `ack` or `retract`.
     pub fn apply_ours(&mut self, ev: &Event) -> bool {
-        let before = self.map.clone();
-        let shown = self.apply(ev);
-        if shown {
-            self.before_ours = Some((ev.id.to_hex(), before));
-        }
-        shown
+        self.fold(ev, true)
     }
 
-    /// The relay refused our record: back to the map before it, unless
-    /// something newer arrived meanwhile.
-    pub fn retract(&mut self, id: &str) {
-        if let Some((ours, before)) = self.before_ours.take() {
-            if ours == id && self.map.as_ref().is_some_and(|r| r.id == id) {
-                self.map = before;
-            } else if ours != id {
-                self.before_ours = Some((ours, before));
+    /// The relay took our record.
+    pub fn ack(&mut self, id: &str) {
+        if let Some(i) = self.pending.iter().position(|r| r.id == id) {
+            let rec = self.pending.remove(i);
+            let newer = self.confirmed.as_ref().is_none_or(|c| {
+                (rec.at, std::cmp::Reverse(&rec.id)) > (c.at, std::cmp::Reverse(&c.id))
+            });
+            if newer {
+                self.confirmed = Some(rec);
             }
+        }
+    }
+
+    /// The relay refused our record. If it is the one shown, show the
+    /// newest of our other unacked records, else what the relay holds:
+    /// never a record the relay has refused.
+    pub fn retract(&mut self, id: &str) {
+        self.pending.retain(|r| r.id != id);
+        if self.map.as_ref().is_some_and(|r| r.id == id) {
+            self.map = self
+                .pending
+                .last()
+                .cloned()
+                .or_else(|| self.confirmed.clone());
         }
     }
 }
@@ -370,7 +417,11 @@ pub fn builder(m: &Map, at: u64) -> anyhow::Result<EventBuilder> {
     content.insert("v".into(), json!(1));
     content.insert(
         "default".into(),
-        json!(m.default.clone().unwrap_or_default()),
+        match (&m.default, &m.kept_default) {
+            (Some(p), _) => json!(p),
+            (None, Some(raw)) => raw.clone(),
+            (None, None) => json!(""),
+        },
     );
     content.insert("channels".into(), Value::Object(channels));
     Ok(
@@ -580,6 +631,116 @@ mod tests {
         s.apply_ours(&ev);
         s.retract(&ev.id.to_hex());
         assert!(s.map().is_none());
+    }
+
+    /// Two picks in flight: whichever the relay refuses, the shown map is
+    /// never one the relay refused.
+    #[test]
+    fn two_in_flight_never_leave_a_refused_record_shown() {
+        let sign = |s: &Subscriptions, op: &Keys, e: Edit, at| {
+            builder(&s.edited(&e), at)
+                .unwrap()
+                .sign_with_keys(op)
+                .unwrap()
+        };
+        // Both refused, the first refusal arriving after the second is signed.
+        let (op, _, _, mut s) = setup();
+        s.apply(&rec(&op, D_MAP, json!({"default": "kevin"}), 100));
+        let e1 = sign(
+            &s,
+            &op,
+            Edit::Channel(DEV.into(), Some("alice".into())),
+            101,
+        );
+        s.apply_ours(&e1);
+        let e2 = sign(&s, &op, Edit::Channel(OPS.into(), Some("bob".into())), 102);
+        s.apply_ours(&e2);
+        s.retract(&e1.id.to_hex());
+        s.retract(&e2.id.to_hex());
+        let m = s.map().unwrap();
+        assert!(m.channels.is_empty(), "{m:?}");
+        assert_eq!(m.default.as_deref(), Some("kevin"));
+        assert_eq!(
+            s.next_at(100),
+            101,
+            "dated after what the relay holds again"
+        );
+        // The second refused, the first acked: the first stays.
+        let (op, _, _, mut s) = setup();
+        s.apply(&rec(&op, D_MAP, json!({"default": "kevin"}), 100));
+        let e1 = sign(
+            &s,
+            &op,
+            Edit::Channel(DEV.into(), Some("alice".into())),
+            101,
+        );
+        s.apply_ours(&e1);
+        let e2 = sign(&s, &op, Edit::Channel(OPS.into(), Some("bob".into())), 102);
+        s.apply_ours(&e2);
+        s.ack(&e1.id.to_hex());
+        s.retract(&e2.id.to_hex());
+        assert_eq!(
+            s.map().unwrap().channels.get(DEV).map(String::as_str),
+            Some("alice")
+        );
+        assert!(!s.map().unwrap().channels.contains_key(OPS));
+        // The second refused while the first is still unacked: the first shows.
+        let (op, _, _, mut s) = setup();
+        s.apply(&rec(&op, D_MAP, json!({"default": "kevin"}), 100));
+        let e1 = sign(
+            &s,
+            &op,
+            Edit::Channel(DEV.into(), Some("alice".into())),
+            101,
+        );
+        s.apply_ours(&e1);
+        let e2 = sign(&s, &op, Edit::Channel(OPS.into(), Some("bob".into())), 102);
+        s.apply_ours(&e2);
+        s.retract(&e2.id.to_hex());
+        assert_eq!(
+            s.map().unwrap().channels.get(DEV).map(String::as_str),
+            Some("alice")
+        );
+        assert!(!s.map().unwrap().channels.contains_key(OPS));
+    }
+
+    /// A record dated far ahead is skipped (the reconciler's rule), so it
+    /// can't ratchet every later pick into the future.
+    #[test]
+    fn a_far_future_record_is_skipped() {
+        let (op, _, _, mut s) = setup();
+        let now = unix_now();
+        assert!(!s.apply(&rec(&op, D_MAP, json!({"default": "mallory"}), now + 3600)));
+        assert!(s.map().is_none());
+        assert!(s.apply(&rec(&op, D_MAP, json!({"default": "kevin"}), now + 60)));
+    }
+
+    /// An unreadable default is written back unless the edit sets one.
+    #[test]
+    fn an_unreadable_default_is_kept() {
+        let (op, _, _, mut s) = setup();
+        s.apply(&rec(
+            &op,
+            D_MAP,
+            json!({"default": "Kevin X", "channels": {}}),
+            100,
+        ));
+        assert_eq!(s.map().unwrap().default, None);
+        let ev = builder(
+            &s.edited(&Edit::Channel(DEV.into(), Some("alice".into()))),
+            101,
+        )
+        .unwrap()
+        .sign_with_keys(&op)
+        .unwrap();
+        let c: Value = serde_json::from_str(&ev.content).unwrap();
+        assert_eq!(c["default"], json!("Kevin X"));
+        let ev = builder(&s.edited(&Edit::Default(None)), 102)
+            .unwrap()
+            .sign_with_keys(&op)
+            .unwrap();
+        let c: Value = serde_json::from_str(&ev.content).unwrap();
+        assert_eq!(c["default"], json!(""));
     }
 
     /// What this client can't read is written back as found.

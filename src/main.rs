@@ -391,35 +391,16 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
             edit,
             label,
             result,
-        } => match result {
-            Ok(evs) => {
-                for ev in &evs {
-                    app.subscriptions.apply(ev);
-                }
-                let map = app.subscriptions.edited(&edit);
-                if app.subscriptions.map() == Some(&map) {
-                    app.say(format!("{label} (already)"));
-                } else {
-                    sync.set_subscription(app, map, label);
-                }
+        } => {
+            if let Some(map) = app.subscription_fetched(result, &edit, &label) {
+                sync.set_subscription(app, map, label);
             }
-            Err(e) => app.say(format!(
-                "subscription not set: couldn't read the current map ({e}); nothing sent"
-            )),
-        },
+        }
         Msg::SubscriptionSet {
             event,
             label,
             result,
-        } => match result {
-            Ok(()) => app.say(format!(
-                "{label}: takes effect at each session's next start"
-            )),
-            Err(e) => {
-                app.subscriptions.retract(&event.id.to_hex());
-                app.say(format!("subscription not set: {e}"))
-            }
-        },
+        } => app.subscription_set(&event.id.to_hex(), &label, result),
         Msg::Voted {
             event,
             label,

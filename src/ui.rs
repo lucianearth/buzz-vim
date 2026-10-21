@@ -5561,5 +5561,87 @@ mod tests {
         assert!(app.actions.is_empty(), "nothing sent");
         assert_eq!(app.mode, Mode::Subscription, "still picking");
         assert_eq!(app.sub_cursor, 1);
+        key(&mut app, KeyCode::Esc);
+
+        // The rows shift under the cursor (a newer map drops a not-offered
+        // row above it): ⏎ must not send the neighbour that slid in.
+        app.subscriptions.apply(&rec(
+            &me,
+            D_MAP,
+            serde_json::json!({"default": "zed", "channels": {ch: "alice"}}),
+            60,
+        ));
+        key(&mut app, KeyCode::Char('B'));
+        let s = screen_text(&mut app, 100, 30);
+        assert!(
+            s.contains("alice (not offered)") && s.contains("zed (not offered)"),
+            "{s}"
+        );
+        assert_eq!(app.sub_cursor, 2, "on alice");
+        app.subscriptions
+            .apply(&rec(&me, D_MAP, serde_json::json!({"default": "zed"}), 70));
+        assert_eq!(app.sub_row_id(2), Some(Some("zed".into())));
+        key(&mut app, KeyCode::Enter);
+        assert!(app.actions.is_empty(), "zed was never picked: nothing sent");
+        assert_eq!(app.mode, Mode::Subscription);
+        // Seen now: ⏎ again sends what is under the cursor.
+        key(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            app.actions.pop(),
+            Some(crate::app::Action::SetSubscription { edit: Edit::Channel(_, Some(p)), .. }) if p == "zed"
+        ));
+    }
+
+    /// `B` after the fetch: a failed read sends nothing, a no-op says so,
+    /// and the relay's refusal takes the pick back off the status line.
+    #[test]
+    fn b_fetch_and_publish_outcomes() {
+        use crate::subscription::{D_MAP, Edit, Subscriptions, Trust};
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+        let me = Keys::generate();
+        let mut app = App::new(me.public_key().to_hex(), None);
+        let ch = "5e8e98d5-b696-49e2-8c6c-c0bc8faa831a";
+        app.subscriptions = Subscriptions::new(Trust {
+            operators: vec![me.public_key().to_hex()],
+            publishers: vec![],
+        });
+        let held = EventBuilder::new(Kind::from(30078u16), r#"{"default":"kevin"}"#)
+            .tags([Tag::parse(["d", D_MAP]).unwrap()])
+            .custom_created_at(Timestamp::from(100))
+            .sign_with_keys(&me)
+            .unwrap();
+        let edit = Edit::Channel(ch.into(), Some("alice".into()));
+        assert!(
+            app.subscription_fetched(Err(anyhow::anyhow!("timeout")), &edit, "x")
+                .is_none()
+        );
+        assert!(
+            app.subscriptions.map().is_none(),
+            "nothing read, nothing built"
+        );
+        let map = app
+            .subscription_fetched(Ok(vec![held.clone()]), &edit, "x")
+            .expect("a change");
+        assert_eq!(
+            map.default.as_deref(),
+            Some("kevin"),
+            "built on the relay's map"
+        );
+        assert!(
+            app.subscription_fetched(Ok(vec![held]), &Edit::Default(Some("kevin".into())), "y")
+                .is_none(),
+            "no change: nothing to send"
+        );
+        let ours = crate::subscription::builder(&map, app.subscriptions.next_at(100))
+            .unwrap()
+            .sign_with_keys(&me)
+            .unwrap();
+        app.subscriptions.apply_ours(&ours);
+        assert_eq!(app.subscriptions.status(ch).as_deref(), Some("sub alice"));
+        app.subscription_set(&ours.id.to_hex(), "x", Err(anyhow::anyhow!("rejected")));
+        assert_eq!(
+            app.subscriptions.status(ch).as_deref(),
+            Some("sub kevin (default)")
+        );
     }
 }
