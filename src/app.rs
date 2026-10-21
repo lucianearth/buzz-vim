@@ -13,6 +13,7 @@ use ratatui_image::picker::Picker;
 use crate::checklist::Checklists;
 use crate::clip::Pending;
 use crate::config::Loop;
+use crate::control::Board;
 use crate::draft::Draft;
 use crate::keys::Mode;
 use crate::live::ConnState;
@@ -146,6 +147,14 @@ pub enum Action {
     },
     /// Look up these people's names (the Q agent's, in #quick).
     WantProfiles(Vec<String>),
+    /// Read the control channel's notes, replies and reactions.
+    LoadControl,
+    /// A vote on a control request: a kind-7 reaction to the note.
+    React {
+        target: String,
+        emoji: String,
+        label: String,
+    },
     SaveState,
     Quit,
 }
@@ -279,6 +288,20 @@ pub struct App {
     pub routing_sample: Option<usize>,
     /// Why for the sample, and the step picked in it.
     pub routing_why: Option<usize>,
+    /// The Control view (`C`): #control's notes.
+    pub control_view: bool,
+    pub control: Board,
+    /// The topic open (the day list), and the note open in it.
+    pub control_topic: Option<String>,
+    pub control_note: Option<String>,
+    /// The row picked on the topic or day list.
+    pub control_cursor: usize,
+    /// Rows scrolled down on a note.
+    pub control_scroll: usize,
+    /// Tallest scroll from the last draw.
+    pub control_max_scroll: usize,
+    /// The action asked about (y/n) before voting.
+    pub control_vote: Option<usize>,
 }
 
 impl App {
@@ -361,6 +384,14 @@ impl App {
             routing_node: Node::Seen,
             routing_sample: None,
             routing_why: None,
+            control_view: false,
+            control: Board::new(crate::control::DEFAULT_CHANNEL),
+            control_topic: None,
+            control_note: None,
+            control_cursor: 0,
+            control_scroll: 0,
+            control_max_scroll: 0,
+            control_vote: None,
         }
     }
 
@@ -580,6 +611,7 @@ impl App {
     fn switch_tab(&mut self, i: usize) {
         self.needs_view = false;
         self.routing_view = false;
+        self.control_view = false;
         if i < self.tabs.len() && i != self.active {
             self.active = i;
             self.thread = None;
@@ -616,6 +648,7 @@ impl App {
     fn open_needs(&mut self) {
         self.needs_view = true;
         self.routing_view = false;
+        self.control_view = false;
         self.agents_view = false;
         self.checklist_view = false;
         self.needs = self.needs_rows();
@@ -624,6 +657,7 @@ impl App {
     /// Open a row: its message in its thread (or the thread, or the channel).
     fn open_row(&mut self, row: &Row) {
         self.agents_view = false;
+        self.control_view = false;
         self.checklist_view = false;
         self.follow(&row.link());
         self.needs_view = false;
@@ -755,10 +789,204 @@ impl App {
         true
     }
 
+    // ---------- control ----------
+
+    fn open_control(&mut self) {
+        self.control_view = true;
+        self.needs_view = false;
+        self.routing_view = false;
+        self.agents_view = false;
+        self.checklist_view = false;
+        if !self.control.loaded {
+            self.actions.push(Action::LoadControl);
+        }
+    }
+
+    /// The note on screen, if one is open.
+    pub fn control_open_note(&self) -> Option<&crate::control::Note> {
+        self.control_note
+            .as_deref()
+            .and_then(|id| self.control.note(id))
+    }
+
+    /// Rows of the list on screen: topics, or the open topic's days.
+    fn control_rows(&self) -> usize {
+        match &self.control_topic {
+            None => self.control.topics().len(),
+            Some(t) => self.control.days(t).len(),
+        }
+    }
+
+    fn control_open(&mut self) {
+        let i = self.control_cursor;
+        match self.control_topic.clone() {
+            None => {
+                if let Some(t) = self.control.topics().get(i) {
+                    self.control_topic = Some(t.topic.clone());
+                    self.control_cursor = 0;
+                }
+            }
+            Some(t) => {
+                if let Some(n) = self.control.days(&t).get(i) {
+                    self.control_note = Some(n.id.clone());
+                    self.control_scroll = 0;
+                }
+            }
+        }
+    }
+
+    fn control_back(&mut self) {
+        if self.control_note.take().is_some() {
+            return;
+        }
+        if let Some(t) = self.control_topic.take() {
+            // Back on the topic it came from.
+            self.control_cursor = self
+                .control
+                .topics()
+                .iter()
+                .position(|r| r.topic == t)
+                .unwrap_or(0);
+            return;
+        }
+        self.control_view = false;
+    }
+
+    /// A digit on a request: ask before voting that action, or say why not.
+    fn ask_vote(&mut self, action: usize) {
+        let Some(n) = self.control_open_note() else {
+            return;
+        };
+        match self.control.can_vote(n, action, &self.store.me) {
+            Ok(()) => {
+                self.control_vote = Some(action);
+                self.mode = Mode::Vote;
+            }
+            Err(why) => self.say(format!("can't vote: {why}")),
+        }
+    }
+
+    fn send_vote(&mut self) {
+        self.mode = Mode::Normal;
+        let Some(i) = self.control_vote.take() else {
+            return;
+        };
+        let Some(n) = self.control_open_note() else {
+            return;
+        };
+        let Some(a) = n.actions.get(i) else { return };
+        // Asked again: the request may have closed while the box was up.
+        if let Err(why) = self.control.can_vote(n, i, &self.store.me) {
+            return self.say(format!("can't vote: {why}"));
+        }
+        self.actions.push(Action::React {
+            target: n.id.clone(),
+            emoji: a.emoji.clone(),
+            label: a.name.clone(),
+        });
+    }
+
+    /// Open the note's images in the viewer.
+    fn control_images(&mut self) {
+        let urls: Vec<String> = self
+            .control_open_note()
+            .map(|n| {
+                n.media
+                    .iter()
+                    .filter(|m| m.mime.starts_with("image/"))
+                    .map(|m| m.url.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if urls.is_empty() {
+            return self.say("no images on this note");
+        }
+        self.viewer_list = urls;
+        self.mode = Mode::Viewer;
+        self.show_image(0);
+    }
+
+    /// Keys on the Control view. True when the key was its own.
+    fn key_control(&mut self, k: KeyEvent) -> bool {
+        let on_note = self.control_note.is_some();
+        let page = self.page.max(1);
+        match k.code {
+            KeyCode::Char('C') => self.control_view = false,
+            KeyCode::Char('r') => {
+                self.actions.push(Action::LoadControl);
+                self.say("reloading #control");
+            }
+            KeyCode::Char(c @ '1'..='9') if on_note => {
+                let has = self.control_open_note().is_some_and(|n| n.is_request());
+                if !has {
+                    return false;
+                }
+                self.ask_vote(c as usize - '1' as usize);
+            }
+            KeyCode::Char('o') if on_note => self.control_images(),
+            KeyCode::Char('j') | KeyCode::Down if on_note => {
+                self.control_scroll = (self.control_scroll + 1).min(self.control_max_scroll)
+            }
+            KeyCode::Char('k') | KeyCode::Up if on_note => {
+                self.control_scroll = self.control_scroll.saturating_sub(1)
+            }
+            KeyCode::Char('d') | KeyCode::PageDown if on_note => {
+                self.control_scroll = (self.control_scroll + page).min(self.control_max_scroll)
+            }
+            KeyCode::Char('u') | KeyCode::PageUp if on_note => {
+                self.control_scroll = self.control_scroll.saturating_sub(page)
+            }
+            KeyCode::Char('g') | KeyCode::Home if on_note => self.control_scroll = 0,
+            KeyCode::Char('G') | KeyCode::End if on_note => {
+                self.control_scroll = self.control_max_scroll
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.control_cursor =
+                    (self.control_cursor + 1).min(self.control_rows().saturating_sub(1))
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.control_cursor = self.control_cursor.saturating_sub(1)
+            }
+            KeyCode::Char('g') | KeyCode::Home => self.control_cursor = 0,
+            KeyCode::Char('G') | KeyCode::End => {
+                self.control_cursor = self.control_rows().saturating_sub(1)
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') if !on_note => self.control_open(),
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc | KeyCode::Backspace => {
+                self.control_back()
+            }
+            // Writing, threads and reactions would act on the channel
+            // hidden under the view.
+            KeyCode::Char('i')
+            | KeyCode::Char('+')
+            | KeyCode::Char('o')
+            | KeyCode::Char('O')
+            | KeyCode::Char('n')
+            | KeyCode::Char('f')
+            | KeyCode::Char('l')
+            | KeyCode::Enter
+            | KeyCode::Right
+            | KeyCode::Char('<')
+            | KeyCode::Char('>')
+            | KeyCode::Char('[')
+            | KeyCode::Char(']')
+            | KeyCode::Char('s')
+            | KeyCode::Char('T')
+            | KeyCode::Char('R')
+            | KeyCode::Char('d')
+            | KeyCode::Char('u')
+            | KeyCode::PageDown
+            | KeyCode::PageUp => {}
+            _ => return false,
+        }
+        true
+    }
+
     // ---------- routing ----------
 
     fn open_routing(&mut self) {
         self.routing_view = true;
+        self.control_view = false;
         self.needs_view = false;
         self.agents_view = false;
         self.checklist_view = false;
@@ -1613,6 +1841,15 @@ impl App {
                 }
                 _ => {}
             },
+            Mode::Vote => match k.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.send_vote(),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                    self.control_vote = None;
+                    self.mode = Mode::Normal;
+                    self.say("no vote sent");
+                }
+                _ => {}
+            },
             Mode::Archive => match k.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.archive(),
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
@@ -1702,6 +1939,26 @@ impl App {
         if self.needs_view && !ctrl && self.key_needs(k) {
             return;
         }
+        if self.control_view {
+            if !ctrl && self.key_control(k) {
+                return;
+            }
+            // As on the routing view: only keys that leave it, or open
+            // another view, reach the channel hidden under it.
+            let leaves = match k.code {
+                KeyCode::Char(c) if !ctrl => {
+                    matches!(
+                        c,
+                        'q' | 'Q' | '0'..='9' | '!' | 'L' | 'H' | 'c' | 'a' | 'w' | '?'
+                    )
+                }
+                KeyCode::Tab | KeyCode::BackTab => true,
+                _ => false,
+            };
+            if !leaves {
+                return;
+            }
+        }
         if self.routing_view {
             if !ctrl && self.key_routing(k) {
                 return;
@@ -1785,12 +2042,14 @@ impl App {
             KeyCode::Char('c') => {
                 self.needs_view = false;
                 self.routing_view = false;
+                self.control_view = false;
                 self.checklist_view = true;
                 self.agents_view = false;
                 self.checklist_cursor = 0;
             }
             KeyCode::Char('q') | KeyCode::Char('Q') => self.quick(),
             KeyCode::Char('w') => self.open_routing(),
+            KeyCode::Char('C') => self.open_control(),
             KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
             KeyCode::Char('d') | KeyCode::PageDown => self.move_cursor(self.page.max(1) as isize),
@@ -1815,6 +2074,7 @@ impl App {
             KeyCode::Char('a') => {
                 self.needs_view = false;
                 self.routing_view = false;
+                self.control_view = false;
                 self.agents_view = !self.agents_view;
                 self.checklist_view = false;
             }

@@ -8,6 +8,7 @@
 #![allow(clippy::collapsible_if, clippy::collapsible_match)]
 
 pub mod checklist;
+pub mod control;
 pub mod draft;
 pub mod links;
 pub mod live;

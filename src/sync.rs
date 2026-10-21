@@ -12,6 +12,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::{Action, App};
 use crate::checklist::{self, Checklists};
+use crate::control;
 use crate::live::Cmd;
 use crate::model::{self, Applied};
 use crate::needs;
@@ -96,6 +97,18 @@ pub enum Msg {
         result: anyhow::Result<()>,
         text: String,
     },
+    /// The control channel's messages and the notes' reactions, and the
+    /// note ids (for the live tail of reactions).
+    Control {
+        channel: String,
+        result: anyhow::Result<(Vec<Event>, Vec<String>)>,
+    },
+    /// A vote went out, or didn't.
+    Voted {
+        event: Box<Event>,
+        label: String,
+        result: anyhow::Result<()>,
+    },
     /// A dropped file (`label` is its path) or the clipboard, read.
     Attachment {
         label: Option<String>,
@@ -124,6 +137,31 @@ pub struct Sync {
 
 pub fn now() -> u64 {
     nostr::Timestamp::now().as_secs()
+}
+
+/// Every event a filter matches, a page at a time (newest first, then
+/// `until` + `before_id` from the page's last), and an error past `max`
+/// rather than a silently short list. The relay checks most tags only after
+/// its LIMIT, so a short page is the only end we trust.
+pub async fn query_all(r: &Relay, mut filter: Value, max: usize) -> anyhow::Result<Vec<Event>> {
+    const PAGE: usize = 500;
+    let mut out: Vec<Event> = vec![];
+    loop {
+        filter["limit"] = json!(PAGE);
+        let page = r.query(std::slice::from_ref(&filter)).await?;
+        let n = page.len();
+        if let Some(last) = page.last() {
+            filter["until"] = json!(last.created_at.as_secs());
+            filter["before_id"] = json!(last.id.to_hex());
+        }
+        out.extend(page);
+        if out.len() > max {
+            anyhow::bail!("more than {max} events; not showing a partial list");
+        }
+        if n < PAGE {
+            return Ok(out);
+        }
+    }
 }
 
 impl Sync {
@@ -403,6 +441,44 @@ impl Sync {
                 records,
                 today,
             }
+        });
+    }
+
+    /// The control channel: its messages for the last `DAYS_BACK` days and
+    /// every reaction to its notes. A live tail follows in `control_tail`.
+    pub fn load_control(&mut self, channel: &str) {
+        self.control_tail(channel, &[]);
+        let r = self.relay.clone();
+        let channel = channel.to_string();
+        let since = now().saturating_sub(control::DAYS_BACK * 86_400);
+        self.spawn(async move {
+            let result = async {
+                let f = json!({"kinds": [9], "#h": [channel], "since": since});
+                let mut evs = query_all(&r, f, 5000).await?;
+                let ids: Vec<String> = evs
+                    .iter()
+                    .filter(|e| control::parse_note(e).is_some())
+                    .map(|e| e.id.to_hex())
+                    .collect();
+                for chunk in ids.chunks(100) {
+                    evs.extend(query_all(&r, json!({"kinds": [7], "#e": chunk}), 5000).await?);
+                }
+                Ok((evs, ids))
+            }
+            .await;
+            Msg::Control { channel, result }
+        });
+    }
+
+    /// New messages in the control channel, and reactions to its notes.
+    pub fn control_tail(&mut self, channel: &str, notes: &[String]) {
+        let mut filters = vec![json!({"kinds": [9], "#h": [channel], "since": now(), "limit": 0})];
+        if !notes.is_empty() {
+            filters.push(json!({"kinds": [7], "#e": notes, "since": now(), "limit": 0}));
+        }
+        let _ = self.live.send(Cmd::Sub {
+            id: "control".into(),
+            filters,
         });
     }
 
@@ -690,6 +766,15 @@ impl Sync {
             }
             Action::EncodeImage(key) => self.encode(app, key),
             Action::WantProfiles(pks) => self.want_profiles(pks),
+            Action::LoadControl => {
+                let ch = app.control.channel.clone();
+                self.load_control(&ch);
+            }
+            Action::React {
+                target,
+                emoji,
+                label,
+            } => self.react(app, target, emoji, label),
             Action::SendQuick {
                 channel,
                 content,
@@ -910,6 +995,30 @@ impl Sync {
         };
         let r = self.relay.clone();
         self.spawn(async move { Msg::Did(r.publish(&ev).await.map(|_| label.to_string())) });
+    }
+
+    /// A vote on a control request: the action's emoji as a reaction.
+    fn react(&mut self, app: &mut App, target: String, emoji: String, label: String) {
+        let Ok(id) = EventId::from_hex(&target) else {
+            return;
+        };
+        let ev = match buzz_sdk::build_reaction(id, &emoji)
+            .map_err(anyhow::Error::from)
+            .and_then(|b| self.relay.sign(b))
+        {
+            Ok(ev) => ev,
+            Err(e) => return app.say(format!("couldn't vote: {e}")),
+        };
+        app.say(format!("voting {label} {emoji}…"));
+        let r = self.relay.clone();
+        self.spawn(async move {
+            let result = r.publish(&ev).await;
+            Msg::Voted {
+                event: Box::new(ev),
+                label,
+                result,
+            }
+        });
     }
 
     /// A file on our relay needs our auth, which a browser doesn't have:

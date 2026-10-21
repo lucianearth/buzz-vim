@@ -20,6 +20,8 @@ use crate::media::Slot;
 use crate::model::{Channel, Message};
 use crate::theme;
 
+mod control;
+
 const THUMB_COLS: u16 = 36;
 const THUMB_MAX_ROWS: u16 = 12;
 
@@ -48,6 +50,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_needs(f, app, main);
     } else if app.routing_view {
         draw_routing(f, app, main);
+    } else if app.control_view {
+        control::draw_control(f, app, main, &mut images);
     } else if app.agents_view {
         draw_agents(f, app, main);
     } else if app.checklist_view {
@@ -71,6 +75,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             | Mode::Viewer
             | Mode::Quick
             | Mode::Reply
+            | Mode::Vote
     ) || (app.mode == Mode::Insert && !app.mention_candidates().is_empty());
     for (rect, key) in images.into_iter().filter(|_| !overlay) {
         if let Some(p) = app.media.encoded.get(&key) {
@@ -86,8 +91,57 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Hint => draw_hints(f, app),
         Mode::Quick => draw_quick(f, app, area),
         Mode::Reply => draw_reply(f, app, area),
+        Mode::Vote => draw_vote(f, app, area),
         _ => {}
     }
+}
+
+/// The y/n box before a vote goes out.
+fn draw_vote(f: &mut Frame, app: &mut App, area: Rect) {
+    let Some(n) = app.control_open_note() else {
+        return;
+    };
+    let Some(a) = app.control_vote.and_then(|i| n.actions.get(i)) else {
+        return;
+    };
+    let lines = vec![
+        Line::styled(
+            format!("Vote {} {} on this request?", a.name, a.emoji),
+            theme::bright(),
+        ),
+        Line::raw(""),
+        Line::styled(
+            format!(
+                "{} › {} {}",
+                n.topic,
+                n.day.as_deref().unwrap_or("?"),
+                n.source.as_deref().unwrap_or("?")
+            ),
+            theme::muted(),
+        ),
+        Line::styled(
+            format!("sends a {} reaction to the note, signed by you", a.emoji),
+            theme::faint(),
+        ),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(" y ", theme::key()),
+            Span::styled(" vote   ", theme::text()),
+            Span::styled(" n ", theme::key()),
+            Span::styled(" cancel", theme::text()),
+        ]),
+    ];
+    let r = centered(area, 60, lines.len() as u16 + 2);
+    f.render_widget(Clear, r);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(theme::rule())
+                .style(Style::new().bg(theme::gray(1))),
+        ),
+        r,
+    );
 }
 
 /// `f`: a letter chip over the start of every link on screen.

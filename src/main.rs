@@ -16,8 +16,8 @@ mod theme;
 mod ui;
 
 use buzz_vim_core::{
-    checklist, draft, links, live, log, mention, model, needs, quick, readstate, relay, routing,
-    sections, telemetry, unread,
+    checklist, control, draft, links, live, log, mention, model, needs, quick, readstate, relay,
+    routing, sections, telemetry, unread,
 };
 
 use std::sync::Arc;
@@ -141,6 +141,7 @@ async fn run(
         watchers: cfg.loop_.watchers.clone(),
     });
     app.loop_ = cfg.loop_.clone();
+    app.control = control::Board::new(&cfg.loop_.control_channel);
     let saved = state::load(&relay.base, &app.store.me);
     app.chosen = saved.chosen.clone();
     app.read_width = saved.read_width;
@@ -189,6 +190,16 @@ async fn run(
             }
             Some(l) = live_rx.recv() => {
                 match l {
+                    Live::Event { sub, event } if sub == "control" => {
+                        if app.control.apply(&event) {
+                            if control::parse_note(&event).is_some() {
+                                // A new note: follow its reactions too.
+                                let ch = app.control.channel.clone();
+                                sync.control_tail(&ch, &app.control.note_ids());
+                            }
+                            sync.want_profiles([event.pubkey.to_hex()]);
+                        }
+                    }
                     Live::Event { sub, event } => {
                         // Tab 0's tail also carries tabs' messages; whichever
                         // sub brings one first, it counts as a tab's.
@@ -330,6 +341,47 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
             }
             sync.want_profiles(want);
         }
+        Msg::Control { channel, result } => {
+            if channel != app.control.channel {
+                return;
+            }
+            match result {
+                Ok((evs, ids)) => {
+                    let mut board = control::Board::new(&channel);
+                    let mut want = vec![];
+                    for ev in &evs {
+                        if board.apply(ev) {
+                            want.push(ev.pubkey.to_hex());
+                        }
+                    }
+                    for id in board.note_ids() {
+                        if let Some(n) = board.note(&id) {
+                            want.extend(n.approvers.iter().cloned());
+                        }
+                    }
+                    board.loaded = true;
+                    app.control = board;
+                    sync.control_tail(&channel, &ids);
+                    sync.want_profiles(want);
+                }
+                Err(e) => {
+                    app.control.loaded = true;
+                    app.control.error = Some(e.to_string());
+                    app.say(format!("couldn't read #control: {e}"));
+                }
+            }
+        }
+        Msg::Voted {
+            event,
+            label,
+            result,
+        } => match result {
+            Ok(()) => {
+                app.control.apply(&event);
+                app.say(format!("voted {label} {}", event.content));
+            }
+            Err(e) => app.say(format!("vote not sent: {e}")),
+        },
         Msg::QuickSent { id, result, text } => match result {
             Ok(()) => {
                 let agent = app.loop_.quick_agent.clone();
