@@ -543,7 +543,7 @@ impl Lane {
             Lane::NotAQuestion => "Jev heard an ask, Claude didn't",
             Lane::AgentDecides => "the list already answers it",
             Lane::NeedsYou => "new decision, merge, money, access",
-            Lane::NoVerdict => "Jev heard an ask; Claude gave nothing usable",
+            Lane::NoVerdict => "Jev heard an ask; Claude's verdict was missing or unknown",
         }
     }
 
@@ -564,16 +564,18 @@ impl Lane {
 /// turn still running, the long-turn status ask, the 4 h pause after 3
 /// nudges, nothing to judge, or an owner or bot message left unanswered
 /// (stall-judge.py `decide`, the returns before `jev(...)`). A turn that
-/// started or a thread that moved while judging lands there too; the card's
-/// sub-lines say which (`said`). The list stopping while judging is "not
+/// started or a thread that moved while judging lands there too when Jev
+/// had not been asked; the card's sub-lines say which (`said`). The list stopping while judging is "not
 /// running". An ask with no usable Claude verdict has its own card; any
 /// other label this build doesn't know goes in "Jev: other".
 pub fn lane(d: &Decision) -> Option<Lane> {
     Some(match d.stage.as_str() {
         "not_work_thread" => return None,
         "not_running" | "contested_idle" | "stopped_running" => Lane::NotRunning,
-        "turn_started" | "thread_moved" => Lane::BeforeJev,
-        "judged" => match d.jev.as_deref() {
+        // A turn that started or a thread that moved while judging: settled
+        // before Jev only when Jev had not been asked yet; else it leaves by
+        // Jev's label like any judged stop (its sub-line says what happened).
+        "turn_started" | "thread_moved" | "judged" => match d.jev.as_deref() {
             None => Lane::BeforeJev,
             Some(j) => match stream(Some(j)) {
                 Stream::KeepsGoing => Lane::KeepsGoing,
@@ -675,6 +677,12 @@ enum Said {
     NothingToJudge,
     /// "channel bot members unknown; rechecking"
     MembersUnknown,
+    /// "contested; lucian already pinged about these lists"
+    ContestedPinged,
+    /// "contested checklist; lucian asked to pick a driver"
+    ContestedAsk,
+    /// "only release items left"
+    ReleaseLeft,
     Plain,
 }
 
@@ -711,6 +719,12 @@ fn said(reason: &str) -> Said {
         Said::NothingToJudge
     } else if reason.starts_with("channel bot members unknown") {
         Said::MembersUnknown
+    } else if reason.starts_with("contested;") {
+        Said::ContestedPinged
+    } else if reason.starts_with("contested checklist") {
+        Said::ContestedAsk
+    } else if reason.starts_with("only release items left") {
+        Said::ReleaseLeft
     } else {
         Said::Plain
     }
@@ -730,6 +744,9 @@ fn before_jev(s: Said) -> &'static str {
         Said::BotUnanswered => "another bot answered, nothing happened",
         Said::NothingToJudge => "nothing to judge",
         Said::MembersUnknown => "bot members not known yet: looking again",
+        Said::ContestedPinged => "contested list: lucian already pinged",
+        Said::ContestedAsk => "contested list: lucian asked to pick a driver",
+        Said::ReleaseLeft => "only release items left",
         Said::CarryOn | Said::Plain => "",
     }
 }
@@ -740,6 +757,8 @@ fn note(lane: Lane, o: Outcome, s: Said) -> &'static str {
     use {Lane as L, Outcome as O, Said as S};
     match (lane, o, s) {
         (L::BeforeJev, _, s) => before_jev(s),
+        (_, _, S::TurnStarted) => "a turn started while judging: posted nothing",
+        (_, _, S::ThreadMoved) => "the thread moved while judging: posted nothing",
         (_, O::Ping, S::CarryOn) => "agent also told to park it and carry on with other items",
         (L::NeedsYou, O::Ping, S::Stuck) => {
             "agent was at 3 nudges, nothing ticked, so no message, 4 h pause"
@@ -2120,12 +2139,20 @@ mod tests {
         // Judged with no Jev label: settled before Jev was asked.
         assert_eq!(l("judged", None, None), Some(L::BeforeJev));
         assert_eq!(l("judged", None, Some("needs_owner")), Some(L::BeforeJev));
+        // A turn that started or a thread that moved while judging: before
+        // Jev only when Jev had not been asked yet.
+        assert_eq!(l("turn_started", None, None), Some(L::BeforeJev));
+        assert_eq!(l("thread_moved", None, None), Some(L::BeforeJev));
+        assert_eq!(
+            l("turn_started", Some("will_continue"), None),
+            Some(L::KeepsGoing)
+        );
         for (stage, want) in [
             ("not_running", L::NotRunning),
             ("contested_idle", L::NotRunning),
             ("stopped_running", L::NotRunning),
-            ("turn_started", L::BeforeJev),
-            ("thread_moved", L::BeforeJev),
+            ("turn_started", L::NeedsYou),
+            ("thread_moved", L::NeedsYou),
             ("", L::JevOther),
             ("brand_new_stage", L::JevOther),
         ] {
@@ -2306,6 +2333,67 @@ mod tests {
                     ]
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn contested_release_and_late_turns_say_what_happened() {
+        let ds = vec![
+            decided(
+                "judged",
+                None,
+                None,
+                "none",
+                "contested; lucian already pinged about these lists",
+            ),
+            decided(
+                "judged",
+                None,
+                None,
+                "ping",
+                "contested checklist; lucian asked to pick a driver",
+            ),
+            decided("judged", None, None, "ping", "only release items left"),
+            decided(
+                "turn_started",
+                Some("will_continue"),
+                None,
+                "none",
+                "a turn started while judging; posting nothing",
+            ),
+        ];
+        let p = pipeline(&ds, NOW, Window::Day);
+        let notes = |l: Lane| -> Vec<(Outcome, Vec<String>)> {
+            p.cards()
+                .find(|c| c.lane == l)
+                .unwrap()
+                .lines
+                .iter()
+                .map(|x| (x.outcome, x.notes.clone()))
+                .collect()
+        };
+        assert_eq!(
+            notes(Lane::BeforeJev),
+            [
+                (
+                    Outcome::Ping,
+                    vec![
+                        "1: contested list: lucian asked to pick a driver".to_string(),
+                        "1: only release items left".to_string(),
+                    ]
+                ),
+                (
+                    Outcome::NoAction,
+                    vec!["contested list: lucian already pinged".to_string()]
+                ),
+            ]
+        );
+        assert_eq!(
+            notes(Lane::KeepsGoing),
+            [(
+                Outcome::NoAction,
+                vec!["a turn started while judging: posted nothing".to_string()]
+            )]
         );
     }
 
