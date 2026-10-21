@@ -287,7 +287,7 @@ struct MessageRow: View, Equatable {
                 ForEach(Array(m.segments.enumerated()), id: \.offset) { _, s in
                     switch s {
                     case let .text(text):
-                        Text(rich(text, mentions: m.mentionNames, theme: theme))
+                        Text(rich(text, mentions: m.mentionNames, theme: theme) { client.linkLabel(url: $0) })
                             .font(.text)
                             .lineSpacing(3)
                             .fixedSize(horizontal: false, vertical: true)
@@ -471,7 +471,9 @@ func stamp(_ at: UInt64) -> String {
 private let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
 
 /// Inline markdown, with bare URLs made tappable and @mentions in the accent.
-func rich(_ src: String, mentions: [String], theme: Theme) -> AttributedString {
+/// `label` names a bare buzz:// link by where it goes, as the TUI does.
+func rich(_ src: String, mentions: [String], theme: Theme,
+          label: (String) -> String? = { _ in nil }) -> AttributedString {
     let opts = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
     var a = (try? AttributedString(markdown: src, options: opts)) ?? AttributedString(src)
     a.foregroundColor = theme.text
@@ -517,5 +519,17 @@ func rich(_ src: String, mentions: [String], theme: Theme) -> AttributedString {
             from = r.upperBound
         }
     }
-    return a
+    // Last, so the ranges above still match `plain`.
+    var out = AttributedString()
+    for run in a.runs {
+        let piece = AttributedString(a[run.range])
+        if let url = run.link, url.scheme == "buzz",
+           String(piece.characters) == url.absoluteString,
+           let l = label(url.absoluteString) {
+            out.append(AttributedString(l, attributes: run.attributes))
+        } else {
+            out.append(piece)
+        }
+    }
+    return out
 }

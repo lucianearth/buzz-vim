@@ -678,6 +678,20 @@ impl Client {
             .collect()
     }
 
+    /// What a bare `buzz://` link reads as: `#channel › thread`,
+    /// `buzz-vim @ 5cdc592`. None leaves the URL as it is.
+    pub fn link_label(&self, url: String) -> Option<String> {
+        let e = self.engine.lock().unwrap();
+        let name = |c: &str| {
+            e.store
+                .channels
+                .get(c)
+                .filter(|c| !c.name.is_empty())
+                .map(|c| c.name.clone())
+        };
+        links::label(&url, &name)
+    }
+
     /// A tapped link that we show ourselves (a channel, a message in one),
     /// or None for the system to open.
     pub fn follow(&self, url: String) -> Option<Follow> {
