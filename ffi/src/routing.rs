@@ -1,9 +1,9 @@
 //! The routing view (see `buzz_vim_core::routing`): the watcher's
-//! stall-judge decisions as layered boxes, a sampled decision per box and
-//! the Why for one decision. Flat records, like the rest of the door.
+//! stall-judge decisions as a pipeline of checks and cards, a sampled
+//! decision per card or outcome line and the Why for one decision. Flat records, like the rest of the door.
 
 use buzz_vim_core::needs::one_line;
-use buzz_vim_core::routing::{self, Decision, Node, Window};
+use buzz_vim_core::routing::{self, Decision, Lane, Node, Outcome, Pick, Window};
 
 use crate::{Client, Engine, now};
 
@@ -25,33 +25,63 @@ impl From<RouteWindow> for Window {
     }
 }
 
-/// One box. `key` is what `route_sample` takes back ("jev:asks_something").
+/// One outcome line on a card: coloured dot, glyph, count, sub-lines.
 #[derive(uniffi::Record, Clone)]
-pub struct RouteNode {
+pub struct RouteOutcome {
+    /// What `route_sample` takes back for this line ("needs_you/ping").
     pub key: String,
-    pub label: String,
-    /// 0..5: stops seen, running, Jev, Claude check, outcome.
-    pub layer: u32,
+    /// "none", "nudge", "ping", "other".
+    pub outcome: String,
+    /// "—", "↻", "🔔".
+    pub glyph: String,
+    /// "no action", "nudged agent", "pinged you" (on a card); "nudged" under
+    /// the totals bar.
+    pub word: String,
+    /// The reserved outcome colour, "#rrggbb".
+    pub color: String,
     pub count: u32,
+    /// Plain sub-lines, each its own line.
+    pub notes: Vec<String>,
 }
 
-/// A band between two boxes: how many decisions went from one to the next.
+/// One exit stream: its strip on the trunk and its card.
 #[derive(uniffi::Record, Clone)]
-pub struct RouteEdge {
-    pub from: String,
-    pub to: String,
+pub struct RouteCard {
+    /// What `route_sample` takes back for the whole card ("needs_you").
+    pub key: String,
+    pub title: String,
+    /// The plain line under the title.
+    pub why: String,
     pub count: u32,
+    /// Strip, border and accent, "#rrggbb".
+    pub color: String,
+    /// The same hue darkened to read as text on the light page: the "N →".
+    pub ink: String,
+    pub outcomes: Vec<RouteOutcome>,
 }
 
-/// The diagram for one window.
+/// One check down the trunk with the cards that peel off at it.
 #[derive(uniffi::Record, Clone)]
-pub struct RouteFlow {
-    /// Layer names, top to bottom; `RouteNode.layer` indexes them.
-    pub layers: Vec<String>,
-    /// Every box drawn, layer by layer, left to right. "other" only when
-    /// something is in it.
-    pub nodes: Vec<RouteNode>,
-    pub edges: Vec<RouteEdge>,
+pub struct RouteGate {
+    /// "46 running. Settled before Jev?"
+    pub caption: String,
+    /// "waiting on a bot 0 · other 0 (not drawn)".
+    pub zeros: Option<String>,
+    pub cards: Vec<RouteCard>,
+}
+
+/// The Routing page for one window.
+#[derive(uniffi::Record, Clone)]
+pub struct RoutePipeline {
+    /// Stops counted (the retired rule's are not).
+    pub total: u32,
+    /// Top to bottom; only checks some stop still reaches.
+    pub gates: Vec<RouteGate>,
+    /// "All N stops ended as": no action, nudged, pinged you (then "other"
+    /// when something is in it). Counts sum to `total`.
+    pub outcomes: Vec<RouteOutcome>,
+    /// "Not counted: N decisions from a retired rule …", when N > 0.
+    pub retired_note: Option<String>,
 }
 
 /// One judge run, with what the app shows for it. Hand it back to
@@ -155,30 +185,64 @@ fn core_decision(d: RouteDecision) -> Decision {
     }
 }
 
-pub(crate) fn flow(ds: &[Decision], now: u64, w: Window) -> RouteFlow {
-    let f = routing::flow(ds, now, w);
-    RouteFlow {
-        layers: f.layers.iter().map(|l| l.name.to_string()).collect(),
-        nodes: f
-            .layers
+fn outcome(o: Outcome, lane: Option<Lane>, count: usize, notes: Vec<String>) -> RouteOutcome {
+    RouteOutcome {
+        key: lane.map_or(String::new(), |lane| {
+            Pick {
+                lane,
+                outcome: Some(o),
+            }
+            .key()
+        }),
+        outcome: o.key().to_string(),
+        glyph: o.glyph().to_string(),
+        word: if lane.is_some() {
+            o.word()
+        } else {
+            o.total_word()
+        }
+        .to_string(),
+        color: o.color().to_string(),
+        count: count as u32,
+        notes,
+    }
+}
+
+pub(crate) fn pipeline(ds: &[Decision], now: u64, w: Window) -> RoutePipeline {
+    let p = routing::pipeline(ds, now, w);
+    RoutePipeline {
+        total: p.total as u32,
+        gates: p
+            .gates
             .iter()
-            .flat_map(|l| &l.nodes)
-            .map(|(n, c)| RouteNode {
-                key: n.key(),
-                label: n.label().to_string(),
-                layer: n.layer() as u32,
-                count: *c as u32,
+            .map(|g| RouteGate {
+                caption: g.caption.clone(),
+                zeros: g.zeros.clone(),
+                cards: g
+                    .cards
+                    .iter()
+                    .map(|c| RouteCard {
+                        key: c.lane.key().to_string(),
+                        title: c.lane.title().to_string(),
+                        why: c.lane.why().to_string(),
+                        count: c.count as u32,
+                        color: c.color.to_string(),
+                        ink: c.ink.clone(),
+                        outcomes: c
+                            .lines
+                            .iter()
+                            .map(|l| outcome(l.outcome, Some(c.lane), l.count, l.notes.clone()))
+                            .collect(),
+                    })
+                    .collect(),
             })
             .collect(),
-        edges: f
-            .edges
+        outcomes: p
+            .outcomes
             .iter()
-            .map(|e| RouteEdge {
-                from: e.from.key(),
-                to: e.to.key(),
-                count: e.count as u32,
-            })
+            .map(|(o, n)| outcome(*o, None, *n, vec![]))
             .collect(),
+        retired_note: p.retired_note(),
     }
 }
 
@@ -200,21 +264,21 @@ pub fn route_why(decision: RouteDecision) -> Vec<RouteStep> {
 
 #[uniffi::export]
 impl Client {
-    /// The routing diagram for the decisions within `window` of now, from
+    /// The Routing page for the decisions within `window` of now, from
     /// every channel we read.
-    pub fn route_flow(&self, window: RouteWindow) -> RouteFlow {
+    pub fn route_pipeline(&self, window: RouteWindow) -> RoutePipeline {
         let e = self.engine.lock().unwrap();
-        flow(&e.checklists.decisions(), now(), window.into())
+        pipeline(&e.checklists.decisions(), now(), window.into())
     }
 
-    /// The `n`th newest decision through the box `key` within `window`,
-    /// wrapping: "sample another" asks for n + 1. None for an unknown key
-    /// or an empty box.
+    /// The `n`th newest decision a card or outcome line holds (its `key`)
+    /// within `window`, wrapping: "sample another" asks for n + 1. None
+    /// for an unknown key or an empty one.
     pub fn route_sample(&self, window: RouteWindow, key: String, n: u32) -> Option<RouteDecision> {
-        let node = Node::from_key(&key)?;
+        let pick = Pick::from_key(&key)?;
         let e = self.engine.lock().unwrap();
         let ds = e.checklists.decisions();
-        let d = routing::sample(&ds, now(), window.into(), node, n as usize)?;
+        let d = routing::sample_pick(&ds, now(), window.into(), pick, n as usize)?;
         Some(decision(&e, d))
     }
 }

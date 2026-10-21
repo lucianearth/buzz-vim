@@ -142,6 +142,9 @@ pub struct Item {
     /// The version shown.
     pub event_id: String,
     pub updated_at: u64,
+    /// When a done item was ticked: the record's `done_at`, else (records
+    /// written before `done_at` existed) the version's time. None unless done.
+    pub done_at: Option<u64>,
 }
 
 impl Item {
@@ -381,6 +384,9 @@ struct ItemJson {
     evidence: Vec<String>,
     #[serde(deserialize_with = "lenient")]
     parked_question: Option<String>,
+    /// Unix seconds of the tick; `buzz checklist tick` writes it.
+    #[serde(deserialize_with = "lenient")]
+    done_at: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -436,6 +442,35 @@ pub fn local_midnight(now: u64) -> u64 {
         .and_hms_opt(0, 0, 0)
         .and_then(|m| Local.from_local_datetime(&m).earliest())
         .map_or(now - now % 86_400, |m| m.timestamp().max(0) as u64)
+}
+
+/// When a done item was ticked, for a row: "15:20" today, "yesterday
+/// 22:10", "Oct 19" earlier this year, "Oct 19 2025" before that.
+pub fn done_label(at: u64, now: u64) -> String {
+    done_label_in(&chrono::Local, at, now)
+}
+
+fn done_label_in<Tz: chrono::TimeZone>(tz: &Tz, at: u64, now: u64) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    use chrono::Datelike;
+    let (Some(t), Some(n)) = (
+        tz.timestamp_opt(at as i64, 0).single(),
+        tz.timestamp_opt(now as i64, 0).single(),
+    ) else {
+        return String::new();
+    };
+    let (day, today) = (t.date_naive(), n.date_naive());
+    if day == today {
+        t.format("%H:%M").to_string()
+    } else if today.pred_opt() == Some(day) {
+        t.format("yesterday %H:%M").to_string()
+    } else if day.year() == today.year() {
+        t.format("%b %-d").to_string()
+    } else {
+        t.format("%b %-d %Y").to_string()
+    }
 }
 
 pub fn is_crash_notice(content: &str) -> bool {
@@ -592,8 +627,9 @@ impl Checklists {
         })
     }
 
-    /// Items in list order: the standing first item, then by `order`, then
-    /// the standing last item.
+    /// Open items in list order (the standing first item, then by `order`,
+    /// then the standing last item), then done items, the latest tick
+    /// first (lucian 2026-10-21: done ones sink, newest finish on top).
     pub fn items(&self, channel: &str) -> Vec<Item> {
         let Some(recs) = self.channels.get(channel) else {
             return vec![];
@@ -610,11 +646,14 @@ impl Checklists {
             .filter_map(|((creator, id), slot)| {
                 let v = accepted(slot, creator, owner)?;
                 let j: ItemJson = serde_json::from_value(v.content.clone()).unwrap_or_default();
+                let status = Status::parse(&j.status);
+                let recorded = j.done_at.filter(|t| *t > 0);
+                let done = status == Status::Done;
                 Some(Item {
                     id: id.clone(),
                     text: j.text,
                     details: j.details,
-                    status: Status::parse(&j.status),
+                    status,
                     release: j.release,
                     order: j.order,
                     standing: j.standing.filter(|s| s == "first" || s == "last"),
@@ -624,6 +663,7 @@ impl Checklists {
                     signer: v.signer.clone(),
                     event_id: v.id.clone(),
                     updated_at: v.at,
+                    done_at: done.then(|| recorded.unwrap_or(v.at)),
                 })
             })
             .collect();
@@ -632,9 +672,12 @@ impl Checklists {
             Some("last") => 2,
             _ => 1,
         };
+        let done = |i: &Item| i.status == Status::Done;
         out.sort_by(|a, b| {
-            rank(a)
-                .cmp(&rank(b))
+            done(a)
+                .cmp(&done(b))
+                .then(b.done_at.cmp(&a.done_at))
+                .then(rank(a).cmp(&rank(b)))
                 .then(a.order.total_cmp(&b.order))
                 .then(a.id.cmp(&b.id))
         });
@@ -958,9 +1001,117 @@ mod tests {
             serde_json::json!({"text": "no evidence", "status": "done", "release": true, "order": 4}),
         );
         let texts: Vec<String> = s.items(CH).into_iter().map(|i| i.text).collect();
-        assert_eq!(texts, ["reconcile", "b", "a", "no evidence", "wrap-up"]);
-        let last = &s.items(CH)[3];
+        // Done ones sink below the standing last item; same tick time: list order.
+        assert_eq!(texts, ["reconcile", "b", "wrap-up", "a", "no evidence"]);
+        let last = &s.items(CH)[4];
         assert!(last.release && last.missing_evidence());
+    }
+
+    #[test]
+    fn done_items_sink_newest_tick_first() {
+        let (owner, bot) = (Keys::generate(), Keys::generate());
+        let bk = hex(&bot);
+        let mut s = store(&owner);
+        s.apply(&rec(
+            &bot,
+            KIND_HEADER,
+            &head_d(&bk),
+            1,
+            head("t", "running"),
+        ));
+        let put = |s: &mut Checklists, id: &str, at: u64, v: Value| {
+            s.apply(&rec(&bot, KIND_ITEM, &item_d(&bk, id), at, v));
+        };
+        let done_at = |text: &str, order: f64, t: u64| {
+            serde_json::json!({"text": text, "status": "done", "order": order,
+                "evidence": ["commit:a"], "done_at": t})
+        };
+        put(
+            &mut s,
+            "00000001",
+            10,
+            serde_json::json!({"text": "reconcile", "standing": "first"}),
+        );
+        put(
+            &mut s,
+            "00000002",
+            10,
+            serde_json::json!({"text": "wrap-up", "standing": "last"}),
+        );
+        put(&mut s, "00000003", 10, item("open b", "open", 2.0));
+        put(&mut s, "00000004", 10, item("open a", "open", 1.0));
+        // Ticked at 500, edited later at 900: the tick time counts, not the edit.
+        put(&mut s, "00000005", 900, done_at("ticked 500", 0.5, 500));
+        put(&mut s, "00000006", 10, done_at("ticked 700", 3.0, 700));
+        // An old record with no done_at: its version's time.
+        put(&mut s, "00000007", 600, item("old 600", "done", 4.0));
+        // A done standing item sinks too.
+        put(
+            &mut s,
+            "00000008",
+            10,
+            serde_json::json!({"text": "standing done",
+            "standing": "first", "status": "done", "done_at": 100}),
+        );
+        let items = s.items(CH);
+        let got: Vec<(&str, Option<u64>)> =
+            items.iter().map(|i| (i.text.as_str(), i.done_at)).collect();
+        assert_eq!(
+            got,
+            [
+                ("reconcile", None),
+                ("open a", None),
+                ("open b", None),
+                ("wrap-up", None),
+                ("ticked 700", Some(700)),
+                ("old 600", Some(600)),
+                ("ticked 500", Some(500)),
+                ("standing done", Some(100)),
+            ]
+        );
+        // Reopened: back in list order with no done time, even if a stale
+        // done_at stayed in the record.
+        put(
+            &mut s,
+            "00000006",
+            20,
+            serde_json::json!({"text": "ticked 700", "status": "open",
+            "order": 3.0, "done_at": 700}),
+        );
+        let items = s.items(CH);
+        let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "reconcile",
+                "open a",
+                "open b",
+                "ticked 700",
+                "wrap-up",
+                "old 600",
+                "ticked 500",
+                "standing done"
+            ]
+        );
+        assert_eq!(items[3].done_at, None);
+    }
+
+    #[test]
+    fn done_labels() {
+        use chrono::{TimeZone, Utc};
+        let at = |y, mo, d, h, mi| {
+            Utc.with_ymd_and_hms(y, mo, d, h, mi, 0)
+                .unwrap()
+                .timestamp() as u64
+        };
+        let now = at(2026, 10, 21, 16, 0);
+        let l = |t| done_label_in(&Utc, t, now);
+        assert_eq!(l(at(2026, 10, 21, 15, 20)), "15:20");
+        assert_eq!(l(at(2026, 10, 21, 0, 5)), "00:05");
+        assert_eq!(l(at(2026, 10, 20, 22, 10)), "yesterday 22:10");
+        assert_eq!(l(at(2026, 10, 19, 9, 0)), "Oct 19");
+        assert_eq!(l(at(2025, 12, 31, 9, 0)), "Dec 31 2025");
+        assert!(!done_label(now, now).is_empty());
     }
 
     #[test]

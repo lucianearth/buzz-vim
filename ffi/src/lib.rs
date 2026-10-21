@@ -37,7 +37,8 @@ mod routing;
 pub use pairing::{PairStep, Pairing};
 pub use push::{PushChallenge, PushDelegation, PushNote, PushRelay};
 pub use routing::{
-    RouteDecision, RouteEdge, RouteFlow, RouteNode, RouteStep, RouteWindow, route_why,
+    RouteCard, RouteDecision, RouteGate, RouteOutcome, RoutePipeline, RouteStep, RouteWindow,
+    route_why,
 };
 
 uniffi::setup_scaffolding!();
@@ -356,6 +357,10 @@ pub struct ChecklistItem {
     pub missing_evidence: bool,
     pub creator: String,
     pub updated_at: u64,
+    /// Done items: when ticked (unix seconds), and that time for the row:
+    /// "15:20", "yesterday 22:10", "Oct 19". Empty for open items.
+    pub done_at: Option<u64>,
+    pub done_label: String,
 }
 
 /// A channel's checklist, read-only (agents write it with `buzz checklist`).
@@ -856,9 +861,11 @@ impl Client {
         }
     }
 
-    /// A channel's checklist: header and items in list order.
+    /// A channel's checklist: header, open items in list order, then done
+    /// items, the latest tick first.
     pub fn checklist(&self, channel: String) -> Checklist {
         let e = self.engine.lock().unwrap();
+        let t = now();
         let h = e.checklists.header(&channel);
         let items = e
             .checklists
@@ -886,6 +893,11 @@ impl Client {
                 release: i.release,
                 standing: i.standing,
                 updated_at: i.updated_at,
+                done_label: i
+                    .done_at
+                    .map(|d| checklist::done_label(d, t))
+                    .unwrap_or_default(),
+                done_at: i.done_at,
             })
             .collect();
         Checklist {
@@ -2829,6 +2841,9 @@ mod tests {
         assert_eq!(list.resume, "agent/x");
         let it = &list.items[0];
         assert!(it.status == ItemStatus::Done && !it.missing_evidence);
+        // No done_at in the record: the version's time stands in.
+        assert_eq!(it.done_at, Some(now() - 10));
+        assert!(!it.done_label.is_empty());
         assert!(
             it.evidence[0]
                 .link
@@ -2944,9 +2959,9 @@ mod tests {
         assert_eq!(e.tab_section["b"], "s");
     }
 
-    /// The routing view from a folded routing log: the flow's boxes and
-    /// bands, a sample with the stop message it read, and its Why with
-    /// the ping it posted. A stranger's log doesn't count.
+    /// The routing view from a folded routing log: the pipeline's checks,
+    /// cards and totals, a sample with the stop message it read, and its
+    /// Why with the ping it posted. A stranger's log doesn't count.
     #[test]
     fn routing_view_from_a_folded_log() {
         use nostr::{EventBuilder, Kind, Timestamp};
@@ -2992,37 +3007,67 @@ mod tests {
             engine: Arc::new(Mutex::new(e)),
             stop: Arc::new(tokio::sync::Notify::new()),
         };
-        assert!(c.route_flow(RouteWindow::Week).edges.is_empty());
+        assert_eq!(c.route_pipeline(RouteWindow::Week).total, 0);
         c.engine.lock().unwrap().fold(&log(&watcher), true);
 
-        let count = |f: &RouteFlow, k: &str| f.nodes.iter().find(|n| n.key == k).map(|n| n.count);
-        let hour = c.route_flow(RouteWindow::Hour);
-        assert_eq!(hour.layers.len(), 5);
-        assert_eq!(count(&hour, "stops_seen"), Some(1));
-        assert_eq!(count(&hour, "out:no_action"), Some(0));
-        // "other" only shows when something is in it.
-        assert_eq!(count(&hour, "jev:other"), None);
-        let day = c.route_flow(RouteWindow::Day);
-        assert_eq!(count(&day, "stops_seen"), Some(2));
-        assert_eq!(count(&day, "out:ping_you"), Some(1));
-        let node = day
-            .nodes
-            .iter()
-            .find(|n| n.key == "claude:needs_you")
-            .unwrap();
-        assert_eq!((node.layer, node.label.as_str()), (3, "needs you"));
-        let band = |a: &str, b: &str| {
-            day.edges
+        let hour = c.route_pipeline(RouteWindow::Hour);
+        assert_eq!(hour.total, 1);
+        let cards = |p: &RoutePipeline| -> Vec<(String, u32)> {
+            p.gates
                 .iter()
-                .find(|e| e.from == a && e.to == b)
-                .map(|e| e.count)
+                .flat_map(|g| &g.cards)
+                .map(|c| (c.key.clone(), c.count))
+                .collect()
         };
-        // A no-op skips straight to its outcome.
-        assert_eq!(band("stops_seen", "out:no_action"), Some(1));
-        assert_eq!(band("jev:asks_something", "claude:needs_you"), Some(1));
+        assert_eq!(cards(&hour), [("needs_you".to_string(), 1)]);
+        let day = c.route_pipeline(RouteWindow::Day);
+        assert_eq!(day.total, 2);
+        assert_eq!(
+            cards(&day),
+            [("not_running".to_string(), 1), ("needs_you".to_string(), 1)]
+        );
+        assert_eq!(
+            day.gates
+                .iter()
+                .map(|g| g.caption.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Is the list running?",
+                "1 running. Settled before Jev?",
+                "1 sent to Jev. Jev: what kind of stop?",
+                "1 asks something. Claude: who should answer?"
+            ]
+        );
+        let you = &day.gates[3].cards[0];
+        assert_eq!(
+            (you.title.as_str(), you.color.as_str()),
+            ("Claude: needs you", "#eb6834")
+        );
+        let ping = &you.outcomes[0];
+        assert_eq!(
+            (
+                ping.key.as_str(),
+                ping.glyph.as_str(),
+                ping.word.as_str(),
+                ping.count
+            ),
+            ("needs_you/ping", "🔔", "pinged you", 1)
+        );
+        assert_eq!(
+            day.outcomes
+                .iter()
+                .map(|o| (o.word.as_str(), o.count, o.color.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("no action", 1, "#5a6674"),
+                ("nudged", 0, "#6dbcfa"),
+                ("pinged you", 1, "#961929")
+            ]
+        );
+        assert!(day.retired_note.is_none());
 
         let d = c
-            .route_sample(RouteWindow::Day, "jev:asks_something".into(), 0)
+            .route_sample(RouteWindow::Day, "needs_you".into(), 0)
             .unwrap();
         assert_eq!(d.channel_label, "#beacon");
         assert_eq!(d.text, "Should staging get the read role?");
@@ -3048,11 +3093,11 @@ mod tests {
         let link = d.link.clone().unwrap();
         assert!(c.follow(link).is_some_and(|f| f.channel == ch));
         // Sampling wraps; an unknown key or an empty box gives nothing.
-        let again = c.route_sample(RouteWindow::Day, "jev:asks_something".into(), 1);
+        let again = c.route_sample(RouteWindow::Day, "needs_you/ping".into(), 1);
         assert_eq!(again.map(|a| a.at), Some(d.at));
         assert!(c.route_sample(RouteWindow::Day, "nope".into(), 0).is_none());
         assert!(
-            c.route_sample(RouteWindow::Hour, "out:no_action".into(), 0)
+            c.route_sample(RouteWindow::Hour, "not_running".into(), 0)
                 .is_none()
         );
 

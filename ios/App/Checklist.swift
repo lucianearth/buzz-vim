@@ -59,6 +59,7 @@ struct LoopLine: View {
 }
 
 /// A channel's checklist, read-only: agents write it with `buzz checklist`.
+/// Open items in list order, then done ones, the latest tick first.
 /// Tap an item for its details and evidence.
 struct ChecklistView: View {
     let client: Client
@@ -126,6 +127,15 @@ struct ChecklistView: View {
                 Text(it.text)
                     .foregroundStyle(it.status == .done ? theme.muted : theme.text)
                 Spacer(minLength: 0)
+                // Done items come after the open ones, latest tick first
+                // (the core orders them); each shows when it was ticked.
+                if !it.doneLabel.isEmpty {
+                    Text(it.doneLabel)
+                        .font(.small)
+                        .foregroundStyle(theme.faint)
+                        .lineLimit(1)
+                        .fixedSize()
+                }
             }
             .font(.text)
             let tags = flags(it)

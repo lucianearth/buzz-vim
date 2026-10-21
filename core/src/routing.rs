@@ -6,6 +6,10 @@
 //! stops seen -> running -> Jev stream -> Claude check (asks only) ->
 //! outcome (nudge the driver / ping you / no action).
 //!
+//! The page draws that as a pipeline (`pipeline`): one trunk with a strip
+//! per exit stream (`Lane`) peeling off at its check into a card with its
+//! outcome lines, then the totals. A Why still walks the `Node` path.
+//!
 //! The watch reader never takes these records: it wants `checklist-type=watch`
 //! and a three-segment `d`. Labels this build doesn't know go in "other".
 
@@ -445,6 +449,666 @@ pub fn sample(ds: &[Decision], now: u64, w: Window, node: Node, n: usize) -> Opt
     let mut hits: Vec<&Decision> = ds
         .iter()
         .filter(|d| in_window(d, now, w) && d.path().contains(&node))
+        .collect();
+    if hits.is_empty() {
+        return None;
+    }
+    hits.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.channel.cmp(&b.channel)));
+    Some(hits[n % hits.len()])
+}
+
+// ---------- the pipeline: the Routing page as lucian approved it ----------
+//
+// One trunk of stops, one coloured strip per exit stream ("lane"), each
+// strip peeling off at the check that settles it into its card. The checks
+// run top to bottom: is the list running, did the watcher settle it before
+// asking Jev, what kind of stop Jev says it is, and (asks only) who Claude
+// says should answer.
+
+/// Where a stop leaves the trunk: one strip and one card each, in trunk
+/// order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Lane {
+    NotRunning,
+    BeforeJev,
+    KeepsGoing,
+    Finished,
+    WaitingOnBot,
+    JevOther,
+    NotAQuestion,
+    AgentDecides,
+    NeedsYou,
+    NoVerdict,
+}
+
+impl Lane {
+    pub const ALL: [Lane; 10] = [
+        Lane::NotRunning,
+        Lane::BeforeJev,
+        Lane::KeepsGoing,
+        Lane::Finished,
+        Lane::WaitingOnBot,
+        Lane::JevOther,
+        Lane::NotAQuestion,
+        Lane::AgentDecides,
+        Lane::NeedsYou,
+        Lane::NoVerdict,
+    ];
+
+    /// A stable name for the apps to hand back.
+    pub fn key(self) -> &'static str {
+        match self {
+            Lane::NotRunning => "not_running",
+            Lane::BeforeJev => "before_jev",
+            Lane::KeepsGoing => "keeps_going",
+            Lane::Finished => "finished",
+            Lane::WaitingOnBot => "waiting_on_a_bot",
+            Lane::JevOther => "jev_other",
+            Lane::NotAQuestion => "not_a_question",
+            Lane::AgentDecides => "agent_decides",
+            Lane::NeedsYou => "needs_you",
+            Lane::NoVerdict => "no_verdict",
+        }
+    }
+
+    pub fn from_key(k: &str) -> Option<Lane> {
+        Lane::ALL.into_iter().find(|l| l.key() == k)
+    }
+
+    /// The card's title.
+    pub fn title(self) -> &'static str {
+        match self {
+            Lane::NotRunning => "List not running",
+            Lane::BeforeJev => "Settled before Jev",
+            Lane::KeepsGoing => "Jev: keeps going",
+            Lane::Finished => "Jev: finished",
+            Lane::WaitingOnBot => "Jev: waiting on a bot",
+            Lane::JevOther => "Jev: other",
+            Lane::NotAQuestion => "Claude: not a question",
+            Lane::AgentDecides => "Claude: agent decides",
+            Lane::NeedsYou => "Claude: needs you",
+            Lane::NoVerdict => "Jev: asks something, no Claude verdict",
+        }
+    }
+
+    /// The card's plain line under the title.
+    pub fn why(self) -> &'static str {
+        match self {
+            Lane::NotRunning => "nobody said go; the watcher stays out",
+            Lane::BeforeJev => "the watcher acted without asking Jev",
+            Lane::KeepsGoing => "said it would continue, then stopped",
+            Lane::Finished => "reported done with items still open",
+            Lane::WaitingOnBot => "waiting on another bot's answer",
+            Lane::JevOther => "a label this build doesn't know",
+            Lane::NotAQuestion => "Jev heard an ask, Claude didn't",
+            Lane::AgentDecides => "the list already answers it",
+            Lane::NeedsYou => "new decision, merge, money, access",
+            Lane::NoVerdict => "Jev heard an ask; Claude's verdict was missing or unknown",
+        }
+    }
+
+    /// Its name in a check's "not drawn" line.
+    fn short(self) -> &'static str {
+        match self {
+            Lane::WaitingOnBot => "waiting on a bot",
+            Lane::JevOther => "other",
+            l => l.title(),
+        }
+    }
+}
+
+/// The stream a decision leaves by. None for the retired "other thread"
+/// rule (`not_work_thread`), which no count includes.
+///
+/// A judged stop Jev never labelled was settled before Jev was asked: a
+/// turn still running, the long-turn status ask, the 4 h pause after 3
+/// nudges, nothing to judge, or an owner or bot message left unanswered
+/// (stall-judge.py `decide`, the returns before `jev(...)`). A turn that
+/// started or a thread that moved while judging lands there too when Jev
+/// had not been asked; the card's sub-lines say which (`said`). The list stopping while judging is "not
+/// running". An ask with no usable Claude verdict has its own card; any
+/// other label this build doesn't know goes in "Jev: other".
+pub fn lane(d: &Decision) -> Option<Lane> {
+    Some(match d.stage.as_str() {
+        "not_work_thread" => return None,
+        "not_running" | "contested_idle" | "stopped_running" => Lane::NotRunning,
+        // A turn that started or a thread that moved while judging: settled
+        // before Jev only when Jev had not been asked yet; else it leaves by
+        // Jev's label like any judged stop (its sub-line says what happened).
+        "turn_started" | "thread_moved" | "judged" => match d.jev.as_deref() {
+            None => Lane::BeforeJev,
+            Some(j) => match stream(Some(j)) {
+                Stream::KeepsGoing => Lane::KeepsGoing,
+                Stream::Finished => Lane::Finished,
+                Stream::WaitingOnBot => Lane::WaitingOnBot,
+                Stream::Other => Lane::JevOther,
+                Stream::Asks => match check(d.model.as_deref()) {
+                    Check::NotAQuestion => Lane::NotAQuestion,
+                    Check::AgentDecides => Lane::AgentDecides,
+                    Check::NeedsOwner => Lane::NeedsYou,
+                    Check::Other => Lane::NoVerdict,
+                },
+            },
+        },
+        _ => Lane::JevOther,
+    })
+}
+
+impl Outcome {
+    /// The three reserved outcome colours (slate, sky, crimson).
+    pub fn color(self) -> &'static str {
+        match self {
+            Outcome::NoAction => "#5a6674",
+            Outcome::Nudge => "#6dbcfa",
+            Outcome::Ping => "#961929",
+            Outcome::Other => "#9aa3ad",
+        }
+    }
+
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Outcome::NoAction => "—",
+            Outcome::Nudge => "↻",
+            Outcome::Ping => "🔔",
+            Outcome::Other => "?",
+        }
+    }
+
+    /// On a card's outcome line.
+    pub fn word(self) -> &'static str {
+        match self {
+            Outcome::NoAction => "no action",
+            Outcome::Nudge => "nudged agent",
+            Outcome::Ping => "pinged you",
+            Outcome::Other => "other",
+        }
+    }
+
+    /// Under the totals bar.
+    pub fn total_word(self) -> &'static str {
+        match self {
+            Outcome::Nudge => "nudged",
+            o => o.word(),
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Outcome::NoAction => "none",
+            Outcome::Nudge => "nudge",
+            Outcome::Ping => "ping",
+            Outcome::Other => "other",
+        }
+    }
+}
+
+/// Inside a card, the most important first.
+const CARD_ORDER: [Outcome; 4] = [
+    Outcome::Ping,
+    Outcome::Nudge,
+    Outcome::NoAction,
+    Outcome::Other,
+];
+
+/// What the judge's reason says happened, for an outcome line's sub-line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Said {
+    /// "real ask pinged; agent told to continue with other items"
+    CarryOn,
+    /// "3 nudges without a tick; quiet until …"
+    Stuck,
+    /// "driver ⏳: still blocked; quiet until …"
+    Hourglass,
+    /// "long turn since …; status asked"
+    StatusAsked,
+    /// "long turn already asked about, or no agent in the thread"
+    StatusAlready,
+    /// "a turn is running in this channel" (also the contested one)
+    TurnRunning,
+    /// "a turn started while judging; posting nothing"
+    TurnStarted,
+    /// "the thread moved while judging; posting nothing"
+    ThreadMoved,
+    /// "lucian's message has no reply"
+    OwnerUnanswered,
+    /// "macbot's message has no reply"
+    BotUnanswered,
+    /// "last word is not an agent's; nothing to judge"
+    NothingToJudge,
+    /// "channel bot members unknown; rechecking"
+    MembersUnknown,
+    /// "contested; lucian already pinged about these lists"
+    ContestedPinged,
+    /// "contested checklist; lucian asked to pick a driver"
+    ContestedAsk,
+    /// "only release items left"
+    ReleaseLeft,
+    Plain,
+}
+
+/// stall-judge.py's `OWNER_NAME` (its default; the env can rename it).
+const OWNER_NAME: &str = "lucian";
+
+/// The reason strings are stall-judge.py's (`decide`, `run`'s `route`).
+fn said(reason: &str) -> Said {
+    if reason.starts_with("real ask pinged") {
+        Said::CarryOn
+    } else if reason.contains("nudges without a tick") {
+        Said::Stuck
+    } else if reason.starts_with("driver ⏳") {
+        Said::Hourglass
+    } else if reason.starts_with("long turn already") {
+        Said::StatusAlready
+    } else if reason.starts_with("long turn") {
+        Said::StatusAsked
+    } else if reason.contains("a turn is running") {
+        Said::TurnRunning
+    } else if reason.starts_with("a turn started") {
+        Said::TurnStarted
+    } else if reason.starts_with("the thread moved") {
+        Said::ThreadMoved
+    } else if let Some(i) = reason.find("'s message has no reply") {
+        // "no open items; macbot's message has no reply" names its bot last.
+        let who = reason[..i].rsplit("; ").next().unwrap_or("");
+        if who == OWNER_NAME {
+            Said::OwnerUnanswered
+        } else {
+            Said::BotUnanswered
+        }
+    } else if reason.contains("nothing to judge") {
+        Said::NothingToJudge
+    } else if reason.starts_with("channel bot members unknown") {
+        Said::MembersUnknown
+    } else if reason.starts_with("contested;") {
+        Said::ContestedPinged
+    } else if reason.starts_with("contested checklist") {
+        Said::ContestedAsk
+    } else if reason.starts_with("only release items left") {
+        Said::ReleaseLeft
+    } else {
+        Said::Plain
+    }
+}
+
+/// Why a stop was settled before Jev was asked, whatever the outcome.
+fn before_jev(s: Said) -> &'static str {
+    match s {
+        Said::TurnRunning => "a turn was still running",
+        Said::TurnStarted => "a turn started while judging",
+        Said::ThreadMoved => "the thread moved while judging",
+        Said::StatusAsked => "long turn: asked for a status update",
+        Said::StatusAlready => "long turn: status already asked",
+        Said::Stuck => "3 nudges, nothing ticked: 4 h pause",
+        Said::Hourglass => "driver still blocked (⏳): 4 h pause",
+        Said::OwnerUnanswered => "lucian's message had no reply",
+        Said::BotUnanswered => "another bot answered, nothing happened",
+        Said::NothingToJudge => "nothing to judge",
+        Said::MembersUnknown => "bot members not known yet: looking again",
+        Said::ContestedPinged => "contested list: lucian already pinged",
+        Said::ContestedAsk => "contested list: lucian asked to pick a driver",
+        Said::ReleaseLeft => "only release items left",
+        Said::CarryOn | Said::Plain => "",
+    }
+}
+
+/// The sub-line for stops of `lane` that ended in `o`, by what the reason
+/// said (as the mock words it).
+fn note(lane: Lane, o: Outcome, s: Said) -> &'static str {
+    use {Lane as L, Outcome as O, Said as S};
+    match (lane, o, s) {
+        (L::BeforeJev, _, s) => before_jev(s),
+        (_, _, S::TurnStarted) => "a turn started while judging: posted nothing",
+        (_, _, S::ThreadMoved) => "the thread moved while judging: posted nothing",
+        (_, O::Ping, S::CarryOn) => "agent also told to park it and carry on with other items",
+        (L::NeedsYou, O::Ping, S::Stuck) => {
+            "agent was at 3 nudges, nothing ticked, so no message, 4 h pause"
+        }
+        (_, O::Ping, S::Stuck) => "no ask, but stuck: 3 nudges and nothing ticked",
+        (_, O::NoAction, S::Stuck) => "still stuck after the stuck ping: no second ping, 4 h pause",
+        (_, O::Nudge, S::CarryOn) => {
+            "repeats of an ask you'd already had: no second ping; told to carry on"
+        }
+        (L::AgentDecides, O::Nudge, _) => "told to decide it and carry on",
+        (_, O::Nudge, _) => "told to carry on with the list",
+        _ => "",
+    }
+}
+
+/// One outcome line on a card: dot, glyph, count and its plain sub-lines.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutcomeLine {
+    pub outcome: Outcome,
+    pub count: usize,
+    /// One line when every stop here went the same way, else one
+    /// "N: what happened" line per way.
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Card {
+    pub lane: Lane,
+    pub count: usize,
+    /// The strip, the border, the accent.
+    pub color: &'static str,
+    /// The same hue darkened to read as text on the light page (the "N →").
+    pub ink: String,
+    pub lines: Vec<OutcomeLine>,
+}
+
+/// One check down the trunk, with the cards that peel off at it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gate {
+    /// "46 running. Settled before Jev?": the stops still on the trunk
+    /// folded into the question.
+    pub caption: String,
+    /// "waiting on a bot 0 · other 0 (not drawn)".
+    pub zeros: Option<String>,
+    pub cards: Vec<Card>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pipeline {
+    /// Every stop counted (the retired rule's are not).
+    pub total: usize,
+    /// Only checks some stop still reaches.
+    pub gates: Vec<Gate>,
+    /// "All N stops ended as": no action, nudged, pinged you, then "other"
+    /// only when something is in it. Sums to `total`.
+    pub outcomes: Vec<(Outcome, usize)>,
+    /// Decisions from the retired "other thread" rule, left out.
+    pub retired: usize,
+}
+
+impl Pipeline {
+    /// Every card, in trunk order (the first to leave first).
+    pub fn cards(&self) -> impl Iterator<Item = &Card> {
+        self.gates.iter().flat_map(|g| &g.cards)
+    }
+
+    /// What Tab / j / k step through: each card, then its outcome lines.
+    pub fn picks(&self) -> Vec<Pick> {
+        let mut out = vec![];
+        for c in self.cards() {
+            out.push(Pick {
+                lane: c.lane,
+                outcome: None,
+            });
+            out.extend(c.lines.iter().map(|l| Pick {
+                lane: c.lane,
+                outcome: Some(l.outcome),
+            }));
+        }
+        out
+    }
+
+    /// How many stops a pick holds.
+    pub fn count(&self, p: Pick) -> usize {
+        let Some(c) = self.cards().find(|c| c.lane == p.lane) else {
+            return 0;
+        };
+        match p.outcome {
+            None => c.count,
+            Some(o) => c
+                .lines
+                .iter()
+                .find(|l| l.outcome == o)
+                .map_or(0, |l| l.count),
+        }
+    }
+
+    /// "Not counted: …" for the footer, when anything was.
+    pub fn retired_note(&self) -> Option<String> {
+        (self.retired > 0).then(|| {
+            let s = if self.retired == 1 { "" } else { "s" };
+            format!(
+                "Not counted: {} decision{s} from a retired rule (stops outside the thread where you said go).",
+                self.retired
+            )
+        })
+    }
+}
+
+/// A card, or one outcome line on it: what a tap samples from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pick {
+    pub lane: Lane,
+    pub outcome: Option<Outcome>,
+}
+
+impl Pick {
+    /// "needs_you", "needs_you/ping".
+    pub fn key(self) -> String {
+        match self.outcome {
+            None => self.lane.key().to_string(),
+            Some(o) => format!("{}/{}", self.lane.key(), o.key()),
+        }
+    }
+
+    pub fn from_key(k: &str) -> Option<Pick> {
+        let (l, o) = match k.split_once('/') {
+            Some((l, o)) => (l, Some(o)),
+            None => (k, None),
+        };
+        let lane = Lane::from_key(l)?;
+        let outcome = match o {
+            None => None,
+            Some(o) => Some(CARD_ORDER.into_iter().find(|x| x.key() == o)?),
+        };
+        Some(Pick { lane, outcome })
+    }
+
+    /// "Claude: needs you", "Claude: needs you · pinged you".
+    pub fn label(self) -> String {
+        match self.outcome {
+            None => self.lane.title().to_string(),
+            Some(o) => format!("{} · {}", self.lane.title(), o.word()),
+        }
+    }
+
+    fn holds(self, d: &Decision) -> bool {
+        lane(d) == Some(self.lane) && self.outcome.is_none_or(|o| outcome(&d.outcome) == o)
+    }
+}
+
+/// The checks, top to bottom: the question, the lanes that leave there,
+/// and what the stops still on the trunk are called after it.
+const GATES: [(&str, &[Lane], &str); 4] = [
+    ("Is the list running?", &[Lane::NotRunning], "running"),
+    ("Settled before Jev?", &[Lane::BeforeJev], "sent to Jev"),
+    (
+        "Jev: what kind of stop?",
+        &[
+            Lane::KeepsGoing,
+            Lane::Finished,
+            Lane::WaitingOnBot,
+            Lane::JevOther,
+        ],
+        "asks something",
+    ),
+    (
+        "Claude: who should answer?",
+        &[
+            Lane::NotAQuestion,
+            Lane::AgentDecides,
+            Lane::NeedsYou,
+            Lane::NoVerdict,
+        ],
+        "",
+    ),
+];
+
+/// Categorical slots in exit order, handed out to the lanes drawn (adjacent
+/// strips stay apart for colour-blind eyes). Spares for the rare day
+/// "waiting on a bot", "other" and "no Claude verdict" show.
+pub const PALETTE: [&str; 10] = [
+    "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#8a6d3b",
+    "#3a8fa3", "#b0457a",
+];
+
+/// "1 stop", "2 stops".
+pub fn stops(n: usize) -> String {
+    format!("{n} stop{}", if n == 1 { "" } else { "s" })
+}
+
+fn rgb(hex: &str) -> (u8, u8, u8) {
+    let h = hex.trim_start_matches('#');
+    let p = |i: usize| h.get(i..i + 2).and_then(|s| u8::from_str_radix(s, 16).ok());
+    (p(0).unwrap_or(0), p(2).unwrap_or(0), p(4).unwrap_or(0))
+}
+
+fn luminance((r, g, b): (u8, u8, u8)) -> f64 {
+    let f = |c: u8| {
+        let c = c as f64 / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+}
+
+/// The same hue, darkened until it reads as text on the page (WCAG 4.5:1
+/// on #f7f8fc).
+pub fn ink(hex: &str) -> String {
+    let bg = luminance(rgb("#f7f8fc"));
+    let (r, g, b) = rgb(hex);
+    for t in (0..=100).step_by(2) {
+        let k = 1.0 - t as f64 / 100.0;
+        let c = (
+            (r as f64 * k) as u8,
+            (g as f64 * k) as u8,
+            (b as f64 * k) as u8,
+        );
+        if (bg + 0.05) / (luminance(c) + 0.05) >= 4.5 {
+            return format!("#{:02x}{:02x}{:02x}", c.0, c.1, c.2);
+        }
+    }
+    "#1d1a24".into()
+}
+
+fn outcome_line(lane: Lane, o: Outcome, ds: &[&Decision]) -> Option<OutcomeLine> {
+    let mine: Vec<&&Decision> = ds.iter().filter(|d| outcome(&d.outcome) == o).collect();
+    if mine.is_empty() {
+        return None;
+    }
+    let mut by: BTreeMap<Said, usize> = BTreeMap::new();
+    for d in &mine {
+        *by.entry(said(&d.reason)).or_default() += 1;
+    }
+    // Same words from two reasons count as one way.
+    let mut ways: Vec<(&str, usize)> = vec![];
+    for (s, n) in by {
+        let t = note(lane, o, s);
+        match ways.iter_mut().find(|(w, _)| *w == t) {
+            Some(w) => w.1 += n,
+            None => ways.push((t, n)),
+        }
+    }
+    let notes = match ways.as_slice() {
+        [("", _)] => vec![],
+        [(t, _)] => vec![t.to_string()],
+        _ => ways
+            .iter()
+            .map(|(t, n)| format!("{n}: {}", if t.is_empty() { "other" } else { t }))
+            .collect(),
+    };
+    Some(OutcomeLine {
+        outcome: o,
+        count: mine.len(),
+        notes,
+    })
+}
+
+/// The pipeline for the decisions within `w` of `now`.
+pub fn pipeline(ds: &[Decision], now: u64, w: Window) -> Pipeline {
+    let mut by: BTreeMap<Lane, Vec<&Decision>> = BTreeMap::new();
+    let mut retired = 0;
+    for d in ds.iter().filter(|d| in_window(d, now, w)) {
+        match lane(d) {
+            Some(l) => by.entry(l).or_default().push(d),
+            None => retired += 1,
+        }
+    }
+    let n = |l: Lane| by.get(&l).map_or(0, Vec::len);
+    let total: usize = by.values().map(Vec::len).sum();
+    // Colours go to the lanes drawn, in trunk order.
+    let colors: HashMap<Lane, &'static str> = Lane::ALL
+        .into_iter()
+        .filter(|l| n(*l) > 0)
+        .zip(PALETTE)
+        .collect();
+    let mut gates = vec![];
+    let mut left = total;
+    let mut rest: Option<String> = None;
+    for (question, lanes, after) in GATES {
+        if left == 0 {
+            break;
+        }
+        let caption = match &rest {
+            Some(r) => format!("{r}. {question}"),
+            None => question.to_string(),
+        };
+        let zeros: Vec<String> = lanes
+            .iter()
+            .filter(|l| matches!(l, Lane::WaitingOnBot | Lane::JevOther) && n(**l) == 0)
+            .map(|l| format!("{} 0", l.short()))
+            .collect();
+        let cards: Vec<Card> = lanes
+            .iter()
+            .filter(|l| n(**l) > 0)
+            .map(|&l| {
+                let color = colors.get(&l).copied().unwrap_or("#9aa3ad");
+                let mine = &by[&l];
+                Card {
+                    lane: l,
+                    count: mine.len(),
+                    color,
+                    ink: ink(color),
+                    lines: CARD_ORDER
+                        .into_iter()
+                        .filter_map(|o| outcome_line(l, o, mine))
+                        .collect(),
+                }
+            })
+            .collect();
+        left -= cards.iter().map(|c| c.count).sum::<usize>();
+        rest = Some(format!("{left} {after}"));
+        gates.push(Gate {
+            caption,
+            zeros: (!zeros.is_empty()).then(|| format!("{} (not drawn)", zeros.join(" · "))),
+            cards,
+        });
+    }
+    let mut outcomes: Vec<(Outcome, usize)> = [Outcome::NoAction, Outcome::Nudge, Outcome::Ping]
+        .into_iter()
+        .chain([Outcome::Other])
+        .map(|o| {
+            let c = by
+                .values()
+                .flatten()
+                .filter(|d| outcome(&d.outcome) == o)
+                .count();
+            (o, c)
+        })
+        .collect();
+    if outcomes[3].1 == 0 {
+        outcomes.pop();
+    }
+    Pipeline {
+        total,
+        gates,
+        outcomes,
+        retired,
+    }
+}
+
+/// The `n`th newest decision a card (or one of its outcome lines) holds
+/// within the window, round again past the oldest.
+pub fn sample_pick(ds: &[Decision], now: u64, w: Window, p: Pick, n: usize) -> Option<&Decision> {
+    let mut hits: Vec<&Decision> = ds
+        .iter()
+        .filter(|d| in_window(d, now, w) && p.holds(d))
         .collect();
     if hits.is_empty() {
         return None;
@@ -1183,6 +1847,705 @@ mod tests {
         .unwrap();
         assert_eq!(p.jev.as_deref(), Some("asks_decision"));
         assert!(sample(&[], NOW, Window::Week, Node::Seen, 0).is_none());
+    }
+
+    /// A decision with this reason, as a struct.
+    fn decided(
+        stage: &str,
+        jev: Option<&str>,
+        model: Option<&str>,
+        out: &str,
+        reason: &str,
+    ) -> Decision {
+        Decision {
+            channel: CH.into(),
+            record: "r".into(),
+            watch: None,
+            at: NOW - 60,
+            thread: None,
+            stop: None,
+            trigger: "idle".into(),
+            stage: stage.into(),
+            jev: jev.map(String::from),
+            model: model.map(String::from),
+            outcome: out.into(),
+            posts: vec![],
+            state: None,
+            reason: reason.into(),
+        }
+    }
+
+    /// The prod log the approved mock (option A) was drawn from: 119
+    /// decisions, 6 of them from the retired other-thread rule.
+    fn prod_mix() -> Vec<Decision> {
+        let mut v = vec![];
+        let mut add = |k: usize, d: Decision| v.extend(std::iter::repeat_n(d, k));
+        let nh = Some("needs_human_action");
+        let ad = Some("asks_decision");
+        let stuck = "3 nudges without a tick; quiet until 11:10 UTC";
+        let carry = "real ask pinged; agent told to continue with other items";
+        add(
+            67,
+            decided(
+                "not_running",
+                None,
+                None,
+                "none",
+                "the checklist is not running; no action",
+            ),
+        );
+        add(
+            6,
+            decided(
+                "not_work_thread",
+                None,
+                None,
+                "none",
+                "not the work thread of a running channel; no action",
+            ),
+        );
+        add(
+            7,
+            decided(
+                "judged",
+                None,
+                None,
+                "none",
+                "a turn is running in this channel",
+            ),
+        );
+        add(
+            1,
+            decided(
+                "judged",
+                None,
+                None,
+                "nudge",
+                "long turn since 04:18 UTC; status asked",
+            ),
+        );
+        add(
+            6,
+            decided(
+                "judged",
+                Some("will_continue"),
+                None,
+                "nudge",
+                "Jev: will_continue",
+            ),
+        );
+        add(
+            1,
+            decided(
+                "judged",
+                Some("reported_done"),
+                None,
+                "nudge",
+                "Jev: reported_done",
+            ),
+        );
+        add(
+            11,
+            decided(
+                "judged",
+                nh,
+                Some("not_a_question"),
+                "nudge",
+                "Jev: needs_human_action; model: not an ask",
+            ),
+        );
+        add(
+            2,
+            decided(
+                "judged",
+                ad,
+                Some("not_a_question"),
+                "nudge",
+                "Jev: asks_decision; model: not an ask",
+            ),
+        );
+        add(
+            1,
+            decided("judged", nh, Some("not_a_question"), "ping", stuck),
+        );
+        add(
+            1,
+            decided("judged", ad, Some("not_a_question"), "ping", stuck),
+        );
+        add(
+            2,
+            decided("judged", nh, Some("not_a_question"), "none", stuck),
+        );
+        add(
+            2,
+            decided(
+                "judged",
+                ad,
+                Some("agent_decides"),
+                "nudge",
+                "Jev: asks_decision; model: agent_decides",
+            ),
+        );
+        add(6, decided("judged", ad, Some("needs_owner"), "ping", carry));
+        add(2, decided("judged", nh, Some("needs_owner"), "ping", carry));
+        add(2, decided("judged", ad, Some("needs_owner"), "ping", stuck));
+        add(
+            2,
+            decided("judged", ad, Some("needs_owner"), "nudge", carry),
+        );
+        v
+    }
+
+    #[test]
+    fn the_pipeline_matches_the_approved_mock() {
+        let p = pipeline(&prod_mix(), NOW, Window::Day);
+        use Lane as L;
+        assert_eq!((p.total, p.retired), (113, 6));
+        let lanes: Vec<(Lane, usize)> = p.cards().map(|c| (c.lane, c.count)).collect();
+        assert_eq!(
+            lanes,
+            [
+                (L::NotRunning, 67),
+                (L::BeforeJev, 8),
+                (L::KeepsGoing, 6),
+                (L::Finished, 1),
+                (L::NotAQuestion, 17),
+                (L::AgentDecides, 2),
+                (L::NeedsYou, 12)
+            ]
+        );
+        let caps: Vec<&str> = p.gates.iter().map(|g| g.caption.as_str()).collect();
+        assert_eq!(
+            caps,
+            [
+                "Is the list running?",
+                "46 running. Settled before Jev?",
+                "38 sent to Jev. Jev: what kind of stop?",
+                "31 asks something. Claude: who should answer?"
+            ]
+        );
+        let zeros: Vec<Option<&str>> = p.gates.iter().map(|g| g.zeros.as_deref()).collect();
+        assert_eq!(
+            zeros,
+            [
+                None,
+                None,
+                Some("waiting on a bot 0 · other 0 (not drawn)"),
+                None
+            ]
+        );
+        // The mock's colours, and its darkened counts.
+        let cols: Vec<(&str, &str)> = p.cards().map(|c| (c.color, c.ink.as_str())).collect();
+        assert_eq!(
+            cols,
+            [
+                ("#2a78d6", "#2770c9"),
+                ("#eb6834", "#b75128"),
+                ("#1baf7a", "#13815a"),
+                ("#eda100", "#976700"),
+                ("#e87ba4", "#a75876"),
+                ("#008300", "#008300"),
+                ("#6250d6", "#6250d6")
+            ]
+        );
+        let card = |l: Lane| p.cards().find(|c| c.lane == l).unwrap().clone();
+        let lines = |l: Lane| -> Vec<(Outcome, usize, Vec<String>)> {
+            card(l)
+                .lines
+                .into_iter()
+                .map(|x| (x.outcome, x.count, x.notes))
+                .collect()
+        };
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        use super::Outcome as O;
+        assert_eq!(lines(L::NotRunning), [(O::NoAction, 67, vec![])]);
+        assert_eq!(
+            lines(L::BeforeJev),
+            [
+                (O::Nudge, 1, s(&["long turn: asked for a status update"])),
+                (O::NoAction, 7, s(&["a turn was still running"]))
+            ]
+        );
+        assert_eq!(
+            lines(L::KeepsGoing),
+            [(O::Nudge, 6, s(&["told to carry on with the list"]))]
+        );
+        assert_eq!(
+            lines(L::NotAQuestion),
+            [
+                (
+                    O::Ping,
+                    2,
+                    s(&["no ask, but stuck: 3 nudges and nothing ticked"])
+                ),
+                (O::Nudge, 13, s(&["told to carry on with the list"])),
+                (
+                    O::NoAction,
+                    2,
+                    s(&["still stuck after the stuck ping: no second ping, 4 h pause"])
+                )
+            ]
+        );
+        assert_eq!(
+            lines(L::AgentDecides),
+            [(O::Nudge, 2, s(&["told to decide it and carry on"]))]
+        );
+        assert_eq!(
+            lines(L::NeedsYou),
+            [
+                (
+                    O::Ping,
+                    10,
+                    s(&[
+                        "8: agent also told to park it and carry on with other items",
+                        "2: agent was at 3 nudges, nothing ticked, so no message, 4 h pause"
+                    ])
+                ),
+                (
+                    O::Nudge,
+                    2,
+                    s(&["repeats of an ask you'd already had: no second ping; told to carry on"])
+                )
+            ]
+        );
+        assert_eq!(
+            p.outcomes,
+            [(O::NoAction, 76), (O::Nudge, 25), (O::Ping, 12)]
+        );
+        assert_eq!(
+            p.retired_note().as_deref(),
+            Some(
+                "Not counted: 6 decisions from a retired rule (stops outside the thread where you said go)."
+            )
+        );
+    }
+
+    #[test]
+    fn lanes_classify_every_stage() {
+        use Lane as L;
+        let l = |stage: &str, jev: Option<&str>, model: Option<&str>| {
+            lane(&decided(stage, jev, model, "none", ""))
+        };
+        // The retired rule is in no lane, whatever Jev said.
+        assert_eq!(l("not_work_thread", None, None), None);
+        assert_eq!(
+            l(
+                "not_work_thread",
+                Some("asks_decision"),
+                Some("needs_owner")
+            ),
+            None
+        );
+        // Judged with no Jev label: settled before Jev was asked.
+        assert_eq!(l("judged", None, None), Some(L::BeforeJev));
+        assert_eq!(l("judged", None, Some("needs_owner")), Some(L::BeforeJev));
+        // A turn that started or a thread that moved while judging: before
+        // Jev only when Jev had not been asked yet.
+        assert_eq!(l("turn_started", None, None), Some(L::BeforeJev));
+        assert_eq!(l("thread_moved", None, None), Some(L::BeforeJev));
+        assert_eq!(
+            l("turn_started", Some("will_continue"), None),
+            Some(L::KeepsGoing)
+        );
+        for (stage, want) in [
+            ("not_running", L::NotRunning),
+            ("contested_idle", L::NotRunning),
+            ("stopped_running", L::NotRunning),
+            ("turn_started", L::NeedsYou),
+            ("thread_moved", L::NeedsYou),
+            ("", L::JevOther),
+            ("brand_new_stage", L::JevOther),
+        ] {
+            assert_eq!(
+                l(stage, Some("asks_decision"), Some("needs_owner")),
+                Some(want),
+                "{stage}"
+            );
+        }
+        for (jev, want) in [
+            ("will_continue", L::KeepsGoing),
+            ("cut_off", L::KeepsGoing),
+            ("reported_done", L::Finished),
+            ("waiting_on_agent", L::WaitingOnBot),
+            ("new_label", L::JevOther),
+        ] {
+            assert_eq!(
+                l("judged", Some(jev), Some("needs_owner")),
+                Some(want),
+                "{jev}"
+            );
+        }
+        for jev in ["asks_decision", "needs_access", "needs_human_action"] {
+            for (model, want) in [
+                (Some("not_a_question"), L::NotAQuestion),
+                (Some("agent_decides"), L::AgentDecides),
+                (Some("needs_owner"), L::NeedsYou),
+                (Some("maybe"), L::NoVerdict),
+                (None, L::NoVerdict),
+            ] {
+                assert_eq!(l("judged", Some(jev), model), Some(want), "{jev} {model:?}");
+            }
+        }
+        for k in Lane::ALL {
+            assert_eq!(Lane::from_key(k.key()), Some(k));
+        }
+        // An ask with no usable Claude verdict says so, not "a label this
+        // build doesn't know".
+        assert_eq!(
+            L::NoVerdict.title(),
+            "Jev: asks something, no Claude verdict"
+        );
+        assert!(!L::NoVerdict.why().contains("doesn't know"));
+    }
+
+    #[test]
+    fn an_unanswered_owner_nudge_is_not_a_running_turn() {
+        // judgebot on 403be6ec: stall-judge writes `judged` with no Jev for an
+        // owner_unanswered nudge; it must not read "a turn was still running".
+        let ds = vec![decided(
+            "judged",
+            None,
+            None,
+            "nudge",
+            "lucian's message has no reply",
+        )];
+        let p = pipeline(&ds, NOW, Window::Day);
+        let gate = p
+            .gates
+            .iter()
+            .find(|g| g.cards.iter().any(|c| c.lane == Lane::BeforeJev))
+            .unwrap();
+        assert_eq!(gate.caption, "1 running. Settled before Jev?");
+        assert!(p.gates.iter().all(|g| !g.caption.contains("mid-turn")));
+        let card = &gate.cards[0];
+        assert_eq!(card.lane.title(), "Settled before Jev");
+        assert_eq!(card.lane.why(), "the watcher acted without asking Jev");
+        assert_eq!(card.lines.len(), 1);
+        assert_eq!(
+            (card.lines[0].outcome, card.lines[0].count),
+            (Outcome::Nudge, 1)
+        );
+        assert_eq!(card.lines[0].notes, ["lucian's message had no reply"]);
+        assert!(
+            card.lines
+                .iter()
+                .flat_map(|l| &l.notes)
+                .all(|n| !n.contains("turn was still running"))
+        );
+    }
+
+    #[test]
+    fn settled_before_jev_splits_by_reason() {
+        // The reasons stall-judge.py's `decide` writes before it asks Jev.
+        let mut ds = vec![];
+        let mut add = |k: usize, stage: &str, outcome: &str, reason: &str| {
+            ds.extend(std::iter::repeat_n(
+                decided(stage, None, None, outcome, reason),
+                k,
+            ))
+        };
+        add(3, "judged", "nudge", "lucian's message has no reply");
+        add(2, "judged", "nudge", "macbot's message has no reply");
+        add(
+            1,
+            "judged",
+            "nudge",
+            "long turn since 04:18 UTC; status asked",
+        );
+        add(4, "judged", "none", "a turn is running in this channel");
+        add(
+            2,
+            "judged",
+            "none",
+            "backing off until 11:10 UTC after 3 nudges without a tick",
+        );
+        add(
+            1,
+            "judged",
+            "none",
+            "last word is not an agent's; nothing to judge",
+        );
+        add(
+            1,
+            "turn_started",
+            "none",
+            "a turn started while judging; posting nothing",
+        );
+        add(
+            1,
+            "judged",
+            "none",
+            "long turn already asked about, or no agent in the thread",
+        );
+        add(
+            1,
+            "judged",
+            "ping",
+            "3 nudges without a tick; quiet until 11:10 UTC",
+        );
+        add(
+            1,
+            "judged",
+            "none",
+            "no open items; macbot's message has no reply",
+        );
+        let p = pipeline(&ds, NOW, Window::Day);
+        let c = p.cards().next().unwrap();
+        assert_eq!((c.lane, c.count), (Lane::BeforeJev, 17));
+        let got: Vec<(Outcome, usize, Vec<&str>)> = c
+            .lines
+            .iter()
+            .map(|l| {
+                (
+                    l.outcome,
+                    l.count,
+                    l.notes.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    Outcome::Ping,
+                    1,
+                    vec!["3 nudges, nothing ticked: 4 h pause"]
+                ),
+                (
+                    Outcome::Nudge,
+                    6,
+                    vec![
+                        "1: long turn: asked for a status update",
+                        "3: lucian's message had no reply",
+                        "2: another bot answered, nothing happened",
+                    ]
+                ),
+                (
+                    Outcome::NoAction,
+                    10,
+                    vec![
+                        "2: 3 nudges, nothing ticked: 4 h pause",
+                        "1: long turn: status already asked",
+                        "4: a turn was still running",
+                        "1: a turn started while judging",
+                        "1: another bot answered, nothing happened",
+                        "1: nothing to judge",
+                    ]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn contested_release_and_late_turns_say_what_happened() {
+        let ds = vec![
+            decided(
+                "judged",
+                None,
+                None,
+                "none",
+                "contested; lucian already pinged about these lists",
+            ),
+            decided(
+                "judged",
+                None,
+                None,
+                "ping",
+                "contested checklist; lucian asked to pick a driver",
+            ),
+            decided("judged", None, None, "ping", "only release items left"),
+            decided(
+                "turn_started",
+                Some("will_continue"),
+                None,
+                "none",
+                "a turn started while judging; posting nothing",
+            ),
+        ];
+        let p = pipeline(&ds, NOW, Window::Day);
+        let notes = |l: Lane| -> Vec<(Outcome, Vec<String>)> {
+            p.cards()
+                .find(|c| c.lane == l)
+                .unwrap()
+                .lines
+                .iter()
+                .map(|x| (x.outcome, x.notes.clone()))
+                .collect()
+        };
+        assert_eq!(
+            notes(Lane::BeforeJev),
+            [
+                (
+                    Outcome::Ping,
+                    vec![
+                        "1: contested list: lucian asked to pick a driver".to_string(),
+                        "1: only release items left".to_string(),
+                    ]
+                ),
+                (
+                    Outcome::NoAction,
+                    vec!["contested list: lucian already pinged".to_string()]
+                ),
+            ]
+        );
+        assert_eq!(
+            notes(Lane::KeepsGoing),
+            [(
+                Outcome::NoAction,
+                vec!["a turn started while judging: posted nothing".to_string()]
+            )]
+        );
+    }
+
+    #[test]
+    fn stop_counts_are_singular_at_one() {
+        assert_eq!(stops(0), "0 stops");
+        assert_eq!(stops(1), "1 stop");
+        assert_eq!(stops(2), "2 stops");
+    }
+
+    #[test]
+    fn pipeline_tallies_sum_to_the_total() {
+        // Every stage, label and outcome, known and not, over a week.
+        let mut ds = vec![];
+        let stages = [
+            "not_running",
+            "contested_idle",
+            "judged",
+            "turn_started",
+            "not_work_thread",
+            "zzz",
+        ];
+        let jevs = [
+            None,
+            Some("will_continue"),
+            Some("reported_done"),
+            Some("waiting_on_agent"),
+            Some("asks_decision"),
+            Some("odd"),
+        ];
+        let models = [
+            None,
+            Some("needs_owner"),
+            Some("agent_decides"),
+            Some("not_a_question"),
+        ];
+        let outs = ["none", "nudge", "ping", "escalate"];
+        let mut i = 0u64;
+        for s in stages {
+            for j in jevs {
+                for m in models {
+                    for o in outs {
+                        let mut d = decided(
+                            s,
+                            j,
+                            m,
+                            o,
+                            if i.is_multiple_of(3) {
+                                "real ask pinged; x"
+                            } else {
+                                "y"
+                            },
+                        );
+                        d.at = NOW - (i * 997) % (8 * 86_400);
+                        ds.push(d);
+                        i += 1;
+                    }
+                }
+            }
+        }
+        for w in Window::ALL {
+            let p = pipeline(&ds, NOW, w);
+            let inside = ds.iter().filter(|d| in_window(d, NOW, w)).count();
+            assert_eq!(p.total + p.retired, inside, "{w:?}");
+            assert_eq!(
+                p.retired,
+                ds.iter()
+                    .filter(|d| in_window(d, NOW, w) && d.stage == "not_work_thread")
+                    .count()
+            );
+            assert_eq!(p.cards().map(|c| c.count).sum::<usize>(), p.total);
+            assert_eq!(p.outcomes.iter().map(|o| o.1).sum::<usize>(), p.total);
+            for c in p.cards() {
+                assert!(c.count > 0, "zero lanes are not drawn");
+                assert_eq!(c.lines.iter().map(|l| l.count).sum::<usize>(), c.count);
+                for l in &c.lines {
+                    let p2 = Pick {
+                        lane: c.lane,
+                        outcome: Some(l.outcome),
+                    };
+                    assert_eq!(p.count(p2), l.count);
+                    assert_eq!(Pick::from_key(&p2.key()), Some(p2));
+                }
+            }
+            // An unknown outcome shows in the totals only when it happened.
+            let other = ds.iter().any(|d| {
+                in_window(d, NOW, w) && d.outcome == "escalate" && d.stage != "not_work_thread"
+            });
+            assert_eq!(p.outcomes.len(), if other { 4 } else { 3 }, "{w:?}");
+            // Colours are distinct across the drawn lanes.
+            let mut cols: Vec<&str> = p.cards().map(|c| c.color).collect();
+            cols.sort();
+            cols.dedup();
+            assert_eq!(cols.len(), p.cards().count());
+        }
+        // Nothing in the window: no checks, nothing retired, three zeros.
+        let p = pipeline(&ds, NOW + 30 * 86_400, Window::Hour);
+        assert!(p.gates.is_empty() && p.total == 0 && p.retired_note().is_none());
+        assert_eq!(
+            p.outcomes.iter().map(|o| o.1).collect::<Vec<_>>(),
+            [0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn a_tap_samples_its_card_or_line() {
+        let mut ds = prod_mix();
+        for (i, d) in ds.iter_mut().enumerate() {
+            d.at = NOW - i as u64;
+        }
+        let p = pipeline(&ds, NOW, Window::Day);
+        let picks = p.picks();
+        assert_eq!(
+            picks[0],
+            Pick {
+                lane: Lane::NotRunning,
+                outcome: None
+            }
+        );
+        assert_eq!(picks.len(), 7 + 11, "7 cards and their 11 outcome lines");
+        for pk in &picks {
+            let first = sample_pick(&ds, NOW, Window::Day, *pk, 0).unwrap();
+            assert!(pk.holds(first));
+            // Round again after every one.
+            let n = p.count(*pk);
+            assert_eq!(sample_pick(&ds, NOW, Window::Day, *pk, n).unwrap(), first);
+        }
+        let you_ping = Pick {
+            lane: Lane::NeedsYou,
+            outcome: Some(Outcome::Ping),
+        };
+        assert_eq!(you_ping.key(), "needs_you/ping");
+        assert_eq!(you_ping.label(), "Claude: needs you · pinged you");
+        assert_eq!(
+            sample_pick(&ds, NOW, Window::Day, you_ping, 0)
+                .unwrap()
+                .outcome,
+            "ping"
+        );
+        // The retired rule is never sampled, and an empty pick gives nothing.
+        assert!(
+            ds.iter()
+                .filter(|d| d.stage == "not_work_thread")
+                .all(|d| lane(d).is_none())
+        );
+        let none = Pick {
+            lane: Lane::WaitingOnBot,
+            outcome: None,
+        };
+        assert!(sample_pick(&ds, NOW, Window::Day, none, 0).is_none());
+        assert_eq!(p.count(none), 0);
+        assert!(Pick::from_key("needs_you/bogus").is_none() && Pick::from_key("nope").is_none());
     }
 
     #[test]

@@ -21,7 +21,7 @@ use crate::mention;
 use crate::model::Store;
 use crate::needs::{self, Row};
 use crate::readstate::{self, ReadState};
-use crate::routing::{self, Decision, Node, Window};
+use crate::routing::{self, Decision, Lane, Pick, Window};
 use crate::sections::Section;
 use crate::telemetry::Agents;
 use crate::unread::{self, Next};
@@ -49,8 +49,8 @@ pub enum Hit {
     NeedsTab,
     /// A row on tab 0.
     NeedsRow(usize),
-    /// A box on the routing view.
-    RoutingNode(Node),
+    /// A card or outcome line on the routing view.
+    RoutingPick(Pick),
 }
 
 /// A piece of a link on screen, from the last draw.
@@ -273,9 +273,9 @@ pub struct App {
     /// The routing view (`w`): how the watcher routed each stop it judged.
     pub routing_view: bool,
     pub routing_window: Window,
-    /// The box picked (j k ⇥).
-    pub routing_node: Node,
-    /// The sample on show from that box: its nth newest decision.
+    /// The card or outcome line picked (j k ⇥).
+    pub routing_pick: Pick,
+    /// The sample on show from that pick: its nth newest decision.
     pub routing_sample: Option<usize>,
     /// Why for the sample, and the step picked in it.
     pub routing_why: Option<usize>,
@@ -358,7 +358,10 @@ impl App {
             reply_sent: None,
             routing_view: false,
             routing_window: Window::Day,
-            routing_node: Node::Seen,
+            routing_pick: Pick {
+                lane: Lane::NotRunning,
+                outcome: None,
+            },
             routing_sample: None,
             routing_why: None,
         }
@@ -775,12 +778,12 @@ impl App {
     pub fn routing_picked(&self, ds: &[Decision]) -> Option<Decision> {
         let n = self.routing_sample?;
         let now = crate::sync::now();
-        routing::sample(ds, now, self.routing_window, self.routing_node, n).cloned()
+        routing::sample_pick(ds, now, self.routing_window, self.routing_pick, n).cloned()
     }
 
-    fn pick_box(&mut self, n: Node) {
-        self.routing_node = n;
-        // A sample on show follows to the new box, unless it's empty.
+    fn pick_box(&mut self, n: Pick) {
+        self.routing_pick = n;
+        // A sample on show follows to the new pick, unless it's empty.
         if self.routing_sample.is_some() {
             self.routing_sample = Some(0);
             if self.routing_picked(&self.routing_decisions()).is_none() {
@@ -790,14 +793,18 @@ impl App {
         self.routing_why = None;
     }
 
-    /// The box `by` boxes on in drawing order: `wrap` goes round.
+    /// The pick `by` on in drawing order (each card, then its outcome
+    /// lines): `wrap` goes round.
     fn step_box(&mut self, by: isize, wrap: bool) {
         let ds = self.routing_decisions();
-        let nodes = routing::flow(&ds, crate::sync::now(), self.routing_window).nodes();
+        let nodes = routing::pipeline(&ds, crate::sync::now(), self.routing_window).picks();
+        if nodes.is_empty() {
+            return;
+        }
         let n = nodes.len() as isize;
         let at = nodes
             .iter()
-            .position(|x| *x == self.routing_node)
+            .position(|x| *x == self.routing_pick)
             .unwrap_or(0) as isize;
         let to = if wrap {
             (at + by).rem_euclid(n)
@@ -809,12 +816,12 @@ impl App {
 
     fn sample_box(&mut self) {
         let ds = self.routing_decisions();
-        let f = routing::flow(&ds, crate::sync::now(), self.routing_window);
-        if f.count(self.routing_node) == 0 {
+        let p = routing::pipeline(&ds, crate::sync::now(), self.routing_window);
+        if p.count(self.routing_pick) == 0 {
             let w = self.routing_window.label();
             return self.say(format!(
                 "nothing in {} in the last {w}",
-                self.routing_node.label()
+                self.routing_pick.label()
             ));
         }
         self.routing_sample = Some(self.routing_sample.map_or(0, |n| n + 1));
@@ -2248,7 +2255,7 @@ impl App {
                 _ if self.routing_view
                     && !matches!(
                         hit,
-                        Some(Hit::Tab(_) | Hit::NeedsTab | Hit::RoutingNode(_) | Hit::Handle)
+                        Some(Hit::Tab(_) | Hit::NeedsTab | Hit::RoutingPick(_) | Hit::Handle)
                     ) => {}
                 Some(Hit::Tab(i)) => self.switch_tab(i),
                 Some(Hit::NeedsTab) => self.open_needs(),
@@ -2294,10 +2301,10 @@ impl App {
                 Some(Hit::CloseThread) if self.agents_view => self.agents_view = false,
                 Some(Hit::CloseThread) if self.checklist_view => self.checklist_view = false,
                 Some(Hit::ChecklistItem(i)) => self.checklist_cursor = i,
-                Some(Hit::RoutingNode(_)) if self.mode != Mode::Normal => {}
-                Some(Hit::RoutingNode(n)) => {
-                    // Click a box to pick it, again to sample it.
-                    if self.routing_node == n && self.routing_sample.is_none() {
+                Some(Hit::RoutingPick(_)) if self.mode != Mode::Normal => {}
+                Some(Hit::RoutingPick(n)) => {
+                    // Click a card or line to pick it, again to sample it.
+                    if self.routing_pick == n && self.routing_sample.is_none() {
                         self.on_key(KeyEvent::from(KeyCode::Enter));
                     } else {
                         self.pick_box(n);
