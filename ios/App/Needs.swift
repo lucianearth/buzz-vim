@@ -203,10 +203,11 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
             UNNotificationRequest(identifier: r.key, content: content, trigger: nil))
     }
 
-    /// Show them while the app is open too.
+    /// Quiet while the app is open (lucian, 2026-10-21): no banner, no sound;
+    /// it lands in Notification Center, and Needs you and the bell show it.
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        completionHandler([.banner, .sound])
+        completionHandler([.list])
     }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
