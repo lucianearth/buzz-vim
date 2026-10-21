@@ -502,7 +502,9 @@ fn draw_overview(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             " no open requests".into()
         };
-        buf.set_line(body.x, y, &Line::styled(msg, theme::faint()), w);
+        if y < bottom {
+            buf.set_line(body.x, y, &Line::styled(msg, theme::faint()), w);
+        }
         y += 2;
     } else {
         let amber = health_color(Health::Warn);

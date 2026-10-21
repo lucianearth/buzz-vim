@@ -862,6 +862,12 @@ impl Board {
                     .iter()
                     .filter(|n| n.topic == topic)
                     .count();
+                // An open request from any day keeps the tile at least amber.
+                let health = if open > 0 {
+                    health.max(Health::Warn)
+                } else {
+                    health
+                };
                 Tile {
                     topic,
                     health,
@@ -1550,6 +1556,11 @@ mod tests {
             30,
         ));
         assert_eq!(b.open_requests().len(), 1);
+        // A healthy newer day doesn't turn the tile green while a request
+        // from an earlier day is still open.
+        b.apply(&note(&k, "2026-10-22", "build-box", 40, &details(1), &[]));
+        let t = &b.tiles("2026-10-22")[0];
+        assert_eq!((t.open, t.health), (1, Health::Warn));
     }
 
     #[test]
