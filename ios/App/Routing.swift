@@ -12,11 +12,12 @@ func channelPage(_ id: String?) -> String? {
     return id
 }
 
-/// How the watcher routed every stop it judged (`buzz_vim_core::routing`):
-/// stops seen, running, Jev's stream, the Claude check (asks only) and the
-/// outcome, as layered boxes with the bands between them, over 1h / 24h /
-/// 7d. Tap a box for a real decision through it; its Why drills down to
-/// each step's record.
+/// How the watcher routed every stop it judged (`buzz_vim_core::routing`),
+/// as the pipeline lucian approved: one trunk of stops, a coloured strip
+/// per exit stream (width by count) peeling off at the check that settles
+/// it into its card, then what all the stops ended as, over 1h / 24h / 7d.
+/// Tap a card, or one of its outcome lines, for a real decision from it;
+/// its Why drills down to each step's record.
 struct RoutingView: View {
     let client: Client
     /// Opens a `buzz://` link (its channel tab, its thread).
@@ -24,7 +25,8 @@ struct RoutingView: View {
     @Environment(Model.self) private var model
     @Environment(\.theme) private var theme
     @State private var window: RouteWindow = .day
-    /// The box sampled, and which of its decisions (newest first).
+    /// The card or outcome line sampled ("needs_you", "needs_you/ping"),
+    /// and which of its decisions (newest first).
     @State private var picked: String?
     @State private var nth: UInt32 = 0
     @State private var sample: RouteDecision?
@@ -32,9 +34,9 @@ struct RoutingView: View {
 
     var body: some View {
         let _ = model.version
-        let flow = client.routeFlow(window: window)
+        let pipe = client.routePipeline(window: window)
         ZStack {
-            overview(flow)
+            overview(pipe)
                 .opacity(why == nil ? 1 : 0)
                 .allowsHitTesting(why == nil)
             if let d = why {
@@ -47,7 +49,7 @@ struct RoutingView: View {
         .clipped()
         .sheet(isPresented: Binding(get: { sample != nil }, set: { if !$0 { sample = nil; picked = nil } })) {
             if let d = sample {
-                SampleCard(decision: d, box: flow.nodes.first(where: { $0.key == picked })?.label ?? "",
+                SampleCard(decision: d, box: pickLabel(pipe, picked),
                            open: { link in
                                sample = nil
                                picked = nil
@@ -66,30 +68,37 @@ struct RoutingView: View {
         }
     }
 
-    private func overview(_ flow: RouteFlow) -> some View {
-        let seen = flow.nodes.first(where: { $0.layer == 0 })?.count ?? 0
-        return ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+    private func overview(_ pipe: RoutePipeline) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
                 Text("Routing")
                     .font(.heading)
                     .foregroundStyle(theme.bright)
                     .padding(.top, 12)
                 picker
-                if seen == 0 {
+                Text("Each colour is one group of stops. It runs down the band and peels off at the check that settles it, into its card. Width = number of stops. The number on an arrow is how many stops left there; the card says what the watcher did with them. Jev reads the agent's last message; Claude double-checks anything Jev calls a question.")
+                    .font(.small)
+                    .foregroundStyle(theme.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+                OutcomeLegend(items: pipe.outcomes, long: true)
+                if pipe.total == 0 {
                     Text("no routing decisions in the last \(label(window))")
                         .font(.small)
                         .foregroundStyle(theme.muted)
                         .frame(maxWidth: .infinity)
                         .padding(.top, 40)
                 } else {
-                    FlowDiagram(flow: flow, picked: picked, tap: pick)
-                    Text("tap a box for a real decision through it")
+                    PipelineDiagram(pipe: pipe, picked: picked, tap: pick)
+                    Totals(pipe: pipe)
+                }
+                if let note = pipe.retiredNote {
+                    Text(note)
                         .font(.small)
                         .foregroundStyle(theme.faint)
-                        .frame(maxWidth: .infinity)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            .padding(.horizontal, 22)
+            .padding(.horizontal, 16)
             .padding(.bottom, 40)
         }
     }
@@ -126,17 +135,30 @@ struct RoutingView: View {
         }
     }
 
-    private func pick(_ n: RouteNode) {
-        guard n.count > 0 else {
-            model.say("nothing went through \(n.label) in the last \(label(window))")
-            return
+    /// "Claude: needs you", or "Claude: needs you · pinged you" for a line.
+    private func pickLabel(_ pipe: RoutePipeline, _ key: String?) -> String {
+        guard let key else { return "" }
+        for g in pipe.gates {
+            for c in g.cards {
+                if c.key == key { return c.title }
+                if let o = c.outcomes.first(where: { $0.key == key }) { return "\(c.title) · \(o.word)" }
+            }
         }
-        picked = n.key
-        nth = 0
-        sample = client.routeSample(window: window, key: n.key, n: 0)
+        return ""
     }
 
-    /// The next decision through the same box, round again past the oldest.
+    private func pick(_ key: String, _ count: UInt32, _ name: String) {
+        guard count > 0 else {
+            model.say("nothing in \(name) in the last \(label(window))")
+            return
+        }
+        picked = key
+        nth = 0
+        sample = client.routeSample(window: window, key: key, n: 0)
+    }
+
+    /// The next decision from the same card or line, round again past the
+    /// oldest.
     private func another() {
         guard let key = picked else { return }
         nth &+= 1
@@ -148,8 +170,8 @@ struct RoutingView: View {
     }
 }
 
-/// The three ends: no action, a nudge to the driver, a ping to you. A box
-/// (and the band into it) takes the color of where it leads.
+/// The three ends of the Why chain: no action, a nudge to the driver, a ping
+/// to you. A Why step takes the color of where it leads.
 private enum FlowTone {
     case quiet, nudge, ping
 
@@ -174,145 +196,295 @@ private func flowColor(_ key: String, _ theme: Theme) -> Color {
     FlowTone(key).color(theme)
 }
 
-/// Where each box sits, for the bands drawn behind them.
-private struct BoxAnchors: PreferenceKey {
-    static let defaultValue: [String: Anchor<CGRect>] = [:]
-    static func reduce(value: inout [String: Anchor<CGRect>], nextValue: () -> [String: Anchor<CGRect>]) {
-        value.merge(nextValue()) { $1 }
-    }
+/// "#rrggbb" from the core (stream and outcome colours).
+private func hexColor(_ s: String) -> Color {
+    let v = UInt32(s.dropFirst(s.hasPrefix("#") ? 1 : 0), radix: 16) ?? 0x9AA3AD
+    return Color(.sRGB, red: Double(v >> 16 & 0xFF) / 255, green: Double(v >> 8 & 0xFF) / 255,
+                 blue: Double(v & 0xFF) / 255, opacity: 1)
 }
 
-/// The layered boxes, top to bottom, with a band for every pair of boxes
-/// decisions went between, as wide as the share that went. The left lane
-/// stays clear for the no-ops falling straight to "no action".
-private struct FlowDiagram: View {
-    let flow: RouteFlow
-    let picked: String?
-    let tap: (RouteNode) -> Void
+/// Dot + glyph + word for each outcome: under the intro (`long`, no
+/// counts) and under the totals bar (with counts).
+private struct OutcomeLegend: View {
+    let items: [RouteOutcome]
+    let long: Bool
     @Environment(\.theme) private var theme
-    @State private var width: CGFloat = 0
-
-    /// Each layer's left inset, as a share of the width.
-    private let insets: [CGFloat] = [0, 0.26, 0.26, 0.5, 0]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 34) {
-            ForEach(0..<flow.layers.count, id: \.self) { i in
-                let nodes = flow.nodes.filter { $0.layer == UInt32(i) }
-                HStack(alignment: .top, spacing: 6) {
-                    ForEach(nodes, id: \.key) { n in
-                        box(n, wide: nodes.count == 1)
+        HStack(spacing: 12) {
+            ForEach(items, id: \.outcome) { o in
+                HStack(spacing: 5) {
+                    Circle().fill(hexColor(o.color)).frame(width: 8, height: 8)
+                    if long {
+                        Text("\(o.glyph) \(o.outcome == "nudge" ? "nudged the agent" : o.word)")
+                            .foregroundStyle(theme.muted)
+                    } else {
+                        Text(o.glyph).foregroundStyle(theme.text)
+                        Text("\(o.count)").font(.textBold).foregroundStyle(theme.bright)
+                        Text(o.word).foregroundStyle(theme.muted)
                     }
                 }
-                .padding(.leading, width * (i < insets.count ? insets[i] : 0))
+                .lineLimit(1)
+                if !long && o.outcome != items.last?.outcome { Spacer(minLength: 0) }
             }
         }
-        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
-        .backgroundPreferenceValue(BoxAnchors.self) { anchors in
+        .font(.small)
+        .minimumScaleFactor(0.8)
+    }
+}
+
+/// "All N stops ended as": one bar in the three outcome colours, then the
+/// counts.
+private struct Totals: View {
+    let pipe: RoutePipeline
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        let total = CGFloat(max(pipe.total, 1))
+        let shown = pipe.outcomes.filter { $0.count > 0 }
+        VStack(alignment: .leading, spacing: 8) {
+            Text("All \(pipe.total) stops ended as")
+                .font(.name)
+                .foregroundStyle(theme.bright)
             GeometryReader { geo in
-                let rects = anchors.mapValues { geo[$0] }
-                Canvas { ctx, _ in draw(ctx, rects) }
-            }
-        }
-        .padding(.top, 4)
-    }
-
-    private func box(_ n: RouteNode, wide: Bool) -> some View {
-        let color = flowColor(n.key, theme)
-        let end = n.layer == 4
-        let on = n.key == picked
-        return Button { tap(n) } label: {
-            Group {
-                if wide {
-                    HStack {
-                        Text(n.label).font(.label).foregroundStyle(theme.bright)
-                        Spacer()
-                        Text("\(n.count)").font(.textBold).foregroundStyle(theme.bright)
+                let room = geo.size.width - CGFloat(max(shown.count - 1, 0)) * 2
+                HStack(spacing: 2) {
+                    ForEach(shown, id: \.outcome) { o in
+                        Rectangle()
+                            .fill(hexColor(o.color))
+                            .frame(width: max(2, room * CGFloat(o.count) / total))
                     }
-                    .padding(.horizontal, 14)
-                } else {
-                    VStack(spacing: 2) {
-                        Text(n.label)
-                            .font(end ? .chipOn : .tiny)
-                            .foregroundStyle(end ? theme.bright : theme.text)
-                            .multilineTextAlignment(.center)
-                            .lineLimit(2)
-                            .minimumScaleFactor(0.8)
-                        Text("\(n.count)")
-                            .font(end ? .heading : .textBold)
-                            .foregroundStyle(end ? theme.bright : (n.count > 0 ? color : theme.faint))
-                    }
-                    .padding(.horizontal, 4)
                 }
             }
-            .frame(maxWidth: .infinity, minHeight: end ? 64 : 48)
-            .background(end ? color.opacity(0.22) : theme.card, in: RoundedRectangle(cornerRadius: 10))
-            .background(theme.canvas, in: RoundedRectangle(cornerRadius: 10))
-            .overlay(
-                RoundedRectangle(cornerRadius: 10)
-                    .stroke(on ? color : (end ? color.opacity(0.6) : theme.rule), lineWidth: on ? 2 : 1)
-            )
-            .contentShape(Rectangle())
+            .frame(height: 12)
+            .clipShape(RoundedRectangle(cornerRadius: 4))
+            OutcomeLegend(items: pipe.outcomes, long: false)
         }
-        .buttonStyle(.plain)
-        .anchorPreference(key: BoxAnchors.self, value: .bounds) { [n.key: $0] }
+        .padding(.top, 8)
     }
+}
 
-    /// Each band leaves its box's bottom and enters the next one's top,
-    /// as straight as it can (over the box at its other end), side by side
-    /// in the order of where they go (or come from), kept inside the box.
-    private func draw(_ ctx: GraphicsContext, _ rects: [String: CGRect]) {
-        let total = CGFloat(max(flow.nodes.first(where: { $0.layer == 0 })?.count ?? 1, 1))
-        let widest: CGFloat = 46
-        let edges = flow.edges.filter { rects[$0.from] != nil && rects[$0.to] != nil && $0.count > 0 }
-        let thick = { (e: RouteEdge) in max(2, widest * CGFloat(e.count) / total) }
-        var outX: [Int: CGFloat] = [:]
-        var inX: [Int: CGFloat] = [:]
-        // true: the bands leaving each box; false: those entering it.
-        for side in [true, false] {
-            let groups = Dictionary(grouping: edges.indices) { side ? edges[$0].from : edges[$0].to }
-            for (node, idx) in groups {
-                guard let r = rects[node] else { continue }
-                let other = { (i: Int) in rects[side ? edges[i].to : edges[i].from]?.midX ?? 0 }
-                let sorted = idx.sorted { other($0) < other($1) }
-                var xs: [CGFloat] = []
-                var end = r.minX
-                for i in sorted {
-                    let w = thick(edges[i])
-                    let want = min(max(other(i) - w / 2, r.minX), r.maxX - w)
-                    xs.append(max(want, end))
-                    end = xs[xs.count - 1] + w
-                }
-                // Past the right edge: the whole group slides back in.
-                let over = max(0, min(end - r.maxX, (xs.first ?? r.minX) - r.minX))
-                for (k, i) in sorted.enumerated() {
-                    if side { outX[i] = xs[k] - over } else { inX[i] = xs[k] - over }
+/// The trunk and its cards, top to bottom. Every row draws the strips still
+/// running down at a fixed x (`Strips`), so they line up from row to row;
+/// a card's row also draws its own strip turning right into it.
+private struct PipelineDiagram: View {
+    let pipe: RoutePipeline
+    let picked: String?
+    let tap: (String, UInt32, String) -> Void
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        let s = Strips(pipe: pipe)
+        VStack(alignment: .leading, spacing: 0) {
+            // stops seen
+            HStack(spacing: 10) {
+                Text("\(pipe.total)")
+                    .font(.heading)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 10)
+                    .frame(minWidth: s.trunkWidth, minHeight: 44, alignment: .leading)
+                    .background(hexColor("#4a5568"), in: RoundedRectangle(cornerRadius: 6))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("stops seen").font(.textBold).foregroundStyle(theme.bright)
+                    Text("each time an agent went quiet").font(.tiny).foregroundStyle(theme.muted)
                 }
             }
-        }
-        for i in edges.indices {
-            let e = edges[i]
-            guard let a = rects[e.from], let b = rects[e.to], let x0 = outX[i], let x1 = inX[i] else { continue }
-            let w = thick(e)
-            let (y0, y1) = (a.maxY, b.minY)
-            let mid = (y0 + y1) / 2
-            var p = Path()
-            p.move(to: CGPoint(x: x0, y: y0))
-            p.addCurve(to: CGPoint(x: x1, y: y1), control1: CGPoint(x: x0, y: mid), control2: CGPoint(x: x1, y: mid))
-            p.addLine(to: CGPoint(x: x1 + w, y: y1))
-            p.addCurve(to: CGPoint(x: x0 + w, y: y0), control1: CGPoint(x: x1 + w, y: mid),
-                       control2: CGPoint(x: x0 + w, y: mid))
-            p.closeSubpath()
-            ctx.fill(p, with: .color(flowColor(e.to, theme).opacity(0.45)))
+            ForEach(Array(pipe.gates.enumerated()), id: \.offset) { gi, g in
+                // The check: a quiet caption beside the trunk.
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(g.caption).font(.small).foregroundStyle(theme.muted)
+                    if let z = g.zeros {
+                        Text(z).font(.tiny).foregroundStyle(theme.faint)
+                    }
+                }
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.vertical, 8)
+                .padding(.leading, s.trunkWidth + 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(alignment: .leading) { s.trunk(from: s.start(ofGate: gi)) }
+                ForEach(g.cards, id: \.key) { c in
+                    let i = s.index(of: c.key)
+                    CardView(card: c, picked: picked, tap: tap)
+                        .padding(.leading, s.cardX)
+                        .padding(.vertical, 6)
+                        .frame(minHeight: s.bandTop + s.width(i) + 22, alignment: .top)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(alignment: .leading) { s.peel(i, card: c) }
+                }
+            }
         }
     }
 }
 
-/// A sampled decision through a box: where and what the watcher stopped
+/// Where each stream's strip sits on the trunk. The stream that leaves
+/// first is on the right, nearest the cards, so every strip peels right
+/// without crossing one still running down.
+private struct Strips {
+    let cards: [RouteCard]
+    let lefts: [CGFloat]
+    let widths: [CGFloat]
+    let trunkWidth: CGFloat
+    /// Cards before each gate (one more entry for past the last).
+    let gateStarts: [Int]
+    /// Where the cards start.
+    var cardX: CGFloat { trunkWidth + 40 }
+    /// How far down a card's row its strip turns right.
+    let bandTop: CGFloat = 22
+    private static let gap: CGFloat = 1.5
+
+    init(pipe: RoutePipeline) {
+        cards = pipe.gates.flatMap { $0.cards }
+        var starts = [0]
+        for g in pipe.gates { starts.append(starts[starts.count - 1] + g.cards.count) }
+        gateStarts = starts
+        let total = CGFloat(max(pipe.total, 1))
+        // About 90 points of trunk for the stops, at least 3 per strip.
+        let k = min(0.8, 90 / total)
+        widths = cards.map { max(3, CGFloat($0.count) * k) }
+        var x: CGFloat = 0
+        var ls = Array(repeating: CGFloat(0), count: cards.count)
+        for i in cards.indices.reversed() {
+            ls[i] = x
+            x += widths[i] + Strips.gap
+        }
+        lefts = ls
+        trunkWidth = max(x - Strips.gap, 0)
+    }
+
+    func index(of key: String) -> Int {
+        cards.firstIndex(where: { $0.key == key }) ?? cards.count
+    }
+
+    /// The first card at or after gate `g`: the strips still running there.
+    func start(ofGate g: Int) -> Int {
+        gateStarts[min(g, gateStarts.count - 1)]
+    }
+
+    func width(_ i: Int) -> CGFloat { i < widths.count ? widths[i] : 0 }
+
+    /// The strips from card `from` on, straight down the whole row.
+    func trunk(from: Int) -> some View {
+        Canvas { ctx, size in
+            for i in cards.indices where i >= from {
+                ctx.fill(Path(CGRect(x: lefts[i], y: 0, width: widths[i], height: size.height)),
+                         with: .color(hexColor(cards[i].color)))
+            }
+        }
+        .frame(width: cardX)
+    }
+
+    /// Card `i`'s row: the strips still running past it, and its own strip
+    /// coming down, turning right and ending in an arrow at the card with
+    /// the count on it.
+    func peel(_ i: Int, card: RouteCard) -> some View {
+        let color = hexColor(card.color)
+        let ink = hexColor(card.ink)
+        let (l, h) = (lefts[i], widths[i])
+        let r = l + h
+        let yc = bandTop
+        let xe = cardX
+        return ZStack(alignment: .topLeading) {
+            trunk(from: i + 1)
+            Canvas { ctx, _ in
+                let r1: CGFloat = 6
+                let r2 = r1 + h
+                var p = Path()
+                p.move(to: CGPoint(x: l, y: 0))
+                p.addLine(to: CGPoint(x: r, y: 0))
+                p.addLine(to: CGPoint(x: r, y: yc - r1))
+                p.addQuadCurve(to: CGPoint(x: r + r1, y: yc), control: CGPoint(x: r, y: yc))
+                p.addLine(to: CGPoint(x: xe - 6, y: yc))
+                p.addLine(to: CGPoint(x: xe - 6, y: yc + h))
+                p.addLine(to: CGPoint(x: l + r2, y: yc + h))
+                p.addQuadCurve(to: CGPoint(x: l, y: yc + h - r2), control: CGPoint(x: l, y: yc + h))
+                p.closeSubpath()
+                ctx.fill(p, with: .color(color))
+                let mid = yc + h / 2
+                var a = Path()
+                a.move(to: CGPoint(x: xe - 8, y: mid - 6))
+                a.addLine(to: CGPoint(x: xe - 1, y: mid))
+                a.addLine(to: CGPoint(x: xe - 8, y: mid + 6))
+                a.closeSubpath()
+                ctx.fill(a, with: .color(color))
+            }
+            .frame(width: cardX)
+            // The count: inside a wide band, white; above a thin one, in
+            // the stream's colour darkened for contrast.
+            Text("\(card.count) →")
+                .font(.textBold)
+                .foregroundStyle(h >= 20 ? Color.white : ink)
+                .frame(width: xe - 12, alignment: .trailing)
+                .offset(y: h >= 20 ? yc + h / 2 - 10 : yc - 20)
+        }
+        .frame(width: cardX, alignment: .topLeading)
+    }
+}
+
+/// One stream's card: title, plain line, then its outcome lines (coloured
+/// dot, glyph, word, count, sub-lines). Tap the card or a line to sample.
+private struct CardView: View {
+    let card: RouteCard
+    let picked: String?
+    let tap: (String, UInt32, String) -> Void
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        let color = hexColor(card.color)
+        let on = picked == card.key
+        VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(card.title).font(.name).foregroundStyle(theme.bright)
+                Text(card.why).font(.tiny).foregroundStyle(theme.muted)
+            }
+            ForEach(card.outcomes, id: \.key) { o in
+                Button { tap(o.key, o.count, "\(card.title) · \(o.word)") } label: {
+                    outcomeLine(o)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(.leading, 18)
+        .padding(.trailing, 10)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(theme.card, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(alignment: .leading) {
+            Rectangle().fill(color).frame(width: 5).padding(.vertical, 8)
+        }
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(color, lineWidth: on ? 3 : 1.5))
+        .contentShape(Rectangle())
+        .onTapGesture { tap(card.key, card.count, card.title) }
+    }
+
+    private func outcomeLine(_ o: RouteOutcome) -> some View {
+        let on = picked == o.key
+        return HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Circle().fill(hexColor(o.color)).frame(width: 8, height: 8)
+            Text(o.glyph).font(.small).foregroundStyle(theme.text).frame(minWidth: 16)
+            VStack(alignment: .leading, spacing: 1) {
+                (Text("\(o.word) ") + Text("\(o.count)").bold())
+                    .font(.small)
+                    .foregroundStyle(theme.bright)
+                ForEach(o.notes, id: \.self) { n in
+                    Text(n).font(.tiny).foregroundStyle(theme.muted)
+                }
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 2)
+        .padding(.horizontal, 4)
+        .background(on ? hexColor(o.color).opacity(0.18) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
+        .contentShape(Rectangle())
+    }
+}
+
+/// A sampled decision from a card or outcome line: where and what the watcher stopped
 /// on, how it routed, what it posted.
 private struct SampleCard: View {
     let decision: RouteDecision
-    /// The box it was sampled from.
+    /// The card (or line) it was sampled from.
     let box: String
     let open: (String) -> Void
     let another: () -> Void
