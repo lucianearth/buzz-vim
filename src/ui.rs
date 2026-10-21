@@ -1778,41 +1778,6 @@ fn draw_needs(f: &mut Frame, app: &mut App, area: Rect) {
 
 // ---------- routing ----------
 
-/// Chips flowed into lines `width` wide, each line after the first
-/// indented: (lines, (row, column, width, node) of every chip with one).
-type Chip = (String, Style, Option<crate::routing::Node>);
-type Placed = (u16, u16, u16, crate::routing::Node);
-
-fn flow_chips(
-    lead: Span<'static>,
-    chips: Vec<Chip>,
-    sep: &str,
-    width: usize,
-) -> (Vec<Line<'static>>, Vec<Placed>) {
-    let indent = lead.width();
-    let (mut lines, mut placed) = (vec![], vec![]);
-    let mut cur = vec![lead];
-    let mut col = indent;
-    for (i, (text, style, node)) in chips.into_iter().enumerate() {
-        let gap = if i == 0 || col == indent { "" } else { sep };
-        if col + gap.width() + text.width() > width && col > indent {
-            lines.push(Line::from(std::mem::take(&mut cur)));
-            cur.push(Span::raw(" ".repeat(indent)));
-            col = indent;
-        } else if !gap.is_empty() {
-            cur.push(Span::styled(gap.to_string(), theme::faint()));
-            col += gap.width();
-        }
-        if let Some(n) = node {
-            placed.push((lines.len() as u16, col as u16, text.width() as u16, n));
-        }
-        col += text.width();
-        cur.push(Span::styled(text, style));
-    }
-    lines.push(Line::from(cur));
-    (lines, placed)
-}
-
 fn channel_name(app: &App, channel: &str) -> String {
     app.store
         .channels
@@ -1831,25 +1796,57 @@ fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
-/// The routing view (`w`): the watcher's five layers with a count in every
-/// box and on every band between them, over a 1h / 24h / 7d window. Enter
-/// on a box samples a real decision from it; Enter again is its Why.
+/// Word-wrap plain text at `w` columns (a word longer than that gets its
+/// own row).
+fn wrap_words(s: &str, w: usize) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    let mut cur = String::new();
+    for word in s.split_whitespace() {
+        if !cur.is_empty() && cur.width() + 1 + word.width() > w {
+            out.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() || out.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Columns per strip on the trunk: width follows the count, at least one
+/// each, about `room` in all.
+fn strip_widths(counts: &[usize], room: usize) -> Vec<usize> {
+    let total: usize = counts.iter().sum::<usize>().max(1);
+    counts
+        .iter()
+        .map(|c| ((c * room + total / 2) / total).max(1))
+        .collect()
+}
+
+/// The routing view (`w`): the approved pipeline in text. One coloured
+/// strip per exit stream runs down the trunk and peels right at its check
+/// into its card; the checks are quiet captions with the remainder folded
+/// in; the totals bar closes it. Enter on a card or an outcome line
+/// samples a real decision from it; Enter again is its Why.
 fn draw_routing(f: &mut Frame, app: &mut App, area: Rect) {
-    use crate::routing::{self, Node, Window};
+    use crate::routing::{self, Lane, Node, Outcome, Pick, Window};
     let now = crate::sync::now();
     let ds = app.routing_decisions();
     let picked = app.routing_picked(&ds);
     if let (Some(_), Some(d)) = (app.routing_why, &picked) {
         return draw_why(f, app, area, d);
     }
-    // The sample aged out of the window (or its box emptied): back to the
+    // The sample aged out of the window (or its card emptied): back to the
     // diagram, so the keys act on what's drawn.
     if picked.is_none() {
         app.routing_sample = None;
         app.routing_why = None;
     }
     let win = app.routing_window;
-    let flow = routing::flow(&ds, now, win);
+    let p = routing::pipeline(&ds, now, win);
     let [title, rule, body] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -1866,13 +1863,13 @@ fn draw_routing(f: &mut Frame, app: &mut App, area: Rect) {
         t.push(Span::styled(format!(" {} ", w.label()), st));
     }
     t.push(Span::styled(
-        format!("   {} stops in {}", flow.count(Node::Seen), win.label()),
+        format!("   {} in {}", routing::stops(p.total), win.label()),
         theme::muted(),
     ));
     let keys = if app.routing_sample.is_some() {
         "    ⏎ why  s another  o open thread  t window  esc back"
     } else {
-        "    t window  j k ⇥ box  ⏎ sample  esc back"
+        "    t window  j k ⇥ card  ⏎ sample  esc back"
     };
     t.push(Span::styled(keys, theme::faint()));
     f.render_widget(Paragraph::new(Line::from(t)), title);
@@ -1891,86 +1888,259 @@ fn draw_routing(f: &mut Frame, app: &mut App, area: Rect) {
         );
         return;
     }
-    if !flow.nodes().contains(&app.routing_node) {
-        app.routing_node = Node::Seen;
+    let picks = p.picks();
+    if !picks.contains(&app.routing_pick) {
+        app.routing_pick = picks.first().copied().unwrap_or(Pick {
+            lane: Lane::NotRunning,
+            outcome: None,
+        });
     }
     let width = body.width as usize;
-    let mut lines: Vec<Line> = vec![Line::raw("")];
-    let mut hits = vec![];
-    for (i, layer) in flow.layers.iter().enumerate() {
-        let lead = Span::styled(format!("  {:<14}", layer.name), theme::muted());
-        let chips = layer
-            .nodes
-            .iter()
-            .map(|(n, c)| {
-                let st = if *n == app.routing_node {
-                    theme::tab_active()
-                } else if *c == 0 {
-                    theme::faint()
-                } else {
-                    theme::bright()
-                };
-                // Marked as well as lit, so it reads in plain text too.
-                let (l, r) = if *n == app.routing_node {
-                    ("▶", "◀")
-                } else {
-                    ("[", "]")
-                };
-                (format!("{l} {} {c} {r}", n.label()), st, Some(*n))
-            })
-            .collect();
-        let (ls, placed) = flow_chips(lead, chips, " ", width);
-        let top = lines.len() as u16;
-        hits.extend(placed.into_iter().map(|(r, c, w, n)| (top + r, c, w, n)));
-        lines.extend(ls);
-        if i + 1 == flow.layers.len() {
-            break;
-        }
-        // The bands out of this layer: one box goes on, the rest skip
-        // straight to their outcome.
-        let one = layer.nodes.len() == 1;
-        let bands: Vec<Chip> = flow
-            .edges
-            .iter()
-            .filter(|e| e.from.layer() == i)
-            .map(|e| {
-                let arrow = if e.to.layer() == i + 1 { "↓" } else { "↘" };
-                let text = if one {
-                    format!("{arrow} {} {}", e.to.label(), e.count)
-                } else {
-                    format!("{} {arrow} {} {}", e.from.label(), e.to.label(), e.count)
-                };
-                (text, theme::muted(), None)
-            })
-            .collect();
-        let lead = Span::styled(format!("  {:<14}", ""), theme::faint());
-        let bands = if bands.is_empty() {
-            vec![("↓ 0".to_string(), theme::faint(), None)]
-        } else {
-            bands
-        };
-        lines.extend(flow_chips(lead, bands, " · ", width).0);
+
+    // The trunk: the last stream to leave sits on the left, so every strip
+    // peels right without crossing one still running down.
+    let cards: Vec<&routing::Card> = p.cards().collect();
+    let widths = strip_widths(
+        &cards.iter().map(|c| c.count).collect::<Vec<_>>(),
+        (width / 8).clamp(7, 16),
+    );
+    // Column where each card's strip starts, right to left in exit order.
+    let trunk_w: usize = widths.iter().sum();
+    let mut starts = vec![0; cards.len()];
+    let mut x = 2 + trunk_w;
+    for (i, w) in widths.iter().enumerate() {
+        x -= w;
+        starts[i] = x;
     }
-    // A sample keeps its rows on a short screen; the diagram clips first.
+    let card_x = 2 + trunk_w + 9;
+    let strip = |i: usize| theme::hex(cards[i].color, None);
+    // The trunk on one row: the strips still running from `from` on.
+    let trunk = |from: usize| -> Vec<Span<'static>> {
+        let mut v = vec![Span::raw("  ")];
+        for i in (0..cards.len()).rev() {
+            let s = if i >= from { "┃" } else { " " };
+            v.push(Span::styled(s.repeat(widths[i]), strip(i)));
+        }
+        v
+    };
+    // A row: the trunk, then `rest` from the card column (or right after
+    // the trunk when `at_card` is false).
+    let row = |from: usize, at_card: bool, rest: Vec<Span<'static>>| -> Line<'static> {
+        let mut v = trunk(from);
+        v.push(Span::raw(" ".repeat(if at_card {
+            card_x - 2 - trunk_w
+        } else {
+            2
+        })));
+        v.extend(rest);
+        Line::from(v)
+    };
+
+    let mut lines: Vec<Line> = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(
+                format!("  {} ", p.total),
+                theme::bright().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if p.total == 1 {
+                    "stop seen"
+                } else {
+                    "stops seen"
+                },
+                theme::bright(),
+            ),
+            Span::styled(" · each time an agent went quiet", theme::faint()),
+        ]),
+    ];
+    let mut hits: Vec<(u16, u16, u16, Pick)> = vec![];
+    let mut sel_row = 0u16;
+    let mut i = 0;
+    for (k, g) in p.gates.iter().enumerate() {
+        if k == 0 {
+            lines.push(row(i, false, vec![]));
+        }
+        lines.push(row(
+            i,
+            false,
+            vec![Span::styled(g.caption.clone(), theme::muted())],
+        ));
+        if let Some(z) = &g.zeros {
+            lines.push(row(i, false, vec![Span::styled(z.clone(), theme::faint())]));
+        }
+        for c in &g.cards {
+            let col = theme::hex(c.color, None);
+            let ink = theme::hex(c.color, Some(&c.ink));
+            let pick = Pick {
+                lane: c.lane,
+                outcome: None,
+            };
+            let on = app.routing_pick == pick;
+            // The peel: this strip turns right into its card.
+            let mut v = vec![Span::raw("  ")];
+            for j in (0..cards.len()).rev() {
+                let s = if j > i {
+                    "┃".repeat(widths[j])
+                } else if j == i {
+                    format!("┗{}", "━".repeat(widths[j] - 1))
+                } else {
+                    "━".repeat(widths[j])
+                };
+                v.push(Span::styled(s, if j > i { strip(j) } else { col }));
+            }
+            let n = format!(" {} → ", c.count);
+            let lead = card_x - 2 - trunk_w;
+            v.push(Span::styled(
+                "━".repeat(lead.saturating_sub(n.width())),
+                col,
+            ));
+            v.push(Span::styled(
+                n,
+                Style::new().fg(ink).add_modifier(Modifier::BOLD),
+            ));
+            let mark = if on { "▶ " } else { "" };
+            let tstyle = if on {
+                theme::tab_active()
+            } else {
+                theme::bright().add_modifier(Modifier::BOLD)
+            };
+            v.push(Span::styled("▌", col));
+            v.push(Span::styled(format!("{mark}{}", c.lane.title()), tstyle));
+            if on {
+                sel_row = lines.len() as u16;
+            }
+            hits.push((
+                lines.len() as u16,
+                card_x as u16,
+                (c.lane.title().width() + mark.width() + 1) as u16,
+                pick,
+            ));
+            lines.push(Line::from(v));
+            let bar = || Span::styled("▌", col);
+            lines.push(row(
+                i + 1,
+                true,
+                vec![
+                    bar(),
+                    Span::styled(c.lane.why().to_string(), theme::faint()),
+                ],
+            ));
+            for l in &c.lines {
+                let pick = Pick {
+                    lane: c.lane,
+                    outcome: Some(l.outcome),
+                };
+                let on = app.routing_pick == pick;
+                let text = format!("{} {} {}", l.outcome.glyph(), l.outcome.word(), l.count);
+                if on {
+                    sel_row = lines.len() as u16;
+                }
+                hits.push((
+                    lines.len() as u16,
+                    card_x as u16,
+                    (text.width() + 3 + if on { 2 } else { 0 }) as u16,
+                    pick,
+                ));
+                lines.push(row(
+                    i + 1,
+                    true,
+                    vec![
+                        bar(),
+                        Span::styled(if on { "▶ " } else { "" }, theme::tab_active()),
+                        Span::styled("● ", theme::hex(l.outcome.color(), None)),
+                        Span::styled(
+                            text,
+                            if on {
+                                theme::tab_active()
+                            } else {
+                                theme::text()
+                            },
+                        ),
+                    ],
+                ));
+                for note in &l.notes {
+                    let room = width.saturating_sub(card_x + 5).max(10);
+                    for part in wrap_words(note, room) {
+                        lines.push(row(
+                            i + 1,
+                            true,
+                            vec![bar(), Span::styled(format!("    {part}"), theme::muted())],
+                        ));
+                    }
+                }
+            }
+            lines.push(row(i + 1, false, vec![]));
+            i += 1;
+        }
+    }
+    // The totals: one bar in the three outcome colours, then the counts.
+    let total = p.total.max(1);
+    let bar_w = width.saturating_sub(4).min(60);
+    lines.push(Line::from(Span::styled(
+        format!("  All {} ended as", routing::stops(p.total)),
+        theme::bright().add_modifier(Modifier::BOLD),
+    )));
+    let mut bar = vec![Span::raw("  ")];
+    let mut used = 0;
+    let shown: Vec<&(Outcome, usize)> = p.outcomes.iter().filter(|o| o.1 > 0).collect();
+    for (k, (o, n)) in shown.iter().enumerate() {
+        let w = if k + 1 == shown.len() {
+            bar_w - used
+        } else {
+            ((n * bar_w + total / 2) / total).max(1).min(bar_w - used)
+        };
+        used += w;
+        bar.push(Span::styled("━".repeat(w), theme::hex(o.color(), None)));
+    }
+    if shown.is_empty() {
+        bar.push(Span::styled("━".repeat(bar_w), theme::faint()));
+    }
+    lines.push(Line::from(bar));
+    let mut legend = vec![Span::raw("  ")];
+    for (o, n) in &p.outcomes {
+        legend.push(Span::styled("● ", theme::hex(o.color(), None)));
+        legend.push(Span::styled(format!("{} ", o.glyph()), theme::text()));
+        legend.push(Span::styled(
+            format!("{n} "),
+            theme::bright().add_modifier(Modifier::BOLD),
+        ));
+        legend.push(Span::styled(
+            format!("{}   ", o.total_word()),
+            theme::muted(),
+        ));
+    }
+    lines.push(Line::from(legend));
+    if let Some(note) = p.retired_note() {
+        lines.push(Line::styled(format!("  {note}"), theme::faint()));
+    }
+
+    // A sample keeps its rows on a short screen; the diagram scrolls to
+    // keep the pick in view.
     let room = if picked.is_some() {
         body.height.saturating_sub(10)
     } else {
         body.height
     };
     let diagram_h = (lines.len() as u16 + 1).min(room);
-    for (row, col, w, n) in hits.into_iter().filter(|h| h.0 < diagram_h) {
+    let scroll = (sel_row + 4).saturating_sub(diagram_h);
+    let scroll = scroll.min((lines.len() as u16 + 1).saturating_sub(diagram_h));
+    for (r, col, w, n) in hits
+        .into_iter()
+        .filter(|h| h.0 >= scroll && h.0 - scroll < diagram_h)
+    {
         app.hits.push((
             Rect {
                 x: body.x + col,
-                y: body.y + row,
+                y: body.y + r - scroll,
                 width: w.min(body.width.saturating_sub(col)),
                 height: 1,
             },
-            Hit::RoutingNode(n),
+            Hit::RoutingPick(n),
         ));
     }
     f.render_widget(
-        Paragraph::new(lines),
+        Paragraph::new(lines).scroll((scroll, 0)),
         Rect {
             height: diagram_h,
             ..body
@@ -1985,12 +2155,12 @@ fn draw_routing(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
     // The sample: where and who, the message, its route and result.
-    let total = flow.count(app.routing_node).max(1);
+    let total = p.count(app.routing_pick).max(1);
     let n = app.routing_sample.unwrap_or(0) % total + 1;
     let w = width.saturating_sub(4);
     let head = format!(
         "─ sample {n} of {total} · {} · {} ",
-        app.routing_node.label(),
+        app.routing_pick.label(),
         win.label()
     );
     let mut s: Vec<Line> = vec![Line::styled(
@@ -3949,6 +4119,19 @@ mod tests {
                 "list ideating",
             ));
         }
+        // The retired other-thread rule: in no count, only the footer.
+        for i in 0..2 {
+            l1.push(d(
+                now - 2500 - i * 60,
+                "",
+                "not_work_thread",
+                None,
+                None,
+                "none",
+                &[],
+                "not the work thread of a running channel; no action",
+            ));
+        }
         for i in 0..4 {
             l2.push(d(
                 now - 7200 - i * 900,
@@ -4072,59 +4255,117 @@ mod tests {
         app
     }
 
-    /// `w`: the five layers with box and band counts; t steps the window;
-    /// ⏎ samples the picked box, s samples another, ⏎ again is its Why with
-    /// each step's record; esc walks back out.
+    /// `w`: the pipeline: strips peeling into cards with their outcome
+    /// lines, quiet checks with the remainder folded in, the totals; t
+    /// steps the window; ⏎ samples the picked card or line, s samples
+    /// another, ⏎ again is its Why with each step's record; esc walks back
+    /// out.
     #[test]
     fn the_routing_view_samples_and_explains() {
         let mut app = routing_fixture();
         let key = |app: &mut App, c: KeyCode| app.on_term(crossterm::event::Event::Key(c.into()));
         key(&mut app, KeyCode::Char('w'));
         assert!(app.routing_view);
-        let s = screen_text(&mut app, 120, 40);
+        let s = screen_text(&mut app, 120, 60);
         for want in [
             " 24h ",
             "31 stops in 24h",
-            "▶ stops seen 31 ◀",
-            "↓ running 13",
-            "↘ no action 18",
-            "[ running 13 ]",
-            "[ keeps going 5 ]",
-            "[ waiting on a bot 1 ]",
-            "[ finished 1 ]",
-            "[ asks something 2 ]",
-            "asks something ↓ needs you 1",
-            "[ agent decides 1 ]",
-            "[ needs you 1 ]",
-            "[ not a question 0 ]",
-            "needs you ↓ ping you 1",
-            "[ no action 23 ]",
-            "[ nudge the driver 7 ]",
-            "[ ping you 1 ]",
+            "31 stops seen",
+            "  Is the list running?",
+            "┗━━━━━━━━━━ 18 → ▌▶ List not running",
+            "▌nobody said go; the watcher stays out",
+            "▌● — no action 18",
+            "13 running. Settled before Jev?",
+            " 4 → ▌Settled before Jev",
+            "▌the watcher acted without asking Jev",
+            "▌    a turn started while judging",
+            "9 sent to Jev. Jev: what kind of stop?",
+            "other 0 (not drawn)",
+            " 5 → ▌Jev: keeps going",
+            "▌● ↻ nudged agent 5",
+            "▌    told to carry on with the list",
+            " 1 → ▌Jev: finished",
+            " 1 → ▌Jev: waiting on a bot",
+            "2 asks something. Claude: who should answer?",
+            " 1 → ▌Claude: agent decides",
+            "▌    told to decide it and carry on",
+            "┗━━━━━━━━━━━━━━━━━━━ 1 → ▌Claude: needs you",
+            "pinged you 1",
+            "All 31 stops ended as",
+            "● — 23 no action",
+            "● ↻ 7 nudged",
         ] {
             assert!(s.contains(want), "{want}\n{s}");
         }
-        assert!(!s.contains("other"), "{s}");
+        // Zero streams are not drawn; the retired rule's stops are only
+        // the footer's.
+        assert!(!s.contains("not a question"), "{s}");
+        assert!(
+            s.contains("Not counted: 2 decisions from a retired rule"),
+            "{s}"
+        );
+        // A click picks a card's outcome line, a second click samples it.
+        let hit = app
+            .hits
+            .iter()
+            .find(|(_, h)| {
+                *h == Hit::RoutingPick(crate::routing::Pick {
+                    lane: crate::routing::Lane::KeepsGoing,
+                    outcome: Some(crate::routing::Outcome::Nudge),
+                })
+            })
+            .map(|(r, _)| *r)
+            .unwrap();
+        let click = |app: &mut App| {
+            app.on_term(crossterm::event::Event::Mouse(
+                crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Down(
+                        crossterm::event::MouseButton::Left,
+                    ),
+                    column: hit.x + 1,
+                    row: hit.y,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                },
+            ))
+        };
+        click(&mut app);
+        assert_eq!(app.routing_pick.label(), "Jev: keeps going · nudged agent");
+        assert!(app.routing_sample.is_none());
+        click(&mut app);
+        let s = screen_text(&mut app, 120, 60);
+        assert!(
+            s.contains("sample 1 of 5 · Jev: keeps going · nudged agent"),
+            "{s}"
+        );
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Char('g'));
         // The window: 7d takes in the 4-day-old one; 1h drops most.
         key(&mut app, KeyCode::Char('t'));
-        let s = screen_text(&mut app, 120, 40);
+        let s = screen_text(&mut app, 120, 60);
         assert!(
-            s.contains("32 stops in 7d") && s.contains("[ not a question 1 ]"),
+            s.contains("32 stops in 7d") && s.contains("▌Claude: not a question"),
             "{s}"
         );
         key(&mut app, KeyCode::Char('t'));
-        assert!(screen_text(&mut app, 120, 40).contains("stops in 1h"));
+        let s = screen_text(&mut app, 120, 40);
+        assert!(s.contains("11 stops in 1h"), "{s}");
         key(&mut app, KeyCode::Char('t'));
         assert_eq!(app.routing_window, crate::routing::Window::Day);
-        // ⇥ to "asks something" (box 6), then sample it.
+        // ⇥ walks each card, then its outcome lines: 5 is "keeps going ·
+        // nudged agent", 12 the "needs you" card.
         for _ in 0..5 {
             key(&mut app, KeyCode::Tab);
         }
-        assert_eq!(app.routing_node.label(), "asks something");
-        assert!(screen_text(&mut app, 120, 40).contains("▶ asks something 2 ◀"));
+        assert_eq!(app.routing_pick.label(), "Jev: keeps going · nudged agent");
+        assert!(screen_text(&mut app, 120, 60).contains("▌▶ ● ↻ nudged agent 5"));
+        for _ in 0..7 {
+            key(&mut app, KeyCode::Tab);
+        }
+        assert_eq!(app.routing_pick.label(), "Claude: needs you");
+        assert!(screen_text(&mut app, 120, 60).contains("▌▶ Claude: needs you"));
         key(&mut app, KeyCode::Enter);
         let s = screen_text(&mut app, 120, 40);
-        assert!(s.contains("sample 1 of 2 · asks something · 24h"), "{s}");
+        assert!(s.contains("sample 1 of 1 · Claude: needs you · 24h"), "{s}");
         assert!(s.contains("#techne-sdk-shape · taskbot · 4m ago"), "{s}");
         assert!(
             s.contains("“Should staging get the new read role tonight?”"),
@@ -4135,14 +4376,13 @@ mod tests {
                 && s.contains("ping you · 1 posted · waiting on lucian"),
             "{s}"
         );
+        // s goes round a card of one.
         key(&mut app, KeyCode::Char('s'));
         let s = screen_text(&mut app, 120, 40);
         assert!(
-            s.contains("sample 2 of 2") && s.contains("claude  agent decides"),
+            s.contains("sample 1 of 1") && s.contains("claude  needs you"),
             "{s}"
         );
-        key(&mut app, KeyCode::Char('s'));
-        assert!(screen_text(&mut app, 120, 40).contains("sample 1 of 2"));
         // Why: every step, each with its record.
         key(&mut app, KeyCode::Enter);
         let s = screen_text(&mut app, 120, 40);
@@ -4191,16 +4431,32 @@ mod tests {
         assert!(app.routing_sample.is_none() && app.routing_view);
         key(&mut app, KeyCode::Esc);
         assert!(!app.routing_view);
-        // A sample follows j to an empty box by closing, and ⏎ there
-        // samples nothing rather than opening a Why with nothing in it.
+        // A sample follows j to the next line on the card; past the last
+        // pick j stays put, and ⏎ there is the Why of what's on show.
         key(&mut app, KeyCode::Char('w'));
-        app.routing_node = crate::routing::Node::Claude(crate::routing::Check::NeedsOwner);
+        app.routing_pick = crate::routing::Pick {
+            lane: crate::routing::Lane::AgentDecides,
+            outcome: None,
+        };
         key(&mut app, KeyCode::Enter);
         assert!(app.routing_sample.is_some());
+        let s = screen_text(&mut app, 120, 40);
+        assert!(s.contains("claude  agent decides"), "{s}");
         key(&mut app, KeyCode::Char('j'));
-        assert_eq!(app.routing_node.label(), "not a question");
-        assert!(app.routing_sample.is_none());
-        key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.routing_pick.label(),
+            "Claude: agent decides · nudged agent"
+        );
+        assert_eq!(app.routing_sample, Some(0));
+        key(&mut app, KeyCode::Char('G'));
+        key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.routing_pick.label(), "Claude: needs you · pinged you");
+        let s = screen_text(&mut app, 120, 40);
+        assert!(
+            s.contains("sample 1 of 1 · Claude: needs you · pinged you"),
+            "{s}"
+        );
+        key(&mut app, KeyCode::Esc);
         assert!(app.routing_sample.is_none() && app.routing_why.is_none());
         // ^d doesn't page the channel underneath.
         let sel = app.selected.clone();
@@ -4288,7 +4544,7 @@ mod tests {
             return;
         };
         let mut app = routing_fixture();
-        let (w, h) = (120, 40);
+        let (w, h) = (120, 60);
         let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
         let mut shot = |app: &mut App, name: &str| {
             t.draw(|f| draw(f, app)).unwrap();
@@ -4304,6 +4560,7 @@ mod tests {
         };
         let key = |app: &mut App, c: KeyCode| app.on_term(crossterm::event::Event::Key(c.into()));
         key(&mut app, KeyCode::Char('w'));
+        shot(&mut app, "tui-pipeline-top");
         for _ in 0..5 {
             key(&mut app, KeyCode::Tab);
         }
