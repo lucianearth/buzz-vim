@@ -48,6 +48,18 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
   waiting on release, with a link to its ping), open / done counts and agent crashes today. A channel
   where two or more lists claim the checklist and the owner hasn't picked a driver shows `contested` with
   their creators, and no list until he does
+- `C` the Control view: the private #control channel's notes (`buzz control publish`, one per topic, day
+  and source; the newest wins, a missing day is a gap). The overview is an ops cockpit: open requests on
+  top with their vote keys (a digit votes the picked request, or the only one), a tile per topic (status
+  color: ok green, warn amber, page red, no note dim; the newest note's first line; a 14-day sparkline of
+  the topic's key metric: hooks cost per useful call, converge held runs, fleet-audit problems, upgrade
+  events, else notes per day), then the newest hooks note's gauges (value, baseline, delta: green better,
+  amber flag, red page; a flag is never green) and its seats. Tiles reflow down to 80 columns. `j` `k`
+  move, `⏎` a request's note or a topic's days, `⏎` a day's note: its summary, images and details. hooks/1
+  notes get the gauges, trend charts (one point per day, the baseline dashed), a hooks-alive strip, seats with dead hooks highlighted, agent types with their ⚑ flag
+  and ramp by repo; any other schema shows its JSON. A request shows its actions as `1`–`9` with votes and
+  status: pressing one asks, then sends that reaction as your vote (only approvers', when it names any).
+  `r` reloads. The channel is `control_channel` (`BUZZ_VIM_CONTROL_CHANNEL`), default #control
 - `q` or `Q` (or `^q`, which also works while writing) asks a quick question: a box that posts a new top-level message
   in #quick, starting with `[Q]` and @mentioning taskbot. Press `^q` again in the box to add the channel you're
   in (its name, id, link and latest 30 messages' ids) so taskbot can read it; again takes it off. A DM or
@@ -99,6 +111,8 @@ In `buzz-vim/config.json` (or the env var):
 - `watcher` (`BUZZ_VIM_WATCHER`, comma separated; in config.json a list or a comma-separated string): the
   watcher's pubkeys; its state counts only from these. Default the watcher seat (`d84ddba9…`). A value of
   another type is ignored with a warning, and the default used.
+- `control_channel` (`BUZZ_VIM_CONTROL_CHANNEL`): the channel id the Control view (`C`) reads, default
+  #control (`ee7289a1-…`).
 - `quick_channel` (`BUZZ_VIM_QUICK_CHANNEL`), default `quick`, and `quick_agent` (`BUZZ_VIM_QUICK_AGENT`),
   default `taskbot`: where Q posts and who it @mentions.
 

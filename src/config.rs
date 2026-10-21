@@ -34,6 +34,9 @@ struct File {
     quick_channel: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     quick_agent: Option<String>,
+    /// The channel the Control view (`C`) reads, by id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    control_channel: Option<String>,
 }
 
 pub struct Config {
@@ -45,14 +48,16 @@ pub struct Config {
 }
 
 /// Operator-loop settings: `owner`, `watcher`, `quick_channel` and
-/// `quick_agent` in config.json, or `BUZZ_VIM_OWNER`, `BUZZ_VIM_WATCHER`
-/// (comma separated), `BUZZ_VIM_QUICK_CHANNEL`, `BUZZ_VIM_QUICK_AGENT`.
+/// `quick_agent`, `control_channel` in config.json, or `BUZZ_VIM_OWNER`,
+/// `BUZZ_VIM_WATCHER` (comma separated), `BUZZ_VIM_QUICK_CHANNEL`,
+/// `BUZZ_VIM_QUICK_AGENT`, `BUZZ_VIM_CONTROL_CHANNEL`.
 #[derive(Clone, Debug)]
 pub struct Loop {
     pub owner: String,
     pub watchers: Vec<String>,
     pub quick_channel: String,
     pub quick_agent: String,
+    pub control_channel: String,
 }
 
 impl Default for Loop {
@@ -65,6 +70,7 @@ impl Default for Loop {
                 .collect(),
             quick_channel: crate::quick::CHANNEL.to_string(),
             quick_agent: crate::quick::AGENT.to_string(),
+            control_channel: crate::control::DEFAULT_CHANNEL.to_string(),
         }
     }
 }
@@ -117,6 +123,9 @@ fn loop_settings(file: &File) -> Loop {
         quick_agent: env("BUZZ_VIM_QUICK_AGENT")
             .or(file.quick_agent.clone())
             .unwrap_or(d.quick_agent),
+        control_channel: env("BUZZ_VIM_CONTROL_CHANNEL")
+            .or(file.control_channel.clone())
+            .unwrap_or(d.control_channel),
     }
 }
 
