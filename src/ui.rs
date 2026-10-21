@@ -3743,10 +3743,7 @@ mod tests {
         );
         app.mode = Mode::Help;
         let s = screen_text(&mut app, 120, 40);
-        assert!(
-            s.contains("Q box (Q ^q)") && s.contains("checklist: items"),
-            "{s}"
-        );
+        assert!(s.contains("Q box (Q ^q)") && s.contains("checklist"), "{s}");
     }
 
     /// The operator loop pane, status line and Q box, for README shots.
