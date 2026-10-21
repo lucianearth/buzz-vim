@@ -33,6 +33,23 @@ pub fn tone(role: Role, level: u8) -> Color {
     rgb(palette::tone(role, level, light()))
 }
 
+/// A fixed "#rrggbb" (the Routing page's stream and outcome colours), the
+/// same on both ramps. On the light ramp `dark` stands in, when given: a
+/// hue darkened to read as text on the light page.
+pub fn hex(hex: &str, dark: Option<&str>) -> Color {
+    let h = match dark {
+        Some(d) if light() => d,
+        _ => hex,
+    }
+    .trim_start_matches('#');
+    let p = |i: usize| {
+        h.get(i..i + 2)
+            .and_then(|s| u8::from_str_radix(s, 16).ok())
+            .unwrap_or(0)
+    };
+    Color::Rgb(p(0), p(2), p(4))
+}
+
 pub fn set_light(on: bool) {
     LIGHT.store(on, Ordering::Relaxed);
 }
