@@ -346,8 +346,10 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
                 return;
             }
             match result {
-                Ok((evs, ids)) => {
-                    let mut board = control::Board::new(&channel);
+                Ok((evs, _ids)) => {
+                    // Fold into the board we have, so live events and votes
+                    // that landed while this load ran are kept.
+                    let mut board = std::mem::take(&mut app.control);
                     let mut want = vec![];
                     for ev in &evs {
                         if board.apply(ev) {
@@ -360,6 +362,15 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
                         }
                     }
                     board.loaded = true;
+                    board.error = None;
+                    if app
+                        .control_note
+                        .as_deref()
+                        .is_some_and(|id| board.note(id).is_none())
+                    {
+                        app.control_note = None;
+                    }
+                    let ids = board.note_ids();
                     app.control = board;
                     sync.control_tail(&channel, &ids);
                     sync.want_profiles(want);

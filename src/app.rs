@@ -1705,6 +1705,11 @@ impl App {
             self.reply_draft.insert(&text);
             return;
         }
+        // Nor does the Control view: a paste there would land in the
+        // channel hidden under it (or swap the vote box for Insert).
+        if self.control_view {
+            return self.say("nothing to paste into on the Control view");
+        }
         // Nor does the routing view.
         if self.routing_view {
             return;
@@ -2480,6 +2485,18 @@ impl App {
                     return;
                 }
                 // The routing view scrolls nothing; the channel under it stays put.
+                if self.control_view {
+                    // The wheel scrolls the note, or moves the list's pick.
+                    if self.control_note.is_some() {
+                        let s = self.control_scroll as isize + d;
+                        self.control_scroll = s.clamp(0, self.control_max_scroll as isize) as usize;
+                    } else {
+                        let c = self.control_cursor as isize + d.signum();
+                        let n = self.control_rows() as isize;
+                        self.control_cursor = c.clamp(0, (n - 1).max(0)) as usize;
+                    }
+                    return;
+                }
                 if self.routing_view {
                     return;
                 }

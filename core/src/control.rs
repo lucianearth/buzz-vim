@@ -531,7 +531,12 @@ pub const HOOKS_TRENDS: &[Trend] = &[
 /// The days a chart spans: every day from the source's first note in the
 /// topic to its last, gaps included.
 pub fn chart_days(notes: &[&Note]) -> Vec<String> {
-    let days: BTreeSet<&str> = notes.iter().filter_map(|n| n.day.as_deref()).collect();
+    // A malformed day (a hand-built event) mustn't blank the whole range.
+    let days: BTreeSet<&str> = notes
+        .iter()
+        .filter_map(|n| n.day.as_deref())
+        .filter(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").is_ok())
+        .collect();
     match (days.iter().next(), days.iter().next_back()) {
         (Some(a), Some(b)) => day_range(a, b),
         _ => vec![],
@@ -1026,6 +1031,22 @@ mod tests {
                 .unwrap_err(),
             "the request is closed (approve)"
         );
+    }
+
+    #[test]
+    fn a_malformed_day_does_not_blank_the_charts() {
+        let k = Keys::generate();
+        let mut b = Board::new(CH);
+        b.apply(&note(&k, "2026-10-20", "build-box", 1, &details(1), &[]));
+        b.apply(&note(&k, "zzz", "build-box", 1, &details(2), &[]));
+        let cur = b
+            .days("hooks")
+            .into_iter()
+            .find(|n| n.day.as_deref() == Some("2026-10-20"))
+            .unwrap()
+            .clone();
+        let (days, _) = hooks_charts(&b, "build-box", &cur);
+        assert_eq!(days, vec!["2026-10-20".to_string()]);
     }
 
     #[test]

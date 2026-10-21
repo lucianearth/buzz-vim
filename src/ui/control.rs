@@ -28,6 +28,8 @@ use crate::media::Slot;
 use crate::theme;
 
 const CHART_ROWS: u16 = 10;
+/// The tallest a note is drawn; past it, a line says it was cut.
+const MAX_ROWS: u16 = 4000;
 /// OKLab hues for a status: ok green, partial amber, dead red.
 const OK: f32 = 145.0;
 const PARTIAL: f32 = 75.0;
@@ -325,20 +327,29 @@ fn draw_note(
     let cols = if w >= 100 { 2 } else { 1 };
     let height = |p: &Piece| -> u16 {
         match p {
-            Piece::Lines(l) => l.len() as u16,
+            Piece::Lines(l) => l.len().min(MAX_ROWS as usize) as u16,
             Piece::Charts(_, c) => (c.len() as u16).div_ceil(cols) * CHART_ROWS + 1,
             Piece::Image(_, dim) => {
                 crate::media::thumb_rows(*dim, THUMB_COLS.min(w), THUMB_MAX_ROWS) + 1
             }
         }
     };
-    let total: u16 = pieces.iter().map(height).sum::<u16>().min(4000);
+    // Summed in usize: a huge JSON note mustn't overflow, and past MAX_ROWS
+    // it is clipped with a line that says so.
+    let want: usize = pieces.iter().map(|p| height(p) as usize).sum();
+    let clipped = want > MAX_ROWS as usize;
+    let total: u16 = want.min(MAX_ROWS as usize) as u16 + u16::from(clipped);
     let mut buf = Buffer::empty(Rect::new(0, 0, w, total));
     let mut y = 0u16;
     let mut placed = vec![];
     for p in &pieces {
-        let h = height(p);
-        if y + h > total {
+        let room = MAX_ROWS.saturating_sub(y);
+        let h = match p {
+            Piece::Lines(_) => height(p).min(room),
+            _ if height(p) > room => break,
+            _ => height(p),
+        };
+        if h == 0 {
             break;
         }
         let r = Rect::new(0, y, w, h);
@@ -367,6 +378,13 @@ fn draw_note(
             }
         }
         y += h;
+    }
+    if clipped {
+        Paragraph::new(Line::styled(
+            format!("… cut at {MAX_ROWS} lines; buzz control get shows it all"),
+            theme::faint(),
+        ))
+        .render(Rect::new(0, total - 1, w, 1), &mut buf);
     }
 
     // Copy the rows on screen out.
@@ -492,7 +510,7 @@ fn strip_lines(strip: &[(String, Option<String>)]) -> Vec<Line<'static>> {
     vec![
         Line::from(spans),
         Line::styled(
-            "charts: one point per day, a missing day is a gap; the dim line and \"vs\" are the baseline",
+            "charts: one point per day (•), a missing day is a gap; the dashed line and \"vs\" are the baseline",
             theme::faint(),
         ),
         Line::raw(""),
@@ -531,10 +549,20 @@ fn render_chart(c: &control::Chart, days: &[String], r: Rect, buf: &mut Buffer) 
     }
     // Owned data first; the datasets borrow it.
     let segs: Vec<Vec<Vec<(f64, f64)>>> = c.series.iter().map(|s| s.segments()).collect();
-    let bases: Vec<Option<[(f64, f64); 2]>> = c
+    // A baseline is dashed (a dot every few columns), so it never reads as
+    // data across days; data is a solid line or, for a lone day, a dot.
+    let cols = r.width.saturating_sub(8).max(4) as usize;
+    let dashes = (cols / 3).max(2);
+    let bases: Vec<Option<Vec<(f64, f64)>>> = c
         .series
         .iter()
-        .map(|s| s.baseline.map(|b| [(x0, b), (x1, b)]))
+        .map(|s| {
+            s.baseline.map(|b| {
+                (0..dashes)
+                    .map(|k| (x0 + (x1 - x0) * k as f64 / (dashes - 1) as f64, b))
+                    .collect()
+            })
+        })
         .collect();
     let mut sets = vec![];
     for (i, b) in bases.iter().enumerate() {
@@ -542,7 +570,7 @@ fn render_chart(c: &control::Chart, days: &[String], r: Rect, buf: &mut Buffer) 
             sets.push(
                 Dataset::default()
                     .marker(Marker::Braille)
-                    .graph_type(GraphType::Line)
+                    .graph_type(GraphType::Scatter)
                     .style(series_style(i).add_modifier(Modifier::DIM))
                     .data(b),
             );
@@ -1071,6 +1099,103 @@ mod tests {
                 .0
                 .contains("only the note's approvers")
         );
+    }
+
+    #[test]
+    fn a_lone_day_is_a_dot_on_a_dashed_baseline() {
+        let me = Keys::generate();
+        let mut app = App::new(me.public_key().to_hex(), None);
+        app.control.loaded = true;
+        let k = Keys::generate();
+        app.control.apply(&note(
+            &k,
+            "hooks",
+            "hooks/1",
+            "2026-10-21",
+            &hooks(767000, "ok"),
+            vec![],
+        ));
+        for c in [KeyCode::Char('C'), KeyCode::Enter, KeyCode::Enter] {
+            key(&mut app, c);
+        }
+        let s = screen(&mut app, 140, 120);
+        let is_braille = |c: char| ('\u{2801}'..='\u{28FF}').contains(&c);
+        for l in s.lines() {
+            let cs: Vec<char> = l.chars().collect();
+            assert!(
+                !cs.windows(2).any(|w| is_braille(w[0]) && is_braille(w[1])),
+                "a solid line on a one-day chart:\n{l}"
+            );
+        }
+        // Each chart's dot sits inside its own frame: between its y axis and
+        // the next chart (two per row at this width, each half the body).
+        let row = s
+            .lines()
+            .find(|l| l.contains("Ramp after handoff"))
+            .map(|_| ())
+            .and_then(|_| {
+                let lines: Vec<&str> = s.lines().collect();
+                let i = lines
+                    .iter()
+                    .position(|l| l.contains("Ramp after handoff"))?;
+                Some(lines[i + 1..i + 9].join("\n"))
+            })
+            .unwrap();
+        let dots: Vec<usize> = row
+            .lines()
+            .flat_map(|l| {
+                l.chars()
+                    .enumerate()
+                    .filter(|(_, c)| *c == '•')
+                    .map(|(i, _)| i)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(dots.len(), 2, "{row}");
+        let half = 140 / 2;
+        assert!(
+            dots.iter().any(|&x| x < half) && dots.iter().any(|&x| x > half + 6),
+            "{row}"
+        );
+    }
+
+    #[test]
+    fn paste_wheel_and_a_huge_note_stay_on_the_view() {
+        let (mut app, _) = fixture();
+        let k = Keys::generate();
+        // ~70k rows of pretty JSON: clipped, not a u16 overflow.
+        let big: Vec<serde_json::Value> = (0..23_000).map(|i| json!([i])).collect();
+        app.control.apply(&note(
+            &k,
+            "zbig",
+            "zbig/1",
+            "2026-10-21",
+            &json!(big),
+            vec![],
+        ));
+        key(&mut app, KeyCode::Char('C'));
+        app.on_term(TermEvent::Paste("hello".into()));
+        assert_eq!(
+            app.mode,
+            Mode::Normal,
+            "a paste must not open the hidden channel's draft"
+        );
+        key(&mut app, KeyCode::Char('G'));
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Enter);
+        assert!(app.control_note.is_some());
+        let _ = screen(&mut app, 120, 40);
+        key(&mut app, KeyCode::Char('G'));
+        let s = screen(&mut app, 120, 40);
+        assert!(s.contains("cut at 4000 lines"), "{s}");
+        // The wheel scrolls the note.
+        app.on_term(TermEvent::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 10,
+            row: 10,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }));
+        assert_eq!(app.control_scroll, app.control_max_scroll - 3);
     }
 
     #[test]
