@@ -16,7 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use nostr::Event;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::model::{Media, Message};
 
@@ -431,6 +431,43 @@ impl Board {
     }
 }
 
+// ---------- reading the channel ----------
+
+/// The control channel's messages for the last `DAYS_BACK` days before
+/// `now`, and every reaction to its notes; with the note ids, for the live
+/// tail of reactions (`tail_filters`).
+pub async fn fetch(
+    r: &crate::relay::Relay,
+    channel: &str,
+    now: u64,
+) -> anyhow::Result<(Vec<Event>, Vec<String>)> {
+    let since = now.saturating_sub(DAYS_BACK * 86_400);
+    let f = json!({"kinds": [9], "#h": [channel], "since": since});
+    let mut evs = r.query_all(f, 5000).await?;
+    let ids: Vec<String> = evs
+        .iter()
+        .filter(|e| parse_note(e).is_some())
+        .map(|e| e.id.to_hex())
+        .collect();
+    for chunk in ids.chunks(100) {
+        evs.extend(
+            r.query_all(json!({"kinds": [7], "#e": chunk}), 5000)
+                .await?,
+        );
+    }
+    Ok((evs, ids))
+}
+
+/// The live tail from `now`: new messages in the channel, and reactions to
+/// `notes`.
+pub fn tail_filters(channel: &str, notes: &[String], now: u64) -> Vec<Value> {
+    let mut filters = vec![json!({"kinds": [9], "#h": [channel], "since": now, "limit": 0})];
+    if !notes.is_empty() {
+        filters.push(json!({"kinds": [7], "#e": notes, "since": now, "limit": 0}));
+    }
+    filters
+}
+
 // ---------- charts ----------
 
 /// Every day from `first` to `last`, both included (YYYY-MM-DD).
@@ -679,6 +716,16 @@ pub fn short_tokens(v: f64) -> String {
         format!("{:.1}k", v / 1e3)
     } else {
         format!("{v:.0}")
+    }
+}
+
+/// A value as people read it in its unit: 767k, 42%, 3, 2.5.
+pub fn value_label(v: f64, unit: Unit) -> String {
+    match unit {
+        Unit::Tokens => short_tokens(v),
+        Unit::Pct => format!("{v:.0}%"),
+        Unit::Count if v.fract() == 0.0 => format!("{v:.0}"),
+        Unit::Count => format!("{v:.1}"),
     }
 }
 

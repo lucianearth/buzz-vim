@@ -179,6 +179,31 @@ impl Relay {
         Err(last.unwrap_or_else(|| anyhow!("query failed")))
     }
 
+    /// Every event a filter matches, a page at a time (newest first, then
+    /// `until` + `before_id` from the page's last), and an error past `max`
+    /// rather than a silently short list. The relay checks most tags only after
+    /// its LIMIT, so a short page is the only end we trust.
+    pub async fn query_all(&self, mut filter: Value, max: usize) -> Result<Vec<Event>> {
+        const PAGE: usize = 500;
+        let mut out: Vec<Event> = vec![];
+        loop {
+            filter["limit"] = serde_json::json!(PAGE);
+            let page = self.query(std::slice::from_ref(&filter)).await?;
+            let n = page.len();
+            if let Some(last) = page.last() {
+                filter["until"] = serde_json::json!(last.created_at.as_secs());
+                filter["before_id"] = serde_json::json!(last.id.to_hex());
+            }
+            out.extend(page);
+            if out.len() > max {
+                bail!("more than {max} events; not showing a partial list");
+            }
+            if n < PAGE {
+                return Ok(out);
+            }
+        }
+    }
+
     /// Add each agent to the channel as a bot (NIP-29 kind 9000), one at a
     /// time. Stops at the first the relay refuses.
     pub async fn add_members(&self, channel: &str, pubkeys: &[String]) -> Result<()> {

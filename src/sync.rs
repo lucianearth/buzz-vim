@@ -139,31 +139,6 @@ pub fn now() -> u64 {
     nostr::Timestamp::now().as_secs()
 }
 
-/// Every event a filter matches, a page at a time (newest first, then
-/// `until` + `before_id` from the page's last), and an error past `max`
-/// rather than a silently short list. The relay checks most tags only after
-/// its LIMIT, so a short page is the only end we trust.
-pub async fn query_all(r: &Relay, mut filter: Value, max: usize) -> anyhow::Result<Vec<Event>> {
-    const PAGE: usize = 500;
-    let mut out: Vec<Event> = vec![];
-    loop {
-        filter["limit"] = json!(PAGE);
-        let page = r.query(std::slice::from_ref(&filter)).await?;
-        let n = page.len();
-        if let Some(last) = page.last() {
-            filter["until"] = json!(last.created_at.as_secs());
-            filter["before_id"] = json!(last.id.to_hex());
-        }
-        out.extend(page);
-        if out.len() > max {
-            anyhow::bail!("more than {max} events; not showing a partial list");
-        }
-        if n < PAGE {
-            return Ok(out);
-        }
-    }
-}
-
 impl Sync {
     pub fn new(relay: Relay, live: UnboundedSender<Cmd>, tx: UnboundedSender<Msg>) -> Self {
         Sync {
@@ -450,35 +425,18 @@ impl Sync {
         self.control_tail(channel, &[]);
         let r = self.relay.clone();
         let channel = channel.to_string();
-        let since = now().saturating_sub(control::DAYS_BACK * 86_400);
+        let at = now();
         self.spawn(async move {
-            let result = async {
-                let f = json!({"kinds": [9], "#h": [channel], "since": since});
-                let mut evs = query_all(&r, f, 5000).await?;
-                let ids: Vec<String> = evs
-                    .iter()
-                    .filter(|e| control::parse_note(e).is_some())
-                    .map(|e| e.id.to_hex())
-                    .collect();
-                for chunk in ids.chunks(100) {
-                    evs.extend(query_all(&r, json!({"kinds": [7], "#e": chunk}), 5000).await?);
-                }
-                Ok((evs, ids))
-            }
-            .await;
+            let result = control::fetch(&r, &channel, at).await;
             Msg::Control { channel, result }
         });
     }
 
     /// New messages in the control channel, and reactions to its notes.
     pub fn control_tail(&mut self, channel: &str, notes: &[String]) {
-        let mut filters = vec![json!({"kinds": [9], "#h": [channel], "since": now(), "limit": 0})];
-        if !notes.is_empty() {
-            filters.push(json!({"kinds": [7], "#e": notes, "since": now(), "limit": 0}));
-        }
         let _ = self.live.send(Cmd::Sub {
             id: "control".into(),
-            filters,
+            filters: control::tail_filters(channel, notes, now()),
         });
     }
 

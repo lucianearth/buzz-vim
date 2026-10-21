@@ -28,7 +28,7 @@ use super::{
     time_label,
 };
 use crate::app::App;
-use crate::control::{self, Gauge, Health, Note, Tile, Tone, Unit};
+use crate::control::{self, Gauge, Health, Note, Tile, Tone};
 use crate::media::Slot;
 use crate::theme;
 
@@ -56,15 +56,6 @@ fn status_style(s: &str) -> Style {
 
 fn series_style(i: usize) -> Style {
     Style::new().fg(theme::ink(theme::nth(i * 2 + 1), 19))
-}
-
-fn value_label(v: f64, unit: Unit) -> String {
-    match unit {
-        Unit::Tokens => control::short_tokens(v),
-        Unit::Pct => format!("{v:.0}%"),
-        Unit::Count if v.fract() == 0.0 => format!("{v:.0}"),
-        Unit::Count => format!("{v:.1}"),
-    }
 }
 
 /// Every chart's y labels take this many columns, right-aligned, so the
@@ -196,7 +187,7 @@ fn render_tile(t: &Tile, picked: bool, r: Rect, buf: &mut Buffer) {
     let mut lines = vec![Line::styled(fit_words(&t.line, w), line_style)];
     let mut spark = sparkline(&t.spark, 1, Style::new().fg(color));
     if let Some(v) = t.spark.iter().rev().flatten().next() {
-        let v = value_label(*v, t.metric.unit);
+        let v = control::value_label(*v, t.metric.unit);
         let label = format!(" {}", t.metric.label);
         if width_of(&spark) + 1 + v.width() <= w {
             spark.push(Span::styled(format!(" {v}"), theme::bright()));
@@ -240,10 +231,13 @@ fn render_gauge(g: &Gauge, r: Rect, buf: &mut Buffer) {
         .baseline
         .map(|b| control::delta_label(g.value, b, g.unit))
         .unwrap_or_default();
-    let mut left = vec![Span::styled(value_label(g.value, g.unit), theme::bright())];
+    let mut left = vec![Span::styled(
+        control::value_label(g.value, g.unit),
+        theme::bright(),
+    )];
     let room = |l: &[Span], extra: &str| width_of(l) + extra.width() + 1 + delta.width() <= w;
     if let Some(b) = g.baseline {
-        let vs = format!("  vs {}", value_label(b, g.unit));
+        let vs = format!("  vs {}", control::value_label(b, g.unit));
         if room(&left, &vs) {
             left.push(Span::styled(vs, theme::muted()));
         }
@@ -955,13 +949,13 @@ fn render_chart(c: &control::Chart, days: &[String], r: Rect, buf: &mut Buffer) 
             title.push(Span::styled(format!(" ━ {}", s.label), series_style(i)));
             if let Some(v) = last.filter(|_| level >= 1) {
                 title.push(Span::styled(
-                    format!(" {}", value_label(*v, c.unit)),
+                    format!(" {}", control::value_label(*v, c.unit)),
                     theme::text(),
                 ));
             }
             if let Some(b) = s.baseline.filter(|_| level >= 2) {
                 title.push(Span::styled(
-                    format!(" vs {}", value_label(b, c.unit)),
+                    format!(" vs {}", control::value_label(b, c.unit)),
                     theme::faint(),
                 ));
             }
@@ -1048,7 +1042,7 @@ fn render_chart(c: &control::Chart, days: &[String], r: Rect, buf: &mut Buffer) 
                 .bounds([0.0, ymax])
                 .labels(
                     [0.0, ymax / 2.0, ymax]
-                        .map(|v| format!("{:>Y_LABEL_W$}", value_label(v, c.unit))),
+                        .map(|v| format!("{:>Y_LABEL_W$}", control::value_label(v, c.unit))),
                 )
                 .style(theme::faint()),
         );

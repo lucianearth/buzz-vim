@@ -568,6 +568,7 @@ dependencies = [
  "buzz-sdk",
  "buzz-vim-core",
  "buzz-ws-client",
+ "chrono",
  "nostr",
  "rustls",
  "serde_json",
