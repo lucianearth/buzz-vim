@@ -692,6 +692,11 @@ impl Client {
         links::label(&url, &name)
     }
 
+    /// A buzz:// link Buzz Desktop opens (a PR, issue, repo), not one we show.
+    pub fn opens_in_desktop(&self, url: String) -> bool {
+        links::target(&url) == links::Target::Desktop
+    }
+
     /// A tapped link that we show ourselves (a channel, a message in one),
     /// or None for the system to open.
     pub fn follow(&self, url: String) -> Option<Follow> {

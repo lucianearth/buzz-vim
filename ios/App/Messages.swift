@@ -287,7 +287,9 @@ struct MessageRow: View, Equatable {
                 ForEach(Array(m.segments.enumerated()), id: \.offset) { _, s in
                     switch s {
                     case let .text(text):
-                        Text(rich(text, mentions: m.mentionNames, theme: theme) { client.linkLabel(url: $0) })
+                        Text(rich(text, mentions: m.mentionNames, theme: theme,
+                                  label: { client.linkLabel(url: $0) },
+                                  desktop: { client.opensInDesktop(url: $0) }))
                             .font(.text)
                             .lineSpacing(3)
                             .fixedSize(horizontal: false, vertical: true)
@@ -471,9 +473,11 @@ func stamp(_ at: UInt64) -> String {
 private let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
 
 /// Inline markdown, with bare URLs made tappable and @mentions in the accent.
-/// `label` names a bare buzz:// link by where it goes, as the TUI does.
+/// `label` names a bare buzz:// link by where it goes, as the TUI does;
+/// links `desktop` says Buzz Desktop opens get a 🐝, as Desktop shows them.
 func rich(_ src: String, mentions: [String], theme: Theme,
-          label: (String) -> String? = { _ in nil }) -> AttributedString {
+          label: (String) -> String? = { _ in nil },
+          desktop: (String) -> Bool = { _ in false }) -> AttributedString {
     let opts = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
     var a = (try? AttributedString(markdown: src, options: opts)) ?? AttributedString(src)
     a.foregroundColor = theme.text
@@ -497,10 +501,13 @@ func rich(_ src: String, mentions: [String], theme: Theme,
         guard let url = URL(string: String(plain[r])), let s = span(r), a[s].link == nil else { continue }
         a[s].link = url
     }
+    // Only links written with their scheme: the detector also takes file
+    // names like lib.rs (.rs is a country) for web addresses.
     if let det = detector {
         let ns = NSRange(plain.startIndex..., in: plain)
         for match in det.matches(in: plain, range: ns) {
             guard let r = Range(match.range, in: plain), let url = match.url,
+                  plain[r].hasPrefix("http://") || plain[r].hasPrefix("https://"),
                   let s = span(r), a[s].link == nil else { continue }
             a[s].link = url
         }
@@ -521,8 +528,15 @@ func rich(_ src: String, mentions: [String], theme: Theme,
     }
     // Last, so the ranges above still match `plain`.
     var out = AttributedString()
+    var prev: URL?
     for run in a.runs {
         let piece = AttributedString(a[run.range])
+        if let url = run.link, url != prev, url.scheme == "buzz", desktop(url.absoluteString) {
+            var bee = AttributedString("🐝 ", attributes: run.attributes)
+            bee.underlineStyle = nil
+            out.append(bee)
+        }
+        prev = run.link
         if let url = run.link, url.scheme == "buzz",
            String(piece.characters) == url.absoluteString,
            let l = label(url.absoluteString) {
