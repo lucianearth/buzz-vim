@@ -485,9 +485,11 @@ impl Checklists {
         }
     }
 
-    /// REQ filters for one channel's records.
-    pub fn filters(channel: &str) -> Vec<Value> {
-        vec![serde_json::json!({"kinds": KINDS, "#h": [channel], "limit": 500})]
+    /// The filter for one channel's records. Fetch it with
+    /// `Relay::query_all`: a busy list passes one 500-event page, and
+    /// newest-first paging would otherwise drop its oldest items.
+    pub fn filter(channel: &str) -> Value {
+        serde_json::json!({"kinds": KINDS, "#h": [channel]})
     }
 
     /// Fold one record. Returns true when it is a valid record and the
@@ -825,6 +827,53 @@ mod tests {
 
     fn title(s: &Checklists) -> Option<String> {
         s.header(CH).map(|h| h.title)
+    }
+
+    /// A list with more than one page of records (e13fdb65: techne's 51
+    /// items): an item written once, long ago, still shows after 600
+    /// later edits of another.
+    #[tokio::test]
+    async fn a_busy_list_keeps_its_oldest_item() {
+        let (owner, bot) = (Keys::generate(), Keys::generate());
+        let bk = hex(&bot);
+        let mut all = vec![
+            rec(&bot, KIND_HEADER, &head_d(&bk), 1, head("busy", "running")),
+            rec(
+                &bot,
+                KIND_ITEM,
+                &item_d(&bk, "00000001"),
+                2,
+                item("first item", "open", 0.0),
+            ),
+        ];
+        for i in 0..600u64 {
+            let body = item(&format!("edit {i}"), "open", 1.0);
+            all.push(rec(&bot, KIND_ITEM, &item_d(&bk, "00000002"), 10 + i, body));
+        }
+        let fold = |evs: &[Event]| {
+            let mut s = store(&owner);
+            for e in evs {
+                s.apply(e);
+            }
+            s.items(CH).into_iter().map(|i| i.text).collect::<Vec<_>>()
+        };
+        // One capped page (the old fetch) loses the header and the old item.
+        let one = crate::relay::fake::answer(&all, &serde_json::json!({"limit": 500}));
+        assert!(!fold(&one).contains(&"first item".to_string()));
+        let got = crate::relay::page_all(Checklists::filter(CH), 500, 20_000, |f| {
+            assert_eq!(f["#h"], serde_json::json!([CH]));
+            let page = crate::relay::fake::answer(&all, &f);
+            async move { Ok(page) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(got.len(), 602);
+        let mut s = store(&owner);
+        for e in &got {
+            s.apply(e);
+        }
+        assert_eq!(title(&s).as_deref(), Some("busy"));
+        assert_eq!(fold(&got), ["first item", "edit 599"]);
     }
 
     #[test]
