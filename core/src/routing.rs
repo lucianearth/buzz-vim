@@ -910,7 +910,7 @@ fn outcome_line(lane: Lane, o: Outcome, ds: &[&Decision]) -> Option<OutcomeLine>
         }
     }
     let notes = match ways.as_slice() {
-        [(t, _)] if t.is_empty() => vec![],
+        [("", _)] => vec![],
         [(t, _)] => vec![t.to_string()],
         _ => ways
             .iter()
@@ -2124,7 +2124,7 @@ mod tests {
                             j,
                             m,
                             o,
-                            if i % 3 == 0 {
+                            if i.is_multiple_of(3) {
                                 "real ask pinged; x"
                             } else {
                                 "y"
