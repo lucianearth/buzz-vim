@@ -399,10 +399,12 @@ impl Board {
         self.replies.get(&note.id).map_or(0, Vec::len)
     }
 
-    /// The newer note for a request's topic, day and source, if any: the
-    /// one that counts now (`latest`). The box acts only on its newest
-    /// request (aei `cmd_poll` reads one `alert_event_id`, and each event of
-    /// the day republishes the day's note), so an older one is superseded.
+    /// The note that replaced a request, if any, from the same author and
+    /// for the same topic and source: a newer note for its day (aei
+    /// republishes the day's note on each event), or a newer request on
+    /// any day (aei `cmd_poll` reads only its newest `alert_event_id`, and
+    /// the 04:00 stage replaces yesterday's offer with today's). Another
+    /// author's note never supersedes one.
     pub fn superseded_by(&self, note: &Note) -> Option<&Note> {
         let (Some(d), Some(s)) = (note.day.as_deref(), note.source.as_deref()) else {
             return None;
@@ -410,18 +412,19 @@ impl Board {
         self.notes
             .values()
             .filter(|n| {
-                n.topic == note.topic
-                    && n.day.as_deref() == Some(d)
+                n.author == note.author
+                    && n.topic == note.topic
                     && n.source.as_deref() == Some(s)
+                    && (n.day.as_deref() == Some(d) || (n.is_request() && n.day.is_some()))
                     && (n.created_at, &n.id) > (note.created_at, &note.id)
             })
             .max_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)))
     }
 
     /// A request's status: a `closed` reply by the author or an approver,
-    /// else `superseded` (with the newer note as `by_event`) once a newer
-    /// note for its topic, day and source exists, else the newest
-    /// `control-status` reply, else the note's own tag.
+    /// else `superseded` (with the newer note as `by_event`) once
+    /// `superseded_by` finds one, else the newest `control-status` reply,
+    /// else the note's own tag.
     pub fn status(&self, note: &Note) -> Status {
         let newest = self
             .replies
@@ -480,7 +483,7 @@ impl Board {
             }
             Some("superseded") => {
                 return Err(
-                    "superseded: a newer note for this day and source replaced this request".into(),
+                    "superseded: a newer note from its source replaced this request".into(),
                 );
             }
             Some(other) => return Err(format!("the request is {other}")),
@@ -996,9 +999,9 @@ impl Board {
             .collect()
     }
 
-    /// Requests still open, newest first: only while each is the newest
-    /// note for its topic, day and source (an older one is superseded), so
-    /// a request from an earlier day stays open until closed or replaced.
+    /// Requests still open, newest first: not closed, and not superseded
+    /// (`superseded_by`) by a newer note for their day or a newer request
+    /// from the same author, topic and source.
     pub fn open_requests(&self) -> Vec<&Note> {
         let mut v: Vec<&Note> = self
             .notes
@@ -1640,18 +1643,19 @@ mod tests {
     fn open_requests_newest_first_and_closed_ones_drop() {
         let k = Keys::generate();
         let mut b = Board::new(CH);
-        let req = |day: &str, at: u64| {
+        // Two sources: one source's newer request would supersede the other.
+        let req = |day: &str, source: &str, at: u64| {
             note(
                 &k,
                 day,
-                "build-box",
+                source,
                 at,
                 &details(1),
                 &[&[TAG_ACTION, "approve", "👍"], &[TAG_STATUS, "open"]],
             )
         };
-        let a = req("2026-10-20", 10);
-        let c = req("2026-10-21", 20);
+        let a = req("2026-10-20", "mac", 10);
+        let c = req("2026-10-21", "build-box", 20);
         b.apply(&a);
         b.apply(&c);
         let ids: Vec<String> = b.open_requests().iter().map(|n| n.id.clone()).collect();
@@ -1818,9 +1822,9 @@ mod tests {
         let lucian = Keys::generate();
         let lp = lucian.public_key().to_hex();
         let mut b = Board::new(CH);
-        let req = |day: &str, source: &str, at: u64| {
+        let req = |k: &Keys, day: &str, source: &str, at: u64| {
             note(
-                &k,
+                k,
                 day,
                 source,
                 at,
@@ -1832,21 +1836,17 @@ mod tests {
                 ],
             )
         };
-        let old = req("2026-10-21", "build-box", 10);
-        let new = req("2026-10-21", "build-box", 20);
-        let other_source = req("2026-10-21", "mac", 5);
-        let other_day = req("2026-10-20", "build-box", 5);
-        for e in [&old, &new, &other_source, &other_day] {
+        let open_ids =
+            |b: &Board| -> Vec<String> { b.open_requests().iter().map(|n| n.id.clone()).collect() };
+        let old = req(&k, "2026-10-21", "build-box", 10);
+        let new = req(&k, "2026-10-21", "build-box", 20);
+        let other_source = req(&k, "2026-10-21", "mac", 6);
+        for e in [&old, &new, &other_source] {
             b.apply(e);
         }
-        let ids: Vec<String> = b.open_requests().iter().map(|n| n.id.clone()).collect();
         assert_eq!(
-            ids,
-            vec![
-                new.id.to_hex(),
-                other_source.id.to_hex(),
-                other_day.id.to_hex()
-            ]
+            open_ids(&b),
+            vec![new.id.to_hex(), other_source.id.to_hex()]
         );
         let o = b.note(&old.id.to_hex()).unwrap().clone();
         let st = b.status(&o);
@@ -1861,14 +1861,44 @@ mod tests {
             b.can_vote(b.note(&new.id.to_hex()).unwrap(), 0, &lp)
                 .is_ok()
         );
+
+        // Another author's note for the same day and source changes nothing.
+        let stranger = Keys::generate();
+        b.apply(&note(
+            &stranger,
+            "2026-10-21",
+            "build-box",
+            25,
+            &details(1),
+            &[],
+        ));
+        let strangers = req(&stranger, "2026-10-22", "build-box", 26);
+        b.apply(&strangers);
+        assert!(open_ids(&b).contains(&new.id.to_hex()));
+
+        // A plain report from the source on a later day doesn't supersede it.
+        b.apply(&note(&k, "2026-10-22", "build-box", 27, &details(1), &[]));
+        assert!(open_ids(&b).contains(&new.id.to_hex()));
+
+        // A newer request from the source on a later day does: the box's
+        // 04:00 stage replaces yesterday's offer.
+        let next = req(&k, "2026-10-23", "build-box", 30);
+        b.apply(&next);
+        let n = b.note(&new.id.to_hex()).unwrap().clone();
+        assert_eq!(b.status(&n).by_event, Some(next.id.to_hex()));
+        assert!(!open_ids(&b).contains(&new.id.to_hex()));
+
         // A plain report later that day (aei republishes the day's note on
         // each event, a decline or a roll) supersedes the request too.
-        let n = b.note(&new.id.to_hex()).unwrap().clone();
-        b.apply(&note(&k, "2026-10-21", "build-box", 30, &details(1), &[]));
-        assert_eq!(b.status(&n).status.as_deref(), Some("superseded"));
-        let ids: Vec<String> = b.open_requests().iter().map(|n| n.id.clone()).collect();
-        assert_eq!(ids, vec![other_source.id.to_hex(), other_day.id.to_hex()]);
-        assert_eq!(b.tiles("2026-10-21")[0].open, 2);
+        let nx = b.note(&next.id.to_hex()).unwrap().clone();
+        assert_eq!(b.status(&nx).status.as_deref(), Some("open"));
+        b.apply(&note(&k, "2026-10-23", "build-box", 40, &details(1), &[]));
+        assert_eq!(b.status(&nx).status.as_deref(), Some("superseded"));
+        assert_eq!(
+            open_ids(&b),
+            vec![strangers.id.to_hex(), other_source.id.to_hex()]
+        );
+
         // An explicit close still reads as closed, not superseded.
         b.apply(&ev(
             &k,
@@ -1879,7 +1909,7 @@ mod tests {
                 &["e", &o.id, "", "root"],
                 &[TAG_STATUS, "closed", "decline"],
             ],
-            40,
+            50,
         ));
         assert_eq!(b.status(&o).status.as_deref(), Some("closed"));
     }

@@ -2481,6 +2481,7 @@ impl App {
         let Some(person) = row.clone().filter(|_| row == self.sub_expect) else {
             self.sub_cursor = self.sub_cursor.min(self.sub_people().len());
             self.sub_expect = self.sub_row_id(self.sub_cursor);
+            self.sub_confirm = false;
             return self.say("the list changed; pick again");
         };
         // No relay map yet: this record replaces the dashboard's whole map

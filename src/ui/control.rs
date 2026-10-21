@@ -43,6 +43,9 @@ const DEAD: f32 = 25.0;
 const DATA: f32 = 215.0;
 
 fn status_style(s: &str) -> Style {
+    if s == "superseded" {
+        return theme::faint().add_modifier(Modifier::BOLD);
+    }
     let hue = match s {
         "ok" => OK,
         "dead" => DEAD,
@@ -52,6 +55,16 @@ fn status_style(s: &str) -> Style {
         .fg(theme::gray(1))
         .bg(theme::ink(hue, 17))
         .add_modifier(Modifier::BOLD)
+}
+
+/// A request status as `status_style` reads it: open is amber, superseded
+/// dim (nothing to do), anything else (closed) green.
+fn request_word(st: &str) -> &'static str {
+    match st {
+        "open" => "partial",
+        "superseded" => "superseded",
+        _ => "ok",
+    }
 }
 
 fn series_style(i: usize) -> Style {
@@ -345,7 +358,7 @@ fn request_strip(app: &App, ids: &[String], all: usize, w: usize) -> Vec<Line<'s
         let st = app.control.status(n).status.unwrap_or_else(|| "?".into());
         let mut tail = vec![Span::styled(
             format!(" {st} "),
-            status_style(if st == "open" { "partial" } else { "ok" }),
+            status_style(request_word(&st)),
         )];
         if !n.approvers.is_empty() {
             let names: Vec<String> = n.approvers.iter().map(|p| app.store.name_of(p)).collect();
@@ -843,10 +856,7 @@ fn request_lines(app: &App, n: &Note) -> Vec<Line<'static>> {
     let s = st.status.clone().unwrap_or_else(|| "no status".into());
     let mut head = vec![
         Span::styled("request  ", theme::bright()),
-        Span::styled(
-            format!(" {s} "),
-            status_style(if s == "open" { "partial" } else { "ok" }),
-        ),
+        Span::styled(format!(" {s} "), status_style(request_word(&s))),
     ];
     if let Some(o) = &st.outcome {
         head.push(Span::styled(format!("  {o}"), theme::text()));
