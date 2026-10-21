@@ -436,7 +436,7 @@ private struct Spark: View {
                             .cornerRadius(2)
                     } else {
                         AreaMark(x: .value("day", Double(p.id)), y: .value("value", p.value),
-                                 series: .value("run", p.run))
+                                 series: .value("run", p.run), stacking: .unstacked)
                             .foregroundStyle(LinearGradient(colors: [color.opacity(0.28), color.opacity(0)],
                                                             startPoint: .top, endPoint: .bottom))
                         LineMark(x: .value("day", Double(p.id)), y: .value("value", p.value),
@@ -465,9 +465,10 @@ private struct SparkScale: ViewModifier {
     let days: Int
     let bars: Bool
 
+    @ViewBuilder
     func body(content: Content) -> some View {
         if bars {
-            content.chartXScale(domain: (0..<max(days, 1)).map(String.init))
+            content.chartXScale(domain: (0..<max(days, 1)).map { String($0) })
         } else {
             content.chartXScale(domain: -0.5...(Double(max(days, 1)) - 0.5))
         }
@@ -556,7 +557,7 @@ private struct GaugeCard: View {
 
 /// How full a gauge draws: a percent of 100, else the value on a scale a
 /// quarter past the larger of value and baseline, so both stay inside.
-private func fill(_ g: ControlGauge) -> (value: Double, baseline: Double?) {
+private func gaugeFill(_ g: ControlGauge) -> (value: Double, baseline: Double?) {
     let scale = g.unit == .pct ? 100 : max(g.value, g.baseline ?? 0) * 1.25
     guard scale > 0 else { return (0, nil) }
     return (min(max(g.value / scale, 0), 1), g.baseline.map { min(max($0 / scale, 0), 1) })
@@ -568,7 +569,7 @@ private struct Ring: View {
     @Environment(\.theme) private var theme
 
     var body: some View {
-        let f = fill(gauge)
+        let f = gaugeFill(gauge)
         ZStack {
             Circle().stroke(theme.idle, lineWidth: 7)
             Circle()
@@ -593,7 +594,7 @@ private struct Meter: View {
     @Environment(\.theme) private var theme
 
     var body: some View {
-        let f = fill(gauge)
+        let f = gaugeFill(gauge)
         GeometryReader { geo in
             ZStack(alignment: .leading) {
                 Capsule().fill(theme.idle)
