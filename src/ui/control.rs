@@ -571,7 +571,8 @@ fn render_chart(c: &control::Chart, days: &[String], r: Rect, buf: &mut Buffer) 
     let xl = if days.len() > 1 {
         vec![day(days.first()), day(days.last())]
     } else {
-        vec![day(days.first())]
+        // One label is not drawn: centre it between two blanks.
+        vec![String::new(), day(days.first()), String::new()]
     };
     let chart = Chart::new(sets)
         .block(
@@ -908,6 +909,11 @@ mod tests {
                 t(&["control-action", "approve", "👍"]),
                 t(&["control-action", "hold", "⏳"]),
                 t(&["control-status", "open"]),
+                t(&[
+                    "imeta",
+                    "url https://buzz.example/media/chart.png",
+                    "m image/png",
+                ]),
             ],
         ));
         (app, me)
@@ -992,6 +998,9 @@ mod tests {
             " 1  approve 👍",
             " 2  hold ⏳",
             "press 1 2 to vote",
+            // Without a graphics-capable terminal an image is named, as in
+            // a timeline.
+            "▣ image/png chart.png",
         ] {
             assert!(s.contains(want), "missing {want:?}:\n{s}");
         }
