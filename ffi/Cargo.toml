@@ -18,6 +18,7 @@ name = "uniffi-bindgen"
 
 [dependencies]
 anyhow = "1.0.104"
+chrono = "0.4.45"
 buzz-vim-core = { path = "../core" }
 buzz-ws-client = { git = "https://github.com/block/buzz", rev = "5397ea49e27fd56d4e0346e2120906d09ac91579" }
 buzz-core = { git = "https://github.com/block/buzz", rev = "5397ea49e27fd56d4e0346e2120906d09ac91579" }

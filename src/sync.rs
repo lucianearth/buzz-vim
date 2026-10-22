@@ -12,12 +12,14 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::{Action, App};
 use crate::checklist::{self, Checklists};
+use crate::control;
 use crate::live::Cmd;
 use crate::model::{self, Applied};
 use crate::needs;
 use crate::readstate::{self, ReadState};
 use crate::relay::{BlobDescriptor, Relay};
 use crate::sections::{self, Lanes};
+use crate::subscription::{self, Subscriptions};
 use crate::unread;
 
 pub enum Msg {
@@ -95,6 +97,30 @@ pub enum Msg {
         id: String,
         result: anyhow::Result<()>,
         text: String,
+    },
+    /// The control channel's messages and the notes' reactions, and the
+    /// note ids (for the live tail of reactions).
+    Control {
+        channel: String,
+        result: anyhow::Result<(Vec<Event>, Vec<String>)>,
+    },
+    /// `B`, step 1: the relay's newest map (or why not), and the edit.
+    SubscriptionFetched {
+        edit: subscription::Edit,
+        label: String,
+        result: anyhow::Result<Vec<Event>>,
+    },
+    /// The subscription map went out (`B`), or didn't.
+    SubscriptionSet {
+        event: Box<Event>,
+        label: String,
+        result: anyhow::Result<()>,
+    },
+    /// A vote went out, or didn't.
+    Voted {
+        event: Box<Event>,
+        label: String,
+        result: anyhow::Result<()>,
     },
     /// A dropped file (`label` is its path) or the clipboard, read.
     Attachment {
@@ -206,6 +232,31 @@ impl Sync {
                     .await
                     .unwrap_or_default(),
             )
+        });
+    }
+
+    /// The subscription map and the people to pick from, and their live
+    /// tail (another device, or the box publishing a new list).
+    pub fn load_subscriptions(&mut self, filters: Vec<Value>) {
+        let at = now();
+        let _ = self.live.send(Cmd::Sub {
+            id: "subscription".into(),
+            filters: filters
+                .iter()
+                .map(|f| {
+                    let mut f = f.clone();
+                    f["since"] = json!(at);
+                    f["limit"] = json!(0);
+                    f
+                })
+                .collect(),
+        });
+        let r = self.relay.clone();
+        self.spawn(async move {
+            match r.query(&filters).await {
+                Ok(evs) => Msg::Events(evs),
+                Err(e) => Msg::Did(Err(e.context("couldn't load the subscription map"))),
+            }
         });
     }
 
@@ -403,6 +454,27 @@ impl Sync {
                 records,
                 today,
             }
+        });
+    }
+
+    /// The control channel: its messages for the last `DAYS_BACK` days and
+    /// every reaction to its notes. A live tail follows in `control_tail`.
+    pub fn load_control(&mut self, channel: &str) {
+        self.control_tail(channel, &[]);
+        let r = self.relay.clone();
+        let channel = channel.to_string();
+        let at = now();
+        self.spawn(async move {
+            let result = control::fetch(&r, &channel, at).await;
+            Msg::Control { channel, result }
+        });
+    }
+
+    /// New messages in the control channel, and reactions to its notes.
+    pub fn control_tail(&mut self, channel: &str, notes: &[String]) {
+        let _ = self.live.send(Cmd::Sub {
+            id: "control".into(),
+            filters: control::tail_filters(channel, notes, now()),
         });
     }
 
@@ -691,6 +763,16 @@ impl Sync {
             }
             Action::EncodeImage(key) => self.encode(app, key),
             Action::WantProfiles(pks) => self.want_profiles(pks),
+            Action::LoadControl => {
+                let ch = app.control.channel.clone();
+                self.load_control(&ch);
+            }
+            Action::React {
+                target,
+                emoji,
+                label,
+            } => self.react(app, target, emoji, label),
+            Action::SetSubscription { edit, label } => self.fetch_subscription(app, edit, label),
             Action::SendQuick {
                 channel,
                 content,
@@ -911,6 +993,75 @@ impl Sync {
         };
         let r = self.relay.clone();
         self.spawn(async move { Msg::Did(r.publish(&ev).await.map(|_| label.to_string())) });
+    }
+
+    /// `B`, step 1: the map is a read-modify-write of one record, so read
+    /// the relay's newest first; a copy loaded at start (or missed while
+    /// disconnected) would drop picks made elsewhere.
+    fn fetch_subscription(&mut self, app: &mut App, edit: subscription::Edit, label: String) {
+        app.say(format!("{label}…"));
+        let r = self.relay.clone();
+        let filters = app.subscriptions.filters();
+        self.spawn(async move {
+            let result = r.query(&filters).await;
+            Msg::SubscriptionFetched {
+                edit,
+                label,
+                result,
+            }
+        });
+    }
+
+    /// `B`, step 2: the newest map with the edit, signed, shown at once (so
+    /// a second edit builds on it) and published; undone if the relay refuses.
+    pub fn set_subscription(&mut self, app: &mut App, map: subscription::Map, label: String) {
+        let at = match app.subscriptions.next_at(now()) {
+            Ok(at) => at,
+            Err(why) => return app.say(format!("subscription not set: {why}; nothing sent")),
+        };
+        let ev = match subscription::builder(&map, at).and_then(|b| self.relay.sign(b)) {
+            Ok(ev) => ev,
+            Err(e) => return app.say(format!("couldn't sign: {e}")),
+        };
+        app.subscriptions.apply_ours(&ev);
+        let r = self.relay.clone();
+        self.spawn(async move {
+            // A new id the relay calls a duplicate was dropped, not stored.
+            let result = r.publish_new(&ev).await;
+            Msg::SubscriptionSet {
+                event: Box::new(ev),
+                label,
+                result,
+            }
+        });
+    }
+
+    /// A vote on a control request: the action's emoji as a reaction.
+    fn react(&mut self, app: &mut App, target: String, emoji: String, label: String) {
+        let Ok(id) = EventId::from_hex(&target) else {
+            app.control_sending.remove(&target);
+            return;
+        };
+        let ev = match buzz_sdk::build_reaction(id, &emoji)
+            .map_err(anyhow::Error::from)
+            .and_then(|b| self.relay.sign(b))
+        {
+            Ok(ev) => ev,
+            Err(e) => {
+                app.control_sending.remove(&target);
+                return app.say(format!("couldn't vote: {e}"));
+            }
+        };
+        app.say(format!("voting {label} {emoji}…"));
+        let r = self.relay.clone();
+        self.spawn(async move {
+            let result = r.publish(&ev).await;
+            Msg::Voted {
+                event: Box::new(ev),
+                label,
+                result,
+            }
+        });
     }
 
     /// A file on our relay needs our auth, which a browser doesn't have:
@@ -1161,6 +1312,10 @@ pub fn fold(app: &mut App, sync: &mut Sync, ev: &Event, live_channel: bool) -> V
         }
         20001 => {
             app.agents.presence(&ev.pubkey.to_hex(), &ev.content);
+            return vec![];
+        }
+        30078 if Subscriptions::is_record(ev) => {
+            app.subscriptions.apply(ev);
             return vec![];
         }
         30078 if readstate::is_read_state(ev) => {

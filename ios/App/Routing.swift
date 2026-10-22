@@ -1,14 +1,15 @@
 import SwiftUI
 
-/// The Routing page: pinned last, after the channels, never in the
-/// switcher (like tab 0).
+/// The Routing page: pinned after the channels (Control follows it),
+/// never in the switcher (like tab 0).
 enum Routing {
     static let id = "routing"
 }
 
-/// The page's channel, or nil for tab 0 and Routing, which aren't channels.
+/// The page's channel, or nil for tab 0, Routing and Control, which
+/// aren't channels.
 func channelPage(_ id: String?) -> String? {
-    guard let id, id != Needs.id, id != Routing.id else { return nil }
+    guard let id, id != Needs.id, id != Routing.id, id != Control.id else { return nil }
     return id
 }
 

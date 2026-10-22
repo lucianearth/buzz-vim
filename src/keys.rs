@@ -19,6 +19,10 @@ pub enum Mode {
     Reply,
     /// Asking before archiving the tab picked in the tab menu.
     Archive,
+    /// Asking before voting on a control request (a kind-7 reaction).
+    Vote,
+    /// `B`: whose Claude subscription this channel's agents spend.
+    Subscription,
 }
 
 impl Mode {
@@ -36,6 +40,8 @@ impl Mode {
             Mode::Quick => "Q",
             Mode::Reply => "REPLY",
             Mode::Archive => "ARCHIVE?",
+            Mode::Vote => "VOTE?",
+            Mode::Subscription => "SUBSCRIPTION",
         }
     }
 }
@@ -66,6 +72,13 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("c", "checklist", true),
             ("w", "routing: how each stop was routed", false),
             ("t ⏎ s o", "routing: window, sample, another, thread", false),
+            ("C", "control: #control notes, trends, requests", false),
+            ("⏎ 1-9 r", "control: open, vote on a request, reload", false),
+            (
+                "B",
+                "subscription: whose Claude this channel's agents use",
+                false,
+            ),
             (
                 "q Q ^q",
                 "ask #quick; again in the box: + this channel",
@@ -129,6 +142,16 @@ pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
             ("esc", "close (keeps the text)", true),
         ],
         Mode::Archive => &[("y ⏎", "archive", true), ("n esc", "cancel", true)],
+        Mode::Vote => &[
+            ("y ⏎", "send the reaction", true),
+            ("n esc", "cancel", true),
+        ],
+        Mode::Subscription => &[
+            ("j k", "pick", true),
+            ("⇥ h l", "this channel / the default for all", true),
+            ("⏎", "use it (signs and publishes)", true),
+            ("esc", "close", true),
+        ],
         Mode::Reply => &[
             ("⏎", "send into its thread", true),
             ("⇧⏎ ^j", "new line", true),

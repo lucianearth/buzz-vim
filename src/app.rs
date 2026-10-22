@@ -13,6 +13,7 @@ use ratatui_image::picker::Picker;
 use crate::checklist::Checklists;
 use crate::clip::Pending;
 use crate::config::Loop;
+use crate::control::Board;
 use crate::draft::Draft;
 use crate::keys::Mode;
 use crate::live::ConnState;
@@ -23,6 +24,7 @@ use crate::needs::{self, Row};
 use crate::readstate::{self, ReadState};
 use crate::routing::{self, Decision, Lane, Pick, Window};
 use crate::sections::Section;
+use crate::subscription::{self, Subscriptions};
 use crate::telemetry::Agents;
 use crate::unread::{self, Next};
 
@@ -146,6 +148,20 @@ pub enum Action {
     },
     /// Look up these people's names (the Q agent's, in #quick).
     WantProfiles(Vec<String>),
+    /// Read the control channel's notes, replies and reactions.
+    LoadControl,
+    /// A vote on a control request: a kind-7 reaction to the note.
+    React {
+        target: String,
+        emoji: String,
+        label: String,
+    },
+    /// `B`: re-read the map from the relay, apply the edit to the newest,
+    /// sign and publish (`label` says what changed).
+    SetSubscription {
+        edit: subscription::Edit,
+        label: String,
+    },
     SaveState,
     Quit,
 }
@@ -279,6 +295,39 @@ pub struct App {
     pub routing_sample: Option<usize>,
     /// Why for the sample, and the step picked in it.
     pub routing_why: Option<usize>,
+    /// The Control view (`C`): #control's notes.
+    pub control_view: bool,
+    pub control: Board,
+    /// The topic open (the day list), and the note open in it.
+    pub control_topic: Option<String>,
+    pub control_note: Option<String>,
+    /// The row picked on the topic or day list.
+    pub control_cursor: usize,
+    /// Rows scrolled down on a note.
+    pub control_scroll: usize,
+    /// Tallest scroll from the last draw.
+    pub control_max_scroll: usize,
+    /// The action asked about (y/n) before voting, and the request it is on.
+    pub control_vote: Option<usize>,
+    pub control_vote_on: Option<String>,
+    /// Requests whose vote is on its way to the relay: no second one (a
+    /// double tap) until it answers.
+    pub control_sending: std::collections::BTreeSet<String>,
+    /// Which Claude subscription each channel's agents spend (`B`).
+    pub subscriptions: Subscriptions,
+    /// The `B` picker: on the default for every channel (else this one),
+    /// and its row (0 = follow the default / each agent's owner).
+    pub sub_all: bool,
+    pub sub_cursor: usize,
+    /// The row under the cursor as last drawn from (None: none yet; Some(None):
+    /// follow the default). ⏎ refuses if the rows moved under it since.
+    pub sub_expect: Option<Option<String>>,
+    /// ⏎ was pressed once with no relay map yet: the next ⏎ publishes the
+    /// first record, which replaces the dashboard's whole map.
+    pub sub_confirm: bool,
+    /// Today for the overview's sparklines (YYYY-MM-DD); None = the UTC
+    /// date now. Tests pin it.
+    pub control_today: Option<String>,
 }
 
 impl App {
@@ -364,6 +413,22 @@ impl App {
             },
             routing_sample: None,
             routing_why: None,
+            control_view: false,
+            control: Board::new(crate::control::DEFAULT_CHANNEL),
+            control_topic: None,
+            control_note: None,
+            control_cursor: 0,
+            control_scroll: 0,
+            control_max_scroll: 0,
+            control_vote: None,
+            control_vote_on: None,
+            control_sending: Default::default(),
+            subscriptions: Subscriptions::default(),
+            sub_all: false,
+            sub_cursor: 0,
+            sub_expect: None,
+            sub_confirm: false,
+            control_today: None,
         }
     }
 
@@ -583,6 +648,7 @@ impl App {
     fn switch_tab(&mut self, i: usize) {
         self.needs_view = false;
         self.routing_view = false;
+        self.control_view = false;
         if i < self.tabs.len() && i != self.active {
             self.active = i;
             self.thread = None;
@@ -619,6 +685,7 @@ impl App {
     fn open_needs(&mut self) {
         self.needs_view = true;
         self.routing_view = false;
+        self.control_view = false;
         self.agents_view = false;
         self.checklist_view = false;
         self.needs = self.needs_rows();
@@ -627,6 +694,7 @@ impl App {
     /// Open a row: its message in its thread (or the thread, or the channel).
     fn open_row(&mut self, row: &Row) {
         self.agents_view = false;
+        self.control_view = false;
         self.checklist_view = false;
         self.follow(&row.link());
         self.needs_view = false;
@@ -758,10 +826,298 @@ impl App {
         true
     }
 
+    // ---------- control ----------
+
+    fn open_control(&mut self) {
+        self.control_view = true;
+        self.needs_view = false;
+        self.routing_view = false;
+        self.agents_view = false;
+        self.checklist_view = false;
+        if !self.control.loaded {
+            self.actions.push(Action::LoadControl);
+        }
+    }
+
+    /// The note on screen, if one is open.
+    pub fn control_open_note(&self) -> Option<&crate::control::Note> {
+        self.control_note
+            .as_deref()
+            .and_then(|id| self.control.note(id))
+    }
+
+    /// The day the overview's sparklines end on.
+    pub fn control_day(&self) -> String {
+        self.control_today
+            .clone()
+            .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string())
+    }
+
+    /// The overview's picks, top to bottom: the open requests in the strip
+    /// (ids), then the topic tiles (names).
+    pub fn control_overview(&self) -> (Vec<String>, Vec<String>) {
+        let reqs = self
+            .control
+            .open_requests()
+            .iter()
+            .take(crate::control::STRIP_MAX)
+            .map(|n| n.id.clone())
+            .collect();
+        let tiles = self
+            .control
+            .tiles(&self.control_day())
+            .into_iter()
+            .map(|t| t.topic)
+            .collect();
+        (reqs, tiles)
+    }
+
+    /// Rows of the list on screen: the overview's picks, or the open
+    /// topic's days.
+    fn control_rows(&self) -> usize {
+        match &self.control_topic {
+            None => {
+                let (r, t) = self.control_overview();
+                r.len() + t.len()
+            }
+            Some(t) => self.control.days(t).len(),
+        }
+    }
+
+    fn control_open(&mut self) {
+        let i = self.control_cursor;
+        match self.control_topic.clone() {
+            None => {
+                let (reqs, tiles) = self.control_overview();
+                if let Some(id) = reqs.get(i) {
+                    // Straight to the request; back returns here.
+                    self.control_note = Some(id.clone());
+                    self.control_scroll = 0;
+                } else if let Some(t) = tiles.get(i - reqs.len()) {
+                    self.control_topic = Some(t.clone());
+                    self.control_cursor = 0;
+                }
+            }
+            Some(t) => {
+                if let Some(n) = self.control.days(&t).get(i) {
+                    self.control_note = Some(n.id.clone());
+                    self.control_scroll = 0;
+                }
+            }
+        }
+    }
+
+    fn control_back(&mut self) {
+        if self.control_note.take().is_some() {
+            return;
+        }
+        if let Some(t) = self.control_topic.take() {
+            // Back on the tile it came from.
+            let (reqs, tiles) = self.control_overview();
+            self.control_cursor = reqs.len() + tiles.iter().position(|r| *r == t).unwrap_or(0);
+            return;
+        }
+        self.control_view = false;
+    }
+
+    /// The request a vote is asked about.
+    pub fn control_vote_note(&self) -> Option<&crate::control::Note> {
+        self.control_vote_on
+            .as_deref()
+            .and_then(|id| self.control.note(id))
+    }
+
+    /// Whether `me` may vote `action` on `n` now: the board's rule, and no
+    /// vote of ours on it still in flight.
+    pub fn can_vote(&self, n: &crate::control::Note, action: usize) -> Result<(), String> {
+        self.control.can_vote(n, action, &self.store.me)?;
+        if self.control_sending.contains(&n.id) {
+            return Err("your vote on this request is still being sent".into());
+        }
+        Ok(())
+    }
+
+    /// The relay's answer to a vote: counted, or said why not; either way
+    /// the request takes votes again (if the board allows).
+    pub fn control_voted(&mut self, ev: &nostr::Event, label: &str, result: anyhow::Result<()>) {
+        if let Some(target) = ev
+            .tags
+            .iter()
+            .map(|t| t.as_slice())
+            .filter(|t| t.first().is_some_and(|n| n == "e"))
+            .filter_map(|t| t.get(1))
+            .last()
+        {
+            self.control_sending.remove(target);
+        }
+        match result {
+            Ok(()) => {
+                self.control.apply(ev);
+                self.say(format!("voted {label} {}", ev.content));
+            }
+            Err(e) => self.say(format!("vote not sent: {e}")),
+        }
+    }
+
+    /// A digit on a request: ask before voting that action, or say why not.
+    fn ask_vote(&mut self, id: &str, action: usize) {
+        let Some(n) = self.control.note(id) else {
+            return;
+        };
+        match self.can_vote(n, action) {
+            Ok(()) => {
+                self.control_vote = Some(action);
+                self.control_vote_on = Some(id.to_string());
+                self.mode = Mode::Vote;
+            }
+            Err(why) => self.say(format!("can't vote: {why}")),
+        }
+    }
+
+    fn send_vote(&mut self) {
+        self.mode = Mode::Normal;
+        let Some(i) = self.control_vote.take() else {
+            return;
+        };
+        let Some(n) = self
+            .control_vote_on
+            .take()
+            .and_then(|id| self.control.note(&id))
+        else {
+            return;
+        };
+        let Some(a) = n.actions.get(i) else { return };
+        // Asked again: the request may have closed while the box was up.
+        if let Err(why) = self.can_vote(n, i) {
+            return self.say(format!("can't vote: {why}"));
+        }
+        self.control_sending.insert(n.id.clone());
+        self.actions.push(Action::React {
+            target: n.id.clone(),
+            emoji: a.emoji.clone(),
+            label: a.name.clone(),
+        });
+    }
+
+    /// Open the note's images in the viewer.
+    fn control_images(&mut self) {
+        let urls: Vec<String> = self
+            .control_open_note()
+            .map(|n| {
+                n.media
+                    .iter()
+                    .filter(|m| m.mime.starts_with("image/"))
+                    .map(|m| m.url.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if urls.is_empty() {
+            return self.say("no images on this note");
+        }
+        self.viewer_list = urls;
+        self.mode = Mode::Viewer;
+        self.show_image(0);
+    }
+
+    /// Keys on the Control view. True when the key was its own.
+    fn key_control(&mut self, k: KeyEvent) -> bool {
+        let on_note = self.control_note.is_some();
+        let page = self.page.max(1);
+        match k.code {
+            KeyCode::Char('C') => self.control_view = false,
+            KeyCode::Char('r') => {
+                self.actions.push(Action::LoadControl);
+                self.say("reloading #control");
+            }
+            KeyCode::Char(c @ '1'..='9') if on_note => {
+                let Some(id) = self
+                    .control_open_note()
+                    .filter(|n| n.is_request())
+                    .map(|n| n.id.clone())
+                else {
+                    return false;
+                };
+                self.ask_vote(&id, c as usize - '1' as usize);
+            }
+            // On the overview a digit votes the request picked, or the only
+            // one; with none open it leaves for the tab, as elsewhere.
+            KeyCode::Char(c @ '1'..='9') if self.control_topic.is_none() => {
+                let (reqs, _) = self.control_overview();
+                let id = match reqs.get(self.control_cursor) {
+                    Some(id) => id.clone(),
+                    None if reqs.len() == 1 => reqs[0].clone(),
+                    None if reqs.is_empty() => return false,
+                    None => {
+                        self.say("pick a request with j k first");
+                        return true;
+                    }
+                };
+                self.ask_vote(&id, c as usize - '1' as usize);
+            }
+            KeyCode::Char('o') if on_note => self.control_images(),
+            KeyCode::Char('j') | KeyCode::Down if on_note => {
+                self.control_scroll = (self.control_scroll + 1).min(self.control_max_scroll)
+            }
+            KeyCode::Char('k') | KeyCode::Up if on_note => {
+                self.control_scroll = self.control_scroll.saturating_sub(1)
+            }
+            KeyCode::Char('d') | KeyCode::PageDown if on_note => {
+                self.control_scroll = (self.control_scroll + page).min(self.control_max_scroll)
+            }
+            KeyCode::Char('u') | KeyCode::PageUp if on_note => {
+                self.control_scroll = self.control_scroll.saturating_sub(page)
+            }
+            KeyCode::Char('g') | KeyCode::Home if on_note => self.control_scroll = 0,
+            KeyCode::Char('G') | KeyCode::End if on_note => {
+                self.control_scroll = self.control_max_scroll
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.control_cursor =
+                    (self.control_cursor + 1).min(self.control_rows().saturating_sub(1))
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.control_cursor = self.control_cursor.saturating_sub(1)
+            }
+            KeyCode::Char('g') | KeyCode::Home => self.control_cursor = 0,
+            KeyCode::Char('G') | KeyCode::End => {
+                self.control_cursor = self.control_rows().saturating_sub(1)
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') if !on_note => self.control_open(),
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc | KeyCode::Backspace => {
+                self.control_back()
+            }
+            // Writing, threads and reactions would act on the channel
+            // hidden under the view.
+            KeyCode::Char('i')
+            | KeyCode::Char('+')
+            | KeyCode::Char('o')
+            | KeyCode::Char('O')
+            | KeyCode::Char('n')
+            | KeyCode::Char('f')
+            | KeyCode::Char('l')
+            | KeyCode::Enter
+            | KeyCode::Right
+            | KeyCode::Char('<')
+            | KeyCode::Char('>')
+            | KeyCode::Char('[')
+            | KeyCode::Char(']')
+            | KeyCode::Char('s')
+            | KeyCode::Char('T')
+            | KeyCode::Char('R')
+            | KeyCode::Char('d')
+            | KeyCode::Char('u')
+            | KeyCode::PageDown
+            | KeyCode::PageUp => {}
+            _ => return false,
+        }
+        true
+    }
+
     // ---------- routing ----------
 
     fn open_routing(&mut self) {
         self.routing_view = true;
+        self.control_view = false;
         self.needs_view = false;
         self.agents_view = false;
         self.checklist_view = false;
@@ -1484,6 +1840,11 @@ impl App {
             self.reply_draft.insert(&text);
             return;
         }
+        // Nor does the Control view: a paste there would land in the
+        // channel hidden under it (or swap the vote box for Insert).
+        if self.control_view {
+            return self.say("nothing to paste into on the Control view");
+        }
         // Nor does the routing view.
         if self.routing_view {
             return;
@@ -1620,6 +1981,17 @@ impl App {
                 }
                 _ => {}
             },
+            Mode::Vote => match k.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.send_vote(),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                    self.control_vote = None;
+                    self.control_vote_on = None;
+                    self.mode = Mode::Normal;
+                    self.say("no vote sent");
+                }
+                _ => {}
+            },
+            Mode::Subscription => self.key_subscription(k),
             Mode::Archive => match k.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.archive(),
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
@@ -1709,6 +2081,26 @@ impl App {
         if self.needs_view && !ctrl && self.key_needs(k) {
             return;
         }
+        if self.control_view {
+            if !ctrl && self.key_control(k) {
+                return;
+            }
+            // As on the routing view: only keys that leave it, or open
+            // another view, reach the channel hidden under it.
+            let leaves = match k.code {
+                KeyCode::Char(c) if !ctrl => {
+                    matches!(
+                        c,
+                        'q' | 'Q' | '0'..='9' | '!' | 'L' | 'H' | 'c' | 'a' | 'w' | '?'
+                    )
+                }
+                KeyCode::Tab | KeyCode::BackTab => true,
+                _ => false,
+            };
+            if !leaves {
+                return;
+            }
+        }
         if self.routing_view {
             if !ctrl && self.key_routing(k) {
                 return;
@@ -1792,12 +2184,15 @@ impl App {
             KeyCode::Char('c') => {
                 self.needs_view = false;
                 self.routing_view = false;
+                self.control_view = false;
                 self.checklist_view = true;
                 self.agents_view = false;
                 self.checklist_cursor = 0;
             }
             KeyCode::Char('q') | KeyCode::Char('Q') => self.quick(),
             KeyCode::Char('w') => self.open_routing(),
+            KeyCode::Char('C') => self.open_control(),
+            KeyCode::Char('B') => self.open_subscription(),
             KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
             KeyCode::Char('d') | KeyCode::PageDown => self.move_cursor(self.page.max(1) as isize),
@@ -1822,6 +2217,7 @@ impl App {
             KeyCode::Char('a') => {
                 self.needs_view = false;
                 self.routing_view = false;
+                self.control_view = false;
                 self.agents_view = !self.agents_view;
                 self.checklist_view = false;
             }
@@ -1981,6 +2377,198 @@ impl App {
         let next = (at as isize + delta).clamp(0, n.saturating_sub(1) as isize) as usize;
         if next != at {
             self.show_image(next);
+        }
+    }
+
+    /// `B` in a channel: the subscription picker, on what it uses now.
+    fn open_subscription(&mut self) {
+        let Some(channel) = self.current().map(str::to_string) else {
+            return self.say("open a channel first");
+        };
+        self.sub_all = false;
+        self.sub_confirm = false;
+        self.sub_cursor = self.sub_row_of(&channel);
+        self.sub_expect = self.sub_row_id(self.sub_cursor);
+        self.mode = Mode::Subscription;
+    }
+
+    /// The picker's rows after the first: the people the box offers, then
+    /// anyone picked now (this channel or the default) whom it doesn't, so
+    /// the cursor can sit on the current pick and ⏎ keeps it.
+    pub fn sub_people(&self) -> Vec<subscription::Person> {
+        let mut out = self.subscriptions.people().to_vec();
+        let m = self.subscriptions.map();
+        let here = self
+            .current()
+            .and_then(|c| m.and_then(|m| m.channels.get(c).cloned()));
+        let default = m.and_then(|m| m.default.clone());
+        for id in [here, default].into_iter().flatten() {
+            if !out.iter().any(|p| p.id == id) {
+                out.push(subscription::Person {
+                    label: format!("{id} (not offered)"),
+                    id,
+                });
+            }
+        }
+        out
+    }
+
+    /// What a picker row stands for: Some(None) follow the default (or the
+    /// owner), Some(Some(id)) a person, None past the end.
+    pub fn sub_row_id(&self, row: usize) -> Option<Option<String>> {
+        match row.checked_sub(1) {
+            None => Some(None),
+            Some(i) => self.sub_people().get(i).map(|p| Some(p.id.clone())),
+        }
+    }
+
+    /// The row for what's set now, in the picker's current scope.
+    fn sub_row_of(&self, channel: &str) -> usize {
+        let m = self.subscriptions.map();
+        let set = if self.sub_all {
+            m.and_then(|m| m.default.clone())
+        } else {
+            m.and_then(|m| m.channels.get(channel).cloned())
+        };
+        set.and_then(|p| self.sub_people().iter().position(|x| x.id == p))
+            .map_or(0, |i| i + 1)
+    }
+
+    fn key_subscription(&mut self, k: KeyEvent) {
+        let n = self.sub_people().len() + 1;
+        // Any key but ⏎ takes back a pending "⏎ again".
+        if k.code != KeyCode::Enter {
+            self.sub_confirm = false;
+        }
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('B') => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.sub_cursor = (self.sub_cursor + 1).min(n - 1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => self.sub_cursor = self.sub_cursor.saturating_sub(1),
+            KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Char('h')
+            | KeyCode::Char('l')
+            | KeyCode::Left
+            | KeyCode::Right => {
+                self.sub_all = !self.sub_all;
+                if let Some(c) = self.current().map(str::to_string) {
+                    self.sub_cursor = self.sub_row_of(&c);
+                }
+            }
+            KeyCode::Enter => return self.choose_subscription(),
+            _ => return,
+        }
+        self.sub_expect = self.sub_row_id(self.sub_cursor);
+    }
+
+    /// ⏎ in the picker: the new map, signed and published by sync. Only an
+    /// operator's record counts, so anyone else is told rather than sent.
+    fn choose_subscription(&mut self) {
+        let Some(channel) = self.current().map(str::to_string) else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        if !self.subscriptions.is_operator(&self.store.me) {
+            self.mode = Mode::Normal;
+            return self
+                .say("only an operator's pick counts (subscription_operators); nothing sent");
+        }
+        // The rows can move under the cursor (a newer map, a new people
+        // list): send only what was under it, never a neighbour or "clear".
+        let row = self.sub_row_id(self.sub_cursor);
+        let Some(person) = row.clone().filter(|_| row == self.sub_expect) else {
+            self.sub_cursor = self.sub_cursor.min(self.sub_people().len());
+            self.sub_expect = self.sub_row_id(self.sub_cursor);
+            self.sub_confirm = false;
+            return self.say("the list changed; pick again");
+        };
+        // No relay map yet: this record replaces the dashboard's whole map
+        // at the next reconcile. Asked once more, never sent on one ⏎.
+        if self.subscriptions.map().is_none() && !self.sub_confirm {
+            self.sub_confirm = true;
+            return self.say(
+                "the first pick replaces the dashboard's whole map (every dashboard pick goes); ⏎ again to publish",
+            );
+        }
+        self.sub_confirm = false;
+        let who = person.as_deref().map(|p| self.subscriptions.label(p));
+        let name = self
+            .store
+            .channels
+            .get(&channel)
+            .map_or_else(|| channel.chars().take(8).collect(), |c| c.name.clone());
+        let (edit, label) = if self.sub_all {
+            (
+                subscription::Edit::Default(person.clone()),
+                format!(
+                    "default subscription: {}",
+                    who.unwrap_or_else(|| "each agent's owner".into())
+                ),
+            )
+        } else {
+            (
+                subscription::Edit::Channel(channel.clone(), person.clone()),
+                format!(
+                    "#{name} subscription: {}",
+                    who.unwrap_or_else(|| "the default".into())
+                ),
+            )
+        };
+        self.mode = Mode::Normal;
+        // Whether it changes anything is decided against the relay's newest
+        // map at publish time (sync), not this possibly stale copy.
+        self.actions.push(Action::SetSubscription { edit, label });
+    }
+
+    /// `B`, after the relay's newest map came back: fold it, apply the edit;
+    /// the map to sign, or None when it changes nothing (said so).
+    pub fn subscription_fetched(
+        &mut self,
+        result: anyhow::Result<Vec<nostr::Event>>,
+        edit: &subscription::Edit,
+        label: &str,
+    ) -> Option<subscription::Map> {
+        let evs = match result {
+            Ok(evs) => evs,
+            Err(e) => {
+                self.say(format!(
+                    "subscription not set: couldn't read the current map ({e}); nothing sent"
+                ));
+                return None;
+            }
+        };
+        for ev in &evs {
+            self.subscriptions.apply(ev);
+        }
+        let map = self.subscriptions.edited(edit);
+        if let Err(why) = subscription::check_version(&map) {
+            self.say(format!("subscription not set: {why}; nothing sent"));
+            return None;
+        }
+        if self.subscriptions.map() == Some(&map) {
+            self.say(format!("{label} (already)"));
+            return None;
+        }
+        Some(map)
+    }
+
+    /// `B`, the relay's answer to our record.
+    pub fn subscription_set(&mut self, id: &str, label: &str, result: anyhow::Result<()>) {
+        match result {
+            Ok(()) => {
+                self.subscriptions.ack(id);
+                self.say(format!(
+                    "{label}: takes effect at each session's next start"
+                ))
+            }
+            Err(e) => {
+                // Refused, or dropped as older than the relay's newest: the
+                // record shown goes, and B again builds on what is stored.
+                self.subscriptions.retract(id);
+                self.say(format!("subscription not set: {e}; pick again"))
+            }
         }
     }
 
@@ -2227,6 +2815,18 @@ impl App {
                     return;
                 }
                 // The routing view scrolls nothing; the channel under it stays put.
+                if self.control_view {
+                    // The wheel scrolls the note, or moves the list's pick.
+                    if self.control_note.is_some() {
+                        let s = self.control_scroll as isize + d;
+                        self.control_scroll = s.clamp(0, self.control_max_scroll as isize) as usize;
+                    } else {
+                        let c = self.control_cursor as isize + d.signum();
+                        let n = self.control_rows() as isize;
+                        self.control_cursor = c.clamp(0, (n - 1).max(0)) as usize;
+                    }
+                    return;
+                }
                 if self.routing_view {
                     return;
                 }

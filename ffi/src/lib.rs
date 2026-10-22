@@ -14,6 +14,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use buzz_vim_core::checklist::{self, Checklists};
+use buzz_vim_core::control::{self as ctl, Board};
 use buzz_vim_core::links;
 use buzz_vim_core::live::{self, Cmd, ConnState, Live};
 use buzz_vim_core::mention;
@@ -31,9 +32,15 @@ use nostr::{Event, EventId, Keys, Tag};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
+mod control;
 mod pairing;
 mod push;
 mod routing;
+pub use control::{
+    ControlAction, ControlChart, ControlDay, ControlGauge, ControlHealth, ControlNote,
+    ControlOverview, ControlReaction, ControlRequest, ControlRow, ControlSeat, ControlSeries,
+    ControlStatusDay, ControlTable, ControlTile, ControlUnit, DeltaTone, control_value_label,
+};
 pub use pairing::{PairStep, Pairing};
 pub use push::{PushChallenge, PushDelegation, PushNote, PushRelay};
 pub use routing::{
@@ -312,6 +319,13 @@ pub fn ink(key: String, level: u8, light: bool) -> Rgb {
     palette::ink(palette::hue(&key), level, light).into()
 }
 
+/// Step `level` at an OKLab `hue` in degrees: the Control view's status
+/// colors, the same hues the terminal's Control tab uses.
+#[uniffi::export]
+pub fn hue_ink(hue: f32, level: u8, light: bool) -> Rgb {
+    palette::ink(hue, level, light).into()
+}
+
 /// The pubkey (hex) for an nsec or hex secret, or why it isn't one.
 #[uniffi::export]
 pub fn pubkey_for(secret: String) -> Result<String, BuzzError> {
@@ -484,6 +498,17 @@ enum Msg {
         records: anyhow::Result<Vec<Event>>,
         today: anyhow::Result<Vec<Event>>,
     },
+    /// The control channel's history and its notes' reactions.
+    Control {
+        channel: String,
+        result: anyhow::Result<(Vec<Event>, Vec<String>)>,
+    },
+    /// A vote on a control request went out, or didn't.
+    Voted {
+        event: Box<Event>,
+        label: String,
+        result: anyhow::Result<()>,
+    },
 }
 
 struct Engine {
@@ -527,6 +552,10 @@ struct Engine {
     checklists: Checklists,
     /// The channel whose checklist records are tailed live.
     checklist_for: Option<String>,
+    /// The Control page's notes (`control.rs`), and whether it has been
+    /// opened (then a reconnect reloads it).
+    control: Board,
+    control_open: bool,
 }
 
 fn now() -> u64 {
@@ -615,6 +644,8 @@ impl Client {
             notices: vec![],
             checklists: Checklists::default(),
             checklist_for: None,
+            control: Board::new(ctl::DEFAULT_CHANNEL),
+            control_open: false,
         };
         let engine = Arc::new(Mutex::new(engine));
         {
@@ -2078,6 +2109,12 @@ impl Engine {
                 }
                 self.want_profiles(want);
             }
+            Msg::Control { channel, result } => self.on_control(channel, result),
+            Msg::Voted {
+                event,
+                label,
+                result,
+            } => self.on_voted(&event, label, result),
             Msg::Sent { id, result } => {
                 let Some(ev) = self.sending.remove(&id) else {
                     return;
@@ -2096,6 +2133,7 @@ impl Engine {
 
     fn on_live(&mut self, l: Live, was_online: &mut bool) {
         match l {
+            Live::Event { sub, event } if sub == "control" => self.on_control_live(&event),
             Live::Event { sub, event } => {
                 // Tab 0's tail carries tabs' messages too: count them as the tab's.
                 let tab = sub == "needs"
@@ -2118,6 +2156,9 @@ impl Engine {
                         }
                         if let Some(c) = self.current.clone() {
                             self.load_checklist(&c);
+                        }
+                        if self.control_open {
+                            self.load_control();
                         }
                         self.load_needs();
                     }
@@ -2598,7 +2639,7 @@ mod tests {
         assert_eq!((light.r, light.g, light.b), (0xf8, 0xfa, 0xff));
     }
 
-    fn engine() -> Engine {
+    pub(crate) fn engine() -> Engine {
         let keys = Keys::generate();
         let _g = RT.enter();
         let relay = Relay::new("wss://example.invalid", keys.clone(), None).unwrap();
@@ -2636,6 +2677,8 @@ mod tests {
             notices: vec![],
             checklists: Checklists::default(),
             checklist_for: None,
+            control: Board::new(ctl::DEFAULT_CHANNEL),
+            control_open: false,
         }
     }
 

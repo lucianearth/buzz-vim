@@ -8,6 +8,7 @@
 #![allow(clippy::collapsible_if, clippy::collapsible_match)]
 
 pub mod checklist;
+pub mod control;
 pub mod draft;
 pub mod links;
 pub mod live;
@@ -22,5 +23,6 @@ pub mod readstate;
 pub mod relay;
 pub mod routing;
 pub mod sections;
+pub mod subscription;
 pub mod telemetry;
 pub mod unread;

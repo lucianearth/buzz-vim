@@ -48,6 +48,24 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
   waiting on release, with a link to its ping), open / done counts and agent crashes today. A channel
   where two or more lists claim the checklist and the owner hasn't picked a driver shows `contested` with
   their creators, and no list until he does
+- `C` the Control view: the private #control channel's notes (`buzz control publish`, one per topic, day
+  and source; the newest wins, a missing day is a gap). The overview is an ops cockpit: open requests on
+  top with their vote keys (a digit votes the picked request, or the only one), a tile per topic (status
+  color: ok green, warn amber, page red, no note dim; the newest note's first line; a 14-day sparkline of
+  the topic's key metric: hooks cost per useful call, converge held runs, fleet-audit problems, upgrade
+  events, else notes per day), then the newest hooks note's gauges (value, baseline, delta: green better,
+  amber flag, red page; a flag is never green) and its seats. Tiles reflow down to 80 columns. `j` `k`
+  move, `⏎` a request's note or a topic's days, `⏎` a day's note: its summary, images and details. hooks/1
+  notes get the gauges, trend charts (one point per day, the baseline dashed), a hooks-alive strip, seats with dead hooks highlighted, agent types with their ⚑ flag
+  and ramp by repo; any other schema shows its JSON. A request shows its actions as `1`–`9` with votes and
+  status: pressing one asks, then sends that reaction as your vote (only approvers', when it names any).
+  `r` reloads. The channel is `control_channel` (`BUZZ_VIM_CONTROL_CHANNEL`), default #control
+- `B` in a channel picks whose Claude subscription its agents spend: this channel, or (`Tab`) the default
+  for every channel. Rows are "follow the default" (or each agent's owner) and the people the box offers;
+  a pick the box no longer offers stays listed as "not offered". `⏎` reads the newest map from the relay,
+  applies the change, signs it and publishes it (kind 30078 `d=buzz-subscription`); the aei reconciler
+  takes it from an operator's key only and it applies at each session's next start. The status line's
+  right end shows `sub <person>` or `sub <person> (default)`
 - `q` or `Q` (or `^q`, which also works while writing) asks a quick question: a box that posts a new top-level message
   in #quick, starting with `[Q]` and @mentioning taskbot. Press `^q` again in the box to add the channel you're
   in (its name, id, link and latest 30 messages' ids) so taskbot can read it; again takes it off. A DM or
@@ -80,6 +98,14 @@ taskbot. Tap the Q chip in the sheet to add the channel you're in, unless it is 
 name, id, link, open thread and latest 30 messages' ids); tap it again to take that off. Closing the sheet keeps the text. Send lands you in
 the new thread in #quick, where the answer comes.
 
+The control chip, last in the tab row after routing, is the terminal's Control view (`C`) in the same
+ops-cockpit style, from the same core: the open requests on top in an amber card with a button per declared
+action (a tap reacts with that action's emoji, which is the vote; a dim button says why you can't vote it),
+a tile per topic (status color and glyph, the worst note's line, a 14-day sparkline of the topic's key
+metric), the newest hooks note's gauges (value, baseline, delta in its tone, 14 days) and its seats. A tile
+opens the topic's days, a day its note (the hooks note has its status by day, gauges, trend charts and
+tables; any other schema shows its details as JSON). Pull down to read #control again.
+
 Closed, it gets real pushes through upstream Buzz's push (`buzz-push-v1`): the phone enrolls its APNs token
 with the push gateway (`Push.gateway` in `ios/App/Push.swift`, App Attest), delegates to the relay's push
 key, and publishes a lease (kind 30350, encrypted to the relay) for one thing only: the watcher's messages
@@ -99,6 +125,12 @@ In `buzz-vim/config.json` (or the env var):
 - `watcher` (`BUZZ_VIM_WATCHER`, comma separated; in config.json a list or a comma-separated string): the
   watcher's pubkeys; its state counts only from these. Default the watcher seat (`d84ddba9…`). A value of
   another type is ignored with a warning, and the default used.
+- `control_channel` (`BUZZ_VIM_CONTROL_CHANNEL`): the channel id the Control view (`C`) reads, default
+  #control (`ee7289a1-…`).
+- `subscription_operators` (`BUZZ_VIM_SUB_OPERATORS`, comma separated): whose `B` map counts, default
+  lucian (`5c017fc7…`), the same default as the box's reconciler. `subscription_publishers`
+  (`BUZZ_VIM_SUB_PUBLISHERS`): who may publish the people list, default the box's poster key
+  (`f708a2af…`). Keys are 64 lowercase hex; any other value is ignored with a warning.
 - `quick_channel` (`BUZZ_VIM_QUICK_CHANNEL`), default `quick`, and `quick_agent` (`BUZZ_VIM_QUICK_AGENT`),
   default `taskbot`: where Q posts and who it @mentions.
 

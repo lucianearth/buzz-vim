@@ -57,6 +57,17 @@ struct Theme {
     var routeNudge: Color { light ? hex(0x2F6BC9) : hex(0x4A90F0) }
     var routePing: Color { light ? hex(0xC8621A) : hex(0xFF8A3D) }
 
+    /// The Control view's colors: the terminal Control tab's OKLab hues
+    /// (src/ui/control.rs), on the same ramp. ok green, warn amber, page
+    /// red, and cyan for data that carries no status.
+    func hue(_ h: Float, _ level: UInt8 = 19) -> Color {
+        cached("hue-\(h)-\(level)-\(light)") { hueInk(hue: h, level: level, light: light) }
+    }
+    var ok: Color { hue(145) }
+    var warn: Color { hue(75) }
+    var page: Color { hue(25) }
+    var data: Color { hue(215) }
+
     private func hex(_ v: UInt32) -> Color {
         Color(.sRGB, red: Double(v >> 16 & 0xFF) / 255, green: Double(v >> 8 & 0xFF) / 255,
               blue: Double(v & 0xFF) / 255, opacity: 1)
