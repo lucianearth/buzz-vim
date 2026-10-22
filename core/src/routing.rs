@@ -270,6 +270,7 @@ fn stage_label(s: &str) -> String {
         "not_running" => "list not running".into(),
         "contested_idle" => "contested, nothing runs".into(),
         "not_work_thread" => "not the work thread".into(),
+        "newer_elsewhere" => "newer message in another thread".into(),
         "judged" => "list running".into(),
         "turn_started" => "a turn started while judging".into(),
         "stopped_running" => "the list stopped running".into(),
@@ -408,11 +409,18 @@ fn in_window(d: &Decision, now: u64, w: Window) -> bool {
     d.at.saturating_add(w.secs()) >= now
 }
 
+/// Within `w` of `now`, and counted: the stops [`lane`] leaves out
+/// (`not_work_thread`, `newer_elsewhere`) are in no diagram, sample or total,
+/// so the diagram agrees with [`pipeline`].
+fn counted(d: &Decision, now: u64, w: Window) -> bool {
+    in_window(d, now, w) && lane(d).is_some()
+}
+
 /// The diagram for the decisions within `w` of `now`.
 pub fn flow(ds: &[Decision], now: u64, w: Window) -> Flow {
     let mut counts: HashMap<Node, usize> = HashMap::new();
     let mut edges: BTreeMap<(Node, Node), usize> = BTreeMap::new();
-    for d in ds.iter().filter(|d| in_window(d, now, w)) {
+    for d in ds.iter().filter(|d| counted(d, now, w)) {
         let p = d.path();
         for n in &p {
             *counts.entry(*n).or_default() += 1;
@@ -448,7 +456,7 @@ pub fn flow(ds: &[Decision], now: u64, w: Window) -> Flow {
 pub fn sample(ds: &[Decision], now: u64, w: Window, node: Node, n: usize) -> Option<&Decision> {
     let mut hits: Vec<&Decision> = ds
         .iter()
-        .filter(|d| in_window(d, now, w) && d.path().contains(&node))
+        .filter(|d| counted(d, now, w) && d.path().contains(&node))
         .collect();
     if hits.is_empty() {
         return None;
@@ -558,7 +566,9 @@ impl Lane {
 }
 
 /// The stream a decision leaves by. None for the retired "other thread"
-/// rule (`not_work_thread`), which no count includes.
+/// rule (`not_work_thread`) and for `newer_elsewhere` (the channel's newest
+/// message was in another thread, which is judged and counted on its own),
+/// neither of which any count includes.
 ///
 /// A judged stop Jev never labelled was settled before Jev was asked: a
 /// turn still running, the long-turn status ask, the 4 h pause after 3
@@ -570,7 +580,7 @@ impl Lane {
 /// other label this build doesn't know goes in "Jev: other".
 pub fn lane(d: &Decision) -> Option<Lane> {
     Some(match d.stage.as_str() {
-        "not_work_thread" => return None,
+        "not_work_thread" | "newer_elsewhere" => return None,
         "not_running" | "contested_idle" | "stopped_running" => Lane::NotRunning,
         // A turn that started or a thread that moved while judging: settled
         // before Jev only when Jev had not been asked yet; else it leaves by
@@ -817,6 +827,8 @@ pub struct Pipeline {
     pub outcomes: Vec<(Outcome, usize)>,
     /// Decisions from the retired "other thread" rule, left out.
     pub retired: usize,
+    /// `newer_elsewhere` stops, left out: the newer thread is counted itself.
+    pub elsewhere: usize,
 }
 
 impl Pipeline {
@@ -857,14 +869,31 @@ impl Pipeline {
     }
 
     /// "Not counted: …" for the footer, when anything was.
-    pub fn retired_note(&self) -> Option<String> {
-        (self.retired > 0).then(|| {
-            let s = if self.retired == 1 { "" } else { "s" };
-            format!(
-                "Not counted: {} decision{s} from a retired rule (stops outside the thread where you said go).",
-                self.retired
-            )
-        })
+    pub fn not_counted_note(&self) -> Option<String> {
+        let parts = self.not_counted();
+        (!parts.is_empty()).then(|| format!("Not counted: {}.", parts.join("; ")))
+    }
+
+    /// What the footer leaves out, one phrase per reason ("6 decisions
+    /// from a retired rule (…)"): a narrow screen puts each on its own line.
+    pub fn not_counted(&self) -> Vec<String> {
+        let s = |n: usize| if n == 1 { "" } else { "s" };
+        let mut parts = vec![];
+        if self.retired > 0 {
+            parts.push(format!(
+                "{} decision{} from a retired rule (stops outside the thread where you said go)",
+                self.retired,
+                s(self.retired)
+            ));
+        }
+        if self.elsewhere > 0 {
+            parts.push(format!(
+                "{} stop{} with a newer message in another thread (that thread is counted)",
+                self.elsewhere,
+                s(self.elsewhere)
+            ));
+        }
+        parts
     }
 }
 
@@ -1023,10 +1052,11 @@ fn outcome_line(lane: Lane, o: Outcome, ds: &[&Decision]) -> Option<OutcomeLine>
 /// The pipeline for the decisions within `w` of `now`.
 pub fn pipeline(ds: &[Decision], now: u64, w: Window) -> Pipeline {
     let mut by: BTreeMap<Lane, Vec<&Decision>> = BTreeMap::new();
-    let mut retired = 0;
+    let (mut retired, mut elsewhere) = (0, 0);
     for d in ds.iter().filter(|d| in_window(d, now, w)) {
         match lane(d) {
             Some(l) => by.entry(l).or_default().push(d),
+            None if d.stage == "newer_elsewhere" => elsewhere += 1,
             None => retired += 1,
         }
     }
@@ -1100,6 +1130,7 @@ pub fn pipeline(ds: &[Decision], now: u64, w: Window) -> Pipeline {
         gates,
         outcomes,
         retired,
+        elsewhere,
     }
 }
 
@@ -2113,7 +2144,7 @@ mod tests {
             [(O::NoAction, 76), (O::Nudge, 25), (O::Ping, 12)]
         );
         assert_eq!(
-            p.retired_note().as_deref(),
+            p.not_counted_note().as_deref(),
             Some(
                 "Not counted: 6 decisions from a retired rule (stops outside the thread where you said go)."
             )
@@ -2398,6 +2429,87 @@ mod tests {
     }
 
     #[test]
+    fn flow_leaves_out_what_the_pipeline_does_not_count() {
+        // Review 2026-10-21: flow() still put not_work_thread and
+        // newer_elsewhere stops in "stops seen", "list running" and an
+        // outcome, so the diagram's total disagreed with the pipeline's.
+        let mut ds = prod_mix();
+        let before = flow(&ds, NOW, Window::Day);
+        ds.extend(std::iter::repeat_n(
+            decided("newer_elsewhere", None, None, "none", "x"),
+            4,
+        ));
+        ds.extend(std::iter::repeat_n(
+            decided("not_work_thread", None, None, "none", "y"),
+            3,
+        ));
+        let f = flow(&ds, NOW, Window::Day);
+        assert_eq!(f, before);
+        assert_eq!(f.count(Node::Seen), pipeline(&ds, NOW, Window::Day).total);
+        // Nor does a sample draw one.
+        let only = [
+            decided("newer_elsewhere", None, None, "none", "x"),
+            decided("not_work_thread", None, None, "none", "y"),
+        ];
+        assert_eq!(flow(&only, NOW, Window::Day).count(Node::Seen), 0);
+        assert!(sample(&only, NOW, Window::Day, Node::Seen, 0).is_none());
+    }
+
+    #[test]
+    fn newer_elsewhere_adds_nothing_to_cards_or_total() {
+        // stall-judge's flat-channel rule (aei 56edfe2): the channel's newest
+        // message is in another thread, which is judged and counted itself.
+        let mut ds = prod_mix();
+        let before = pipeline(&ds, NOW, Window::Day);
+        assert_eq!(
+            lane(&decided("newer_elsewhere", None, None, "none", "")),
+            None
+        );
+        assert_eq!(
+            lane(&decided("newer_elsewhere", Some("odd"), None, "none", "")),
+            None
+        );
+        let one = decided("newer_elsewhere", None, None, "none", "x");
+        ds.extend(std::iter::repeat_n(one, 4));
+        let p = pipeline(&ds, NOW, Window::Day);
+        assert_eq!(p.total, before.total);
+        assert_eq!(p.gates, before.gates);
+        assert_eq!(p.outcomes, before.outcomes);
+        assert!(p.cards().all(|c| c.lane != Lane::JevOther));
+        assert_eq!((p.retired, p.elsewhere), (6, 4));
+        assert_eq!(
+            p.not_counted_note().as_deref(),
+            Some(
+                "Not counted: 6 decisions from a retired rule (stops outside the thread where you said go); \
+                 4 stops with a newer message in another thread (that thread is counted)."
+            )
+        );
+        // Alone, singular.
+        let only = [decided("newer_elsewhere", None, None, "none", "x")];
+        let p = pipeline(&only, NOW, Window::Day);
+        assert_eq!((p.total, p.elsewhere), (0, 1));
+        assert_eq!(
+            p.not_counted_note().as_deref(),
+            Some(
+                "Not counted: 1 stop with a newer message in another thread (that thread is counted)."
+            )
+        );
+        assert!(
+            sample_pick(
+                &only,
+                NOW,
+                Window::Day,
+                Pick {
+                    lane: Lane::JevOther,
+                    outcome: None
+                },
+                0
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn stop_counts_are_singular_at_one() {
         assert_eq!(stops(0), "0 stops");
         assert_eq!(stops(1), "1 stop");
@@ -2414,6 +2526,7 @@ mod tests {
             "judged",
             "turn_started",
             "not_work_thread",
+            "newer_elsewhere",
             "zzz",
         ];
         let jevs = [
@@ -2457,13 +2570,14 @@ mod tests {
         for w in Window::ALL {
             let p = pipeline(&ds, NOW, w);
             let inside = ds.iter().filter(|d| in_window(d, NOW, w)).count();
-            assert_eq!(p.total + p.retired, inside, "{w:?}");
-            assert_eq!(
-                p.retired,
+            assert_eq!(p.total + p.retired + p.elsewhere, inside, "{w:?}");
+            let staged = |st: &str| {
                 ds.iter()
-                    .filter(|d| in_window(d, NOW, w) && d.stage == "not_work_thread")
+                    .filter(|d| in_window(d, NOW, w) && d.stage == st)
                     .count()
-            );
+            };
+            assert_eq!(p.retired, staged("not_work_thread"));
+            assert_eq!(p.elsewhere, staged("newer_elsewhere"));
             assert_eq!(p.cards().map(|c| c.count).sum::<usize>(), p.total);
             assert_eq!(p.outcomes.iter().map(|o| o.1).sum::<usize>(), p.total);
             for c in p.cards() {
@@ -2480,7 +2594,9 @@ mod tests {
             }
             // An unknown outcome shows in the totals only when it happened.
             let other = ds.iter().any(|d| {
-                in_window(d, NOW, w) && d.outcome == "escalate" && d.stage != "not_work_thread"
+                in_window(d, NOW, w)
+                    && d.outcome == "escalate"
+                    && !matches!(d.stage.as_str(), "not_work_thread" | "newer_elsewhere")
             });
             assert_eq!(p.outcomes.len(), if other { 4 } else { 3 }, "{w:?}");
             // Colours are distinct across the drawn lanes.
@@ -2491,7 +2607,7 @@ mod tests {
         }
         // Nothing in the window: no checks, nothing retired, three zeros.
         let p = pipeline(&ds, NOW + 30 * 86_400, Window::Hour);
-        assert!(p.gates.is_empty() && p.total == 0 && p.retired_note().is_none());
+        assert!(p.gates.is_empty() && p.total == 0 && p.not_counted_note().is_none());
         assert_eq!(
             p.outcomes.iter().map(|o| o.1).collect::<Vec<_>>(),
             [0, 0, 0]

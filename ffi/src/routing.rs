@@ -73,14 +73,15 @@ pub struct RouteGate {
 /// The Routing page for one window.
 #[derive(uniffi::Record, Clone)]
 pub struct RoutePipeline {
-    /// Stops counted (the retired rule's are not).
+    /// Stops counted (the retired rule's and `newer_elsewhere` are not).
     pub total: u32,
     /// Top to bottom; only checks some stop still reaches.
     pub gates: Vec<RouteGate>,
     /// "All N stops ended as": no action, nudged, pinged you (then "other"
     /// when something is in it). Counts sum to `total`.
     pub outcomes: Vec<RouteOutcome>,
-    /// "Not counted: N decisions from a retired rule …", when N > 0.
+    /// The footer's "Not counted: …" (retired rule, newer message in
+    /// another thread), when anything was. Name kept for the Swift side.
     pub retired_note: Option<String>,
 }
 
@@ -242,7 +243,7 @@ pub(crate) fn pipeline(ds: &[Decision], now: u64, w: Window) -> RoutePipeline {
             .iter()
             .map(|(o, n)| outcome(*o, None, *n, vec![]))
             .collect(),
-        retired_note: p.retired_note(),
+        retired_note: p.not_counted_note(),
     }
 }
 

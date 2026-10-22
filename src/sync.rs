@@ -391,7 +391,7 @@ impl Sync {
         let channel = id.to_string();
         let today = checklist::local_midnight(now());
         self.spawn(async move {
-            let records = r.query(&Checklists::filters(&channel)).await;
+            let records = r.query_all(Checklists::filter(&channel)).await;
             let today = r
                 .query(&[
                     json!({"kinds": model::UNREAD_KINDS, "#h": [channel], "since": today,
@@ -433,10 +433,11 @@ impl Sync {
         let r = self.relay.clone();
         let history = needs::filters(&ids, &dms, operator, now, false);
         self.spawn(async move {
-            Msg::Events(r.query(&history).await.unwrap_or_else(|e| {
+            let evs = r.query(&history).await.unwrap_or_else(|e| {
                 crate::log::line(format!("needs: {e}"));
                 vec![]
-            }))
+            });
+            Msg::Events(needs::fill_busy_lists(&r, evs).await)
         });
     }
 
