@@ -152,6 +152,44 @@ pub fn filters(
     f
 }
 
+/// Channels whose checklist records filled the history's one page
+/// (`filters`, 500 per channel): their older items may be missing, so
+/// [`fill_busy_lists`] pages them in full.
+pub fn busy_lists(events: &[nostr::Event]) -> Vec<String> {
+    let mut n: HashMap<&str, usize> = HashMap::new();
+    for e in events {
+        if crate::checklist::KINDS.contains(&e.kind.as_u16())
+            && let Some(h) = crate::model::tag(e, "h")
+        {
+            *n.entry(h).or_default() += 1;
+        }
+    }
+    let mut out: Vec<String> = n
+        .into_iter()
+        .filter(|(_, k)| *k >= crate::relay::PAGE)
+        .map(|(h, _)| h.to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+/// The history plus every checklist record of each busy list
+/// ([`busy_lists`]). A failed page leaves that channel as it was.
+pub async fn fill_busy_lists(
+    relay: &crate::relay::Relay,
+    mut events: Vec<nostr::Event>,
+) -> Vec<nostr::Event> {
+    for c in busy_lists(&events) {
+        if let Ok(more) = relay
+            .query_all(crate::checklist::Checklists::filter(&c))
+            .await
+        {
+            events.extend(more);
+        }
+    }
+    events
+}
+
 /// Every row, Needs an answer first (oldest first), then FYI (newest
 /// first, the latest `FYI_MAX` only).
 /// The operator is the checklist owner (config `owner`, default lucian).
@@ -498,6 +536,25 @@ mod tests {
 
     fn keys(rows: &[Row]) -> Vec<(Section, String)> {
         rows.iter().map(|r| (r.section, r.label())).collect()
+    }
+
+    #[test]
+    fn a_full_page_of_list_records_marks_the_list_busy() {
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let k = Keys::generate();
+        let ev = |kind: u16, ch: &str| {
+            EventBuilder::new(Kind::Custom(kind), "")
+                .tags([Tag::parse(["h", ch]).unwrap()])
+                .sign_with_keys(&k)
+                .unwrap()
+        };
+        let mut evs = vec![];
+        evs.extend((0..500).map(|_| ev(30470, CH)));
+        evs.extend((0..499).map(|_| ev(30470, DM)));
+        // Messages don't count toward a list's page.
+        evs.extend((0..600).map(|_| ev(9, DM)));
+        assert_eq!(busy_lists(&evs), [CH.to_string()]);
+        assert!(busy_lists(&evs[500..]).is_empty());
     }
 
     #[test]

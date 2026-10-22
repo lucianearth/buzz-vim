@@ -513,7 +513,7 @@ pub async fn fetch(
 ) -> anyhow::Result<(Vec<Event>, Vec<String>)> {
     let since = now.saturating_sub(DAYS_BACK * 86_400);
     let f = json!({"kinds": [9], "#h": [channel], "since": since});
-    let mut evs = r.query_all(f, 5000).await?;
+    let mut evs = r.query_all_at_most(f, 5000).await?;
     let ids: Vec<String> = evs
         .iter()
         .filter(|e| parse_note(e).is_some())
@@ -521,7 +521,7 @@ pub async fn fetch(
         .collect();
     for chunk in ids.chunks(100) {
         evs.extend(
-            r.query_all(json!({"kinds": [7], "#e": chunk}), 5000)
+            r.query_all_at_most(json!({"kinds": [7], "#e": chunk}), 5000)
                 .await?,
         );
     }

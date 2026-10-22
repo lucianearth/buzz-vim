@@ -1743,7 +1743,7 @@ impl Engine {
         let channel = id.to_string();
         let today = checklist::local_midnight(now());
         self.spawn(async move {
-            let records = r.query(&Checklists::filters(&channel)).await;
+            let records = r.query_all(Checklists::filter(&channel)).await;
             let today = r
                 .query(&[
                     json!({"kinds": model::UNREAD_KINDS, "#h": [channel], "since": today,
@@ -1854,7 +1854,10 @@ impl Engine {
         self.sub("needs", live);
         let r = self.relay.clone();
         let history = needs::filters(&ids, &dms, &op, now, false);
-        self.spawn(async move { Msg::Events(Ok(r.query(&history).await.unwrap_or_default())) });
+        self.spawn(async move {
+            let evs = r.query(&history).await.unwrap_or_default();
+            Msg::Events(Ok(needs::fill_busy_lists(&r, evs).await))
+        });
     }
 
     fn is_agent(&self, pk: &str) -> bool {

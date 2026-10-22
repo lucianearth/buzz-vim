@@ -179,29 +179,28 @@ impl Relay {
         Err(last.unwrap_or_else(|| anyhow!("query failed")))
     }
 
-    /// Every event a filter matches, a page at a time (newest first, then
-    /// `until` + `before_id` from the page's last), and an error past `max`
-    /// rather than a silently short list. The relay checks most tags only after
-    /// its LIMIT, so a short page is the only end we trust.
-    pub async fn query_all(&self, mut filter: Value, max: usize) -> Result<Vec<Event>> {
-        const PAGE: usize = 500;
-        let mut out: Vec<Event> = vec![];
-        loop {
-            filter["limit"] = serde_json::json!(PAGE);
-            let page = self.query(std::slice::from_ref(&filter)).await?;
-            let n = page.len();
-            if let Some(last) = page.last() {
-                filter["until"] = serde_json::json!(last.created_at.as_secs());
-                filter["before_id"] = serde_json::json!(last.id.to_hex());
-            }
-            out.extend(page);
-            if out.len() > max {
-                bail!("more than {max} events; not showing a partial list");
-            }
-            if n < PAGE {
-                return Ok(out);
-            }
+    /// Every event one filter matches, page after page (see [`page_all`]):
+    /// the relay answers at most [`PAGE`] per query.
+    pub async fn query_all(&self, filter: Value) -> Result<Vec<Event>> {
+        page_all(filter, PAGE, QUERY_ALL_BOUND, |f| {
+            let r = self.clone();
+            async move { r.query(&[f]).await }
+        })
+        .await
+    }
+
+    /// [`Relay::query_all`] with a hard ceiling: an error past `max` events
+    /// rather than a silently short list.
+    pub async fn query_all_at_most(&self, filter: Value, max: usize) -> Result<Vec<Event>> {
+        let out = page_all(filter, PAGE, max.saturating_add(1), |f| {
+            let r = self.clone();
+            async move { r.query(&[f]).await }
+        })
+        .await?;
+        if out.len() > max {
+            bail!("more than {max} events; not showing a partial list");
         }
+        Ok(out)
     }
 
     /// Add each agent to the channel as a bot (NIP-29 kind 9000), one at a
@@ -478,8 +477,146 @@ fn is_duplicate(message: &str) -> bool {
     message == "duplicate" || message.starts_with("duplicate:")
 }
 
+/// The most the relay bridge returns for one query.
+pub const PAGE: usize = 500;
+/// Where [`Relay::query_all`] stops paging: a runaway filter costs at most
+/// this many events, and what came back so far is kept.
+pub const QUERY_ALL_BOUND: usize = 20_000;
+
+/// Fetch every event `filter` matches, newest first, following the relay
+/// bridge's composite `(until, before_id)` cursor (`created_at < until`, or
+/// the same second and `id > before_id`) until a short page. Stops at
+/// `bound` events, or if a page brings nothing new.
+pub async fn page_all<F, Fut>(
+    mut filter: Value,
+    page: usize,
+    bound: usize,
+    mut fetch: F,
+) -> Result<Vec<Event>>
+where
+    F: FnMut(Value) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<Event>>>,
+{
+    let mut out: Vec<Event> = vec![];
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        filter["limit"] = serde_json::json!(page);
+        let got = fetch(filter.clone()).await?;
+        let full = got.len() >= page;
+        let Some(last) = got.last().map(|e| (e.created_at.as_secs(), e.id.to_hex())) else {
+            return Ok(out);
+        };
+        let before = out.len();
+        out.extend(got.into_iter().filter(|e| seen.insert(e.id)));
+        if !full || out.len() == before || out.len() >= bound {
+            return Ok(out);
+        }
+        filter["until"] = serde_json::json!(last.0);
+        filter["before_id"] = serde_json::json!(last.1);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod fake {
+    use nostr::Event;
+    use serde_json::Value;
+
+    /// The relay bridge's answer to one filter over `all`, kinds and tags
+    /// aside: newest first, ties by id ascending, the composite cursor,
+    /// `limit`.
+    pub fn answer(all: &[Event], f: &Value) -> Vec<Event> {
+        let mut v: Vec<&Event> = all.iter().collect();
+        v.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.id.to_hex().cmp(&b.id.to_hex()))
+        });
+        let until = f["until"].as_u64();
+        let before = f["before_id"].as_str();
+        v.into_iter()
+            .filter(|e| match (until, before) {
+                (Some(u), Some(b)) => {
+                    let at = e.created_at.as_secs();
+                    at < u || (at == u && e.id.to_hex().as_str() > b)
+                }
+                (Some(u), None) => e.created_at.as_secs() <= u,
+                _ => true,
+            })
+            .take(f["limit"].as_u64().unwrap_or(500) as usize)
+            .cloned()
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{fake, page_all};
+    use nostr::{EventBuilder, Keys, Kind, Timestamp};
+
+    fn evs(n: u64, per_second: u64) -> Vec<nostr::Event> {
+        let k = Keys::generate();
+        (0..n)
+            .map(|i| {
+                EventBuilder::new(Kind::Custom(30470), format!("{i}"))
+                    .custom_created_at(Timestamp::from(1000 + i / per_second))
+                    .sign_with_keys(&k)
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    /// 1234 events, seven to a second so ties straddle every page edge:
+    /// all of them come back once, in three pages.
+    #[tokio::test]
+    async fn paging_gets_every_event_past_one_page() {
+        let all = evs(1234, 7);
+        let mut calls = 0;
+        let got = page_all(serde_json::json!({"kinds": [30470]}), 500, 20_000, |f| {
+            calls += 1;
+            let page = fake::answer(&all, &f);
+            async move { Ok(page) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(got.len(), 1234);
+        let mut ids: Vec<_> = got.iter().map(|e| e.id).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 1234);
+        // Exactly one page's worth ends with an empty page.
+        let all = evs(500, 3);
+        let got = page_all(serde_json::json!({}), 500, 20_000, |f| {
+            let page = fake::answer(&all, &f);
+            async move { Ok(page) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(got.len(), 500);
+    }
+
+    /// A bound stops the paging; a relay that ignores the cursor can't loop.
+    #[tokio::test]
+    async fn paging_stops_at_the_bound_and_on_a_stuck_cursor() {
+        let all = evs(1234, 1);
+        let got = page_all(serde_json::json!({}), 500, 600, |f| {
+            let page = fake::answer(&all, &f);
+            async move { Ok(page) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(got.len(), 1000);
+        let mut calls = 0;
+        let got = page_all(serde_json::json!({}), 500, 20_000, |_| {
+            calls += 1;
+            let page = all[..500].to_vec();
+            async move { Ok(page) }
+        })
+        .await
+        .unwrap();
+        assert_eq!((got.len(), calls), (500, 2));
+    }
+
     /// A relay that answers every request with `body` (HTTP 200).
     async fn answering(body: &'static str) -> super::Relay {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
