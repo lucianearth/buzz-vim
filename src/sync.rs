@@ -21,6 +21,7 @@ use crate::relay::{BlobDescriptor, Relay};
 use crate::sections::{self, Lanes};
 use crate::subscription::{self, Subscriptions};
 use crate::unread;
+use crate::usage::Usage;
 
 pub enum Msg {
     Channels(anyhow::Result<Vec<Event>>),
@@ -256,6 +257,31 @@ impl Sync {
             match r.query(&filters).await {
                 Ok(evs) => Msg::Events(evs),
                 Err(e) => Msg::Did(Err(e.context("couldn't load the subscription map"))),
+            }
+        });
+    }
+
+    /// The box's Claude usage records and their live tail (rewritten every
+    /// few minutes).
+    pub fn load_usage(&mut self, filters: Vec<Value>) {
+        let at = now();
+        let _ = self.live.send(Cmd::Sub {
+            id: "usage".into(),
+            filters: filters
+                .iter()
+                .map(|f| {
+                    let mut f = f.clone();
+                    f["since"] = json!(at);
+                    f["limit"] = json!(0);
+                    f
+                })
+                .collect(),
+        });
+        let r = self.relay.clone();
+        self.spawn(async move {
+            match r.query(&filters).await {
+                Ok(evs) => Msg::Events(evs),
+                Err(e) => Msg::Did(Err(e.context("couldn't load Claude usage"))),
             }
         });
     }
@@ -1312,6 +1338,10 @@ pub fn fold(app: &mut App, sync: &mut Sync, ev: &Event, live_channel: bool) -> V
         }
         20001 => {
             app.agents.presence(&ev.pubkey.to_hex(), &ev.content);
+            return vec![];
+        }
+        30078 if Usage::is_record(ev) => {
+            app.usage.apply(ev);
             return vec![];
         }
         30078 if Subscriptions::is_record(ev) => {
