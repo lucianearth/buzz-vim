@@ -1328,15 +1328,18 @@ fn draw_agents(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// The Claude usage block on top of the agents screen: one row per
-/// subscription with its 5-hour and weekly bars (green, amber from 80%, red
-/// at the limit), the reset countdown and how old the reading is (red past
-/// 20 minutes), and a second row when the last check failed. Returns the
-/// area left below it; nothing is drawn until a record exists.
+/// subscription with how old the reading is (red `stale` past 20 minutes),
+/// then its 5-hour and weekly bars (green, amber from 80%, red at the limit)
+/// and when each resets, and a second row when the last check failed. It
+/// takes at most half the area; rows that don't fit are counted. Returns
+/// the area left below it; nothing is drawn until a record exists.
 fn draw_usage(f: &mut Frame, app: &App, area: Rect) -> Rect {
     use crate::usage::{WARN_PERCENT, duration, is_stale, view};
     use buzz_vim_core::control::Health;
     let records = app.usage.records();
-    if records.is_empty() || area.height < 4 {
+    // The heading and one row, out of half the area (the gap below is extra).
+    let room = (area.height / 2).saturating_sub(1) as usize;
+    if records.is_empty() || room < 2 {
         return area;
     }
     let now = std::time::SystemTime::now()
@@ -1349,8 +1352,13 @@ fn draw_usage(f: &mut Frame, app: &App, area: Rect) -> Rect {
         .max()
         .unwrap_or(0)
         .clamp(6, 18);
-    // edge 2, label, 2 gap, 2 x (name 5, bar, " 100%" 5, " in 23h 59m" 11, 2 gap), age 14.
-    let bar_w = ((area.width as usize).saturating_sub(2 + label_w + 2 + 46 + 14) / 2).clamp(3, 20);
+    // "stale 23h" / "59m ago"
+    const AGE_W: usize = 9;
+    // The age sits right after the label, so a narrow screen cuts the
+    // weekly reset, never the stale mark. Each window: name 5, bar,
+    // " limit" 6, " in 23h 59m  " 13.
+    let fixed = 2 + label_w + 2 + AGE_W + 2;
+    let bar_w = ((area.width as usize).saturating_sub(fixed + 2 * 24) / 2).clamp(3, 20);
     let window = |name: &str, w: &crate::usage::Window| -> Vec<Span<'static>> {
         let v = view(w, now);
         let tone = if v.at_limit {
@@ -1390,33 +1398,45 @@ fn draw_usage(f: &mut Frame, app: &App, area: Rect) -> Rect {
         Span::raw("  "),
         Span::styled("Claude usage", theme::bright()),
     ])];
-    let room = area.height.saturating_sub(3) as usize;
-    for r in records {
-        if lines.len() >= room {
+    let total = records.len();
+    for (i, r) in records.into_iter().enumerate() {
+        // While more records follow this one, keep a line for "+N more".
+        let left = total - i;
+        let need = if left > 1 { 2 } else { 1 };
+        if lines.len() + need > room {
+            lines.push(Line::styled(format!("  +{left} more"), theme::faint()));
             break;
         }
+        let label = if r.label.width() <= label_w {
+            r.label.clone()
+        } else {
+            clip(&r.label, label_w)
+        };
+        let age = duration(now.saturating_sub(r.checked_at));
         let mut spans = vec![
             Span::raw("  "),
-            Span::styled(pad_to(&clip(&r.label, label_w + 1), label_w), theme::text()),
+            Span::styled(pad_to(&label, label_w), theme::text()),
+            Span::raw("  "),
+            if is_stale(r, now) {
+                Span::styled(pad_to(&format!("stale {age}"), AGE_W), color(Health::Page))
+            } else {
+                Span::styled(pad_to(&format!("{age} ago"), AGE_W), theme::faint())
+            },
             Span::raw("  "),
         ];
         spans.extend(window("5h", &r.five_hour));
         spans.extend(window("week", &r.seven_day));
-        let age = duration(now.saturating_sub(r.checked_at));
-        spans.push(if is_stale(r, now) {
-            Span::styled(format!("stale {age}"), color(Health::Page))
-        } else {
-            Span::styled(format!("{age} ago"), theme::faint())
-        });
         lines.push(Line::from(spans));
+        // The failure line only when it leaves room for what follows.
         if let Some(e) = &r.error {
-            if lines.len() < room {
+            if lines.len() + need <= room {
+                let indent = 4 + label_w;
                 lines.push(Line::from(vec![
-                    Span::raw(" ".repeat(4 + label_w)),
+                    Span::raw(" ".repeat(indent)),
                     Span::styled(
                         clip(
                             &format!("last check failed: {e}"),
-                            (area.width as usize).saturating_sub(4 + label_w),
+                            (area.width as usize).saturating_sub(indent),
                         ),
                         color(Health::Page),
                     ),
@@ -6001,5 +6021,32 @@ mod tests {
             .collect();
         assert!(fg.contains(&amber), "weekly bar amber");
         assert!(fg.iter().any(|c| *c != amber), "5h bar not amber");
+        // 80 columns: the stale mark survives; a short screen counts the rest.
+        app.usage.apply(&rec(
+            &publ,
+            "zed",
+            now,
+            w(0.1, "allowed", now + 60),
+            w(0.1, "allowed", now + 60),
+        ));
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let narrow: Vec<String> = (0..30)
+            .map(|y| (0..80).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let kevin = narrow.iter().find(|r| r.contains("kevin's Max")).unwrap();
+        assert!(kevin.contains("stale 1h"), "{kevin}");
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 16)).unwrap();
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let short: String = (0..16)
+            .map(|y| (0..100).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            short.contains("kevin's Max") && short.contains("+2 more"),
+            "{short}"
+        );
     }
 }
