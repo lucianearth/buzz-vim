@@ -53,8 +53,8 @@ pub enum Show {
     Help,
     /// The footer strip and the overlay.
     Both,
-    /// Only the footer (and a box's own legend): a box's moving and
-    /// closing, which the overlay says once under "move".
+    /// Only the footer (and a box's own legend): a box's plain j k and
+    /// esc, which the overlay's "move" section already says.
     Footer,
 }
 
@@ -186,11 +186,13 @@ const ORDER: Section = (
         ("esc", "done", Footer),
     ],
 );
-/// Upload, reset, archive and vote all ask the same way.
+/// Upload, reset, archive and vote all ask the same way: one overlay
+/// section, while each footer says what yes does.
 const CONFIRM: Section = (
     "confirms (upload, reset, vote, archive)",
-    &[("y ⏎", "yes", Both), ("n esc", "cancel", Both)],
+    &[("y ⏎", "yes", Help), ("n esc", "cancel", Help)],
 );
+const NO: Key = ("n esc", "cancel", Footer);
 const QUICK: Section = (
     "Q box (q Q ^q)",
     &[
@@ -221,7 +223,7 @@ const VIEWER: Section = (
     "image (o)",
     &[
         ("← →", "prev / next image", Both),
-        ("esc q o", "close", Footer),
+        ("esc q o ⏎", "close", Both),
         ("O", "open in Preview", Both),
     ],
 );
@@ -254,12 +256,14 @@ pub const HELP: [&[Section]; 2] = [
 /// A mode's keys, by section.
 pub fn sections(mode: Mode) -> &'static [Section] {
     match mode {
-        // Footer order: n i o f a c ?.
         Mode::Normal => &[MOVE, TABS, MESSAGES, SCREENS, APP, AGENTS, ROUTING, CONTROL],
         Mode::Insert => &[INSERT],
         Mode::Sections => &[SECTIONS],
         Mode::Order => &[ORDER],
-        Mode::Confirm | Mode::Reset | Mode::Archive | Mode::Vote => &[CONFIRM],
+        Mode::Confirm => &[("upload", &[("y ⏎", "upload to Buzz", Footer), NO])],
+        Mode::Reset => &[("reset", &[("y ⏎", "reset", Footer), NO])],
+        Mode::Archive => &[("archive", &[("y ⏎", "archive", Footer), NO])],
+        Mode::Vote => &[("vote", &[("y ⏎", "send the reaction", Footer), NO])],
         Mode::Quick => &[QUICK],
         Mode::Reply => &[REPLY],
         Mode::Subscription => &[SUBSCRIPTION],
@@ -270,6 +274,6 @@ pub fn sections(mode: Mode) -> &'static [Section] {
 }
 
 /// A mode's keys in order: the footer strip shows those with `footer()`.
-pub fn legend(mode: Mode) -> impl Iterator<Item = &'static Key> + Clone {
-    sections(mode).iter().flat_map(|s| s.1)
+pub fn legend(mode: Mode) -> Vec<&'static Key> {
+    sections(mode).iter().flat_map(|s| s.1).collect()
 }

@@ -114,8 +114,7 @@ fn draw_subscription(f: &mut Frame, app: &mut App, area: Rect) {
     let subs = &app.subscriptions;
     let map = subs.map();
     let legend = crate::keys::legend(Mode::Subscription);
-    let h =
-        (people.len() as u16 + legend.clone().count() as u16 + 10).clamp(14, area.height.max(14));
+    let h = (people.len() as u16 + legend.len() as u16 + 10).clamp(14, area.height.max(14));
     let r = centered(area, 64, h);
     clear(f, r);
     let block = Block::bordered()
@@ -205,7 +204,7 @@ fn draw_subscription(f: &mut Frame, app: &mut App, area: Rect) {
             theme::faint(),
         ));
     }
-    for (i, (k, what, _)) in legend.enumerate() {
+    for (i, (k, what, _)) in legend.iter().enumerate() {
         lines.push(Line::from(vec![
             Span::raw(" "),
             Span::styled(format!(" {k} "), theme::chip(theme::nth(i))),
@@ -3001,7 +3000,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 + chain.as_ref().map_or(0, |c| c.width() + 1)
                 + usage_w as usize,
         );
-        for (i, (k, what, _)) in legend(app.mode).filter(|l| l.2.footer()).enumerate() {
+        for (i, (k, what, _)) in legend(app.mode).iter().filter(|l| l.2.footer()).enumerate() {
             let (key, desc) = (format!(" {k} "), format!(" {what}  "));
             let w = key.width() + desc.width();
             if (chain.is_some() || usage.is_some()) && w > room {
@@ -3159,7 +3158,7 @@ fn draw_order(f: &mut Frame, app: &mut App, area: Rect) {
     ];
     let legend = crate::keys::legend(Mode::Order);
     let rows = (inner.height as usize)
-        .saturating_sub(3 + legend.clone().count())
+        .saturating_sub(3 + legend.len())
         .max(1);
     let first = app
         .order_cursor
@@ -3188,7 +3187,7 @@ fn draw_order(f: &mut Frame, app: &mut App, area: Rect) {
         ]));
     }
     lines.push(Line::raw(""));
-    for (i, (k, what, _)) in legend.enumerate() {
+    for (i, (k, what, _)) in legend.iter().enumerate() {
         lines.push(Line::from(vec![
             Span::raw(" "),
             Span::styled(format!(" {k} "), theme::chip(theme::nth(i))),
@@ -3303,7 +3302,7 @@ fn help_height() -> u16 {
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    // On a short screen the banner goes first, then the bottom rows clip.
+    // On a short screen the banner is dropped before any row clips.
     let banner = if help_height() <= area.height.saturating_sub(2) {
         art::BANNER.len() as u16 + 1
     } else {
@@ -5051,7 +5050,8 @@ mod tests {
     }
 
     /// Every `?` row fits its column, nothing a mode lists is missing from
-    /// the overlay, and it's shorter than the flat list was (48 rows).
+    /// the overlay, it's shorter than the flat list was (48 rows), and the
+    /// footer keeps its keys.
     #[test]
     fn help_rows_fit_and_every_mode_is_in_it() {
         use crate::keys::{HELP, Mode::*, sections};
@@ -5084,6 +5084,12 @@ mod tests {
             }
         }
         assert!(help_height() < 48, "{}", help_height());
+        let footer: Vec<&str> = crate::keys::legend(Normal)
+            .iter()
+            .filter(|k| k.2.footer())
+            .map(|k| k.0)
+            .collect();
+        assert_eq!(footer, ["n", "i", "o", "f", "a", "c", "?"]);
     }
 
     /// After following links, the footer shows the way back.
