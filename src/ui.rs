@@ -114,7 +114,8 @@ fn draw_subscription(f: &mut Frame, app: &mut App, area: Rect) {
     let subs = &app.subscriptions;
     let map = subs.map();
     let legend = crate::keys::legend(Mode::Subscription);
-    let h = (people.len() as u16 + legend.len() as u16 + 10).clamp(14, area.height.max(14));
+    let h =
+        (people.len() as u16 + legend.clone().count() as u16 + 10).clamp(14, area.height.max(14));
     let r = centered(area, 64, h);
     clear(f, r);
     let block = Block::bordered()
@@ -204,7 +205,7 @@ fn draw_subscription(f: &mut Frame, app: &mut App, area: Rect) {
             theme::faint(),
         ));
     }
-    for (i, (k, what, _)) in legend.iter().enumerate() {
+    for (i, (k, what, _)) in legend.enumerate() {
         lines.push(Line::from(vec![
             Span::raw(" "),
             Span::styled(format!(" {k} "), theme::chip(theme::nth(i))),
@@ -3000,7 +3001,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 + chain.as_ref().map_or(0, |c| c.width() + 1)
                 + usage_w as usize,
         );
-        for (i, (k, what, _)) in legend(app.mode).iter().filter(|l| l.2).enumerate() {
+        for (i, (k, what, _)) in legend(app.mode).filter(|l| l.2.footer()).enumerate() {
             let (key, desc) = (format!(" {k} "), format!(" {what}  "));
             let w = key.width() + desc.width();
             if (chain.is_some() || usage.is_some()) && w > room {
@@ -3158,7 +3159,7 @@ fn draw_order(f: &mut Frame, app: &mut App, area: Rect) {
     ];
     let legend = crate::keys::legend(Mode::Order);
     let rows = (inner.height as usize)
-        .saturating_sub(3 + legend.len())
+        .saturating_sub(3 + legend.clone().count())
         .max(1);
     let first = app
         .order_cursor
@@ -3187,7 +3188,7 @@ fn draw_order(f: &mut Frame, app: &mut App, area: Rect) {
         ]));
     }
     lines.push(Line::raw(""));
-    for (i, (k, what, _)) in legend.iter().enumerate() {
+    for (i, (k, what, _)) in legend.enumerate() {
         lines.push(Line::from(vec![
             Span::raw(" "),
             Span::styled(format!(" {k} "), theme::chip(theme::nth(i))),
@@ -3277,62 +3278,57 @@ fn draw_confirm(f: &mut Frame, app: &mut App, area: Rect) {
     app.hits.push((no, Hit::ConfirmNo));
 }
 
+/// Width of a `?` overlay column; a row that doesn't fit is clipped.
+const HELP_COL: u16 = 41;
+
+/// One `?` overlay column: each section's title, then a row per key.
+fn help_column(sections: &[crate::keys::Section]) -> Vec<Line<'static>> {
+    let mut lines = vec![];
+    for (title, keys) in sections {
+        lines.push(Line::styled(format!(" {title}"), theme::bright()));
+        for (k, what, _) in keys.iter().filter(|k| k.2.help()) {
+            lines.push(Line::from(vec![
+                Span::styled(format!("   {k:<9} "), theme::text()),
+                Span::styled(what.to_string(), theme::muted()),
+            ]));
+        }
+    }
+    lines
+}
+
+/// Rows the `?` overlay wants: the taller column, the banner, the border.
+fn help_height() -> u16 {
+    let tall = crate::keys::HELP.iter().map(|c| help_column(c).len());
+    (tall.max().unwrap_or(0) + art::BANNER.len() + 3) as u16
+}
+
 fn draw_help(f: &mut Frame, area: Rect) {
-    let right = [
-        Mode::Insert,
-        Mode::Sections,
-        Mode::Order,
-        Mode::Confirm,
-        Mode::Quick,
-        Mode::Reply,
-    ];
-    let tall = (legend(Mode::Normal).len() + 2)
-        .max(right.iter().map(|m| legend(*m).len() + 2).sum::<usize>());
-    let r = centered(area, 84, tall as u16 + art::BANNER.len() as u16 + 3);
+    // On a short screen the banner goes first, then the bottom rows clip.
+    let banner = if help_height() <= area.height.saturating_sub(2) {
+        art::BANNER.len() as u16 + 1
+    } else {
+        0
+    };
+    let r = centered(area, 2 * HELP_COL + 2, help_height());
     clear(f, r);
     let block = Block::bordered()
         .border_style(theme::text())
         .title(Span::styled(" keys ", theme::bright()));
     let inner = block.inner(r);
     f.render_widget(block, r);
-    let banner: Vec<Line> = art::BANNER
+    let [top, body] =
+        Layout::vertical([Constraint::Length(banner), Constraint::Min(0)]).areas(inner);
+    let lines: Vec<Line> = art::BANNER
         .iter()
         .map(|l| Line::styled(format!("  {l}"), theme::bright()))
         .collect();
-    let [top, body] = Layout::vertical([
-        Constraint::Length(banner.len() as u16 + 1),
-        Constraint::Min(0),
-    ])
-    .areas(inner);
-    f.render_widget(Paragraph::new(banner), top);
+    f.render_widget(Paragraph::new(lines), top);
     let [left, right] =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body);
-    let column = |modes: &[(Mode, &str)]| {
-        let mut lines: Vec<Line> = vec![];
-        for (mode, title) in modes {
-            lines.push(Line::styled(format!(" {title}"), theme::bright()));
-            for (k, what, _) in legend(*mode) {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("   {k:<9} "), theme::text()),
-                    Span::styled(what.to_string(), theme::muted()),
-                ]));
-            }
-            lines.push(Line::raw(""));
-        }
-        lines
-    };
-    f.render_widget(Paragraph::new(column(&[(Mode::Normal, "normal")])), left);
-    f.render_widget(
-        Paragraph::new(column(&[
-            (Mode::Insert, "insert (i)"),
-            (Mode::Sections, "sections (s)"),
-            (Mode::Order, "tab order (T)"),
-            (Mode::Confirm, "upload"),
-            (Mode::Quick, "Q box (Q ^q)"),
-            (Mode::Reply, "reply (r on tab 0)"),
-        ])),
-        right,
-    );
+        Layout::horizontal([Constraint::Length(HELP_COL), Constraint::Length(HELP_COL)])
+            .areas(body);
+    for (column, rect) in crate::keys::HELP.iter().zip([left, right]) {
+        f.render_widget(Paragraph::new(help_column(column)), rect);
+    }
 }
 
 fn draw_viewer(f: &mut Frame, app: &mut App, area: Rect) {
@@ -4288,8 +4284,11 @@ mod tests {
             "{s}"
         );
         app.mode = Mode::Help;
-        let s = screen_text(&mut app, 120, 40);
-        assert!(s.contains("Q box (Q ^q)") && s.contains("checklist"), "{s}");
+        let s = screen_text(&mut app, 120, 50);
+        assert!(
+            s.contains("Q box (q Q ^q)") && s.contains("checklist"),
+            "{s}"
+        );
     }
 
     /// The operator loop pane, status line and Q box, for README shots.
@@ -5047,8 +5046,44 @@ mod tests {
         assert!(s.contains("move it down / up"), "{s}");
         app.mode = crate::keys::Mode::Help;
         let s = screen(&mut app);
-        assert!(s.contains("move this tab left / right"), "{s}");
+        assert!(s.contains("move tab left / right"), "{s}");
         assert!(s.contains("tab order (T)"), "{s}");
+    }
+
+    /// Every `?` row fits its column, nothing a mode lists is missing from
+    /// the overlay, and it's shorter than the flat list was (48 rows).
+    #[test]
+    fn help_rows_fit_and_every_mode_is_in_it() {
+        use crate::keys::{HELP, Mode::*, sections};
+        for column in HELP {
+            for line in help_column(column) {
+                assert!(line.width() <= HELP_COL as usize, "clipped: {line:?}");
+            }
+        }
+        let modes = [
+            Normal,
+            Insert,
+            Sections,
+            Order,
+            Confirm,
+            Viewer,
+            Hint,
+            Reset,
+            Quick,
+            Reply,
+            Archive,
+            Vote,
+            Subscription,
+        ];
+        for m in modes {
+            for s in sections(m)
+                .iter()
+                .filter(|s| s.1.iter().any(|k| k.2.help()))
+            {
+                assert!(HELP.iter().any(|c| c.contains(s)), "{m:?}: {} missing", s.0);
+            }
+        }
+        assert!(help_height() < 48, "{}", help_height());
     }
 
     /// After following links, the footer shows the way back.

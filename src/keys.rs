@@ -46,126 +46,230 @@ impl Mode {
     }
 }
 
-/// (keys, what, shown in the footer strip)
-pub fn legend(mode: Mode) -> &'static [(&'static str, &'static str, bool)] {
-    match mode {
-        Mode::Normal => &[
-            ("j k ↑↓", "move", false),
-            ("n", "latest", true),
-            ("0", "needs you", false),
-            ("1-9", "tab", false),
-            ("!", "next ⚑, oldest first", false),
-            ("H L ⇥", "prev/next tab", false),
-            ("< >", "move this tab left / right", false),
-            ("T", "tab order", false),
-            ("⏎ l →", "thread", false),
-            ("i", "write", true),
-            ("+", "👍", false),
-            ("s", "sections", false),
-            ("o", "image", true),
-            ("O", "images in Preview (a thread: all of them)", false),
-            ("f", "links", true),
-            ("f", "copy a code block", false),
-            ("⌫ ^o", "back to where a link took you from", false),
-            ("[ ]", "narrower / wider (or drag the right edge)", false),
-            ("a", "agents", true),
-            ("c", "checklist", true),
-            ("w", "routing: how each stop was routed", false),
-            ("t ⏎ s o", "routing: window, sample, another, thread", false),
-            ("C", "control: #control notes, trends, requests", false),
-            ("⏎ 1-9 r", "control: open, vote on a request, reload", false),
-            (
-                "B",
-                "subscription: whose Claude this channel's agents use",
-                false,
-            ),
-            (
-                "q Q ^q",
-                "ask #quick; again in the box: + this channel",
-                false,
-            ),
-            ("r", "agents screen: reset the picked agent here", false),
-            ("?", "help", true),
-            ("r", "reply in thread", false),
-            ("⏎ r", "tab 0: open / reply", false),
-            ("h ← esc", "back (thread, agents)", false),
-            ("g G", "oldest / newest", false),
-            ("d u", "page down / up", false),
-            ("^d ^u", "half page down / up", false),
-            ("^v", "paste image or file", false),
-            ("R", "reload sections", false),
-            ("^c", "quit", false),
-            ("mouse", "click to pick, wheel scrolls", false),
-        ],
-        Mode::Insert => &[
-            ("esc", "normal mode", true),
-            ("⏎", "send", false),
-            ("⇧⏎", "new line", true),
-            ("^j", "new line", false),
-            (
-                "```",
-                "code block: ⏎ is a new line until you close it",
-                false,
-            ),
-            ("@", "mention", true),
-            ("⇥", "pick mention / indent", false),
-            ("^v", "paste image or file", true),
-            ("^w", "delete word", false),
-            ("^u", "clear", false),
-            ("drop file", "attach it (asks first)", false),
-        ],
-        Mode::Sections => &[
-            ("j k", "move", true),
-            ("space", "mark several", true),
-            ("⏎", "switch", true),
-            ("m", "move this channel here", true),
-            ("R", "reload from relay", true),
-            ("esc", "cancel", true),
-        ],
-        Mode::Order => &[
-            ("j k", "pick a tab", true),
-            ("J K", "move it down / up", true),
-            ("⏎", "go to it", true),
-            ("a", "archive it", true),
-            ("esc", "done", true),
-        ],
-        Mode::Confirm => &[("y", "upload to Buzz", true), ("n esc", "cancel", true)],
-        Mode::Reset => &[("y ⏎", "reset", true), ("n esc", "cancel", true)],
-        Mode::Quick => &[
-            ("⏎", "send to #quick", true),
-            (
-                "^q",
-                "+ this channel and its latest messages (again: off)",
-                true,
-            ),
-            ("⇧⏎ ^j", "new line", true),
-            ("esc", "close (keeps the text)", true),
-        ],
-        Mode::Archive => &[("y ⏎", "archive", true), ("n esc", "cancel", true)],
-        Mode::Vote => &[
-            ("y ⏎", "send the reaction", true),
-            ("n esc", "cancel", true),
-        ],
-        Mode::Subscription => &[
-            ("j k", "pick", true),
-            ("⇥ h l", "this channel / the default for all", true),
-            ("⏎", "use it (signs and publishes)", true),
-            ("esc", "close", true),
-        ],
-        Mode::Reply => &[
-            ("⏎", "send into its thread", true),
-            ("⇧⏎ ^j", "new line", true),
-            ("esc", "close (keeps the text)", true),
-        ],
-        Mode::Viewer => &[
-            ("← →", "prev / next image", true),
-            ("esc q o", "close", true),
-            ("O", "Preview (a thread: all of them, one window)", true),
-        ],
-        Mode::Help => &[("esc ?", "close", true)],
-        Mode::Hint => &[
-            ("letters", "follow that link, copy that code", true),
-            ("esc", "cancel", true),
-        ],
+/// Where a key is listed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Show {
+    /// Only in the `?` overlay.
+    Help,
+    /// The footer strip and the overlay.
+    Both,
+    /// Only the footer (and a box's own legend): a box's moving and
+    /// closing, which the overlay says once under "move".
+    Footer,
+}
+
+impl Show {
+    pub fn footer(self) -> bool {
+        self != Show::Help
     }
+    pub fn help(self) -> bool {
+        self != Show::Footer
+    }
+}
+
+/// (keys, what, where it shows)
+pub type Key = (&'static str, &'static str, Show);
+/// A titled run of keys: one section of the `?` overlay.
+pub type Section = (&'static str, &'static [Key]);
+
+use Show::{Both, Footer, Help};
+
+const MOVE: Section = (
+    "move",
+    &[
+        ("j k ↑↓", "move", Help),
+        ("g G", "oldest / newest", Help),
+        ("d u ^d ^u", "page / half page", Help),
+        ("n", "latest", Both),
+        ("h ← esc", "back / close", Help),
+    ],
+);
+const TABS: Section = (
+    "tabs",
+    &[
+        ("0-9", "go to tab (0 needs you)", Help),
+        ("H L ⇥", "prev / next tab", Help),
+        ("< >", "move tab left / right", Help),
+        ("T", "tab order", Help),
+        ("!", "next ⚑, oldest first", Help),
+    ],
+);
+const MESSAGES: Section = (
+    "messages",
+    &[
+        ("i", "write", Both),
+        ("r", "reply in thread", Help),
+        ("+", "👍", Help),
+        ("⏎ l →", "open thread / tab 0 row", Help),
+        ("o", "image", Both),
+        ("O", "images in Preview", Help),
+        ("f", "links", Both),
+        ("⌫ ^o", "back from link", Help),
+        ("^v", "paste image or file", Help),
+    ],
+);
+const APP: Section = (
+    "app",
+    &[
+        ("s", "sections", Help),
+        ("R", "reload sections", Help),
+        ("[ ]", "narrower / wider (or drag)", Help),
+        ("?", "help", Both),
+        ("^c", "quit", Help),
+        ("mouse", "click picks, wheel scrolls", Help),
+    ],
+);
+const SCREENS: Section = (
+    "screens",
+    &[
+        ("a", "agents", Both),
+        ("c", "checklist", Both),
+        ("w", "routing", Help),
+        ("C", "control", Help),
+        ("B", "set Claude subscription", Help),
+        ("q Q ^q", "ask #quick", Help),
+    ],
+);
+const AGENTS: Section = ("agents (a)", &[("r", "reset the picked agent", Help)]);
+const ROUTING: Section = (
+    "routing (w)",
+    &[
+        ("t", "next time window", Help),
+        ("⇥ ⇧⇥", "next / prev card", Help),
+        ("⏎ l", "open: sample, why, record", Help),
+        ("s", "another sample", Help),
+        ("o", "open its thread", Help),
+    ],
+);
+const CONTROL: Section = (
+    "control (C)",
+    &[
+        ("⏎ l", "open request / topic / day", Help),
+        ("1-9", "vote on a request", Help),
+        ("o", "a note's images", Help),
+        ("r", "reload #control", Help),
+    ],
+);
+const INSERT: Section = (
+    "insert (i)",
+    &[
+        ("esc", "normal mode", Footer),
+        ("⏎", "send", Help),
+        ("⇧⏎ ^j", "new line", Both),
+        ("```", "code block: ⏎ = new line", Help),
+        ("@", "mention", Both),
+        ("⇥", "pick mention / indent", Help),
+        // Said under "messages".
+        ("^v", "paste image or file", Footer),
+        ("^w ^u", "delete word / all", Help),
+        ("drop file", "attach it (asks first)", Help),
+    ],
+);
+const SECTIONS: Section = (
+    "sections (s)",
+    &[
+        ("j k", "move", Footer),
+        ("space x", "mark several", Both),
+        ("⏎", "switch", Both),
+        ("m", "move this channel here", Both),
+        ("R", "reload from relay", Both),
+        ("esc", "cancel", Footer),
+    ],
+);
+const ORDER: Section = (
+    "tab order (T)",
+    &[
+        ("j k", "pick a tab", Footer),
+        ("J K", "move it down / up", Both),
+        ("⏎", "go to it", Both),
+        ("a", "archive it", Both),
+        ("esc", "done", Footer),
+    ],
+);
+/// Upload, reset, archive and vote all ask the same way.
+const CONFIRM: Section = (
+    "confirms (upload, reset, vote, archive)",
+    &[("y ⏎", "yes", Both), ("n esc", "cancel", Both)],
+);
+const QUICK: Section = (
+    "Q box (q Q ^q)",
+    &[
+        ("⏎", "send to #quick", Both),
+        ("^q", "add / drop this channel", Both),
+        ("⇧⏎ ^j", "new line", Footer),
+        ("esc", "close (keeps the text)", Footer),
+    ],
+);
+const REPLY: Section = (
+    "reply (r on tab 0)",
+    &[
+        ("⏎", "send into its thread", Both),
+        ("⇧⏎ ^j", "new line", Footer),
+        ("esc", "close (keeps the text)", Footer),
+    ],
+);
+const SUBSCRIPTION: Section = (
+    "Claude subscription (B)",
+    &[
+        ("j k", "pick", Footer),
+        ("⇥ h l", "this channel / default", Both),
+        ("⏎", "use it (signs, publishes)", Both),
+        ("esc", "close", Footer),
+    ],
+);
+const VIEWER: Section = (
+    "image (o)",
+    &[
+        ("← →", "prev / next image", Both),
+        ("esc q o", "close", Footer),
+        ("O", "open in Preview", Both),
+    ],
+);
+const HINT: Section = (
+    "links (f)",
+    &[
+        ("letters", "follow link / copy code", Both),
+        ("esc", "cancel", Footer),
+    ],
+);
+
+/// The `?` overlay, left column then right. A short screen clips the
+/// bottom, so the boxes that list their own keys go last.
+pub const HELP: [&[Section]; 2] = [
+    &[MOVE, TABS, MESSAGES, APP, INSERT, REPLY, QUICK],
+    &[
+        SCREENS,
+        AGENTS,
+        ROUTING,
+        CONTROL,
+        SUBSCRIPTION,
+        SECTIONS,
+        ORDER,
+        VIEWER,
+        HINT,
+        CONFIRM,
+    ],
+];
+
+/// A mode's keys, by section.
+pub fn sections(mode: Mode) -> &'static [Section] {
+    match mode {
+        // Footer order: n i o f a c ?.
+        Mode::Normal => &[MOVE, TABS, MESSAGES, SCREENS, APP, AGENTS, ROUTING, CONTROL],
+        Mode::Insert => &[INSERT],
+        Mode::Sections => &[SECTIONS],
+        Mode::Order => &[ORDER],
+        Mode::Confirm | Mode::Reset | Mode::Archive | Mode::Vote => &[CONFIRM],
+        Mode::Quick => &[QUICK],
+        Mode::Reply => &[REPLY],
+        Mode::Subscription => &[SUBSCRIPTION],
+        Mode::Viewer => &[VIEWER],
+        Mode::Help => &[("help", &[("esc ?", "close", Both)])],
+        Mode::Hint => &[HINT],
+    }
+}
+
+/// A mode's keys in order: the footer strip shows those with `footer()`.
+pub fn legend(mode: Mode) -> impl Iterator<Item = &'static Key> + Clone {
+    sections(mode).iter().flat_map(|s| s.1)
 }
