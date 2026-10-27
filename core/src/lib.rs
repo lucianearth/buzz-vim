@@ -1,8 +1,8 @@
 //! The UI-free half of buzz-vim, shared by the terminal client and the
 //! iPhone app: relay IO, the live socket, the message store, read state,
 //! Desktop's sections, agent telemetry, the color ramp, and the operator
-//! loop's checklist records, Q pop-up, Needs-you tab and routing view, and
-//! push.
+//! loop's checklist records, Q pop-up, Needs-you tab and routing view,
+//! push, and Claude subscription usage.
 
 // Nested `if`s read better than let-chains here, as in the terminal app.
 #![allow(clippy::collapsible_if, clippy::collapsible_match)]
@@ -26,3 +26,4 @@ pub mod sections;
 pub mod subscription;
 pub mod telemetry;
 pub mod unread;
+pub mod usage;

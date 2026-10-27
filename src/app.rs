@@ -315,6 +315,8 @@ pub struct App {
     pub control_sending: std::collections::BTreeSet<String>,
     /// Which Claude subscription each channel's agents spend (`B`).
     pub subscriptions: Subscriptions,
+    /// Each Claude subscription's 5-hour and weekly usage (agents screen).
+    pub usage: crate::usage::Usage,
     /// The `B` picker: on the default for every channel (else this one),
     /// and its row (0 = follow the default / each agent's owner).
     pub sub_all: bool,
@@ -424,6 +426,7 @@ impl App {
             control_vote_on: None,
             control_sending: Default::default(),
             subscriptions: Subscriptions::default(),
+            usage: Default::default(),
             sub_all: false,
             sub_cursor: 0,
             sub_expect: None,

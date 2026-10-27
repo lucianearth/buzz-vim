@@ -40,7 +40,12 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
   the picked tab, `a` then `y` archives it for everyone). The order is synced: dragging tabs on the phone moves them here too, and the other way round
 - `⏎` or `l` open a thread, `r` reply in it, `+` 👍 the selected message; `h`, `←` or `Esc` goes back
 - `a` the agents screen: who is working, where, and their last tool calls. A tab spins while an agent
-  works in that channel, and a thread shows `taskbot thinking` while an agent answers in it
+  works in that channel, and a thread shows `taskbot thinking` while an agent answers in it. On top,
+  **Claude usage**: a row per Claude subscription with its 5-hour and weekly bars (amber from 80%, red
+  and `limit` when the window is used up), when each resets, and how old the reading is (`stale` past
+  20 minutes). The box polls every subscription and publishes one kind 30078 record per person
+  (`d=claude-usage/<person>`, the same numbers as Claude Code's `/usage`), signed by its poster key;
+  only `subscription_publishers`' records count
 - `c` the channel's checklist (the operator loop's records, kinds 30470-30472, read-only here: agents write
   them with `buzz checklist`). Items in order with open / done, the release flag and evidence, and
   the picked item's details and evidence links beside them. There is no parking: a legacy parked item reads as open work. Above a channel's messages a
@@ -129,7 +134,7 @@ In `buzz-vim/config.json` (or the env var):
   #control (`ee7289a1-…`).
 - `subscription_operators` (`BUZZ_VIM_SUB_OPERATORS`, comma separated): whose `B` map counts, default
   lucian (`5c017fc7…`), the same default as the box's reconciler. `subscription_publishers`
-  (`BUZZ_VIM_SUB_PUBLISHERS`): who may publish the people list, default the box's poster key
+  (`BUZZ_VIM_SUB_PUBLISHERS`): who may publish the people list and the Claude usage records, default the box's poster key
   (`f708a2af…`). Keys are 64 lowercase hex; any other value is ignored with a warning.
 - `quick_channel` (`BUZZ_VIM_QUICK_CHANNEL`), default `quick`, and `quick_agent` (`BUZZ_VIM_QUICK_AGENT`),
   default `taskbot`: where Q posts and who it @mentions.

@@ -1173,6 +1173,7 @@ fn draw_agents(f: &mut Frame, app: &mut App, area: Rect) {
         .map(channel_label)
         .unwrap_or_default();
     let area = breadcrumb(f, app, area, &label, "agents", None);
+    let area = draw_usage(f, app, area);
     let here = app.current().map(str::to_string);
     let rows = app.agents.rows(&app.store, here.as_deref());
     if rows.is_empty() {
@@ -1323,6 +1324,132 @@ fn draw_agents(f: &mut Frame, app: &mut App, area: Rect) {
             );
         }
         y += h + 1;
+    }
+}
+
+/// The Claude usage block on top of the agents screen: one row per
+/// subscription with how old the reading is (red `stale` past 20 minutes),
+/// then its 5-hour and weekly bars (green, amber from 80%, red at the limit)
+/// and when each resets, and a second row when the last check failed. It
+/// takes at most half the area; rows that don't fit are counted. Returns
+/// the area left below it; nothing is drawn until a record exists.
+fn draw_usage(f: &mut Frame, app: &App, area: Rect) -> Rect {
+    use crate::usage::{WARN_PERCENT, duration, is_stale, view};
+    use buzz_vim_core::control::Health;
+    let records = app.usage.records();
+    // The heading and one row, out of half the area (the gap below is extra).
+    let room = (area.height / 2).saturating_sub(1) as usize;
+    if records.is_empty() || room < 2 {
+        return area;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let color = |h| Style::new().fg(control::health_color(h));
+    let label_w = records
+        .iter()
+        .map(|r| r.label.width())
+        .max()
+        .unwrap_or(0)
+        .clamp(6, 18);
+    // "stale 23h" / "59m ago"
+    const AGE_W: usize = 9;
+    // The age sits right after the label, so a narrow screen cuts the
+    // weekly reset, never the stale mark. Each window: name 5, bar,
+    // " limit" 6, " in 23h 59m  " 13.
+    let fixed = 2 + label_w + 2 + AGE_W + 2;
+    let bar_w = ((area.width as usize).saturating_sub(fixed + 2 * 24) / 2).clamp(3, 20);
+    let window = |name: &str, w: &crate::usage::Window| -> Vec<Span<'static>> {
+        let v = view(w, now);
+        let tone = if v.at_limit {
+            Health::Page
+        } else if v.percent.is_some_and(|p| p >= WARN_PERCENT) {
+            Health::Warn
+        } else {
+            Health::Ok
+        };
+        let fill = v
+            .percent
+            .map_or(0, |p| (p as usize * bar_w).div_ceil(100).min(bar_w));
+        let pct = match (v.at_limit, v.percent) {
+            (true, _) => "limit".to_string(),
+            (false, Some(p)) => format!("{p}%"),
+            (false, None) => "–".to_string(),
+        };
+        let reset = v
+            .resets_in
+            .map_or(String::new(), |s| format!("in {}", duration(s)));
+        vec![
+            Span::styled(format!("{name:<5}"), theme::muted()),
+            Span::styled("█".repeat(fill), color(tone)),
+            Span::styled("░".repeat(bar_w - fill), theme::faint()),
+            Span::styled(
+                format!(" {pct:>5}"),
+                if v.at_limit {
+                    color(Health::Page).add_modifier(Modifier::BOLD)
+                } else {
+                    theme::text()
+                },
+            ),
+            Span::styled(format!(" {reset:<10}  "), theme::faint()),
+        ]
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::raw("  "),
+        Span::styled("Claude usage", theme::bright()),
+    ])];
+    let total = records.len();
+    for (i, r) in records.into_iter().enumerate() {
+        // While more records follow this one, keep a line for "+N more".
+        let left = total - i;
+        let need = if left > 1 { 2 } else { 1 };
+        if lines.len() + need > room {
+            lines.push(Line::styled(format!("  +{left} more"), theme::faint()));
+            break;
+        }
+        let label = if r.label.width() <= label_w {
+            r.label.clone()
+        } else {
+            clip(&r.label, label_w)
+        };
+        let age = duration(now.saturating_sub(r.checked_at));
+        let mut spans = vec![
+            Span::raw("  "),
+            Span::styled(pad_to(&label, label_w), theme::text()),
+            Span::raw("  "),
+            if is_stale(r, now) {
+                Span::styled(pad_to(&format!("stale {age}"), AGE_W), color(Health::Page))
+            } else {
+                Span::styled(pad_to(&format!("{age} ago"), AGE_W), theme::faint())
+            },
+            Span::raw("  "),
+        ];
+        spans.extend(window("5h", &r.five_hour));
+        spans.extend(window("week", &r.seven_day));
+        lines.push(Line::from(spans));
+        // The failure line only when it leaves room for what follows.
+        if let Some(e) = &r.error {
+            if lines.len() + need <= room {
+                let indent = 4 + label_w;
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(indent)),
+                    Span::styled(
+                        clip(
+                            &format!("last check failed: {e}"),
+                            (area.width as usize).saturating_sub(indent),
+                        ),
+                        color(Health::Page),
+                    ),
+                ]));
+            }
+        }
+    }
+    let h = lines.len() as u16;
+    f.render_widget(Paragraph::new(lines), Rect { height: h, ..area });
+    Rect {
+        y: area.y + h + 1,
+        height: area.height - h - 1,
+        ..area
     }
 }
 
@@ -5790,6 +5917,136 @@ mod tests {
         assert_eq!(
             app.subscriptions.status(ch).as_deref(),
             Some("sub kevin (default)")
+        );
+    }
+
+    /// The agents screen shows each Claude subscription's 5-hour and weekly
+    /// bars from the box's usage records, also with no agent online: amber at
+    /// 80%, "limit" when rejected, the reset countdown, and "stale" past 20
+    /// minutes. Records from another signer don't show.
+    #[test]
+    fn agents_screen_shows_claude_usage_bars() {
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+        let (publ, other) = (Keys::generate(), Keys::generate());
+        let mut app = App::new("me".into(), None);
+        app.usage = crate::usage::Usage::new(vec![publ.public_key().to_hex()]);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let rec = |k: &Keys,
+                   person: &str,
+                   checked: u64,
+                   five: serde_json::Value,
+                   week: serde_json::Value| {
+            EventBuilder::new(
+                Kind::Custom(30078),
+                serde_json::json!({"v": 1, "person": person, "label": format!("{person}'s Max"),
+                    "checked_at": checked, "five_hour": five, "seven_day": week, "agents": [], "error": null})
+                .to_string(),
+            )
+            .tags([Tag::parse(["d", &format!("claude-usage/{person}")]).unwrap()])
+            .custom_created_at(Timestamp::from(checked))
+            .sign_with_keys(k)
+            .unwrap()
+        };
+        let w = |u: f64, st: &str, reset: u64| serde_json::json!({"utilization": u, "resets_at": reset, "status": st});
+        app.usage.apply(&rec(
+            &publ,
+            "lucian",
+            now - 60,
+            w(0.42, "allowed", now + 2 * 3600 + 5 * 60),
+            w(0.85, "allowed_warning", now + 3 * 86400 + 4 * 3600),
+        ));
+        app.usage.apply(&rec(
+            &publ,
+            "kevin",
+            now - 3600,
+            w(0.5, "rejected", now + 600),
+            w(0.1, "allowed", now + 86400),
+        ));
+        app.usage.apply(&rec(
+            &other,
+            "mallory",
+            now,
+            w(0.99, "allowed", now + 60),
+            w(0.99, "allowed", now + 60),
+        ));
+        app.agents_view = true;
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let rows: Vec<String> = (0..30)
+            .map(|y| (0..100).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let screen = rows.join("\n");
+        let row = |needle: &str| {
+            rows.iter()
+                .find(|r| r.contains(needle))
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert!(screen.contains("Claude usage"), "{screen}");
+        let lucian = row("lucian's Max");
+        assert!(
+            lucian.contains("5h") && lucian.contains("42%") && lucian.contains("in 2h 5m"),
+            "{lucian}"
+        );
+        assert!(
+            lucian.contains("week") && lucian.contains("85%") && lucian.contains("in 3d 4h"),
+            "{lucian}"
+        );
+        let kevin = row("kevin's Max");
+        assert!(
+            kevin.contains("limit") && kevin.contains("stale"),
+            "{kevin}"
+        );
+        assert!(!lucian.contains("stale"), "{lucian}");
+        assert!(!screen.contains("mallory"), "{screen}");
+        // Kevin's Max sorts before lucian's.
+        assert!(screen.find("kevin's Max") < screen.find("lucian's Max"));
+        assert!(
+            screen.contains("none of your agents are online"),
+            "{screen}"
+        );
+        // The 85% weekly bar is amber, the 42% one is not.
+        let amber = super::control::health_color(crate::control::Health::Warn);
+        let y = rows
+            .iter()
+            .position(|r| r.contains("lucian's Max"))
+            .unwrap() as u16;
+        let fg: Vec<_> = (0..100)
+            .filter(|&x| buf[(x, y)].symbol() == "█")
+            .map(|x| buf[(x, y)].fg)
+            .collect();
+        assert!(fg.contains(&amber), "weekly bar amber");
+        assert!(fg.iter().any(|c| *c != amber), "5h bar not amber");
+        // 80 columns: the stale mark survives; a short screen counts the rest.
+        app.usage.apply(&rec(
+            &publ,
+            "zed",
+            now,
+            w(0.1, "allowed", now + 60),
+            w(0.1, "allowed", now + 60),
+        ));
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let narrow: Vec<String> = (0..30)
+            .map(|y| (0..80).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let kevin = narrow.iter().find(|r| r.contains("kevin's Max")).unwrap();
+        assert!(kevin.contains("stale 1h"), "{kevin}");
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 16)).unwrap();
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let short: String = (0..16)
+            .map(|y| (0..100).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            short.contains("kevin's Max") && short.contains("+2 more"),
+            "{short}"
         );
     }
 }

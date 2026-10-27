@@ -17,7 +17,7 @@ mod ui;
 
 use buzz_vim_core::{
     checklist, control, draft, links, live, log, mention, model, needs, quick, readstate, relay,
-    routing, sections, subscription, telemetry, unread,
+    routing, sections, subscription, telemetry, unread, usage,
 };
 
 use std::sync::Arc;
@@ -146,6 +146,8 @@ async fn run(
         operators: cfg.loop_.sub_operators.clone(),
         publishers: cfg.loop_.sub_publishers.clone(),
     });
+    // The box's poster key signs the usage records too.
+    app.usage = usage::Usage::new(cfg.loop_.sub_publishers.clone());
     let saved = state::load(&relay.base, &app.store.me);
     app.chosen = saved.chosen.clone();
     app.read_width = saved.read_width;
@@ -157,6 +159,7 @@ async fn run(
     }
     sync.start();
     sync.load_subscriptions(app.subscriptions.filters());
+    sync.load_usage(app.usage.filters());
     sync.want_profiles([app.store.me.clone()]);
 
     let mut input = EventStream::new();
