@@ -468,7 +468,7 @@ impl Sync {
         let channel = id.to_string();
         let today = checklist::local_midnight(now());
         self.spawn(async move {
-            let records = r.query_all(Checklists::filter(&channel)).await;
+            let records = Checklists::fetch(&r, &channel).await;
             let today = r
                 .query(&[
                     json!({"kinds": model::UNREAD_KINDS, "#h": [channel], "since": today,
@@ -1310,6 +1310,10 @@ impl Sync {
 /// look up profiles for.
 pub fn fold(app: &mut App, sync: &mut Sync, ev: &Event, live_channel: bool) -> Vec<String> {
     let kind = ev.kind.as_u16();
+    // The owner's 👍 on a request approves a proposed big item.
+    if kind == model::KIND_REACTION {
+        app.checklists.apply(ev);
+    }
     match kind {
         24200 => {
             if model::tag(ev, "agent") == Some(&ev.pubkey.to_hex()) {

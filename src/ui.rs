@@ -1642,7 +1642,7 @@ fn draw_status(f: &mut Frame, app: &mut App, row: Rect, channel: &str, hint: boo
 /// The checklist pane (`c`): the channel's items in order, the picked
 /// one's details and evidence beside or under them.
 fn draw_checklist(f: &mut Frame, app: &mut App, area: Rect) {
-    use crate::checklist::Status;
+    use crate::checklist::{BigState, Status};
     let Some(channel) = app.current().map(str::to_string) else {
         return;
     };
@@ -1738,9 +1738,26 @@ fn draw_checklist(f: &mut Frame, app: &mut App, area: Rect) {
         };
         // The release marker leads the line (lucian 2026-10-21).
         let lead = if it.release { "release " } else { "" };
+        // Sub-items sit indented under their big item.
+        let indent = if it.parent.is_some() { "   " } else { "" };
         let mut tail = String::new();
         if it.missing_evidence() {
             tail.push_str("  ⚠ no evidence");
+        }
+        if let Some(st) = it
+            .state
+            .filter(|s| !matches!(s, BigState::Open | BigState::Done))
+        {
+            tail.push_str(&format!("  {}", st.label()));
+        }
+        if it.trip {
+            tail.push_str("  re-plan due");
+        }
+        if let (None, Some(t)) = (it.done_at, it.started_at) {
+            tail.push_str(&format!(
+                "  started {}",
+                crate::checklist::done_label(t, now)
+            ));
         }
         // Done items sink below the open ones, newest tick first; each
         // shows when it was ticked (lucian 2026-10-21).
@@ -1748,10 +1765,11 @@ fn draw_checklist(f: &mut Frame, app: &mut App, area: Rect) {
         if !done_at.is_empty() {
             tail.push_str(&format!("  {done_at}"));
         }
-        let room = (list.width as usize).saturating_sub(tail.width() + lead.width() + 5);
+        let room =
+            (list.width as usize).saturating_sub(tail.width() + lead.width() + indent.len() + 5);
         let row_style = if i == cur { theme::tab_active() } else { st };
         lines.push(Line::from(vec![
-            Span::styled(format!(" {mark} "), row_style),
+            Span::styled(format!(" {indent}{mark} "), row_style),
             Span::styled(
                 lead,
                 match (i == cur, it.status) {
@@ -1786,11 +1804,17 @@ fn draw_checklist(f: &mut Frame, app: &mut App, area: Rect) {
     for l in wrap_plain(&it.text, w) {
         d.push(Line::styled(format!(" {l}"), theme::bright()));
     }
-    let mut meta = vec![if it.status == Status::Done {
-        format!("done {}", done_label(it))
-    } else {
-        "open".to_string()
+    let mut meta = vec![match (it.state, it.status) {
+        (Some(st), _) if st != BigState::Done => st.label().to_string(),
+        (_, Status::Done) => format!("done {}", done_label(it)),
+        _ => "open".to_string(),
     }];
+    if let Some(t) = it.started_at {
+        meta.push(format!("started {}", crate::checklist::done_label(t, now)));
+    }
+    if it.trip {
+        meta.push("re-plan due".into());
+    }
     if it.release {
         meta.push("release: needs lucian".into());
     }
@@ -1831,6 +1855,23 @@ fn draw_checklist(f: &mut Frame, app: &mut App, area: Rect) {
     if !it.details.trim().is_empty() {
         d.push(Line::raw(""));
         for l in render_markdown_links(&it.details, w, &[], &|_| None).lines {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(l.spans);
+            d.push(Line::from(spans));
+        }
+    }
+    // A sub-item's notes (handoffs), oldest first.
+    for n in &it.notes {
+        d.push(Line::raw(""));
+        d.push(Line::styled(
+            format!(
+                " note · {} · {}",
+                app.store.name_of(&n.author),
+                crate::checklist::done_label(n.at, now)
+            ),
+            theme::faint(),
+        ));
+        for l in render_markdown_links(&n.content, w, &[], &|_| None).lines {
             let mut spans = vec![Span::raw(" ")];
             spans.extend(l.spans);
             d.push(Line::from(spans));
@@ -4080,6 +4121,161 @@ mod tests {
             "{:?}",
             app.needs
         );
+    }
+
+    /// A v4 list (NIP-CK, Big items and sub-items) in the loop channel:
+    /// big items with their sub-items indented under them, a proposed big
+    /// item, the derived states, start times and a sub-item's notes. Also
+    /// a README shot with `BUZZ_VIM_SHOT`.
+    #[test]
+    fn checklist_pane_nests_sub_items_under_big_items() {
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+        let ch = "2130646b-d6c8-4ec3-93e3-36f77bee1a37";
+        let mut app = loop_fixture();
+        let (lucian, bot) = (Keys::generate(), Keys::generate());
+        let bk = bot.public_key().to_hex();
+        app.store.profiles.insert(
+            bk.clone(),
+            crate::model::Profile {
+                name: "taskbot".into(),
+                ..Default::default()
+            },
+        );
+        app.checklists = crate::checklist::Checklists::new(crate::checklist::Trust {
+            owner: lucian.public_key().to_hex(),
+            watchers: vec![],
+        });
+        let now = crate::sync::now();
+        let sign = |k: &Keys, kind: u16, tags: Vec<Vec<String>>, at: u64, content: String| {
+            EventBuilder::new(Kind::Custom(kind), content)
+                .tags(tags.into_iter().map(|t| Tag::parse(t).unwrap()))
+                .custom_created_at(Timestamp::from(at))
+                .sign_with_keys(k)
+                .unwrap()
+        };
+        let base = |ty: &str| -> Vec<Vec<String>> {
+            [
+                ["h", ch],
+                ["t", "buzz-checklist"],
+                ["channel", ch],
+                ["checklist-type", ty],
+            ]
+            .map(|t| t.map(String::from).to_vec())
+            .to_vec()
+        };
+        let item_d = |id: &str| format!("buzz-checklist/item/{ch}/{bk}/{id}");
+        let mut head = base("header");
+        head.push(vec!["d".into(), format!("buzz-checklist/header/{ch}/{bk}")]);
+        let v = serde_json::json!({"v": 1, "title": "Checklist v4", "mode": "running"});
+        app.checklists
+            .apply(&sign(&bot, 30471, head, now - 9000, v.to_string()));
+        let ago = |m: u64| now - m * 60;
+        let items = [
+            (
+                "00000001",
+                serde_json::json!({"text": "NOW: B3 on W2 (buzz-vim)", "order": 9000}),
+            ),
+            (
+                "0000000a",
+                serde_json::json!({"text": "W2 buzz-vim shows sub-items", "order": 1000}),
+            ),
+            (
+                "000000a1",
+                serde_json::json!({"text": "core reads v4", "parent": "0000000a",
+                "started_at": ago(90), "status": "done", "done_at": ago(40), "evidence": ["commit:4c1d2e0"]}),
+            ),
+            (
+                "000000a2",
+                serde_json::json!({"text": "terminal and iOS show it", "parent": "0000000a",
+                "started_at": ago(35)}),
+            ),
+            (
+                "0000000b",
+                serde_json::json!({"text": "K2 simplicity brief", "order": 2000}),
+            ),
+            (
+                "000000b1",
+                serde_json::json!({"text": "edit agents/simplicity.md", "parent": "0000000b"}),
+            ),
+            (
+                "0000000c",
+                serde_json::json!({"text": "R1 flow-retro skill", "order": 3000,
+                "request": "ab".repeat(32)}),
+            ),
+            (
+                "0000000d",
+                serde_json::json!({"text": "D1 deploy", "order": 4000, "release": true}),
+            ),
+            (
+                "0000000e",
+                serde_json::json!({"text": "S1 spec", "order": 500, "simple_at": ago(5),
+                "evidence": ["msg:".to_string() + &"cd".repeat(32)]}),
+            ),
+            (
+                "000000e1",
+                serde_json::json!({"text": "NIP-CK v4 section", "parent": "0000000e",
+                "started_at": ago(200), "status": "done", "done_at": ago(100), "evidence": ["commit:e7ed846"]}),
+            ),
+            (
+                "000000ff",
+                serde_json::json!({"text": "wrap-up: demo + report", "order": 1e9, "standing": "last"}),
+            ),
+        ];
+        for (id, v) in items {
+            let mut t = base("item");
+            t.push(vec!["d".into(), item_d(id)]);
+            app.checklists
+                .apply(&sign(&bot, 30470, t, now - 8000, v.to_string()));
+        }
+        let mut t = base("note");
+        t.push(vec![
+            "a".into(),
+            format!("30470:{bk}:{}", item_d("000000a2")),
+        ]);
+        let note = "Handoff: core + terminal done; iOS needs macbot.";
+        app.checklists
+            .apply(&sign(&bot, 40470, t, ago(10), note.into()));
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('c').into()));
+        let s = screen_text(&mut app, 120, 34);
+        let at = |t: &str| s.find(t).unwrap_or_else(|| panic!("{t} missing:\n{s}"));
+        // NOW on top; the started big item (by its first sub-item's start)
+        // with its sub-items under it, oldest start first; never started;
+        // proposed; release; wrap-up; the done big item with its sub-item.
+        let order = [
+            "NOW: B3",
+            "W2 buzz-vim",
+            "   ○ terminal and iOS",
+            "   ✓ core reads v4",
+            "K2 simplicity",
+            "   ○ edit agents",
+            "R1 flow-retro",
+            "release D1",
+            "wrap-up",
+            "✓ S1 spec",
+            "   ✓ NIP-CK v4 section",
+        ];
+        for w in order.windows(2) {
+            assert!(at(w[0]) < at(w[1]), "{} before {}:\n{s}", w[0], w[1]);
+        }
+        let row = |t: &str| s.lines().find(|l| l.contains(t)).unwrap().to_string();
+        assert!(row("R1 flow-retro").contains("proposed"), "{s}");
+        let started = format!("started {}", crate::checklist::done_label(ago(35), now));
+        assert!(row("terminal and iOS").contains(&started), "{s}");
+        // The started sub-item's details show its note.
+        for _ in 0..2 {
+            app.on_term(crossterm::event::Event::Key(KeyCode::Char('j').into()));
+        }
+        let s = screen_text(&mut app, 120, 34);
+        assert!(
+            s.contains("note · taskbot") && s.contains("Handoff: core + terminal"),
+            "{s}"
+        );
+        if let Ok(dir) = std::env::var("BUZZ_VIM_SHOT") {
+            let mut t =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 34)).unwrap();
+            t.draw(|f| draw(f, &mut app)).unwrap();
+            dump(t.backend().buffer(), &format!("{dir}/checklist-v4.cells"));
+        }
     }
 
     /// The subscription label and a long checklist summary share the

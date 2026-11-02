@@ -10,8 +10,14 @@
 //! ignored. The owner's newest header picks the driver; with none, one list
 //! drives and two or more are contested. Watch records count only from the
 //! watcher's keys. The vectors in `core/tests/nip-ck-vectors.json` pin it.
+//!
+//! v4 (NIP-CK, Big items and sub-items): an item with `parent` is a
+//! sub-item; an item with sub-items or a `request` is a big item, whose
+//! state, start and finish are derived. Notes (kind 40470) hang off
+//! sub-items. A list with no `parent` reads as before. The vectors in
+//! `core/tests/nip-ck-v4-vectors.json` pin it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use nostr::Event;
 use serde::Deserialize;
@@ -22,7 +28,9 @@ use crate::model::tag;
 pub const KIND_ITEM: u16 = 30470;
 pub const KIND_HEADER: u16 = 30471;
 pub const KIND_WATCH: u16 = 30472;
-pub const KINDS: &[u16] = &[KIND_ITEM, KIND_HEADER, KIND_WATCH];
+/// A note on a sub-item: a regular event, so every one shows.
+pub const KIND_NOTE: u16 = 40470;
+pub const KINDS: &[u16] = &[KIND_ITEM, KIND_HEADER, KIND_WATCH, KIND_NOTE];
 /// The `t` tag every record carries.
 pub const TAG: &str = "buzz-checklist";
 /// lucian: accepted on every record, and he picks the driver (default,
@@ -144,7 +152,54 @@ pub struct Item {
     pub updated_at: u64,
     /// When a done item was ticked: the record's `done_at`, else (records
     /// written before `done_at` existed) the version's time. None unless done.
+    /// A big item's: its `simple_at`, once derived done.
     pub done_at: Option<u64>,
+    /// The big item this sub-item belongs to.
+    pub parent: Option<String>,
+    /// A big item proposed while the list ran: its request message.
+    pub request: Option<String>,
+    /// When work started; a big item's is its first sub-item's.
+    pub started_at: Option<u64>,
+    pub added_at: Option<u64>,
+    pub replan_at: Option<u64>,
+    pub simple_at: Option<u64>,
+    /// A big item's derived state; None for sub-items and plain items.
+    pub state: Option<BigState>,
+    /// A big item's growth trip: more sub-items wait on a re-plan.
+    pub trip: bool,
+    /// A sub-item's notes, oldest first.
+    pub notes: Vec<Note>,
+}
+
+/// A big item's state, derived from its sub-items, the owner's 👍 on its
+/// request and `simple_at`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BigState {
+    Proposed,
+    Open,
+    WaitingOnSimplicity,
+    Done,
+}
+
+impl BigState {
+    pub fn label(self) -> &'static str {
+        match self {
+            BigState::Proposed => "proposed",
+            BigState::Open => "open",
+            BigState::WaitingOnSimplicity => "waiting on simplicity",
+            BigState::Done => "done",
+        }
+    }
+}
+
+/// A note on a sub-item (kind 40470).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Note {
+    pub event_id: String,
+    pub author: String,
+    pub at: u64,
+    /// Markdown.
+    pub content: String,
 }
 
 impl Item {
@@ -281,17 +336,39 @@ fn address(ev: &Event) -> Option<(&str, Addr<'_>)> {
     if tag(ev, "channel") != Some(h) {
         return None;
     }
-    let p: Vec<&str> = tag(ev, "d")?.split('/').collect();
+    Some((h, parse_d(ty, tag(ev, "d")?, h)?))
+}
+
+/// A canonical `d` of type `ty` in channel `h`.
+fn parse_d<'a>(ty: &str, d: &'a str, h: &str) -> Option<Addr<'a>> {
+    let p: Vec<&'a str> = d.split('/').collect();
     if p.len() < 3 || p[0] != TAG || p[1] != ty || p[2] != h {
         return None;
     }
-    let addr = match (ty, &p[3..]) {
+    Some(match (ty, &p[3..]) {
         ("watch", []) => Addr::Watch,
         ("header", [c]) if is_key(c) => Addr::Header { creator: c },
         ("item", [c, id]) if is_key(c) && is_item_id(id) => Addr::Item { creator: c, id },
         _ => return None,
-    };
-    Some((h, addr))
+    })
+}
+
+/// A note's channel and the sub-item it names (`a` =
+/// `30470:<creator>:<item d>`), when `h`, `channel` and the d's channel
+/// agree.
+fn note_address(ev: &Event) -> Option<(&str, (String, String))> {
+    if tag(ev, "t") != Some(TAG) || tag(ev, "checklist-type") != Some("note") {
+        return None;
+    }
+    let h = tag(ev, "h").filter(|h| !h.is_empty())?;
+    if tag(ev, "channel") != Some(h) {
+        return None;
+    }
+    let d = tag(ev, "a")?.strip_prefix("30470:")?.split_once(':')?.1;
+    match parse_d("item", d, h)? {
+        Addr::Item { creator, id } => Some((h, (creator.to_string(), id.to_string()))),
+        _ => None,
+    }
 }
 
 /// Who drives a channel's list (NIP-CK rule v3).
@@ -315,6 +392,8 @@ struct ChannelRecords {
     /// Item addresses: (creator, item id) -> signer -> newest.
     items: BTreeMap<(String, String), Slot>,
     watch: Slot,
+    /// Notes by event id: the sub-item's (creator, id) and the note.
+    notes: BTreeMap<String, ((String, String), Note)>,
     /// Crash notices seen here: message id -> created_at.
     crashes: HashMap<String, u64>,
 }
@@ -324,6 +403,8 @@ struct ChannelRecords {
 pub struct Checklists {
     pub trust: Trust,
     channels: HashMap<String, ChannelRecords>,
+    /// Event ids the owner reacted 👍 to: approved big item requests.
+    approved: HashSet<String>,
     /// The judge's routing logs (30472, `checklist-type=routing`).
     routing: crate::routing::Logs,
 }
@@ -387,6 +468,18 @@ struct ItemJson {
     /// Unix seconds of the tick; `buzz checklist tick` writes it.
     #[serde(deserialize_with = "lenient")]
     done_at: Option<u64>,
+    #[serde(deserialize_with = "lenient")]
+    parent: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    request: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    started_at: Option<u64>,
+    #[serde(deserialize_with = "lenient")]
+    added_at: Option<u64>,
+    #[serde(deserialize_with = "lenient")]
+    replan_at: Option<u64>,
+    #[serde(deserialize_with = "lenient")]
+    simple_at: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -497,6 +590,37 @@ impl Checklists {
     pub fn apply(&mut self, ev: &Event) -> bool {
         if crate::routing::channel_of(ev).is_some() {
             return self.routing.apply(ev);
+        }
+        match ev.kind.as_u16() {
+            crate::model::KIND_REACTION => {
+                let thumb = ev.pubkey.to_hex() == self.trust.owner
+                    && crate::control::normalize_reaction(&ev.content) == crate::model::THUMBS_UP;
+                let target = ev.tags.iter().rev().find_map(|t| match t.as_slice() {
+                    [n, id, ..] if n == "e" => Some(id.clone()),
+                    _ => None,
+                });
+                return match target {
+                    Some(id) if thumb => self.approved.insert(id),
+                    _ => false,
+                };
+            }
+            KIND_NOTE => {
+                let Some((channel, item)) = note_address(ev) else {
+                    return false;
+                };
+                let note = Note {
+                    event_id: ev.id.to_hex(),
+                    author: ev.pubkey.to_hex(),
+                    at: ev.created_at.as_secs(),
+                    content: ev.content.clone(),
+                };
+                let recs = self.channels.entry(channel.to_string()).or_default();
+                return recs
+                    .notes
+                    .insert(note.event_id.clone(), (item, note))
+                    .is_none();
+            }
+            _ => {}
         }
         let Some((channel, addr)) = address(ev) else {
             return false;
@@ -629,10 +753,12 @@ impl Checklists {
         })
     }
 
-    /// Open items in list order (the standing first item, then by `order`,
-    /// release items after the rest, then the standing last item), then
-    /// done items, the latest tick first (lucian 2026-10-21: done ones
-    /// sink, newest finish on top; release items sit at the bottom).
+    /// The channel's items in the one display order (NIP-CK, Display
+    /// order): the standing first item and the `NOW:` line; unfinished
+    /// started items, oldest start first; never-started items; open release
+    /// items; the standing last item; done items, the latest finish first.
+    /// Ties keep `order`. Each big item is followed by its sub-items in the
+    /// same order; a sub-item whose big item isn't on the list doesn't show.
     pub fn items(&self, channel: &str) -> Vec<Item> {
         let Some(recs) = self.channels.get(channel) else {
             return vec![];
@@ -642,7 +768,7 @@ impl Checklists {
             return vec![];
         };
         let owner = self.trust.owner.as_str();
-        let mut out: Vec<Item> = recs
+        let mut all: Vec<Item> = recs
             .items
             .iter()
             .filter(|((creator, _), _)| *creator == driver || creator == owner)
@@ -652,6 +778,18 @@ impl Checklists {
                 let status = Status::parse(&j.status);
                 let recorded = j.done_at.filter(|t| *t > 0);
                 let done = status == Status::Done;
+                // A sub-item's notes, from the driver or the owner.
+                let mut notes: Vec<Note> = recs
+                    .notes
+                    .values()
+                    .filter(|((c, i), n)| {
+                        j.parent.is_some()
+                            && (c, i) == (creator, id)
+                            && (n.author == driver || n.author == owner)
+                    })
+                    .map(|(_, n)| n.clone())
+                    .collect();
+                notes.sort_by(|a, b| (a.at, &a.event_id).cmp(&(b.at, &b.event_id)));
                 Some(Item {
                     id: id.clone(),
                     text: j.text,
@@ -667,25 +805,113 @@ impl Checklists {
                     event_id: v.id.clone(),
                     updated_at: v.at,
                     done_at: done.then(|| recorded.unwrap_or(v.at)),
+                    parent: j.parent.filter(|p| !p.is_empty()),
+                    request: j.request.filter(|r| !r.is_empty()),
+                    started_at: j.started_at,
+                    added_at: j.added_at,
+                    replan_at: j.replan_at,
+                    simple_at: j.simple_at,
+                    state: None,
+                    trip: false,
+                    notes,
                 })
             })
             .collect();
-        let rank = |i: &Item| match i.standing.as_deref() {
-            Some("first") => 0,
-            Some("last") => 3,
-            _ if i.release => 2,
-            _ => 1,
+        let (subs, mut top): (Vec<Item>, Vec<Item>) =
+            all.drain(..).partition(|i| i.parent.is_some());
+        for big in &mut top {
+            let mine: Vec<&Item> = subs
+                .iter()
+                .filter(|s| s.parent.as_ref() == Some(&big.id))
+                .collect();
+            if big.request.is_some() || !mine.is_empty() {
+                self.derive_big(big, &mine);
+            }
+        }
+        let key = |i: &Item| {
+            let rank = match (i.done_at, i.started_at) {
+                (Some(done), _) => (5, -(done as i64)),
+                _ if i.standing.as_deref() == Some("first") || i.text.starts_with("NOW:") => (0, 0),
+                _ if i.standing.as_deref() == Some("last") => (4, 0),
+                _ if i.release => (3, 0),
+                (None, Some(start)) => (1, start as i64),
+                (None, None) => (2, 0),
+            };
+            (rank, i.order)
         };
-        let done = |i: &Item| i.status == Status::Done;
-        out.sort_by(|a, b| {
-            done(a)
-                .cmp(&done(b))
-                .then(b.done_at.cmp(&a.done_at))
-                .then(rank(a).cmp(&rank(b)))
-                .then(a.order.total_cmp(&b.order))
-                .then(a.id.cmp(&b.id))
-        });
+        let sort = |v: &mut Vec<Item>| {
+            v.sort_by(|a, b| {
+                let ((ra, oa), (rb, ob)) = (key(a), key(b));
+                ra.cmp(&rb).then(oa.total_cmp(&ob)).then(a.id.cmp(&b.id))
+            })
+        };
+        sort(&mut top);
+        let mut subs = subs;
+        sort(&mut subs);
+        let mut out = vec![];
+        for big in top {
+            let id = big.id.clone();
+            out.push(big);
+            out.extend(
+                subs.iter()
+                    .filter(|s| s.parent.as_ref() == Some(&id))
+                    .cloned(),
+            );
+        }
         out
+    }
+
+    /// A big item's state, start, finish and trip from its sub-items, the
+    /// owner's 👍 and `simple_at` (NIP-CK, Done is derived; Growth trip).
+    /// Its own `status` and `done_at` are not its state.
+    fn derive_big(&self, big: &mut Item, subs: &[&Item]) {
+        let all_done = !subs.is_empty() && subs.iter().all(|s| s.status == Status::Done);
+        let last_tick = subs.iter().filter_map(|s| s.done_at).max();
+        let state = if big
+            .request
+            .as_ref()
+            .is_some_and(|r| !self.approved.contains(r))
+        {
+            BigState::Proposed
+        } else if !all_done {
+            BigState::Open
+        } else if big
+            .simple_at
+            .is_some_and(|t| last_tick.is_none_or(|l| t >= l))
+        {
+            BigState::Done
+        } else {
+            BigState::WaitingOnSimplicity
+        };
+        let done = state == BigState::Done;
+        big.state = Some(state);
+        big.status = if done { Status::Done } else { Status::Open };
+        big.done_at = if done { big.simple_at } else { None };
+        big.started_at = subs.iter().filter_map(|s| s.started_at).min();
+        big.trip = big.started_at.is_some_and(|start| {
+            let since = start.max(big.replan_at.unwrap_or(0));
+            let added = subs.iter().map(|s| s.added_at.unwrap_or(0));
+            let started_with = added.clone().filter(|t| *t <= start).count();
+            added.filter(|t| *t > since).count() > started_with
+        });
+    }
+
+    /// A channel's records and the reactions to its big item requests
+    /// (`apply` keeps the owner's 👍): `filter`'s pages, then those.
+    pub async fn fetch(relay: &crate::relay::Relay, channel: &str) -> anyhow::Result<Vec<Event>> {
+        let mut records = relay.query_all(Self::filter(channel)).await?;
+        let requests: Vec<String> = records
+            .iter()
+            .filter(|e| e.kind.as_u16() == KIND_ITEM)
+            .filter_map(|e| serde_json::from_str::<Value>(&e.content).ok())
+            .filter_map(|v| v["request"].as_str().map(str::to_string))
+            .collect();
+        if !requests.is_empty() {
+            let thumbs =
+                serde_json::json!({"kinds": [crate::model::KIND_REACTION], "#e": requests});
+            records.extend(relay.query_all(thumbs).await?);
+        }
+        Ok(records)
     }
 
     pub fn watch(&self, channel: &str) -> Option<Watch> {
@@ -1067,8 +1293,11 @@ mod tests {
         assert!(last.release && last.missing_evidence());
     }
 
+    /// The one display order (lucian 2026-11-02): the standing first item
+    /// and the NOW line, started oldest first, never started, open release,
+    /// the standing last item, done newest first.
     #[test]
-    fn done_items_sink_newest_tick_first() {
+    fn items_follow_the_one_display_order() {
         let (owner, bot) = (Keys::generate(), Keys::generate());
         let bk = hex(&bot);
         let mut s = store(&owner);
@@ -1100,6 +1329,16 @@ mod tests {
         );
         put(&mut s, "00000003", 10, item("open b", "open", 2.0));
         put(&mut s, "00000004", 10, item("open a", "open", 1.0));
+        let started = |text: &str, order: f64, at: u64| serde_json::json!({"text": text, "order": order, "started_at": at});
+        put(&mut s, "0000000a", 10, started("started 300", 7.0, 300));
+        put(&mut s, "0000000b", 10, started("started 200", 8.0, 200));
+        put(&mut s, "00000009", 10, item("NOW: b3 on W2", "open", 9.0));
+        put(
+            &mut s,
+            "0000000c",
+            10,
+            serde_json::json!({"text": "release", "release": true, "order": 2.5}),
+        );
         // Ticked at 500, edited later at 900: the tick time counts, not the edit.
         put(&mut s, "00000005", 900, done_at("ticked 500", 0.5, 500));
         put(&mut s, "00000006", 10, done_at("ticked 700", 3.0, 700));
@@ -1120,8 +1359,12 @@ mod tests {
             got,
             [
                 ("reconcile", None),
+                ("NOW: b3 on W2", None),
+                ("started 200", None),
+                ("started 300", None),
                 ("open a", None),
                 ("open b", None),
+                ("release", None),
                 ("wrap-up", None),
                 ("ticked 700", Some(700)),
                 ("old 600", Some(600)),
@@ -1144,16 +1387,117 @@ mod tests {
             texts,
             [
                 "reconcile",
+                "NOW: b3 on W2",
+                "started 200",
+                "started 300",
                 "open a",
                 "open b",
                 "ticked 700",
+                "release",
                 "wrap-up",
                 "old 600",
                 "ticked 500",
                 "standing done"
             ]
         );
-        assert_eq!(items[3].done_at, None);
+        assert_eq!(items[6].done_at, None);
+    }
+
+    /// v4: sub-items follow their big item in the same order; a big item
+    /// sorts by its derived start and finish; notes count from the driver
+    /// or the owner; the owner's 👍 makes a proposed big item open.
+    #[test]
+    fn sub_items_nest_under_big_items_in_the_one_order() {
+        let (owner, bot, x) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let bk = hex(&bot);
+        let mut s = store(&owner);
+        s.apply(&rec(
+            &bot,
+            KIND_HEADER,
+            &head_d(&bk),
+            1,
+            head("t", "running"),
+        ));
+        let put = |s: &mut Checklists, id: &str, v: Value| {
+            s.apply(&rec(&bot, KIND_ITEM, &item_d(&bk, id), 10, v));
+        };
+        let sub = |parent: &str, started: Option<u64>, done: Option<u64>| {
+            serde_json::json!({"text": "sub", "parent": parent, "started_at": started,
+                "status": if done.is_some() { "done" } else { "open" }, "done_at": done,
+                "evidence": ["commit:a"]})
+        };
+        put(&mut s, "0000000a", item("plain a", "open", 0.5));
+        put(&mut s, "0000000b", item("big b", "open", 1.0));
+        put(&mut s, "000000b1", sub("0000000b", Some(3), Some(4)));
+        put(&mut s, "000000b2", sub("0000000b", Some(2), None));
+        put(&mut s, "0000000d", item("plain d", "open", 2.0));
+        put(
+            &mut s,
+            "0000000e",
+            serde_json::json!({"text": "big e", "order": 0.1, "simple_at": 9}),
+        );
+        put(&mut s, "000000e1", sub("0000000e", Some(3), Some(4)));
+        put(
+            &mut s,
+            "0000000f",
+            serde_json::json!({"text": "proposed f", "order": 5, "request": "ab".repeat(32)}),
+        );
+        let note = |who: &Keys, at: u64, text: &str| {
+            let a = format!("30470:{bk}:{}", item_d(&bk, "000000b2"));
+            let t = [
+                ["h", CH],
+                ["t", TAG],
+                ["channel", CH],
+                ["checklist-type", "note"],
+                ["a", a.as_str()],
+            ];
+            EventBuilder::new(Kind::Custom(KIND_NOTE), text)
+                .tags(t.into_iter().map(|t| Tag::parse(t).unwrap()))
+                .custom_created_at(Timestamp::from(at))
+                .sign_with_keys(who)
+                .unwrap()
+        };
+        s.apply(&note(&bot, 30, "second"));
+        s.apply(&note(&owner, 20, "first"));
+        s.apply(&note(&x, 25, "a stranger's"));
+        let rows = |s: &Checklists| -> Vec<(String, Option<BigState>)> {
+            s.items(CH).into_iter().map(|i| (i.id, i.state)).collect()
+        };
+        let want = |f: BigState| -> Vec<(String, Option<BigState>)> {
+            [
+                ("0000000b", Some(BigState::Open)),
+                ("000000b2", None),
+                ("000000b1", None),
+                ("0000000a", None),
+                ("0000000d", None),
+                ("0000000f", Some(f)),
+                ("0000000e", Some(BigState::Done)),
+                ("000000e1", None),
+            ]
+            .into_iter()
+            .map(|(i, st)| (i.to_string(), st))
+            .collect()
+        };
+        assert_eq!(rows(&s), want(BigState::Proposed));
+        let items = s.items(CH);
+        assert_eq!(
+            (items[0].started_at, items[0].status),
+            (Some(2), Status::Open)
+        );
+        let notes: Vec<&str> = items[1].notes.iter().map(|n| n.content.as_str()).collect();
+        assert_eq!(notes, ["first", "second"]);
+        assert_eq!(items[6].done_at, Some(9));
+        // A stranger's 👍 does nothing; the owner's approves.
+        let thumb = |who: &Keys| {
+            EventBuilder::new(Kind::Reaction, "👍\u{FE0F}")
+                .tags([Tag::parse(["e", &"ab".repeat(32)]).unwrap()])
+                .sign_with_keys(who)
+                .unwrap()
+        };
+        assert!(!s.apply(&thumb(&x)));
+        assert_eq!(rows(&s), want(BigState::Proposed));
+        assert!(s.apply(&thumb(&owner)));
+        assert_eq!(rows(&s), want(BigState::Open));
     }
 
     #[test]

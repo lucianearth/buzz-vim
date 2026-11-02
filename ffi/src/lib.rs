@@ -375,6 +375,26 @@ pub struct ChecklistItem {
     /// "15:20", "yesterday 22:10", "Oct 19". Empty for open items.
     pub done_at: Option<u64>,
     pub done_label: String,
+    /// A sub-item's big item: the row sits indented under it.
+    pub parent: Option<String>,
+    /// A big item's derived state: "proposed", "open", "waiting on
+    /// simplicity", "done". None for sub-items and plain items.
+    pub state: Option<String>,
+    /// Unfinished started items: "started 15:20". Empty otherwise.
+    pub started_label: String,
+    /// A big item whose growth trip fired: the next sub-item waits on a
+    /// re-plan.
+    pub trip: bool,
+    /// A sub-item's notes, oldest first.
+    pub notes: Vec<ChecklistNote>,
+}
+
+/// A note on a sub-item: who, when ("15:20") and the markdown.
+#[derive(uniffi::Record, Clone)]
+pub struct ChecklistNote {
+    pub author: String,
+    pub label: String,
+    pub content: String,
 }
 
 /// A channel's checklist, read-only (agents write it with `buzz checklist`).
@@ -892,8 +912,8 @@ impl Client {
         }
     }
 
-    /// A channel's checklist: header, open items in list order, then done
-    /// items, the latest tick first.
+    /// A channel's checklist: header, then the items in the core's one
+    /// display order, each big item followed by its sub-items.
     pub fn checklist(&self, channel: String) -> Checklist {
         let e = self.engine.lock().unwrap();
         let t = now();
@@ -929,6 +949,22 @@ impl Client {
                     .map(|d| checklist::done_label(d, t))
                     .unwrap_or_default(),
                 done_at: i.done_at,
+                started_label: match (i.done_at, i.started_at) {
+                    (None, Some(s)) => format!("started {}", checklist::done_label(s, t)),
+                    _ => String::new(),
+                },
+                parent: i.parent,
+                state: i.state.map(|s| s.label().to_string()),
+                trip: i.trip,
+                notes: i
+                    .notes
+                    .into_iter()
+                    .map(|n| ChecklistNote {
+                        author: e.store.name_of(&n.author),
+                        label: checklist::done_label(n.at, t),
+                        content: n.content,
+                    })
+                    .collect(),
             })
             .collect();
         Checklist {
@@ -1743,7 +1779,7 @@ impl Engine {
         let channel = id.to_string();
         let today = checklist::local_midnight(now());
         self.spawn(async move {
-            let records = r.query_all(Checklists::filter(&channel)).await;
+            let records = Checklists::fetch(&r, &channel).await;
             let today = r
                 .query(&[
                     json!({"kinds": model::UNREAD_KINDS, "#h": [channel], "since": today,
@@ -2172,6 +2208,10 @@ impl Engine {
     /// Fold one event. Returns pubkeys to look up profiles for.
     fn fold(&mut self, ev: &Event, live_channel: bool) -> Vec<String> {
         let kind = ev.kind.as_u16();
+        // The owner's 👍 on a request approves a proposed big item.
+        if kind == model::KIND_REACTION {
+            self.checklists.apply(ev);
+        }
         match kind {
             24200 => {
                 if model::tag(ev, "agent") == Some(&ev.pubkey.to_hex()) {
@@ -2862,6 +2902,38 @@ mod tests {
                 json!({"text": "ship it", "status": "done", "order": 1, "evidence": ["msg:abc", "commit:123"]})),
             true,
         );
+        // v4: a big item and a started sub-item with a note.
+        e.fold(
+            &rec(
+                30470,
+                format!("buzz-checklist/item/{ch}/{bk}/0000000b"),
+                json!({"text": "big", "order": 2}),
+            ),
+            true,
+        );
+        e.fold(
+            &rec(
+                30470,
+                format!("buzz-checklist/item/{ch}/{bk}/000000b1"),
+                json!({"text": "sub", "parent": "0000000b", "started_at": now() - 60}),
+            ),
+            true,
+        );
+        let a = format!("30470:{bk}:buzz-checklist/item/{ch}/{bk}/000000b1");
+        let note = EventBuilder::new(Kind::Custom(checklist::KIND_NOTE), "handoff")
+            .tags(
+                [
+                    ["h", ch],
+                    ["t", "buzz-checklist"],
+                    ["channel", ch],
+                    ["checklist-type", "note"],
+                    ["a", &a],
+                ]
+                .map(|t| Tag::parse(t).unwrap()),
+            )
+            .sign_with_keys(&bot)
+            .unwrap();
+        e.fold(&note, true);
         e.fold(
             &rec(
                 30472,
@@ -2885,7 +2957,19 @@ mod tests {
             ("loop", Some("running"))
         );
         assert_eq!(list.resume, "agent/x");
-        let it = &list.items[0];
+        let ids: Vec<&str> = list.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, ["0000000b", "000000b1", "000000a1"]);
+        let (big, sub) = (&list.items[0], &list.items[1]);
+        assert_eq!(
+            (
+                big.state.as_deref(),
+                big.started_label.starts_with("started ")
+            ),
+            (Some("open"), true)
+        );
+        assert_eq!(sub.parent.as_deref(), Some("0000000b"));
+        assert_eq!(sub.notes[0].content, "handoff");
+        let it = &list.items[2];
         assert!(it.status == ItemStatus::Done && !it.missing_evidence);
         // No done_at in the record: the version's time stands in.
         assert_eq!(it.done_at, Some(now() - 10));
@@ -2906,7 +2990,7 @@ mod tests {
             rows.iter()
                 .any(|r| r.watcher && !r.pushed && r.kind == "stalled")
         );
-        assert_eq!((s.open, s.done, s.crashes_today), (0, 1, 1));
+        assert_eq!((s.open, s.done, s.crashes_today), (2, 1, 1));
         assert!(c.loop_status("other".into()).is_none());
     }
 

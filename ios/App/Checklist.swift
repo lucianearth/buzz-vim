@@ -59,8 +59,9 @@ struct LoopLine: View {
 }
 
 /// A channel's checklist, read-only: agents write it with `buzz checklist`.
-/// Open items in list order, then done ones, the latest tick first.
-/// Tap an item for its details and evidence.
+/// Items in the core's one display order (the terminal's too), each big
+/// item's sub-items indented under it. Tap an item for its details,
+/// evidence and notes.
 struct ChecklistView: View {
     let client: Client
     let channel: String
@@ -156,6 +157,8 @@ struct ChecklistView: View {
                 details(it).padding(.leading, 24).padding(.top, 6)
             }
         }
+        // A sub-item sits indented under its big item.
+        .padding(.leading, it.parent == nil ? 0 : 24)
     }
 
     @ViewBuilder
@@ -185,6 +188,10 @@ struct ChecklistView: View {
                     .font(.text)
                     .foregroundStyle(theme.text)
             }
+            ForEach(Array(it.notes.enumerated()), id: \.offset) { _, n in
+                Text("note · \(n.author) · \(n.label)").font(.small).foregroundStyle(theme.faint)
+                Text(markdown(n.content)).font(.text).foregroundStyle(theme.text)
+            }
         }
     }
 
@@ -196,7 +203,13 @@ struct ChecklistView: View {
     }
 
     private func flags(_ it: ChecklistItem) -> String {
-        it.missingEvidence ? "⚠ no evidence" : ""
+        var f: [String] = []
+        if it.missingEvidence { f.append("⚠ no evidence") }
+        // A big item's state when it isn't plain open or done.
+        if let s = it.state, s != "open", s != "done" { f.append(s) }
+        if it.trip { f.append("re-plan due") }
+        if !it.startedLabel.isEmpty { f.append(it.startedLabel) }
+        return f.joined(separator: " · ")
     }
 
     private func markdown(_ s: String) -> AttributedString {
