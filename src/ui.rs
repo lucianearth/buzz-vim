@@ -6146,8 +6146,11 @@ mod tests {
             &publ,
             "lucian",
             now - 60,
-            w(0.42, "allowed", now + 2 * 3600 + 5 * 60),
-            w(0.85, "allowed_warning", now + 3 * 86400 + 4 * 3600),
+            // Countdowns truncate to the minute and the render reads the
+            // clock again, so pad 30s to keep a second boundary from
+            // turning "2h 5m" into "2h 4m".
+            w(0.42, "allowed", now + 2 * 3600 + 5 * 60 + 30),
+            w(0.85, "allowed_warning", now + 3 * 86400 + 4 * 3600 + 30),
         ));
         app.usage.apply(&rec(
             &publ,
