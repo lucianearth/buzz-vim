@@ -364,7 +364,7 @@ pub struct ChecklistItem {
     pub status: ItemStatus,
     /// Needs lucian to release it.
     pub release: bool,
-    /// "first" / "now" / "last" for the three standing items.
+    /// "first" / "last" for the two standing items.
     pub standing: Option<String>,
     pub evidence: Vec<Evidence>,
     /// Done with no evidence: the spec requires some.

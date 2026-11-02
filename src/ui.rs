@@ -4174,10 +4174,6 @@ mod tests {
         let ago = |m: u64| now - m * 60;
         let items = [
             (
-                "00000001",
-                serde_json::json!({"text": "NOW: B3 on W2 (buzz-vim)", "standing": "now", "order": 1}),
-            ),
-            (
                 "0000000a",
                 serde_json::json!({"text": "W2 buzz-vim shows sub-items", "order": 1000}),
             ),
@@ -4240,11 +4236,10 @@ mod tests {
         app.on_term(crossterm::event::Event::Key(KeyCode::Char('c').into()));
         let s = screen_text(&mut app, 120, 34);
         let at = |t: &str| s.find(t).unwrap_or_else(|| panic!("{t} missing:\n{s}"));
-        // NOW on top; the started big item (by its first sub-item's start)
+        // The started big item (by its first sub-item's start)
         // with its sub-items under it, oldest start first; never started;
         // proposed; release; wrap-up; the done big item with its sub-item.
         let order = [
-            "NOW: B3",
             "W2 buzz-vim",
             "   ○ terminal and iOS",
             "   ✓ core reads v4",
@@ -4264,9 +4259,7 @@ mod tests {
         let started = format!("started {}", crate::checklist::done_label(ago(35), now));
         assert!(row("terminal and iOS").contains(&started), "{s}");
         // The started sub-item's details show its note.
-        for _ in 0..2 {
-            app.on_term(crossterm::event::Event::Key(KeyCode::Char('j').into()));
-        }
+        app.on_term(crossterm::event::Event::Key(KeyCode::Char('j').into()));
         let s = screen_text(&mut app, 120, 34);
         assert!(
             s.contains("note · taskbot") && s.contains("Handoff: core + terminal"),
