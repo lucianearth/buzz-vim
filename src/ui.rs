@@ -1814,6 +1814,9 @@ fn draw_checklist(f: &mut Frame, app: &mut App, area: Rect) {
     if it.trip {
         meta.push("re-plan due".into());
     }
+    if let Some(v) = &it.value {
+        meta.push(format!("value {v}"));
+    }
     if it.release {
         meta.push("release: needs lucian".into());
     }

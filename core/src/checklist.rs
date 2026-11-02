@@ -163,6 +163,8 @@ pub struct Item {
     pub added_at: Option<u64>,
     pub replan_at: Option<u64>,
     pub simple_at: Option<u64>,
+    /// A big item's value bucket: "low" / "medium" / "high".
+    pub value: Option<String>,
     /// A big item's derived state; None for sub-items and plain items.
     pub state: Option<BigState>,
     /// A big item's growth trip: more sub-items wait on a re-plan.
@@ -481,6 +483,8 @@ struct ItemJson {
     replan_at: Option<u64>,
     #[serde(deserialize_with = "lenient")]
     simple_at: Option<u64>,
+    #[serde(deserialize_with = "lenient")]
+    value: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -807,6 +811,9 @@ impl Checklists {
                     added_at: j.added_at,
                     replan_at: j.replan_at,
                     simple_at: j.simple_at,
+                    value: j
+                        .value
+                        .filter(|v| ["low", "medium", "high"].contains(&v.as_str())),
                     state: None,
                     trip: false,
                     notes,
@@ -1434,14 +1441,18 @@ mod tests {
                 "evidence": ["commit:a"]})
         };
         put(&mut s, "0000000a", item("plain a", "open", 0.5));
-        put(&mut s, "0000000b", item("big b", "open", 1.0));
+        put(
+            &mut s,
+            "0000000b",
+            serde_json::json!({"text": "big b", "order": 1.0, "value": "high"}),
+        );
         put(&mut s, "000000b1", sub("0000000b", Some(3), Some(4)));
         put(&mut s, "000000b2", sub("0000000b", Some(2), None));
         put(&mut s, "0000000d", item("plain d", "open", 2.0));
         put(
             &mut s,
             "0000000e",
-            serde_json::json!({"text": "big e", "order": 0.1, "simple_at": 9}),
+            serde_json::json!({"text": "big e", "order": 0.1, "simple_at": 9, "value": "huge"}),
         );
         put(&mut s, "000000e1", sub("0000000e", Some(3), Some(4)));
         put(
@@ -1490,6 +1501,11 @@ mod tests {
         assert_eq!(
             (items[0].started_at, items[0].status),
             (Some(2), Status::Open)
+        );
+        // Value reads leniently: an unknown bucket is none.
+        assert_eq!(
+            (items[0].value.as_deref(), items[6].value.as_deref()),
+            (Some("high"), None)
         );
         let notes: Vec<&str> = items[1].notes.iter().map(|n| n.content.as_str()).collect();
         assert_eq!(notes, ["first", "second"]);
