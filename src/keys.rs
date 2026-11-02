@@ -116,7 +116,7 @@ const APP: Section = (
         ("[ ]", "narrower / wider (or drag)", Help),
         ("?", "help", Both),
         ("^c", "quit", Help),
-        ("mouse", "click picks, wheel scrolls", Help),
+        ("mouse", "click picks, drag copies", Help),
     ],
 );
 const SCREENS: Section = (

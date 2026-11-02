@@ -157,11 +157,22 @@ pub fn dropped_paths(paste: &str) -> Vec<PathBuf> {
     }
 }
 
-/// `f` on a code block: its text onto the system clipboard.
+/// `f` on a code block or a mouse drag: the text onto the clipboard. The
+/// system one when we run locally (the Mac's pasteboard); over ssh, or
+/// with no clipboard here, the terminal's via OSC 52.
 pub fn copy(text: &str) -> Result<()> {
-    arboard::Clipboard::new()
-        .context("no clipboard available")?
-        .set_text(text)?;
+    let local = std::env::var_os("SSH_TTY").is_none()
+        && arboard::Clipboard::new()
+            .and_then(|mut c| c.set_text(text))
+            .is_ok();
+    if !local {
+        use base64::Engine;
+        use std::io::Write;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(text);
+        let mut out = std::io::stdout();
+        write!(out, "\x1b]52;c;{b64}\x07")?;
+        out.flush()?;
+    }
     Ok(())
 }
 

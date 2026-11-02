@@ -9,6 +9,7 @@ use crossterm::event::{
 };
 use ratatui::layout::Rect;
 use ratatui_image::picker::Picker;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::checklist::Checklists;
 use crate::clip::Pending;
@@ -62,6 +63,20 @@ pub struct LinkHit {
     pub url: String,
     /// (message id, link number in it): the pieces of one wrapped link share it.
     pub key: (String, usize),
+}
+
+/// A row of message text on screen, from the last draw, for drag-to-copy.
+#[derive(Clone, Debug)]
+pub struct TextRow {
+    pub x: u16,
+    pub y: u16,
+    pub text: String,
+    /// It continues the row above (a soft wrap), so copying joins them.
+    pub soft: bool,
+    /// Its text's first and end column: indent and padding are left out.
+    pub lead: usize,
+    pub end: usize,
+    pub msg: String,
 }
 
 /// A cursor move this big is g / G: to the first or last message.
@@ -243,6 +258,12 @@ pub struct App {
     /// Dragging the slider, and when it was last clicked (double-click resets).
     pub dragging: bool,
     pub handle_click: Option<std::time::Instant>,
+    pub texts: Vec<TextRow>,
+    /// Left button held on a message: where, and on which. A release
+    /// without a drag is a click on it.
+    pub press: Option<((u16, u16), Pane, String)>,
+    /// Text picked by a drag, (from, to) as (column, row) on screen.
+    pub sel: Option<((u16, u16), (u16, u16))>,
     pub actions: Vec<Action>,
     /// Drafts of messages in flight, restored if the relay rejects them.
     /// event id -> (channel, thread root, the draft it came from)
@@ -384,6 +405,9 @@ impl App {
             body_x: 0,
             dragging: false,
             handle_click: None,
+            texts: vec![],
+            press: None,
+            sel: None,
             actions: vec![],
             pending_sends: HashMap::new(),
             relay_host: String::new(),
@@ -1896,6 +1920,10 @@ impl App {
                 k.code = KeyCode::Char(c.to_uppercase().next().unwrap_or(c));
             }
         }
+        // Any key drops a drag's highlight; Esc in normal mode does only that.
+        if self.sel.take().is_some() && k.code == KeyCode::Esc && self.mode == Mode::Normal {
+            return;
+        }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && k.code == KeyCode::Char('c') && self.mode == Mode::Reply {
             if self.reply_draft.is_empty() {
@@ -2773,7 +2801,90 @@ impl App {
             .map(|l| l.url.clone())
     }
 
+    /// The columns of `t` the drag selection covers, from `t.x`.
+    pub fn selected_cols(&self, t: &TextRow) -> Option<(u16, u16)> {
+        let (a, b) = self.sel?;
+        let (a, b) = if (a.1, a.0) <= (b.1, b.0) {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        if t.y < a.1 || t.y > b.1 {
+            return None;
+        }
+        let end = t.text.width().min(t.end) as u16;
+        let from = if t.y == a.1 {
+            a.0.saturating_sub(t.x)
+        } else {
+            0
+        };
+        let to = if t.y == b.1 {
+            (b.0 + 1).saturating_sub(t.x)
+        } else {
+            end
+        };
+        let (from, to) = (from.max(t.lead as u16), to.min(end));
+        (from < to).then_some((from, to))
+    }
+
+    /// The selected message text: soft wraps joined, real line breaks
+    /// kept, a blank line between messages.
+    pub fn selected_text(&self) -> String {
+        let mut out = String::new();
+        let mut last: Option<&TextRow> = None;
+        for t in &self.texts {
+            let Some((from, to)) = self.selected_cols(t) else {
+                continue;
+            };
+            let (mut col, mut piece) = (0usize, String::new());
+            for c in t.text.chars() {
+                let w = c.width().unwrap_or(0);
+                if col >= from as usize && col < to as usize {
+                    piece.push(c);
+                }
+                col += w;
+            }
+            if let Some(l) = last {
+                if l.msg != t.msg || !t.soft {
+                    out.truncate(out.trim_end().len());
+                    out.push_str(if l.msg != t.msg { "\n\n" } else { "\n" });
+                }
+            }
+            out.push_str(&piece);
+            last = Some(t);
+        }
+        out.trim_end().to_string()
+    }
+
+    fn click_message(&mut self, pane: Pane, id: String) {
+        if self.mode == Mode::Insert {
+            self.mode = Mode::Normal;
+        }
+        let same = self.focus == pane && self.cursor_message().as_deref() == Some(id.as_str());
+        self.focus = pane;
+        let ids = if pane == Pane::Thread {
+            self.thread_ids()
+        } else {
+            self.timeline_ids()
+        };
+        let at_end = ids.last() == Some(&id);
+        self.set_cursor(id, at_end);
+        // Click the selected message again to open its thread.
+        if same && pane == Pane::Timeline {
+            self.open_thread(false);
+        }
+    }
+
     fn on_mouse(&mut self, m: MouseEvent) {
+        if matches!(
+            m.kind,
+            MouseEventKind::Down(MouseButton::Left)
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollUp
+        ) {
+            self.sel = None;
+            self.press = None;
+        }
         let hit = self
             .hits
             .iter()
@@ -2792,6 +2903,25 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) if self.dragging => {
                 self.dragging = false;
                 self.actions.push(Action::SaveState);
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some((at, ..)) = &self.press {
+                    if *at != (m.column, m.row) {
+                        self.sel = Some((*at, (m.column, m.row)));
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some((_, pane, id)) = self.press.take() {
+                    // A drag that picked no text (a jittery click) is a click.
+                    let text = self.selected_text();
+                    if text.is_empty() {
+                        self.sel = None;
+                        self.click_message(pane, id);
+                    } else {
+                        self.actions.push(Action::Copy(text));
+                    }
+                }
             }
             MouseEventKind::Down(MouseButton::Left) if hit == Some(Hit::Handle) => {
                 let now = std::time::Instant::now();
@@ -2871,25 +3001,8 @@ impl App {
                         self.needs_cursor = i;
                     }
                 }
-                Some(Hit::Message(pane, id)) => {
-                    if self.mode == Mode::Insert {
-                        self.mode = Mode::Normal;
-                    }
-                    let same =
-                        self.focus == pane && self.cursor_message().as_deref() == Some(id.as_str());
-                    self.focus = pane;
-                    let ids = if pane == Pane::Thread {
-                        self.thread_ids()
-                    } else {
-                        self.timeline_ids()
-                    };
-                    let at_end = ids.last() == Some(&id);
-                    self.set_cursor(id, at_end);
-                    // Click the selected message again to open its thread.
-                    if same && pane == Pane::Timeline {
-                        self.open_thread(false);
-                    }
-                }
+                // Acted on at release: a drag picks text instead.
+                Some(Hit::Message(pane, id)) => self.press = Some(((m.column, m.row), pane, id)),
                 Some(Hit::Compose) => {
                     if self.mode == Mode::Normal {
                         self.enter_insert();

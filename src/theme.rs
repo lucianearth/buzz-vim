@@ -116,6 +116,10 @@ pub fn tab_active() -> Style {
 pub fn tab_idle() -> Style {
     Style::new().fg(gray(15)).bg(gray(4))
 }
+/// Text picked with a mouse drag.
+pub fn selection() -> Style {
+    Style::new().fg(gray(1)).bg(tone(Role::Accent, 20))
+}
 /// Key hints read as inverted chips.
 pub fn key() -> Style {
     Style::new()
