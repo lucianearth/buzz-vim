@@ -517,9 +517,9 @@ struct BlockOut {
     /// (row, column inside the block, width, link number, url): each piece
     /// of each link.
     links: Vec<(u16, u16, u16, usize, String)>,
-    /// (row, continues the row above, columns to leave out): the message
-    /// text's rows, for drag-to-copy.
-    text: Vec<(u16, bool, usize)>,
+    /// (row, continues the row above, its text's first and end column):
+    /// the message text's rows, for drag-to-copy.
+    text: Vec<(u16, bool, usize, usize)>,
 }
 
 fn time_label(at: u64) -> String {
@@ -654,8 +654,8 @@ fn message_block(
                 r.urls[k].clone(),
             ));
         }
-        for (i, (soft, lead)) in r.copy.into_iter().enumerate() {
-            text.push(((top + i) as u16, soft, lead));
+        for (i, (soft, lead, end)) in r.copy.into_iter().enumerate() {
+            text.push(((top + i) as u16, soft, lead, end));
         }
         for l in r.lines {
             let mut spans = vec![bar.clone(), Span::raw("  ")];
@@ -907,9 +907,7 @@ fn draw_blocks(
             height: visible as u16,
         };
         let lines: Vec<Line> = b.lines.into_iter().skip(skip).take(visible).collect();
-        f.render_widget(Paragraph::new(lines.clone()), rect);
-        app.hits.push((rect, Hit::Message(pane, b.id.clone())));
-        for (r, soft, lead) in b.text {
+        for (r, soft, lead, end) in b.text {
             let r = r as usize;
             if r < skip || r >= skip + visible {
                 continue;
@@ -927,9 +925,12 @@ fn draw_blocks(
                 text,
                 soft,
                 lead,
+                end,
                 msg: b.id.clone(),
             });
         }
+        f.render_widget(Paragraph::new(lines), rect);
+        app.hits.push((rect, Hit::Message(pane, b.id.clone())));
         for (r, c, w, k, url) in b.links {
             let r = r as usize;
             if r < skip || r >= skip + visible || c >= area.width {
@@ -3457,9 +3458,9 @@ pub struct Rendered {
     /// (row, column, width, index into `urls`), one per piece of a link, so
     /// a link wrapped over two lines has two.
     pub at: Vec<(usize, usize, usize, usize)>,
-    /// Per line, for copying a drag: (continues the line above, columns of
-    /// padding or indent to leave out).
-    pub copy: Vec<(bool, usize)>,
+    /// Per line, for copying a drag: (continues the line above, first and
+    /// end column of its text, leaving out indent and padding).
+    pub copy: Vec<(bool, usize, usize)>,
 }
 
 #[cfg(test)]
@@ -3486,19 +3487,20 @@ pub fn render_markdown_links(
         r.urls
             .push(format!("{}{}", crate::links::COPY, lines.join("\n")));
     };
-    let code_line = |out: &mut Vec<Line<'static>>, copy: &mut Vec<(bool, usize)>, raw: &str| {
-        let raw = crate::draft::expand_tabs(raw);
-        for (i, chunk) in wrap_plain(&raw, width.saturating_sub(2))
-            .into_iter()
-            .enumerate()
-        {
-            copy.push((i > 0, 1));
-            out.push(Line::from(Span::styled(
-                pad_to(&format!(" {chunk}"), width),
-                theme::code(),
-            )));
-        }
-    };
+    let code_line =
+        |out: &mut Vec<Line<'static>>, copy: &mut Vec<(bool, usize, usize)>, raw: &str| {
+            let raw = crate::draft::expand_tabs(raw);
+            for (i, chunk) in wrap_plain(&raw, width.saturating_sub(2))
+                .into_iter()
+                .enumerate()
+            {
+                copy.push((i > 0, 1, 1 + chunk.width()));
+                out.push(Line::from(Span::styled(
+                    pad_to(&format!(" {chunk}"), width),
+                    theme::code(),
+                )));
+            }
+        };
     for raw in src.split('\n') {
         let t = raw.trim();
         if let Some(fence) = t.strip_prefix("```") {
@@ -3516,7 +3518,7 @@ pub fn render_markdown_links(
             }
             // The language tag, if any, labels the top of the block.
             if in_fence && !fence.trim().is_empty() {
-                r.copy.push((false, 1));
+                r.copy.push((false, 1, usize::MAX));
                 out.push(Line::from(Span::styled(
                     pad_to(&format!(" {}", fence.trim()), width),
                     theme::code_label(),
@@ -3560,7 +3562,8 @@ pub fn render_markdown_links(
                 theme::muted(),
             )];
             let mut col = prefix.width();
-            r.copy.push((i > 0, if i > 0 { col } else { 0 }));
+            r.copy
+                .push((i > 0, if i > 0 { col } else { 0 }, usize::MAX));
             for (span, link) in l {
                 let w = span.content.width();
                 if let Some(k) = link {
@@ -5462,9 +5465,11 @@ mod tests {
         let k = Keys::generate();
         let mut app = App::new(k.public_key().to_hex(), None);
         let long = "alpha ".repeat(20);
+        let code = "x".repeat(100);
         for (at, text) in [
             (1, format!("{}\nsecond line", long.trim())),
             (2, "hello world".into()),
+            (3, format!("```\n{code}\n```")),
         ] {
             let ev = EventBuilder::new(Kind::Custom(9), text)
                 .tags([Tag::parse(["h", "c1"]).unwrap()])
@@ -5475,7 +5480,7 @@ mod tests {
         }
         app.tabs = vec!["c1".into()];
         app.on_term(TermEvent::Key(KeyEvent::from(KeyCode::Esc)));
-        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
         t.draw(|f| draw(f, &mut app)).unwrap();
         let mouse = |app: &mut App, kind, (column, row): (u16, u16)| {
             app.on_term(TermEvent::Mouse(MouseEvent {
@@ -5513,6 +5518,22 @@ mod tests {
         assert!(lit(first.x, first.y) && lit(last.x + 2, last.y));
         assert!(!lit(last.x + 3, last.y) && !lit(first.x - 1, first.y));
         assert!((0..80).all(|x| !lit(x, last.y - 1)));
+        // A wrapped code line copies whole: no pad at the wrap.
+        let xs: Vec<_> = rows.iter().filter(|r| r.text.contains("xxx")).collect();
+        assert!(xs.len() > 1, "{rows:#?}");
+        let end = xs.last().unwrap();
+        mouse(&mut app, MouseEventKind::Down(left), (xs[0].x, xs[0].y));
+        mouse(&mut app, MouseEventKind::Drag(left), (79, end.y));
+        mouse(&mut app, MouseEventKind::Up(left), (79, end.y));
+        assert!(matches!(app.actions.last(), Some(Action::Copy(t)) if *t == code));
+        // Any key drops the highlight; Esc still leaves insert mode.
+        app.on_term(TermEvent::Key(KeyEvent::from(KeyCode::Char('i'))));
+        assert!(app.sel.is_none() && app.mode == crate::keys::Mode::Insert);
+        app.on_term(TermEvent::Key(KeyEvent::from(KeyCode::Esc)));
+        assert_eq!(app.mode, crate::keys::Mode::Normal);
+        mouse(&mut app, MouseEventKind::Down(left), (first.x, first.y));
+        mouse(&mut app, MouseEventKind::Drag(left), (first.x + 1, first.y));
+        mouse(&mut app, MouseEventKind::Up(left), (first.x + 1, first.y));
         // Esc clears it; a click without a move picks the message.
         app.on_term(TermEvent::Key(KeyEvent::from(KeyCode::Esc)));
         assert!(app.sel.is_none());

@@ -73,8 +73,9 @@ pub struct TextRow {
     pub text: String,
     /// It continues the row above (a soft wrap), so copying joins them.
     pub soft: bool,
-    /// Leading columns that are padding or indent, left out of a copy.
+    /// Its text's first and end column: indent and padding are left out.
     pub lead: usize,
+    pub end: usize,
     pub msg: String,
 }
 
@@ -1919,7 +1920,8 @@ impl App {
                 k.code = KeyCode::Char(c.to_uppercase().next().unwrap_or(c));
             }
         }
-        if k.code == KeyCode::Esc && self.sel.take().is_some() {
+        // Any key drops a drag's highlight; Esc in normal mode does only that.
+        if self.sel.take().is_some() && k.code == KeyCode::Esc && self.mode == Mode::Normal {
             return;
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
@@ -2810,17 +2812,18 @@ impl App {
         if t.y < a.1 || t.y > b.1 {
             return None;
         }
-        let w = t.text.width() as u16;
+        let end = t.text.width().min(t.end) as u16;
         let from = if t.y == a.1 {
             a.0.saturating_sub(t.x)
         } else {
             0
         };
         let to = if t.y == b.1 {
-            (b.0 + 1).saturating_sub(t.x).min(w)
+            (b.0 + 1).saturating_sub(t.x)
         } else {
-            w
+            end
         };
+        let (from, to) = (from.max(t.lead as u16), to.min(end));
         (from < to).then_some((from, to))
     }
 
@@ -2836,7 +2839,7 @@ impl App {
             let (mut col, mut piece) = (0usize, String::new());
             for c in t.text.chars() {
                 let w = c.width().unwrap_or(0);
-                if col >= t.lead.max(from as usize) && col < to as usize {
+                if col >= from as usize && col < to as usize {
                     piece.push(c);
                 }
                 col += w;
@@ -2873,8 +2876,14 @@ impl App {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) {
-        if m.kind == MouseEventKind::Down(MouseButton::Left) {
+        if matches!(
+            m.kind,
+            MouseEventKind::Down(MouseButton::Left)
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollUp
+        ) {
             self.sel = None;
+            self.press = None;
         }
         let hit = self
             .hits
@@ -2895,21 +2904,23 @@ impl App {
                 self.dragging = false;
                 self.actions.push(Action::SaveState);
             }
-            MouseEventKind::Drag(MouseButton::Left) if self.press.is_some() => {
-                if let Some((at, _, _)) = self.press.as_ref().filter(|p| p.0 != (m.column, m.row)) {
-                    self.sel = Some((*at, (m.column, m.row)));
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some((at, ..)) = &self.press {
+                    if *at != (m.column, m.row) {
+                        self.sel = Some((*at, (m.column, m.row)));
+                    }
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) if self.press.is_some() => {
-                let Some((_, pane, id)) = self.press.take() else {
-                    return;
-                };
-                if self.sel.is_none() {
-                    return self.click_message(pane, id);
-                }
-                let text = self.selected_text();
-                if !text.is_empty() {
-                    self.actions.push(Action::Copy(text));
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some((_, pane, id)) = self.press.take() {
+                    // A drag that picked no text (a jittery click) is a click.
+                    let text = self.selected_text();
+                    if text.is_empty() {
+                        self.sel = None;
+                        self.click_message(pane, id);
+                    } else {
+                        self.actions.push(Action::Copy(text));
+                    }
                 }
             }
             MouseEventKind::Down(MouseButton::Left) if hit == Some(Hit::Handle) => {
