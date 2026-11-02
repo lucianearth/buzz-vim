@@ -924,6 +924,7 @@ impl Client {
             .into_iter()
             .map(|i| ChecklistItem {
                 missing_evidence: i.missing_evidence(),
+                started_label: i.started_label(t),
                 status: match i.status {
                     // No parking (lucian 2026-10-20): a legacy parked item is open.
                     checklist::Status::Open | checklist::Status::Parked => ItemStatus::Open,
@@ -949,10 +950,6 @@ impl Client {
                     .map(|d| checklist::done_label(d, t))
                     .unwrap_or_default(),
                 done_at: i.done_at,
-                started_label: match (i.done_at, i.started_at) {
-                    (None, Some(s)) => format!("started {}", checklist::done_label(s, t)),
-                    _ => String::new(),
-                },
                 parent: i.parent,
                 state: i.state.map(|s| s.label().to_string()),
                 trip: i.trip,

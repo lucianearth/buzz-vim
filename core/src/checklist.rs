@@ -207,6 +207,14 @@ impl Item {
     pub fn missing_evidence(&self) -> bool {
         self.status == Status::Done && self.evidence.is_empty()
     }
+
+    /// "started <when>" for unfinished started work, else empty.
+    pub fn started_label(&self, now: u64) -> String {
+        match (self.done_at, self.started_at) {
+            (None, Some(t)) => format!("started {}", done_label(t, now)),
+            _ => String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -310,23 +318,27 @@ fn is_item_id(s: &str) -> bool {
     s.len() == 8 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Where a record lives, from its canonical `d`.
+/// Where a record lives, from its canonical `d` (a note: the sub-item its
+/// `a` names).
 #[derive(Debug, PartialEq, Eq)]
 enum Addr<'a> {
     Header { creator: &'a str },
     Item { creator: &'a str, id: &'a str },
+    Note { creator: &'a str, id: &'a str },
     Watch,
 }
 
 /// A record's channel and address, or None unless the envelope is valid:
 /// one of our kinds, `t` and `checklist-type` right for it, `h` ==
 /// `channel` == the d's channel, and a canonical `d` (no case folding, no
-/// npubs, no missing or extra segments).
+/// npubs, no missing or extra segments); a note's `a` is
+/// `30470:<creator>:<item d>`.
 fn address(ev: &Event) -> Option<(&str, Addr<'_>)> {
     let ty = match ev.kind.as_u16() {
         KIND_ITEM => "item",
         KIND_HEADER => "header",
         KIND_WATCH => "watch",
+        KIND_NOTE => "note",
         _ => return None,
     };
     if tag(ev, "t") != Some(TAG) || tag(ev, "checklist-type") != Some(ty) {
@@ -336,7 +348,14 @@ fn address(ev: &Event) -> Option<(&str, Addr<'_>)> {
     if tag(ev, "channel") != Some(h) {
         return None;
     }
-    Some((h, parse_d(ty, tag(ev, "d")?, h)?))
+    if ty != "note" {
+        return Some((h, parse_d(ty, tag(ev, "d")?, h)?));
+    }
+    let d = tag(ev, "a")?.strip_prefix("30470:")?.split_once(':')?.1;
+    match parse_d("item", d, h)? {
+        Addr::Item { creator, id } => Some((h, Addr::Note { creator, id })),
+        _ => None,
+    }
 }
 
 /// A canonical `d` of type `ty` in channel `h`.
@@ -351,24 +370,6 @@ fn parse_d<'a>(ty: &str, d: &'a str, h: &str) -> Option<Addr<'a>> {
         ("item", [c, id]) if is_key(c) && is_item_id(id) => Addr::Item { creator: c, id },
         _ => return None,
     })
-}
-
-/// A note's channel and the sub-item it names (`a` =
-/// `30470:<creator>:<item d>`), when `h`, `channel` and the d's channel
-/// agree.
-fn note_address(ev: &Event) -> Option<(&str, (String, String))> {
-    if tag(ev, "t") != Some(TAG) || tag(ev, "checklist-type") != Some("note") {
-        return None;
-    }
-    let h = tag(ev, "h").filter(|h| !h.is_empty())?;
-    if tag(ev, "channel") != Some(h) {
-        return None;
-    }
-    let d = tag(ev, "a")?.strip_prefix("30470:")?.split_once(':')?.1;
-    match parse_d("item", d, h)? {
-        Addr::Item { creator, id } => Some((h, (creator.to_string(), id.to_string()))),
-        _ => None,
-    }
 }
 
 /// Who drives a channel's list (NIP-CK rule v3).
@@ -392,8 +393,8 @@ struct ChannelRecords {
     /// Item addresses: (creator, item id) -> signer -> newest.
     items: BTreeMap<(String, String), Slot>,
     watch: Slot,
-    /// Notes by event id: the sub-item's (creator, id) and the note.
-    notes: BTreeMap<String, ((String, String), Note)>,
+    /// Notes: the sub-item's (creator, id) -> (at, event id) -> note.
+    notes: BTreeMap<(String, String), BTreeMap<(u64, String), Note>>,
     /// Crash notices seen here: message id -> created_at.
     crashes: HashMap<String, u64>,
 }
@@ -591,39 +592,44 @@ impl Checklists {
         if crate::routing::channel_of(ev).is_some() {
             return self.routing.apply(ev);
         }
-        match ev.kind.as_u16() {
-            crate::model::KIND_REACTION => {
-                let thumb = ev.pubkey.to_hex() == self.trust.owner
-                    && crate::control::normalize_reaction(&ev.content) == crate::model::THUMBS_UP;
-                let target = ev.tags.iter().rev().find_map(|t| match t.as_slice() {
-                    [n, id, ..] if n == "e" => Some(id.clone()),
-                    _ => None,
-                });
-                return match target {
-                    Some(id) if thumb => self.approved.insert(id),
-                    _ => false,
-                };
-            }
-            KIND_NOTE => {
-                let Some((channel, item)) = note_address(ev) else {
-                    return false;
-                };
-                let note = Note {
-                    event_id: ev.id.to_hex(),
-                    author: ev.pubkey.to_hex(),
-                    at: ev.created_at.as_secs(),
-                    content: ev.content.clone(),
-                };
-                let recs = self.channels.entry(channel.to_string()).or_default();
-                return recs
-                    .notes
-                    .insert(note.event_id.clone(), (item, note))
-                    .is_none();
-            }
-            _ => {}
+        if ev.kind.as_u16() == crate::model::KIND_REACTION {
+            let thumb = ev.pubkey.to_hex() == self.trust.owner
+                && crate::control::normalize_reaction(ev.content.trim()) == crate::model::THUMBS_UP;
+            let target = ev.tags.iter().rev().find_map(|t| match t.as_slice() {
+                [n, id, ..] if n == "e" => Some(id.clone()),
+                _ => None,
+            });
+            return match target {
+                Some(id) if thumb => self.approved.insert(id),
+                _ => false,
+            };
         }
         let Some((channel, addr)) = address(ev) else {
             return false;
+        };
+        let recs = self.channels.entry(channel.to_string()).or_default();
+        let at = ev.created_at.as_secs();
+        let slot = match addr {
+            Addr::Note { creator, id } => {
+                let note = Note {
+                    event_id: ev.id.to_hex(),
+                    author: ev.pubkey.to_hex(),
+                    at,
+                    content: ev.content.clone(),
+                };
+                return recs
+                    .notes
+                    .entry((creator.to_string(), id.to_string()))
+                    .or_default()
+                    .insert((at, note.event_id.clone()), note)
+                    .is_none();
+            }
+            Addr::Header { creator } => recs.headers.entry(creator.to_string()).or_default(),
+            Addr::Item { creator, id } => recs
+                .items
+                .entry((creator.to_string(), id.to_string()))
+                .or_default(),
+            Addr::Watch => &mut recs.watch,
         };
         // Content never decides selection: anything that is not a JSON
         // object reads as `{}` (NIP-CK content reading).
@@ -631,22 +637,12 @@ impl Checklists {
             .ok()
             .filter(Value::is_object)
             .unwrap_or_else(|| Value::Object(Default::default()));
-        let at = ev.created_at.as_secs();
         let mut v = Version {
             signer: ev.pubkey.to_hex(),
             at,
             id: ev.id.to_hex(),
             content,
             began: at,
-        };
-        let recs = self.channels.entry(channel.to_string()).or_default();
-        let slot = match addr {
-            Addr::Header { creator } => recs.headers.entry(creator.to_string()).or_default(),
-            Addr::Item { creator, id } => recs
-                .items
-                .entry((creator.to_string(), id.to_string()))
-                .or_default(),
-            Addr::Watch => &mut recs.watch,
         };
         match slot.get(&v.signer) {
             Some(old) if !v.newer_than(old) => false,
@@ -779,17 +775,15 @@ impl Checklists {
                 let recorded = j.done_at.filter(|t| *t > 0);
                 let done = status == Status::Done;
                 // A sub-item's notes, from the driver or the owner.
-                let mut notes: Vec<Note> = recs
+                let notes: Vec<Note> = recs
                     .notes
-                    .values()
-                    .filter(|((c, i), n)| {
-                        j.parent.is_some()
-                            && (c, i) == (creator, id)
-                            && (n.author == driver || n.author == owner)
-                    })
-                    .map(|(_, n)| n.clone())
+                    .get(&(creator.clone(), id.clone()))
+                    .filter(|_| j.parent.is_some())
+                    .into_iter()
+                    .flat_map(|n| n.values())
+                    .filter(|n| n.author == driver || n.author == owner)
+                    .cloned()
                     .collect();
-                notes.sort_by(|a, b| (a.at, &a.event_id).cmp(&(b.at, &b.event_id)));
                 Some(Item {
                     id: id.clone(),
                     text: j.text,
@@ -805,8 +799,8 @@ impl Checklists {
                     event_id: v.id.clone(),
                     updated_at: v.at,
                     done_at: done.then(|| recorded.unwrap_or(v.at)),
-                    parent: j.parent.filter(|p| !p.is_empty()),
-                    request: j.request.filter(|r| !r.is_empty()),
+                    parent: j.parent,
+                    request: j.request,
                     started_at: j.started_at,
                     added_at: j.added_at,
                     replan_at: j.replan_at,
@@ -842,7 +836,9 @@ impl Checklists {
         let sort = |v: &mut Vec<Item>| {
             v.sort_by(|a, b| {
                 let ((ra, oa), (rb, ob)) = (key(a), key(b));
-                ra.cmp(&rb).then(oa.total_cmp(&ob)).then(a.id.cmp(&b.id))
+                ra.cmp(&rb)
+                    .then(oa.total_cmp(&ob))
+                    .then((&a.creator, &a.id).cmp(&(&b.creator, &b.id)))
             })
         };
         sort(&mut top);

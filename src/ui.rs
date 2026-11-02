@@ -1753,11 +1753,9 @@ fn draw_checklist(f: &mut Frame, app: &mut App, area: Rect) {
         if it.trip {
             tail.push_str("  re-plan due");
         }
-        if let (None, Some(t)) = (it.done_at, it.started_at) {
-            tail.push_str(&format!(
-                "  started {}",
-                crate::checklist::done_label(t, now)
-            ));
+        let started = it.started_label(now);
+        if !started.is_empty() {
+            tail.push_str(&format!("  {started}"));
         }
         // Done items sink below the open ones, newest tick first; each
         // shows when it was ticked (lucian 2026-10-21).
@@ -1809,8 +1807,9 @@ fn draw_checklist(f: &mut Frame, app: &mut App, area: Rect) {
         (_, Status::Done) => format!("done {}", done_label(it)),
         _ => "open".to_string(),
     }];
-    if let Some(t) = it.started_at {
-        meta.push(format!("started {}", crate::checklist::done_label(t, now)));
+    let started = it.started_label(now);
+    if !started.is_empty() {
+        meta.push(started);
     }
     if it.trip {
         meta.push("re-plan due".into());
