@@ -29,6 +29,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.needs = app.needs_rows();
     app.hits.clear();
     app.links.clear();
+    app.texts.clear();
     app.empty_prev = app.empty.take();
     let area = f.area();
     f.render_widget(Block::new().style(Style::new().bg(theme::gray(0))), area);
@@ -60,6 +61,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_thread(f, app, main, &mut images);
     } else {
         draw_timeline(f, app, main, &mut images);
+    }
+    // A mouse drag's selection, lit over the message text.
+    for t in &app.texts {
+        if let Some((a, b)) = app.selected_cols(t) {
+            for x in a..b {
+                if let Some(c) = f.buffer_mut().cell_mut((t.x + x, t.y)) {
+                    c.set_style(theme::selection());
+                }
+            }
+        }
     }
     draw_compose(f, app, compose);
     draw_footer(f, app, foot);
@@ -506,6 +517,9 @@ struct BlockOut {
     /// (row, column inside the block, width, link number, url): each piece
     /// of each link.
     links: Vec<(u16, u16, u16, usize, String)>,
+    /// (row, continues the row above, columns to leave out): the message
+    /// text's rows, for drag-to-copy.
+    text: Vec<(u16, bool, usize)>,
 }
 
 fn time_label(at: u64) -> String {
@@ -555,6 +569,7 @@ fn message_block(
 ) -> BlockOut {
     let mut lines = vec![];
     let mut links = vec![];
+    let mut text = vec![];
     let bar = if selected {
         Span::styled("▌", theme::bright())
     } else {
@@ -638,6 +653,9 @@ fn message_block(
                 k,
                 r.urls[k].clone(),
             ));
+        }
+        for (i, (soft, lead)) in r.copy.into_iter().enumerate() {
+            text.push(((top + i) as u16, soft, lead));
         }
         for l in r.lines {
             let mut spans = vec![bar.clone(), Span::raw("  ")];
@@ -746,6 +764,7 @@ fn message_block(
         lines: out,
         image,
         links,
+        text,
     }
 }
 
@@ -888,8 +907,29 @@ fn draw_blocks(
             height: visible as u16,
         };
         let lines: Vec<Line> = b.lines.into_iter().skip(skip).take(visible).collect();
-        f.render_widget(Paragraph::new(lines), rect);
+        f.render_widget(Paragraph::new(lines.clone()), rect);
         app.hits.push((rect, Hit::Message(pane, b.id.clone())));
+        for (r, soft, lead) in b.text {
+            let r = r as usize;
+            if r < skip || r >= skip + visible {
+                continue;
+            }
+            // Rows are [edge, indent, text…].
+            let text = lines[r - skip]
+                .spans
+                .iter()
+                .skip(2)
+                .map(|s| s.content.as_ref())
+                .collect();
+            app.texts.push(crate::app::TextRow {
+                x: area.x + FRAME,
+                y: row + (r - skip) as u16,
+                text,
+                soft,
+                lead,
+                msg: b.id.clone(),
+            });
+        }
         for (r, c, w, k, url) in b.links {
             let r = r as usize;
             if r < skip || r >= skip + visible || c >= area.width {
@@ -3417,6 +3457,9 @@ pub struct Rendered {
     /// (row, column, width, index into `urls`), one per piece of a link, so
     /// a link wrapped over two lines has two.
     pub at: Vec<(usize, usize, usize, usize)>,
+    /// Per line, for copying a drag: (continues the line above, columns of
+    /// padding or indent to leave out).
+    pub copy: Vec<(bool, usize)>,
 }
 
 #[cfg(test)]
@@ -3443,9 +3486,13 @@ pub fn render_markdown_links(
         r.urls
             .push(format!("{}{}", crate::links::COPY, lines.join("\n")));
     };
-    let code_line = |out: &mut Vec<Line<'static>>, raw: &str| {
+    let code_line = |out: &mut Vec<Line<'static>>, copy: &mut Vec<(bool, usize)>, raw: &str| {
         let raw = crate::draft::expand_tabs(raw);
-        for chunk in wrap_plain(&raw, width.saturating_sub(2)) {
+        for (i, chunk) in wrap_plain(&raw, width.saturating_sub(2))
+            .into_iter()
+            .enumerate()
+        {
+            copy.push((i > 0, 1));
             out.push(Line::from(Span::styled(
                 pad_to(&format!(" {chunk}"), width),
                 theme::code(),
@@ -3459,7 +3506,7 @@ pub fn render_markdown_links(
             if !in_fence && fence.len() > 3 && fence.ends_with("```") {
                 let code = fence.trim_end_matches('`');
                 copy(&mut r, (out.len(), vec![code]));
-                code_line(&mut out, code);
+                code_line(&mut out, &mut r.copy, code);
                 continue;
             }
             in_fence = !in_fence;
@@ -3469,6 +3516,7 @@ pub fn render_markdown_links(
             }
             // The language tag, if any, labels the top of the block.
             if in_fence && !fence.trim().is_empty() {
+                r.copy.push((false, 1));
                 out.push(Line::from(Span::styled(
                     pad_to(&format!(" {}", fence.trim()), width),
                     theme::code_label(),
@@ -3480,7 +3528,7 @@ pub fn render_markdown_links(
             if let Some((_, lines)) = &mut block {
                 lines.push(raw);
             }
-            code_line(&mut out, raw);
+            code_line(&mut out, &mut r.copy, raw);
             continue;
         }
         let (prefix, body) =
@@ -3512,6 +3560,7 @@ pub fn render_markdown_links(
                 theme::muted(),
             )];
             let mut col = prefix.width();
+            r.copy.push((i > 0, if i > 0 { col } else { 0 }));
             for (span, link) in l {
                 let w = span.content.width();
                 if let Some(k) = link {
@@ -5397,6 +5446,86 @@ mod tests {
             .collect();
         assert!(!painted.is_empty() && painted[0] > 2, "{painted:?}");
         assert!(*painted.last().unwrap() < 18, "{painted:?}");
+    }
+
+    /// A left drag over messages picks their text only, lit, and copies it
+    /// on release with soft wraps joined; a click without a move still
+    /// picks the message, and again opens its thread.
+    #[test]
+    fn drag_copies_message_text() {
+        use crate::app::Action;
+        use crossterm::event::{
+            Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
+            MouseEventKind,
+        };
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+        let k = Keys::generate();
+        let mut app = App::new(k.public_key().to_hex(), None);
+        let long = "alpha ".repeat(20);
+        for (at, text) in [
+            (1, format!("{}\nsecond line", long.trim())),
+            (2, "hello world".into()),
+        ] {
+            let ev = EventBuilder::new(Kind::Custom(9), text)
+                .tags([Tag::parse(["h", "c1"]).unwrap()])
+                .custom_created_at(Timestamp::from(at))
+                .sign_with_keys(&k)
+                .unwrap();
+            app.store.apply(&ev);
+        }
+        app.tabs = vec!["c1".into()];
+        app.on_term(TermEvent::Key(KeyEvent::from(KeyCode::Esc)));
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        let mouse = |app: &mut App, kind, (column, row): (u16, u16)| {
+            app.on_term(TermEvent::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }))
+        };
+        let rows = app.texts.clone();
+        let first = rows
+            .iter()
+            .find(|r| r.text.starts_with("alpha"))
+            .unwrap()
+            .clone();
+        let last = rows
+            .iter()
+            .find(|r| r.text.starts_with("hello"))
+            .unwrap()
+            .clone();
+        assert!(rows.iter().filter(|r| r.soft).count() >= 1, "{rows:#?}");
+        let left = MouseButton::Left;
+        mouse(&mut app, MouseEventKind::Down(left), (first.x, first.y));
+        mouse(&mut app, MouseEventKind::Drag(left), (last.x + 2, last.y));
+        mouse(&mut app, MouseEventKind::Up(left), (last.x + 2, last.y));
+        let got = match app.actions.last() {
+            Some(Action::Copy(t)) => t.clone(),
+            _ => String::new(),
+        };
+        assert_eq!(got, format!("{}\nsecond line\n\nhel", long.trim()));
+        // Lit: the picked text, not the frame or the header between.
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let lit = |x, y| buf[(x, y)].bg == theme::selection().bg.unwrap();
+        assert!(lit(first.x, first.y) && lit(last.x + 2, last.y));
+        assert!(!lit(last.x + 3, last.y) && !lit(first.x - 1, first.y));
+        assert!((0..80).all(|x| !lit(x, last.y - 1)));
+        // Esc clears it; a click without a move picks the message.
+        app.on_term(TermEvent::Key(KeyEvent::from(KeyCode::Esc)));
+        assert!(app.sel.is_none());
+        app.actions.clear();
+        mouse(&mut app, MouseEventKind::Down(left), (first.x, first.y));
+        mouse(&mut app, MouseEventKind::Up(left), (first.x, first.y));
+        assert!(app.actions.iter().all(|a| !matches!(a, Action::Copy(_))));
+        assert_eq!(app.cursor_message().as_deref(), Some(first.msg.as_str()));
+        assert!(app.thread.is_none());
+        t.draw(|f| draw(f, &mut app)).unwrap();
+        mouse(&mut app, MouseEventKind::Down(left), (first.x, first.y));
+        mouse(&mut app, MouseEventKind::Up(left), (first.x, first.y));
+        assert!(app.thread.is_some());
     }
 
     #[test]
