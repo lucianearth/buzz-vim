@@ -4172,7 +4172,7 @@ mod tests {
         let items = [
             (
                 "00000001",
-                serde_json::json!({"text": "NOW: B3 on W2 (buzz-vim)", "order": 9000}),
+                serde_json::json!({"text": "NOW: B3 on W2 (buzz-vim)", "standing": "now", "order": 1}),
             ),
             (
                 "0000000a",

@@ -140,7 +140,7 @@ pub struct Item {
     pub status: Status,
     pub release: bool,
     pub order: f64,
-    /// "first" / "last" for the two standing items.
+    /// "first" / "now" / "last" for the three standing items.
     pub standing: Option<String>,
     pub evidence: Vec<String>,
     pub parked_question: Option<String>,
@@ -750,7 +750,7 @@ impl Checklists {
     }
 
     /// The channel's items in the one display order (NIP-CK, Display
-    /// order): the standing first item and the `NOW:` line; unfinished
+    /// order): the standing first and NOW items; unfinished
     /// started items, oldest start first; never-started items; open release
     /// items; the standing last item; done items, the latest finish first.
     /// Ties keep `order`. Each big item is followed by its sub-items in the
@@ -791,7 +791,9 @@ impl Checklists {
                     status,
                     release: j.release,
                     order: j.order,
-                    standing: j.standing.filter(|s| s == "first" || s == "last"),
+                    standing: j
+                        .standing
+                        .filter(|s| ["first", "now", "last"].contains(&s.as_str())),
                     evidence: j.evidence,
                     parked_question: j.parked_question.filter(|q| !q.is_empty()),
                     creator: creator.clone(),
@@ -825,7 +827,7 @@ impl Checklists {
         let key = |i: &Item| {
             let rank = match (i.done_at, i.started_at) {
                 (Some(done), _) => (5, -(done as i64)),
-                _ if i.standing.as_deref() == Some("first") || i.text.starts_with("NOW:") => (0, 0),
+                _ if matches!(i.standing.as_deref(), Some("first" | "now")) => (0, 0),
                 _ if i.standing.as_deref() == Some("last") => (4, 0),
                 _ if i.release => (3, 0),
                 (None, Some(start)) => (1, start as i64),
@@ -1290,7 +1292,7 @@ mod tests {
     }
 
     /// The one display order (lucian 2026-11-02): the standing first item
-    /// and the NOW line, started oldest first, never started, open release,
+    /// and NOW items, started oldest first, never started, open release,
     /// the standing last item, done newest first.
     #[test]
     fn items_follow_the_one_display_order() {
@@ -1328,7 +1330,14 @@ mod tests {
         let started = |text: &str, order: f64, at: u64| serde_json::json!({"text": text, "order": order, "started_at": at});
         put(&mut s, "0000000a", 10, started("started 300", 7.0, 300));
         put(&mut s, "0000000b", 10, started("started 200", 8.0, 200));
-        put(&mut s, "00000009", 10, item("NOW: b3 on W2", "open", 9.0));
+        put(
+            &mut s,
+            "00000009",
+            10,
+            serde_json::json!({"text": "NOW: b3 on W2", "standing": "now", "order": 9.0}),
+        );
+        // A flat list's NOW line is a plain item: no pin.
+        put(&mut s, "0000000d", 10, item("NOW: old", "open", 1.5));
         put(
             &mut s,
             "0000000c",
@@ -1359,6 +1368,7 @@ mod tests {
                 ("started 200", None),
                 ("started 300", None),
                 ("open a", None),
+                ("NOW: old", None),
                 ("open b", None),
                 ("release", None),
                 ("wrap-up", None),
@@ -1387,6 +1397,7 @@ mod tests {
                 "started 200",
                 "started 300",
                 "open a",
+                "NOW: old",
                 "open b",
                 "ticked 700",
                 "release",
@@ -1396,7 +1407,7 @@ mod tests {
                 "standing done"
             ]
         );
-        assert_eq!(items[6].done_at, None);
+        assert_eq!(items[7].done_at, None);
     }
 
     /// v4: sub-items follow their big item in the same order; a big item

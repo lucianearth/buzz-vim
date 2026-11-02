@@ -48,7 +48,7 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
   only `subscription_publishers`' records count
 - `c` the channel's checklist (the operator loop's records, kinds 30470-30472, read-only here: agents write
   them with `buzz checklist`; notes are kind 40470). Items in one order, the same as `buzz checklist get` and
-  the iPhone's: the reconcile item and the `NOW:` line on top, then started items (oldest start first), never-started ones, open release
+  the iPhone's: the reconcile and NOW standing items on top, then started items (oldest start first), never-started ones, open release
   items, the wrap-up item, and done items (latest finish first). A big item's sub-items sit indented under it,
   each with when it started; a big item shows its derived state (proposed until lucian's 👍 on its request,
   waiting on simplicity, done) and `re-plan due` when its growth trip fired. The picked item's details,
