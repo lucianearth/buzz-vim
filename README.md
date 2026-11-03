@@ -47,8 +47,12 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
   (`d=claude-usage/<person>`, the same numbers as Claude Code's `/usage`), signed by its poster key;
   only `subscription_publishers`' records count
 - `c` the channel's checklist (the operator loop's records, kinds 30470-30472, read-only here: agents write
-  them with `buzz checklist`). Items in order with open / done, the release flag and evidence, and
-  the picked item's details and evidence links beside them. There is no parking: a legacy parked item reads as open work. Above a channel's messages a
+  them with `buzz checklist`; notes are kind 40470). Items in one order, the same as `buzz checklist get` and
+  the iPhone's: the reconcile item on top, then started items (oldest start first), never-started ones, open release
+  items, the wrap-up item, and done items (latest finish first). A big item's sub-items sit indented under it,
+  each with when it started; a big item shows its derived state (proposed until lucian's 👍 on its request,
+  waiting on simplicity, done) and `re-plan due` when its growth trip fired. The picked item's details,
+  evidence links and notes show beside the list. There is no parking: a legacy parked item reads as open work. Above a channel's messages a
   status line shows its mode (ideating / running), the watcher's state (working, stalled, waiting on lucian,
   waiting on release, with a link to its ping), open / done counts and agent crashes today. A channel
   where two or more lists claim the checklist and the owner hasn't picked a driver shows `contested` with
