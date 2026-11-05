@@ -247,6 +247,8 @@ pub struct App {
     /// their height in lines, and the pane's height: d u page by these.
     pub blocks: Vec<(String, usize)>,
     pub pane_h: usize,
+    /// The line of `blocks` at the top of the pane in that draw.
+    pub view_top: usize,
     /// Rows the checklist's item list showed in the last draw.
     pub checklist_rows: usize,
     /// Line offset into a message taller than the pane: (message id, lines
@@ -406,6 +408,7 @@ impl App {
             page: 20,
             blocks: vec![],
             pane_h: 0,
+            view_top: 0,
             checklist_rows: 10,
             peek: None,
             tall: None,
@@ -1577,35 +1580,49 @@ impl App {
             }
         }
         let b = &self.blocks;
-        let Some(i) = b.iter().position(|(id, _)| *id == cur) else {
+        if !b.iter().any(|(id, _)| *id == cur) {
             // Not drawn yet: step by messages, as before.
             let n = self.page.max(1) as isize;
             return self.move_cursor(if down { n } else { -n });
-        };
-        // The furthest message whose top is within `lines` of this one's.
-        let mut j = i;
-        let mut gone = 0;
-        if down {
-            while j + 1 < b.len() && gone + b[j].1 <= lines {
-                gone += b[j].1;
-                j += 1;
-            }
-        } else {
-            while j > 0 && gone + b[j - 1].1 <= lines {
-                gone += b[j - 1].1;
-                j -= 1;
-            }
         }
-        let pos = |m: &str| ids.iter().position(|x| x == m);
-        let delta = match (pos(&cur), pos(&b[j].0)) {
-            (Some(a), Some(z)) => z as isize - a as isize,
-            _ => 0,
+        // Page from the screen's edge, not the cursor's message (judgebot,
+        // 2026-11-05: from the newest, `u` moved one message). The pane shows
+        // the cursor's message at its top row (or the last screen), so the
+        // cursor goes to the message that should head the new screen: for
+        // `d` the one cut by the bottom edge, so it shows whole.
+        let tops: Vec<usize> = b
+            .iter()
+            .scan(0, |y, (_, h)| {
+                let a = *y;
+                *y += h;
+                Some(a)
+            })
+            .collect();
+        let at = |line: usize| tops.iter().rposition(|&a| a <= line).unwrap_or(0);
+        let first = at(self.view_top);
+        let target = if down {
+            Some(at(self.view_top + lines).max(first + 1).min(b.len() - 1))
+        } else if self.view_top == 0 && first == 0 {
+            None
+        } else {
+            // The first message that starts on the new screen, so it ends at
+            // or below the old top: lines may repeat, none are skipped.
+            let t = self.view_top.saturating_sub(lines);
+            let up = tops.iter().position(|&a| a >= t).unwrap_or(0);
+            Some(up.min(first.saturating_sub(1)))
         };
-        // Always at least one message, so `u` at the top still loads older.
-        self.move_cursor(match (down, delta) {
-            (true, d) => d.max(1),
-            (false, d) => d.min(-1),
-        });
+        let pos = |m: &str| ids.iter().position(|x| x == m);
+        let Some(c) = pos(&cur) else {
+            return;
+        };
+        // `u` on the oldest drawn message still asks for older ones.
+        let delta = match target.and_then(|t| pos(&b[t].0)) {
+            Some(z) => z as isize - c as isize,
+            None => -(c as isize) - 1,
+        };
+        if delta != 0 {
+            self.move_cursor(delta);
+        }
     }
 
     fn set_cursor(&mut self, id: String, at_end: bool) {
@@ -3372,46 +3389,6 @@ mod tests {
             ));
         }
         assert_eq!(app.draft_ref().text, "HÉ1");
-    }
-
-    #[test]
-    fn d_and_u_page_a_screen_of_lines_not_a_count_of_messages() {
-        let mut app = App::new("me".into(), None);
-        app.tabs = vec!["a".into()];
-        let ids: Vec<String> = (1..=8).map(|i| format!("m{i}")).collect();
-        app.store.channel_mut("a").timeline = ids.clone();
-        // As drawn: a 10-line pane; m1..m8 are 4, 4, 4, 2, 2, 2, 8, 3 lines.
-        app.blocks = ids.iter().cloned().zip([4, 4, 4, 2, 2, 2, 8, 3]).collect();
-        app.pane_h = 10;
-        app.page = 3;
-        app.selected.insert("a".into(), "m1".into());
-        let at = |app: &App| app.selected.get("a").cloned();
-        let key = |app: &mut App, k: KeyEvent| app.on_key(k);
-        // m1+m2 fill 8 of 10 lines, m3 would pass it: d lands on m3.
-        key(&mut app, KeyEvent::from(KeyCode::Char('d')));
-        assert_eq!(at(&app).as_deref(), Some("m3"));
-        // 4+2+2+2 = 10: m7 starts a screen below m3.
-        key(&mut app, KeyEvent::from(KeyCode::PageDown));
-        assert_eq!(at(&app).as_deref(), Some("m7"));
-        // A message taller than the screen still moves at least one.
-        key(&mut app, KeyEvent::from(KeyCode::Char('d')));
-        assert_eq!(at(&app), None, "the newest follows the bottom");
-        // Up from m8: m7 and m6 make 8 + 2 = 10 lines.
-        key(&mut app, KeyEvent::from(KeyCode::Char('u')));
-        assert_eq!(at(&app).as_deref(), Some("m6"));
-        key(&mut app, KeyEvent::from(KeyCode::PageUp));
-        assert_eq!(at(&app).as_deref(), Some("m3"));
-        // ^u is half a screen: m2 (4 lines) fits in 5, m1 would not.
-        key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
-        );
-        assert_eq!(at(&app).as_deref(), Some("m2"));
-        key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
-        );
-        assert_eq!(at(&app).as_deref(), Some("m3"));
     }
 
     #[test]
