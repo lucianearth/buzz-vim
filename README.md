@@ -24,7 +24,8 @@ Your nsec is in Buzz Desktop under Settings → Profile → Private key. `login`
 Normal mode shows the common keys in the footer. Press `?` for all of them.
 
 - `i` write, `Esc` back to normal, `⏎` send, `⇧⏎` (or `⌥⏎`, `^j`) new line
-- `j` `k` move, `1`–`9` jump to a tab, `H` `L` or `⇥` cycle tabs (tab 0 included)
+- `j` `k` move, `d` `u` (or PgDn PgUp) a screen down or up, `^d` `^u` half a screen (in the checklist: a page of
+  items), `1`–`9` jump to a tab, `H` `L` or `⇥` cycle tabs (tab 0 included)
 - `0` is tab 0, **Needs you**, pinned first (it can't be moved, closed or archived). *Needs an answer*: channels
   the watcher marks stalled, waiting on lucian or waiting on release (the row opens its ping), a contested
   channel whose lists run ("two lists claim this channel; pick a driver"), and people's @mentions and DMs to the operator (`owner`) that he hasn't answered.

@@ -835,6 +835,13 @@ fn draw_blocks(
     let total: usize = heights.iter().sum();
     let h = area.height as usize;
     app.page = (h / 3).max(1);
+    if pane == app.focus {
+        app.blocks = blocks
+            .iter()
+            .map(|b| (b.id.clone(), b.lines.len()))
+            .collect();
+        app.pane_h = h;
+    }
     let cur_idx = cursor.and_then(|c| blocks.iter().position(|b| b.id == c));
     // Default: newest at the bottom. With a cursor, scroll just enough.
     let mut top = total.saturating_sub(h);
@@ -1722,6 +1729,7 @@ fn draw_checklist(f: &mut Frame, app: &mut App, area: Rect) {
         (l, d)
     };
     let rows = list.height as usize;
+    app.checklist_rows = rows;
     let first = cur.saturating_sub(rows.saturating_sub(1));
     let now = crate::sync::now();
     let done_label = |it: &crate::checklist::Item| {
@@ -5516,6 +5524,63 @@ mod tests {
         }
         let s = screen(&mut app);
         assert!(s.contains("short"), "{s}");
+    }
+
+    /// On screen, `d` shows the next screenful and `u` the one before: no
+    /// message is skipped and the screen really moves (lucian 2026-11-05).
+    #[test]
+    fn d_and_u_turn_the_screen_like_a_pager() {
+        use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent};
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let k = Keys::generate();
+        let mut app = App::new(k.public_key().to_hex(), None);
+        for i in 1..=60u64 {
+            let ev = EventBuilder::new(Kind::Custom(9), format!("msg{i:02}"))
+                .tags([Tag::parse(["h", "c1"]).unwrap()])
+                .custom_created_at(nostr::Timestamp::from(1_000 + i))
+                .sign_with_keys(&k)
+                .unwrap();
+            app.store.apply(&ev);
+        }
+        app.tabs = vec!["c1".into()];
+        let shown = |app: &mut App| {
+            let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
+            t.draw(|f| draw(f, app)).unwrap();
+            let buf = t.backend().buffer().clone();
+            let s: String = (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            (1..=60)
+                .filter(|i| s.contains(&format!("msg{i:02}")))
+                .collect::<Vec<u32>>()
+        };
+        let key = |app: &mut App, c: KeyCode| app.on_term(TermEvent::Key(KeyEvent::from(c)));
+        key(&mut app, KeyCode::Esc);
+        shown(&mut app);
+        key(&mut app, KeyCode::Char('g'));
+        let first = shown(&mut app);
+        assert_eq!(first.first(), Some(&1), "{first:?}");
+        key(&mut app, KeyCode::Char('d'));
+        let next = shown(&mut app);
+        // The next screen starts where the last one ended, give or take the
+        // message the cursor lands on.
+        assert!(next[0] > first[0] + 1, "{first:?} -> {next:?}");
+        assert!(
+            next[0] <= first.last().unwrap() + 1,
+            "{first:?} -> {next:?}"
+        );
+        assert!(next.last() > first.last(), "{first:?} -> {next:?}");
+        key(&mut app, KeyCode::Char('u'));
+        let back = shown(&mut app);
+        assert!(
+            back[0] < next[0] && back.last() < next.last(),
+            "{next:?} -> {back:?}"
+        );
     }
 
     #[test]
