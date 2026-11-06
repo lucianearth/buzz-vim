@@ -835,6 +835,13 @@ fn draw_blocks(
     let total: usize = heights.iter().sum();
     let h = area.height as usize;
     app.page = (h / 3).max(1);
+    if pane == app.focus {
+        app.blocks = blocks
+            .iter()
+            .map(|b| (b.id.clone(), b.lines.len()))
+            .collect();
+        app.pane_h = h;
+    }
     let cur_idx = cursor.and_then(|c| blocks.iter().position(|b| b.id == c));
     // Default: newest at the bottom. With a cursor, scroll just enough.
     let mut top = total.saturating_sub(h);
@@ -888,6 +895,9 @@ fn draw_blocks(
             app.tall = Some((id.clone(), heights[i], h, off));
         }
         more = Some((off, end - off));
+    }
+    if pane == app.focus {
+        app.view_top = top;
     }
     let mut y = 0usize;
     for b in blocks {
@@ -1722,6 +1732,7 @@ fn draw_checklist(f: &mut Frame, app: &mut App, area: Rect) {
         (l, d)
     };
     let rows = list.height as usize;
+    app.checklist_rows = rows;
     let first = cur.saturating_sub(rows.saturating_sub(1));
     let now = crate::sync::now();
     let done_label = |it: &crate::checklist::Item| {
@@ -5516,6 +5527,170 @@ mod tests {
         }
         let s = screen(&mut app);
         assert!(s.contains("short"), "{s}");
+    }
+
+    /// On screen, `d` shows the next screenful and `u` the one before: no
+    /// message is skipped and the screen really moves (lucian 2026-11-05).
+    #[test]
+    fn d_and_u_turn_the_screen_like_a_pager() {
+        use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent};
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let k = Keys::generate();
+        let mut app = App::new(k.public_key().to_hex(), None);
+        for i in 1..=60u64 {
+            let ev = EventBuilder::new(Kind::Custom(9), format!("msg{i:02}"))
+                .tags([Tag::parse(["h", "c1"]).unwrap()])
+                .custom_created_at(nostr::Timestamp::from(1_000 + i))
+                .sign_with_keys(&k)
+                .unwrap();
+            app.store.apply(&ev);
+        }
+        app.tabs = vec!["c1".into()];
+        let shown = |app: &mut App| {
+            let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
+            t.draw(|f| draw(f, app)).unwrap();
+            let buf = t.backend().buffer().clone();
+            let s: String = (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            (1..=60)
+                .filter(|i| s.contains(&format!("msg{i:02}")))
+                .collect::<Vec<u32>>()
+        };
+        let key = |app: &mut App, c: KeyCode| app.on_term(TermEvent::Key(KeyEvent::from(c)));
+        key(&mut app, KeyCode::Esc);
+        shown(&mut app);
+        key(&mut app, KeyCode::Char('g'));
+        let first = shown(&mut app);
+        assert_eq!(first.first(), Some(&1), "{first:?}");
+        key(&mut app, KeyCode::Char('d'));
+        let next = shown(&mut app);
+        // The next screen starts where the last one ended, give or take the
+        // message the cursor lands on.
+        assert!(next[0] > first[0] + 1, "{first:?} -> {next:?}");
+        assert!(
+            next[0] <= first.last().unwrap() + 1,
+            "{first:?} -> {next:?}"
+        );
+        assert!(next.last() > first.last(), "{first:?} -> {next:?}");
+        key(&mut app, KeyCode::Char('u'));
+        let back = shown(&mut app);
+        assert_eq!(back, first, "{next:?} -> {back:?}");
+        // From where a channel opens (the newest, on the bottom row), `u`
+        // shows the screen that ends where this one starts (judgebot's HOLD:
+        // it moved one message).
+        key(&mut app, KeyCode::Char('G'));
+        let newest = shown(&mut app);
+        assert_eq!(newest.last(), Some(&60), "{newest:?}");
+        let mut screens = vec![newest];
+        for _ in 0..3 {
+            key(&mut app, KeyCode::Char('u'));
+            screens.push(shown(&mut app));
+        }
+        for w in screens.windows(2) {
+            let (now, up) = (&w[0], &w[1]);
+            // No message skipped, at most one shown on both.
+            let (end, start) = (*up.last().unwrap(), now[0]);
+            assert!(end + 1 >= start && end <= start, "{screens:?}");
+        }
+        // And `d` walks back down the same screens to the newest.
+        for i in (0..3).rev() {
+            key(&mut app, KeyCode::Char('d'));
+            assert_eq!(shown(&mut app), screens[i], "{screens:?}");
+        }
+    }
+
+    /// Messages of mixed heights: `u` and `d` from the newest never skip a
+    /// message between screens, and `^u` `^d` move about half as far.
+    #[test]
+    fn paging_mixed_heights_skips_nothing() {
+        use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifiers};
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let k = Keys::generate();
+        let mut app = App::new(k.public_key().to_hex(), None);
+        for i in 1..=80u64 {
+            let lines: Vec<String> = (0..(i % 5)).map(|l| format!("x{l}")).collect();
+            let ev = EventBuilder::new(
+                Kind::Custom(9),
+                format!("msg{i:02}\n\n{}", lines.join("\n\n")),
+            )
+            .tags([Tag::parse(["h", "c1"]).unwrap()])
+            .custom_created_at(nostr::Timestamp::from(1_000 + i))
+            .sign_with_keys(&k)
+            .unwrap();
+            app.store.apply(&ev);
+        }
+        app.tabs = vec!["c1".into()];
+        let shown = |app: &mut App| {
+            let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
+            t.draw(|f| draw(f, app)).unwrap();
+            let buf = t.backend().buffer().clone();
+            let s: String = (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            (1..=80)
+                .filter(|i| s.contains(&format!("msg{i:02}")))
+                .collect::<Vec<u32>>()
+        };
+        let key = |app: &mut App, k: KeyEvent| app.on_term(TermEvent::Key(k));
+        key(&mut app, KeyEvent::from(KeyCode::Esc));
+        let mut screens = vec![shown(&mut app)];
+        for _ in 0..5 {
+            key(&mut app, KeyEvent::from(KeyCode::Char('u')));
+            screens.push(shown(&mut app));
+        }
+        for w in screens.windows(2) {
+            // A header cut off at the top doesn't count as shown, so allow
+            // the one message that straddles the old top edge.
+            let (end, start) = (*w[1].last().unwrap(), w[0][0]);
+            assert!(
+                end + 2 >= start && end < w[0].last().copied().unwrap(),
+                "{screens:?}"
+            );
+            assert!(w[1][0] < w[0][0], "{screens:?}");
+        }
+        // `d` back down: each screen starts where the last ended (or on the
+        // message the old bottom edge cut, shown whole).
+        let mut now = screens.pop().unwrap();
+        for _ in 0..10 {
+            key(&mut app, KeyEvent::from(KeyCode::Char('d')));
+            let next = shown(&mut app);
+            assert!(
+                next[0] <= *now.last().unwrap() + 1 && next[0] > now[0],
+                "{now:?} -> {next:?}"
+            );
+            now = next;
+            if now.last() == Some(&80) {
+                break;
+            }
+        }
+        assert_eq!(now.last(), Some(&80));
+        let before = shown(&mut app);
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        let half = shown(&mut app);
+        // Half a screen: the new screen overlaps the old one.
+        assert!(
+            half[0] < before[0] && *half.last().unwrap() >= before[0],
+            "{before:?} -> {half:?}"
+        );
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        );
+        assert!(shown(&mut app).last() > half.last(), "{half:?}");
     }
 
     #[test]

@@ -243,6 +243,14 @@ pub struct App {
     pub jumps: Vec<Jump>,
     /// Timeline/thread page height from the last draw, for ^d/^u.
     pub page: usize,
+    /// The focused pane's messages from the last draw, top to bottom, with
+    /// their height in lines, and the pane's height: d u page by these.
+    pub blocks: Vec<(String, usize)>,
+    pub pane_h: usize,
+    /// The line of `blocks` at the top of the pane in that draw.
+    pub view_top: usize,
+    /// Rows the checklist's item list showed in the last draw.
+    pub checklist_rows: usize,
     /// Line offset into a message taller than the pane: (message id, lines
     /// from its top). usize::MAX = its bottom. Keyed by id, so moving to
     /// another message drops it.
@@ -398,6 +406,10 @@ impl App {
             extra: None,
             jumps: vec![],
             page: 20,
+            blocks: vec![],
+            pane_h: 0,
+            view_top: 0,
+            checklist_rows: 10,
             peek: None,
             tall: None,
             read_width: None,
@@ -1539,6 +1551,80 @@ impl App {
         self.set_cursor(ids[next].clone(), next == ids.len() - 1);
     }
 
+    /// `d` `u` (a screen) and `^d` `^u` (half): page the focused pane by
+    /// lines on screen, not by a count of messages (lucian 2026-11-05: they
+    /// didn't move like page down and page up).
+    fn page_lines(&mut self, lines: usize, down: bool) {
+        let lines = lines.max(1);
+        let ids = if self.focus == Pane::Thread {
+            self.thread_ids()
+        } else {
+            self.timeline_ids()
+        };
+        let Some(cur) = self.cursor_message() else {
+            return;
+        };
+        // A message taller than the pane pages through its own lines first.
+        if let Some((id, bh, h, off)) = self.tall.clone().filter(|t| t.0 == cur) {
+            let end = bh.saturating_sub(h);
+            let to = if down {
+                (off + lines).min(end)
+            } else {
+                off.saturating_sub(lines)
+            };
+            if to != off {
+                self.peek = Some((id.clone(), to));
+                let last = ids.last() == Some(&id);
+                self.set_cursor(id, last);
+                return;
+            }
+        }
+        let b = &self.blocks;
+        if !b.iter().any(|(id, _)| *id == cur) {
+            // Not drawn yet: step by messages, as before.
+            let n = self.page.max(1) as isize;
+            return self.move_cursor(if down { n } else { -n });
+        }
+        // Page from the screen's edge, not the cursor's message (judgebot,
+        // 2026-11-05: from the newest, `u` moved one message). The pane shows
+        // the cursor's message at its top row (or the last screen), so the
+        // cursor goes to the message that should head the new screen: for
+        // `d` the one cut by the bottom edge, so it shows whole.
+        let tops: Vec<usize> = b
+            .iter()
+            .scan(0, |y, (_, h)| {
+                let a = *y;
+                *y += h;
+                Some(a)
+            })
+            .collect();
+        let at = |line: usize| tops.iter().rposition(|&a| a <= line).unwrap_or(0);
+        let first = at(self.view_top);
+        let target = if down {
+            Some(at(self.view_top + lines).max(first + 1).min(b.len() - 1))
+        } else if self.view_top == 0 && first == 0 {
+            None
+        } else {
+            // The first message that starts on the new screen, so it ends at
+            // or below the old top: lines may repeat, none are skipped.
+            let t = self.view_top.saturating_sub(lines);
+            let up = tops.iter().position(|&a| a >= t).unwrap_or(0);
+            Some(up.min(first.saturating_sub(1)))
+        };
+        let pos = |m: &str| ids.iter().position(|x| x == m);
+        let Some(c) = pos(&cur) else {
+            return;
+        };
+        // `u` on the oldest drawn message still asks for older ones.
+        let delta = match target.and_then(|t| pos(&b[t].0)) {
+            Some(z) => z as isize - c as isize,
+            None => -(c as isize) - 1,
+        };
+        if delta != 0 {
+            self.move_cursor(delta);
+        }
+    }
+
     fn set_cursor(&mut self, id: String, at_end: bool) {
         match self.focus {
             Pane::Thread => self.thread_selected = (!at_end).then_some(id),
@@ -2179,8 +2265,22 @@ impl App {
                 (false, _) if self.active == 0 => self.open_needs(),
                 (false, _) => self.switch_tab(self.active - 1),
             },
-            KeyCode::Char('d') if ctrl => self.move_cursor((self.page / 2).max(1) as isize),
-            KeyCode::Char('u') if ctrl => self.move_cursor(-((self.page / 2).max(1) as isize)),
+            // The checklist pages its own list (lucian 2026-11-05), never the
+            // timeline under it.
+            KeyCode::Char('d') | KeyCode::Char('u') | KeyCode::PageDown | KeyCode::PageUp
+                if self.checklist_view =>
+            {
+                let rows = self.checklist_rows.max(1);
+                let step = if ctrl { (rows / 2).max(1) } else { rows };
+                self.checklist_cursor = match k.code {
+                    KeyCode::Char('d') | KeyCode::PageDown => {
+                        self.checklist_cursor.saturating_add(step)
+                    }
+                    _ => self.checklist_cursor.saturating_sub(step),
+                };
+            }
+            KeyCode::Char('d') if ctrl => self.page_lines(self.pane_h / 2, true),
+            KeyCode::Char('u') if ctrl => self.page_lines(self.pane_h / 2, false),
             KeyCode::Char('j') | KeyCode::Down if self.agents_view => self.agents_cursor += 1,
             KeyCode::Char('k') | KeyCode::Up if self.agents_view => {
                 self.agents_cursor = self.agents_cursor.saturating_sub(1)
@@ -2191,14 +2291,7 @@ impl App {
             }
             // Thread and paging keys would act on the timeline under the
             // pane, out of sight.
-            KeyCode::Enter
-            | KeyCode::Right
-            | KeyCode::Char('l')
-            | KeyCode::Char('r')
-            | KeyCode::Char('d')
-            | KeyCode::Char('u')
-            | KeyCode::PageDown
-            | KeyCode::PageUp
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('r')
                 if self.checklist_view => {}
             KeyCode::Char('k') | KeyCode::Up if self.checklist_view => {
                 self.checklist_cursor = self.checklist_cursor.saturating_sub(1)
@@ -2226,8 +2319,8 @@ impl App {
             KeyCode::Char('B') => self.open_subscription(),
             KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
-            KeyCode::Char('d') | KeyCode::PageDown => self.move_cursor(self.page.max(1) as isize),
-            KeyCode::Char('u') | KeyCode::PageUp => self.move_cursor(-(self.page.max(1) as isize)),
+            KeyCode::Char('d') | KeyCode::PageDown => self.page_lines(self.pane_h, true),
+            KeyCode::Char('u') | KeyCode::PageUp => self.page_lines(self.pane_h, false),
             KeyCode::Char('g') | KeyCode::Home => self.move_cursor(-(JUMP as isize)),
             KeyCode::Char('G') | KeyCode::End => self.move_cursor(JUMP as isize),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
@@ -3296,6 +3389,48 @@ mod tests {
             ));
         }
         assert_eq!(app.draft_ref().text, "HÉ1");
+    }
+
+    #[test]
+    fn d_and_u_page_through_a_tall_message_by_the_screen() {
+        let mut app = App::new("me".into(), None);
+        app.tabs = vec!["a".into()];
+        app.store.channel_mut("a").timeline = vec!["m1".into(), "m2".into()];
+        app.blocks = vec![("m1".into(), 25), ("m2".into(), 3)];
+        app.pane_h = 10;
+        app.selected.insert("a".into(), "m1".into());
+        app.tall = Some(("m1".into(), 25, 10, 0));
+        app.on_key(KeyEvent::from(KeyCode::Char('d')));
+        assert_eq!(app.peek, Some(("m1".into(), 10)));
+        app.tall = Some(("m1".into(), 25, 10, 10));
+        app.on_key(KeyEvent::from(KeyCode::Char('d')));
+        assert_eq!(app.peek, Some(("m1".into(), 15)), "stops at its end");
+        app.tall = Some(("m1".into(), 25, 10, 15));
+        app.on_key(KeyEvent::from(KeyCode::Char('d')));
+        assert_eq!(app.selected.get("a"), None, "then moves on");
+    }
+
+    #[test]
+    fn d_and_u_page_the_checklist_not_the_timeline_under_it() {
+        let mut app = App::new("me".into(), None);
+        app.tabs = vec!["a".into()];
+        app.store.channel_mut("a").timeline = vec!["m1".into(), "m2".into()];
+        app.selected.insert("a".into(), "m2".into());
+        app.on_key(KeyEvent::from(KeyCode::Char('c')));
+        app.checklist_rows = 6;
+        app.on_key(KeyEvent::from(KeyCode::Char('d')));
+        assert_eq!(app.checklist_cursor, 6);
+        app.on_key(KeyEvent::from(KeyCode::PageDown));
+        assert_eq!(app.checklist_cursor, 12);
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.checklist_cursor, 9);
+        app.on_key(KeyEvent::from(KeyCode::Char('u')));
+        app.on_key(KeyEvent::from(KeyCode::PageUp));
+        assert_eq!(app.checklist_cursor, 0);
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(app.checklist_cursor, 3);
+        assert!(app.checklist_view);
+        assert_eq!(app.selected.get("a").map(String::as_str), Some("m2"));
     }
 
     #[test]
