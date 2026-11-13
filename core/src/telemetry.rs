@@ -426,7 +426,14 @@ impl Agents {
                             && root.is_none_or(|r| t.thread.as_deref() == Some(r))
                     })
             })
-            .map(|(pk, a)| a.display_name(pk, store))
+            .map(|(pk, a)| {
+                let name = a.display_name(pk, store);
+                // The model its last tagged message here ran on (patch 86).
+                match store.channels.get(channel).and_then(|c| c.model_of(pk)) {
+                    Some(m) => format!("{name} · {}", crate::model::short_model(m)),
+                    None => name,
+                }
+            })
             .collect();
         names.sort();
         names

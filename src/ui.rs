@@ -629,6 +629,12 @@ fn message_block(
     if is_agent {
         head.push(Span::styled(" ⚙", theme::faint()));
     }
+    if let Some(model) = m.model.as_deref() {
+        head.push(Span::styled(
+            format!(" · {}", crate::model::short_model(model)),
+            theme::muted(),
+        ));
+    }
     head.push(Span::styled(
         format!("  {}", time_label(m.created_at)),
         theme::faint(),
@@ -5466,6 +5472,50 @@ mod tests {
         );
         assert!(rows.iter().any(|r| r.contains("◆ latest")), "{rows:#?}");
         assert!(rows[0].contains("other @1"), "{rows:#?}");
+    }
+
+    /// An agent's message tagged with its model shows `· fable` by its name,
+    /// and the thread header's thinking line names the model too.
+    #[test]
+    fn the_model_tag_shows_beside_the_agents_name() {
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let me = Keys::generate();
+        let bot = Keys::generate();
+        let mut app = App::new(me.public_key().to_hex(), None);
+        let ev = |k: &Keys, content: &str, tags: Vec<Vec<&str>>| {
+            EventBuilder::new(Kind::Custom(9), content)
+                .tags(tags.into_iter().map(|t| Tag::parse(t).unwrap()))
+                .sign_with_keys(k)
+                .unwrap()
+        };
+        let root = ev(&me, "which model?", vec![vec!["h", "c1"]]);
+        let rid = root.id.to_hex();
+        app.store.apply(&root);
+        app.store.apply(&ev(
+            &bot,
+            "this one",
+            vec![
+                vec!["h", "c1"],
+                vec!["e", &rid, "", "reply"],
+                vec!["model", "claude-fable-5-2"],
+            ],
+        ));
+        app.tabs = vec!["c1".into()];
+        let bot_pk = bot.public_key().to_hex();
+        app.agents.own(&bot_pk, "taskbot");
+        app.agents.frame(
+            &bot_pk,
+            &serde_json::json!({"kind": "turn_started", "channelId": "c1",
+                "payload": {"threadRootEventId": rid}}),
+        );
+        app.thread = Some(("c1".into(), rid));
+        let s = screen_text(&mut app, 100, 20);
+        let rows: Vec<&str> = s.lines().collect();
+        assert!(rows[1].contains("taskbot · fable thinking"), "{s}");
+        assert!(
+            rows.iter().any(|r| r.contains("· fable  ")),
+            "message header: {s}"
+        );
     }
 
     #[test]

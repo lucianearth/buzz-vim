@@ -75,6 +75,18 @@ pub struct Message {
     pub mentions: Vec<String>,
     pub media: Vec<Media>,
     pub system: bool,
+    /// The Claude model an agent's session ran on when it sent this, from its
+    /// `["model", <id>]` tag (aei patch 86), e.g. `claude-fable-5-2`.
+    pub model: Option<String>,
+}
+
+/// A model id as shown beside a name: `claude-fable-5-2` is `fable`; an id
+/// that doesn't start with `claude-` shows whole.
+pub fn short_model(id: &str) -> &str {
+    id.strip_prefix("claude-")
+        .and_then(|rest| rest.split('-').next())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(id)
 }
 
 impl Message {
@@ -139,6 +151,9 @@ impl Message {
                 }),
             media,
             system: ev.kind.as_u16() == KIND_SYSTEM,
+            model: tags(ev, "model")
+                .find_map(|t| t.get(1).cloned())
+                .filter(|m| !m.trim().is_empty()),
         }
     }
 }
@@ -181,6 +196,15 @@ pub struct Channel {
 }
 
 impl Channel {
+    /// The model `author`'s newest tagged message here ran on, if any.
+    pub fn model_of(&self, author: &str) -> Option<&str> {
+        self.messages
+            .values()
+            .filter(|m| m.author == author && m.model.is_some())
+            .max_by_key(|m| m.created_at)
+            .and_then(|m| m.model.as_deref())
+    }
+
     pub fn reply_count(&self, root: &str) -> usize {
         let loaded = self.replies.get(root).map_or(0, Vec::len);
         self.summary_replies
@@ -601,6 +625,42 @@ mod tests {
             .custom_created_at(nostr::Timestamp::from(at))
             .sign_with_keys(keys)
             .unwrap()
+    }
+
+    #[test]
+    fn a_model_tag_is_read_and_shown_short() {
+        let a = Keys::generate();
+        let m = Message::from_event(&ev(&a, 9, "hi", vec![vec!["model", "claude-fable-5-2"]], 1));
+        assert_eq!(m.model.as_deref(), Some("claude-fable-5-2"));
+        assert_eq!(Message::from_event(&ev(&a, 9, "hi", vec![], 1)).model, None);
+        assert_eq!(short_model("claude-fable-5-2"), "fable");
+        assert_eq!(short_model("claude-opus-5-5"), "opus");
+        assert_eq!(short_model("gpt-9"), "gpt-9");
+        let mut s = Store::new("me".into());
+        let ch = s.channel_mut("c");
+        let author = a.public_key().to_hex();
+        for (id, at, model) in [
+            ("1", 1, Some("claude-opus-5-5")),
+            ("2", 2, Some("claude-fable-5-2")),
+            ("3", 3, None),
+        ] {
+            ch.messages.insert(
+                id.into(),
+                Message {
+                    id: id.into(),
+                    author: author.clone(),
+                    created_at: at,
+                    model: model.map(str::to_string),
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(
+            ch.model_of(&author),
+            Some("claude-fable-5-2"),
+            "newest tagged"
+        );
+        assert_eq!(ch.model_of("someone"), None);
     }
 
     #[test]

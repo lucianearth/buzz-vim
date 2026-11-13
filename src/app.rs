@@ -3598,6 +3598,7 @@ mod tests {
                 })
                 .collect(),
             system: false,
+            model: None,
         };
         let ch = app.store.channel_mut("ch");
         ch.messages.insert("t".into(), msg("t", 5, None, &["top"]));
@@ -3688,6 +3689,7 @@ mod tests {
             mentions: mentions.iter().map(|s| s.to_string()).collect(),
             media: vec![],
             system: false,
+            model: None,
         };
         let ch = app.store.channel_mut("ch");
         ch.messages.insert("m1".into(), msg("m1", 10, &["bot1"]));
