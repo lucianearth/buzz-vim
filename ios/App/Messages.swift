@@ -267,9 +267,17 @@ struct MessageRow: View, Equatable {
         } else {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline, spacing: 12) {
-                    Text(m.authorName)
-                        .font(.name)
-                        .foregroundStyle(theme.ink(m.author))
+                    HStack(alignment: .firstTextBaseline, spacing: 4) {
+                        Text(m.authorName)
+                            .font(.name)
+                            .foregroundStyle(theme.ink(m.author))
+                        // The agent's Claude model (taskbot · fable).
+                        if !m.model.isEmpty {
+                            Text("· \(m.model)")
+                                .font(.stamp)
+                                .foregroundStyle(theme.muted)
+                        }
+                    }
                     Text(stamp(m.at))
                         .font(.stamp)
                         .foregroundStyle(theme.muted)

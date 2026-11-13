@@ -207,7 +207,7 @@ const SUBSCRIPTION: Section = (
     "Claude subscription (B)",
     &[
         ("j k", "pick", Footer),
-        ("⇥ h l", "this channel / default", Both),
+        ("⇥ h l", "channel / default / model", Both),
         ("⏎", "use it (signs, publishes)", Both),
         ("esc", "close", Footer),
     ],

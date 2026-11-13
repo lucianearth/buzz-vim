@@ -2,9 +2,14 @@
 //!
 //! An operator sets it with `B` in a channel. That signs one NIP-78
 //! app-data record, kind 30078 with `d` = [`D_MAP`], holding the whole map:
-//! `{"v":1,"default":"<person>"|"","channels":{"<uuid>":"<person>"}}`.
+//! `{"v":1,"default":"<person>"|"","channels":{"<uuid>":"<person>"},
+//! "models":{"<uuid>":"fable"|"opus"}}`.
 //! A person is an agentauth user id; `""` / absent means "follow the
 //! default" for a channel and "each agent's owner" for the default.
+//! `models` is the Claude model a channel's agents start their sessions
+//! on (the Model tab); no entry leaves each agent's own default. It is a
+//! sibling of `channels` because those values are person ids, and an older
+//! client keeps it as an unknown top-level key.
 //!
 //! The box's reconciler reads the newest map an operator signed and
 //! writes it into every Claude seat (agents/channel-subscriptions.py in
@@ -25,7 +30,17 @@ use crate::model::tag;
 pub const KIND: u16 = 30078;
 pub const D_MAP: &str = "buzz-subscription";
 pub const D_PEOPLE: &str = "buzz-subscription/people";
-/// chip / opsbot: the key the aei reconciler publishes the people with.
+/// The models a channel can pick: (record value, label, Claude model id).
+pub const MODELS: &[(&str, &str, &str)] = &[
+    ("fable", "Fable", "claude-fable-5-2"),
+    ("opus", "Opus", "claude-opus-5-5"),
+];
+
+/// A model pick's label (`Fable`), or None for a value this client doesn't know.
+pub fn model_label(value: &str) -> Option<&'static str> {
+    MODELS.iter().find(|m| m.0 == value).map(|m| m.1)
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -66,6 +81,10 @@ pub struct Map {
     /// A `default` this client can't read, written back unless replaced.
     pub kept_default: Option<Value>,
     pub kept_channels: serde_json::Map<String, Value>,
+    /// Per-channel model picks (`MODELS` values), and entries this client
+    /// can't read, written back as found.
+    pub models: BTreeMap<String, String>,
+    pub kept_models: serde_json::Map<String, Value>,
     /// The record's `"v"` as found (None: absent). Only 1 is written; a map
     /// of another version is not overwritten (`check_version`).
     pub v: Option<Value>,
@@ -93,6 +112,8 @@ pub enum Edit {
     Channel(String, Option<String>),
     /// The default for every channel (None: each agent's owner).
     Default(Option<String>),
+    /// A channel's model (a `MODELS` value; None: each agent's default).
+    Model(String, Option<String>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,6 +200,20 @@ fn read_map(ev: &Event) -> Map {
             }
         }
     }
+    let mut models = BTreeMap::new();
+    let mut kept_models = serde_json::Map::new();
+    if let Some(m) = o.get("models").and_then(Value::as_object) {
+        for (c, v) in m {
+            match v.as_str() {
+                Some(v) if is_uuid(c) && model_label(v).is_some() => {
+                    models.insert(c.clone(), v.to_string());
+                }
+                _ => {
+                    kept_models.insert(c.clone(), v.clone());
+                }
+            }
+        }
+    }
     let kept_default = match o.get("default") {
         None | Some(Value::Null) => None,
         Some(v) if default.is_none() && v != &json!("") => Some(v.clone()),
@@ -186,7 +221,7 @@ fn read_map(ev: &Event) -> Map {
     };
     let kept = o
         .into_iter()
-        .filter(|(k, _)| !matches!(k.as_str(), "v" | "default" | "channels"))
+        .filter(|(k, _)| !matches!(k.as_str(), "v" | "default" | "channels" | "models"))
         .collect();
     Map {
         default,
@@ -194,6 +229,8 @@ fn read_map(ev: &Event) -> Map {
         kept,
         kept_default,
         kept_channels,
+        models,
+        kept_models,
         v: match o_v {
             Some(Value::Null) | None => None,
             Some(v) => Some(v),
@@ -340,17 +377,22 @@ impl Subscriptions {
     }
 
     /// The status-line text: `sub alice`, `sub kevin (default)`,
-    /// `sub owner (default)`.
+    /// `sub owner (default)`, with the channel's model when picked
+    /// (`sub alice · fable`).
     pub fn status(&self, channel: &str) -> Option<String> {
         let s = self.for_channel(channel)?;
         let who = s
             .person
             .as_deref()
             .map_or_else(|| "owner".to_string(), |p| self.label(p));
+        let model = self
+            .model_for(channel)
+            .and_then(model_label)
+            .map_or(String::new(), |m| format!(" · {}", m.to_lowercase()));
         Some(if s.inherited {
-            format!("sub {who} (default)")
+            format!("sub {who} (default){model}")
         } else {
-            format!("sub {who}")
+            format!("sub {who}{model}")
         })
     }
 
@@ -384,8 +426,20 @@ impl Subscriptions {
                 m.kept_default = None;
                 m.default = p.clone();
             }
+            Edit::Model(c, v) => {
+                m.kept_models.remove(c);
+                match v {
+                    Some(v) => m.models.insert(c.clone(), v.clone()),
+                    None => m.models.remove(c),
+                };
+            }
         }
         m
+    }
+
+    /// A channel's model pick (a `MODELS` value), None for each agent's default.
+    pub fn model_for(&self, channel: &str) -> Option<&str> {
+        self.map()?.models.get(channel).map(String::as_str)
     }
 
     /// The created_at for our next record: now, but always after the map
@@ -457,6 +511,13 @@ pub fn builder(m: &Map, at: u64) -> anyhow::Result<EventBuilder> {
         },
     );
     content.insert("channels".into(), Value::Object(channels));
+    let mut models = m.kept_models.clone();
+    for (c, v) in &m.models {
+        models.insert(c.clone(), json!(v));
+    }
+    if !models.is_empty() {
+        content.insert("models".into(), Value::Object(models));
+    }
     Ok(
         EventBuilder::new(Kind::from(KIND), Value::Object(content).to_string())
             .tags([
@@ -859,6 +920,61 @@ mod tests {
         let ev = builder(&m, 102).unwrap().sign_with_keys(&op).unwrap();
         let c: Value = serde_json::from_str(&ev.content).unwrap();
         assert_eq!(c["channels"][OPS], json!("carol"));
+    }
+
+    /// Model picks ride a top-level `models` map beside `channels`; an edit
+    /// to either keeps the other, and a value this client can't read stays.
+    #[test]
+    fn model_picks_round_trip_beside_the_people() {
+        let (op, _, _, mut s) = setup();
+        s.apply(&rec(
+            &op,
+            D_MAP,
+            json!({"default": "kevin", "channels": {DEV: "alice"},
+                   "models": {DEV: "fable", OPS: "gpt-9", "NOT": "opus"}}),
+            100,
+        ));
+        assert_eq!(s.model_for(DEV), Some("fable"));
+        assert_eq!(s.model_for(OPS), None, "unknown value: not shown");
+        assert_eq!(s.status(DEV).unwrap(), "sub alice · fable");
+        assert_eq!(s.status(OPS).unwrap(), "sub kevin (default)");
+        let ev = builder(
+            &s.edited(&Edit::Channel(OPS.into(), Some("bob".into()))),
+            101,
+        )
+        .unwrap()
+        .sign_with_keys(&op)
+        .unwrap();
+        let c: Value = serde_json::from_str(&ev.content).unwrap();
+        assert_eq!(
+            c["models"],
+            json!({DEV: "fable", OPS: "gpt-9", "NOT": "opus"})
+        );
+        assert!(s.apply(&ev));
+        // Picking replaces a raw entry; clearing drops it; people stay.
+        let m = s.edited(&Edit::Model(OPS.into(), Some("opus".into())));
+        let m = Subscriptions {
+            map: Some(Rec {
+                at: 102,
+                id: "x".into(),
+                value: m,
+            }),
+            ..Default::default()
+        }
+        .edited(&Edit::Model(DEV.into(), None));
+        let ev = builder(&m, 102).unwrap().sign_with_keys(&op).unwrap();
+        let c: Value = serde_json::from_str(&ev.content).unwrap();
+        assert_eq!(c["models"], json!({OPS: "opus", "NOT": "opus"}));
+        assert_eq!(c["channels"], json!({DEV: "alice", OPS: "bob"}));
+        assert_eq!(c["default"], json!("kevin"));
+        // No picks: no models key, the record as before.
+        let (op, _, _, s) = setup();
+        let ev = builder(&s.edited(&Edit::Default(None)), 5)
+            .unwrap()
+            .sign_with_keys(&op)
+            .unwrap();
+        let c: Value = serde_json::from_str(&ev.content).unwrap();
+        assert!(c.get("models").is_none());
     }
 
     #[test]

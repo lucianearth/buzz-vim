@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui_image::Image;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Hit, Pane};
+use crate::app::{App, Hit, Pane, SubTab};
 use crate::art;
 use crate::garden;
 use crate::keys::{Mode, legend};
@@ -161,7 +161,8 @@ fn draw_chanmode(f: &mut Frame, app: &mut App, area: Rect) {
 
 /// `B`: whose Claude subscription this channel's agents spend. Two
 /// scopes (this channel / the default for all), one list: follow the
-/// default (or each agent's owner), then the people the box offers.
+/// default (or each agent's owner), then the people the box offers. A
+/// third tab picks this channel's Claude model.
 fn draw_subscription(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(channel) = app.current().map(str::to_string) else {
         return;
@@ -171,11 +172,48 @@ fn draw_subscription(f: &mut Frame, app: &mut App, area: Rect) {
         .channels
         .get(&channel)
         .map_or_else(|| channel.chars().take(8).collect(), channel_label);
-    let people = app.sub_people();
     let subs = &app.subscriptions;
     let map = subs.map();
+    let tab_on = app.sub_tab;
+    // Each tab: its row labels and its hint; the values and what's set now
+    // come from the app, so the cursor and the drawn rows can't drift.
+    let people = app.sub_people();
+    let (labels, hint): (Vec<String>, &[&str]) = match tab_on {
+        SubTab::Model => (
+            std::iter::once("each agent's default".to_string())
+                .chain(
+                    crate::subscription::MODELS
+                        .iter()
+                        .map(|m| format!("{}  {}", m.1, m.2)),
+                )
+                .collect(),
+            [
+                " Claude agents only; applies from this channel's next session",
+                " (rotate or restart)",
+            ]
+            .as_slice(),
+        ),
+        SubTab::Channel | SubTab::Default => {
+            let first = if tab_on == SubTab::Default {
+                "each agent's owner".to_string()
+            } else {
+                let who = map
+                    .and_then(|m| m.default.as_deref())
+                    .map_or_else(|| "each agent's owner".to_string(), |p| subs.label(p));
+                format!("follow the default ({who})")
+            };
+            (
+                std::iter::once(first)
+                    .chain(people.iter().map(|p| format!("{}  {}", p.label, p.id)))
+                    .collect(),
+                [" takes effect at each session's next start"].as_slice(),
+            )
+        }
+    };
+    let rows: Vec<(String, Option<String>)> = labels.into_iter().zip(app.sub_values()).collect();
+    let now = app.sub_now();
     let legend = crate::keys::legend(Mode::Subscription);
-    let h = (people.len() as u16 + legend.len() as u16 + 10).clamp(14, area.height.max(14));
+    let h = (rows.len() as u16 + legend.len() as u16 + 9).clamp(14, area.height.max(14));
     let r = centered(area, 64, h);
     clear(f, r);
     let block = Block::bordered()
@@ -183,10 +221,10 @@ fn draw_subscription(f: &mut Frame, app: &mut App, area: Rect) {
         .title(Span::styled(" Claude subscription ", theme::bright()));
     let inner = block.inner(r);
     f.render_widget(block, r);
-    let tab = |on: bool, s: String| {
+    let tab = |on: SubTab, s: String| {
         Span::styled(
             format!(" {s} "),
-            if on {
+            if on == tab_on {
                 theme::tab_active()
             } else {
                 theme::tab_idle()
@@ -196,33 +234,16 @@ fn draw_subscription(f: &mut Frame, app: &mut App, area: Rect) {
     let mut lines = vec![
         Line::from(vec![
             Span::raw(" "),
-            tab(!app.sub_all, name.clone()),
+            tab(SubTab::Channel, name),
             Span::raw(" "),
-            tab(app.sub_all, "default for all".into()),
+            tab(SubTab::Default, "default for all".into()),
+            Span::raw(" "),
+            tab(SubTab::Model, "model".into()),
         ]),
         Line::raw(""),
     ];
-    let now = if app.sub_all {
-        map.and_then(|m| m.default.clone())
-    } else {
-        map.and_then(|m| m.channels.get(&channel).cloned())
-    };
-    let default_who = map
-        .and_then(|m| m.default.as_deref())
-        .map_or_else(|| "each agent's owner".to_string(), |p| subs.label(p));
-    let first = if app.sub_all {
-        "each agent's owner".to_string()
-    } else {
-        format!("follow the default ({default_who})")
-    };
-    let mut rows = vec![(first, None::<String>)];
-    rows.extend(
-        people
-            .iter()
-            .map(|p| (format!("{}  {}", p.label, p.id), Some(p.id.clone()))),
-    );
-    for (i, (text, id)) in rows.iter().enumerate() {
-        let mark = if *id == now { "●" } else { " " };
+    for (i, (text, v)) in rows.iter().enumerate() {
+        let mark = if *v == now { "●" } else { " " };
         let st = if i == app.sub_cursor {
             theme::tab_active()
         } else {
@@ -233,7 +254,7 @@ fn draw_subscription(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(format!("{text} "), st),
         ]));
     }
-    if people.is_empty() {
+    if tab_on != SubTab::Model && people.is_empty() {
         lines.push(Line::styled(
             "   no people published yet (the box lists them each minute)",
             theme::faint(),
@@ -260,10 +281,7 @@ fn draw_subscription(f: &mut Frame, app: &mut App, area: Rect) {
             theme::bright(),
         ));
     } else {
-        lines.push(Line::styled(
-            " takes effect at each session's next start",
-            theme::faint(),
-        ));
+        lines.extend(hint.iter().map(|l| Line::styled(*l, theme::faint())));
     }
     for (i, (k, what, _)) in legend.iter().enumerate() {
         lines.push(Line::from(vec![
@@ -625,6 +643,13 @@ fn message_block(
     let mut head = vec![bar.clone(), Span::styled(author, who)];
     if is_agent {
         head.push(Span::styled(" ⚙", theme::faint()));
+    }
+    // Only beside agents: anyone can put a model tag on a message.
+    if let Some(model) = m.model.as_deref().filter(|_| is_agent) {
+        head.push(Span::styled(
+            format!(" · {}", crate::model::short_model(model)),
+            theme::muted(),
+        ));
     }
     head.push(Span::styled(
         format!("  {}", time_label(m.created_at)),
@@ -5173,6 +5198,58 @@ mod tests {
         assert!(rows[0].contains("other @1"), "{rows:#?}");
     }
 
+    /// An agent's message tagged with its model shows `· fable` by its name,
+    /// and the thread header's thinking line names the model too.
+    #[test]
+    fn the_model_tag_shows_beside_the_agents_name() {
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let me = Keys::generate();
+        let bot = Keys::generate();
+        let mut app = App::new(me.public_key().to_hex(), None);
+        let ev = |k: &Keys, content: &str, tags: Vec<Vec<&str>>| {
+            EventBuilder::new(Kind::Custom(9), content)
+                .tags(tags.into_iter().map(|t| Tag::parse(t).unwrap()))
+                .sign_with_keys(k)
+                .unwrap()
+        };
+        let root = ev(&me, "which model?", vec![vec!["h", "c1"]]);
+        let rid = root.id.to_hex();
+        app.store.apply(&root);
+        app.store.apply(&ev(
+            &bot,
+            "this one",
+            vec![
+                vec!["h", "c1"],
+                vec!["e", &rid, "", "reply"],
+                vec!["model", "claude-fable-5-2"],
+            ],
+        ));
+        app.tabs = vec!["c1".into()];
+        let bot_pk = bot.public_key().to_hex();
+        app.agents.own(&bot_pk, "taskbot");
+        app.agents.frame(
+            &bot_pk,
+            &serde_json::json!({"kind": "turn_started", "channelId": "c1",
+                "payload": {"threadRootEventId": rid}}),
+        );
+        app.thread = Some(("c1".into(), rid));
+        // Not shown until the author is known as an agent: anyone can tag.
+        let s = screen_text(&mut app, 100, 20);
+        assert!(!s.lines().any(|r| r.contains("· fable  ")), "{s}");
+        app.store
+            .profiles
+            .entry(bot_pk.clone())
+            .or_default()
+            .is_agent = true;
+        let s = screen_text(&mut app, 100, 20);
+        let rows: Vec<&str> = s.lines().collect();
+        assert!(rows[1].contains("taskbot · fable thinking"), "{s}");
+        assert!(
+            rows.iter().any(|r| r.contains("· fable  ")),
+            "message header: {s}"
+        );
+    }
+
     #[test]
     fn thinking_shows_on_thread_and_channel() {
         use nostr::{EventBuilder, Keys, Kind, Tag};
@@ -5842,6 +5919,93 @@ mod tests {
         assert_eq!(text(&lone), vec!["it's a ` tick"]);
     }
 
+    /// `B`, Model tab: rows are each agent's default, Fable, Opus; ⏎ asks
+    /// sync to publish the map with this channel's model, the people kept.
+    #[test]
+    fn b_model_tab_picks_this_channels_model() {
+        use crate::app::Action;
+        use crate::subscription::{D_MAP, Edit, Subscriptions, Trust};
+        use crossterm::event::{Event, KeyEvent};
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+        let me = Keys::generate();
+        let mut app = App::new(me.public_key().to_hex(), None);
+        let ch = "5e8e98d5-b696-49e2-8c6c-c0bc8faa831a";
+        app.store.channel_mut(ch).name = "model-switch".into();
+        app.store.channel_mut(ch).loaded = true;
+        app.tabs = vec![ch.into()];
+        app.subscriptions = Subscriptions::new(Trust {
+            operators: vec![me.public_key().to_hex()],
+            publishers: vec![],
+        });
+        let held = EventBuilder::new(
+            Kind::from(30078u16),
+            serde_json::json!({"default": "kevin", "models": {ch: "opus"}}).to_string(),
+        )
+        .tags([Tag::parse(["d", D_MAP]).unwrap()])
+        .custom_created_at(Timestamp::from(10))
+        .sign_with_keys(&me)
+        .unwrap();
+        app.subscriptions.apply(&held);
+        let key = |app: &mut App, c| app.on_term(Event::Key(KeyEvent::from(c)));
+        key(&mut app, KeyCode::Char('B'));
+        key(&mut app, KeyCode::BackTab);
+        assert!(
+            app.sub_tab == SubTab::Model,
+            "h/⇤ from the channel tab wraps to model"
+        );
+        assert_eq!(app.sub_cursor, 2, "on the current pick, Opus");
+        let s = screen_text(&mut app, 100, 30);
+        assert!(s.contains("Fable  claude-fable-5-2"), "{s}");
+        assert!(s.contains("next session"), "{s}");
+        key(&mut app, KeyCode::Char('k'));
+        key(&mut app, KeyCode::Enter);
+        let Some(Action::SetSubscription { edit, label }) = app.actions.pop() else {
+            panic!("no SetSubscription for the model");
+        };
+        assert_eq!(edit, Edit::Model(ch.into(), Some("fable".into())));
+        assert_eq!(label, "#model-switch model: Fable");
+        let m = app.subscriptions.edited(&edit);
+        assert_eq!(m.default.as_deref(), Some("kevin"));
+        // Tab from model goes back to this channel's people.
+        key(&mut app, KeyCode::Char('B'));
+        key(&mut app, KeyCode::Tab);
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.sub_tab, SubTab::Model);
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.sub_tab, SubTab::Channel);
+    }
+
+    /// `B`, Model tab, no relay map yet: the panel warns that the first
+    /// pick replaces the dashboard's whole map, and ⏎ asks once more.
+    #[test]
+    fn b_model_tab_warns_before_the_first_map() {
+        use crate::subscription::{Subscriptions, Trust};
+        use crossterm::event::{Event, KeyEvent};
+        let me = nostr::Keys::generate();
+        let mut app = App::new(me.public_key().to_hex(), None);
+        let ch = "5e8e98d5-b696-49e2-8c6c-c0bc8faa831a";
+        app.store.channel_mut(ch).name = "model-switch".into();
+        app.store.channel_mut(ch).loaded = true;
+        app.tabs = vec![ch.into()];
+        app.subscriptions = Subscriptions::new(Trust {
+            operators: vec![me.public_key().to_hex()],
+            publishers: vec![],
+        });
+        let key = |app: &mut App, c| app.on_term(Event::Key(KeyEvent::from(c)));
+        key(&mut app, KeyCode::Char('B'));
+        key(&mut app, KeyCode::BackTab);
+        assert_eq!(app.sub_tab, SubTab::Model);
+        let s = screen_text(&mut app, 100, 30);
+        assert!(s.contains("replaces the dashboard's whole map"), "{s}");
+        assert!(s.contains("asks once more"), "{s}");
+        assert!(!s.contains("next session"), "{s}");
+        key(&mut app, KeyCode::Char('j'));
+        key(&mut app, KeyCode::Enter);
+        assert!(app.actions.is_empty(), "one ⏎ sends nothing");
+        let s = screen_text(&mut app, 100, 30);
+        assert!(s.contains("⏎ again to publish, Esc not"), "{s}");
+    }
+
     /// `B` in a channel: the picker lists follow-the-default and the
     /// people the box published; ⏎ as an operator asks sync to publish the
     /// map with this channel's pick; the status line shows what it uses.
@@ -5932,7 +6096,7 @@ mod tests {
         app.on_term(crossterm::event::Event::Key(
             crossterm::event::KeyEvent::from(KeyCode::Tab),
         ));
-        assert!(app.sub_all);
+        assert_eq!(app.sub_tab, SubTab::Default);
         assert_eq!(app.sub_cursor, 2, "on the current default, lucian");
         app.on_term(crossterm::event::Event::Key(
             crossterm::event::KeyEvent::from(KeyCode::Char('k')),

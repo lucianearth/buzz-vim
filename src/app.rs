@@ -30,6 +30,27 @@ use crate::subscription::{self, Subscriptions};
 use crate::telemetry::Agents;
 use crate::unread::{self, Next};
 
+/// The `B` picker's three tabs, in ring order: whose subscription this
+/// channel spends, the default for all, this channel's Claude model.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SubTab {
+    Channel,
+    Default,
+    Model,
+}
+
+impl SubTab {
+    /// The next tab round the ring (the previous one when `back`).
+    pub fn step(self, back: bool) -> Self {
+        use SubTab::*;
+        match (self, back) {
+            (Channel, false) | (Model, true) => Default,
+            (Default, false) | (Channel, true) => Model,
+            (Model, false) | (Default, true) => Channel,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Pane {
     Timeline,
@@ -339,9 +360,9 @@ pub struct App {
     pub subscriptions: Subscriptions,
     /// Each Claude subscription's 5-hour and weekly usage (agents screen).
     pub usage: crate::usage::Usage,
-    /// The `B` picker: on the default for every channel (else this one),
-    /// and its row (0 = follow the default / each agent's owner).
-    pub sub_all: bool,
+    /// The `B` picker's tab, and its row (0 = follow the default / each
+    /// agent's owner / each agent's default model).
+    pub sub_tab: SubTab,
     pub sub_cursor: usize,
     /// The row under the cursor as last drawn from (None: none yet; Some(None):
     /// follow the default). ⏎ refuses if the rows moved under it since.
@@ -453,7 +474,7 @@ impl App {
             control_sending: Default::default(),
             subscriptions: Subscriptions::default(),
             usage: Default::default(),
-            sub_all: false,
+            sub_tab: SubTab::Channel,
             sub_cursor: 0,
             sub_expect: None,
             sub_confirm: false,
@@ -2395,12 +2416,12 @@ impl App {
 
     /// `B` in a channel: the subscription picker, on what it uses now.
     fn open_subscription(&mut self) {
-        let Some(channel) = self.current().map(str::to_string) else {
+        if self.current().is_none() {
             return self.say("open a channel first");
-        };
-        self.sub_all = false;
+        }
+        self.sub_tab = SubTab::Channel;
         self.sub_confirm = false;
-        self.sub_cursor = self.sub_row_of(&channel);
+        self.sub_cursor = self.sub_row_of();
         self.sub_expect = self.sub_row_id(self.sub_cursor);
         self.mode = Mode::Subscription;
     }
@@ -2426,29 +2447,57 @@ impl App {
         out
     }
 
-    /// What a picker row stands for: Some(None) follow the default (or the
-    /// owner), Some(Some(id)) a person, None past the end.
-    pub fn sub_row_id(&self, row: usize) -> Option<Option<String>> {
-        match row.checked_sub(1) {
-            None => Some(None),
-            Some(i) => self.sub_people().get(i).map(|p| Some(p.id.clone())),
+    /// The picker's rows in its current tab, by what each stands for:
+    /// None first (follow the default, or the owner), then the models or
+    /// the people.
+    pub fn sub_values(&self) -> Vec<Option<String>> {
+        let rest: Vec<String> = match self.sub_tab {
+            SubTab::Model => subscription::MODELS
+                .iter()
+                .map(|m| m.0.to_string())
+                .collect(),
+            SubTab::Channel | SubTab::Default => {
+                self.sub_people().into_iter().map(|p| p.id).collect()
+            }
+        };
+        std::iter::once(None)
+            .chain(rest.into_iter().map(Some))
+            .collect()
+    }
+
+    /// What's set now in the picker's current tab, for this channel.
+    pub fn sub_now(&self) -> Option<String> {
+        let channel = self.current()?;
+        let m = self.subscriptions.map();
+        match self.sub_tab {
+            SubTab::Model => self.subscriptions.model_for(channel).map(str::to_string),
+            SubTab::Default => m.and_then(|m| m.default.clone()),
+            SubTab::Channel => m.and_then(|m| m.channels.get(channel).cloned()),
         }
     }
 
-    /// The row for what's set now, in the picker's current scope.
-    fn sub_row_of(&self, channel: &str) -> usize {
-        let m = self.subscriptions.map();
-        let set = if self.sub_all {
-            m.and_then(|m| m.default.clone())
-        } else {
-            m.and_then(|m| m.channels.get(channel).cloned())
-        };
-        set.and_then(|p| self.sub_people().iter().position(|x| x.id == p))
-            .map_or(0, |i| i + 1)
+    /// What a picker row stands for: Some(None) follow the default (or the
+    /// owner), Some(Some(id)) a person or model, None past the end.
+    pub fn sub_row_id(&self, row: usize) -> Option<Option<String>> {
+        self.sub_values().get(row).cloned()
+    }
+
+    /// How many rows the picker's current tab has.
+    fn sub_rows(&self) -> usize {
+        self.sub_values().len()
+    }
+
+    /// The row for what's set now, in the picker's current tab.
+    fn sub_row_of(&self) -> usize {
+        let now = self.sub_now();
+        self.sub_values()
+            .iter()
+            .position(|v| *v == now)
+            .unwrap_or(0)
     }
 
     fn key_subscription(&mut self, k: KeyEvent) {
-        let n = self.sub_people().len() + 1;
+        let n = self.sub_rows();
         // Any key but ⏎ takes back a pending "⏎ again".
         if k.code != KeyCode::Enter {
             self.sub_confirm = false;
@@ -2465,9 +2514,13 @@ impl App {
             | KeyCode::Char('l')
             | KeyCode::Left
             | KeyCode::Right => {
-                self.sub_all = !self.sub_all;
-                if let Some(c) = self.current().map(str::to_string) {
-                    self.sub_cursor = self.sub_row_of(&c);
+                let back = matches!(
+                    k.code,
+                    KeyCode::BackTab | KeyCode::Char('h') | KeyCode::Left
+                );
+                self.sub_tab = self.sub_tab.step(back);
+                if self.current().is_some() {
+                    self.sub_cursor = self.sub_row_of();
                 }
             }
             KeyCode::Enter => return self.choose_subscription(),
@@ -2492,7 +2545,7 @@ impl App {
         // list): send only what was under it, never a neighbour or "clear".
         let row = self.sub_row_id(self.sub_cursor);
         let Some(person) = row.clone().filter(|_| row == self.sub_expect) else {
-            self.sub_cursor = self.sub_cursor.min(self.sub_people().len());
+            self.sub_cursor = self.sub_cursor.min(self.sub_rows() - 1);
             self.sub_expect = self.sub_row_id(self.sub_cursor);
             self.sub_confirm = false;
             return self.say("the list changed; pick again");
@@ -2512,22 +2565,31 @@ impl App {
             .channels
             .get(&channel)
             .map_or_else(|| channel.chars().take(8).collect(), |c| c.name.clone());
-        let (edit, label) = if self.sub_all {
-            (
+        let (edit, label) = match self.sub_tab {
+            SubTab::Model => (
+                subscription::Edit::Model(channel.clone(), person.clone()),
+                format!(
+                    "#{name} model: {}",
+                    person
+                        .as_deref()
+                        .and_then(subscription::model_label)
+                        .unwrap_or("each agent's default")
+                ),
+            ),
+            SubTab::Default => (
                 subscription::Edit::Default(person.clone()),
                 format!(
                     "default subscription: {}",
                     who.unwrap_or_else(|| "each agent's owner".into())
                 ),
-            )
-        } else {
-            (
+            ),
+            SubTab::Channel => (
                 subscription::Edit::Channel(channel.clone(), person.clone()),
                 format!(
                     "#{name} subscription: {}",
                     who.unwrap_or_else(|| "the default".into())
                 ),
-            )
+            ),
         };
         self.mode = Mode::Normal;
         // Whether it changes anything is decided against the relay's newest
@@ -3507,6 +3569,7 @@ mod tests {
                 })
                 .collect(),
             system: false,
+            model: None,
         };
         let ch = app.store.channel_mut("ch");
         ch.messages.insert("t".into(), msg("t", 5, None, &["top"]));
@@ -3597,6 +3660,7 @@ mod tests {
             mentions: mentions.iter().map(|s| s.to_string()).collect(),
             media: vec![],
             system: false,
+            model: None,
         };
         let ch = app.store.channel_mut("ch");
         ch.messages.insert("m1".into(), msg("m1", 10, &["bot1"]));
