@@ -60,7 +60,7 @@ pub struct Overrides {
 }
 
 /// A mode record's channel and pick, before trust.
-pub fn parse(ev: &Event) -> Option<(&str, ChanMode)> {
+fn parse(ev: &Event) -> Option<(&str, ChanMode)> {
     if ev.kind.as_u16() != KIND {
         return None;
     }
@@ -143,10 +143,25 @@ pub enum Step {
     Save(ChanMode),
     /// The owner signs the running header back to ideating.
     Flip,
-    /// A message from the owner @mentioning the list's creator: the go.
-    Go { to: String },
-    /// No list: a message asking this bot to make one.
-    AskList { to: String },
+    /// A message from the owner @mentioning `to`: the go to the list's
+    /// creator ([`GO_TEXT`]), or with no list, the ask for one
+    /// ([`ASK_LIST_TEXT`]).
+    Send { text: &'static str, to: String },
+}
+
+/// The steps for picking `pick` in `channel`, from what we hold: [`plan`]
+/// with the list's header, the saved pick and the newest bot.
+pub fn steps(
+    store: &Store,
+    lists: &Checklists,
+    saved: &Overrides,
+    channel: &str,
+    pick: ChanMode,
+    is_bot: impl Fn(&str) -> bool,
+) -> Result<Vec<Step>, &'static str> {
+    let header = lists.header(channel);
+    let bot = last_bot(store, channel, is_bot);
+    plan(pick, header.as_ref(), saved.get(channel), bot.as_deref())
 }
 
 /// The steps for picking `pick` in a channel. `bot`: who to ask for a list
@@ -160,14 +175,16 @@ pub fn plan(
     let running = header.is_some_and(|h| h.mode == Mode::Running);
     Ok(match pick {
         ChanMode::Running => match header {
-            None => vec![Step::AskList {
+            None => vec![Step::Send {
+                text: ASK_LIST_TEXT,
                 to: bot
                     .ok_or("no list here, and no bot to ask for one")?
                     .to_string(),
             }],
             Some(_) if running => vec![],
             Some(h) => {
-                let mut s = vec![Step::Go {
+                let mut s = vec![Step::Send {
+                    text: GO_TEXT,
                     to: h.creator.clone(),
                 }];
                 // The saved pick would outlive the run.
@@ -629,18 +646,30 @@ mod tests {
         );
         assert_eq!(
             plan(Running, None, None, Some(&bot)),
-            Ok(vec![Step::AskList { to: bot.clone() }])
+            Ok(vec![Step::Send {
+                text: ASK_LIST_TEXT,
+                to: bot.clone()
+            }])
         );
         assert_eq!(plan(Off, None, None, None), Ok(vec![Step::Save(Off)]));
         t.list("ideating", NOW);
         let h = t.lists.header(CH);
         assert_eq!(
             plan(Running, h.as_ref(), None, None),
-            Ok(vec![Step::Go { to: bot.clone() }])
+            Ok(vec![Step::Send {
+                text: GO_TEXT,
+                to: bot.clone()
+            }])
         );
         assert_eq!(
             plan(Running, h.as_ref(), Some(Off), None),
-            Ok(vec![Step::Go { to: bot.clone() }, Step::Save(Ideating)])
+            Ok(vec![
+                Step::Send {
+                    text: GO_TEXT,
+                    to: bot.clone()
+                },
+                Step::Save(Ideating)
+            ])
         );
         t.list("running", NOW + 1);
         let h = t.lists.header(CH);

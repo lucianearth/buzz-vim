@@ -2531,14 +2531,14 @@ impl Engine {
 
     fn set_mode(&mut self, channel: String, pick: ChanMode) -> Result<String, BuzzError> {
         use chanmode::Step;
-        let header = self.checklists.header(&channel);
         let is_bot = |pk: &str| needs::is_bot(&self.store, &self.agents, &self.checklists, pk);
-        let bot = chanmode::last_bot(&self.store, &channel, is_bot);
-        let steps = chanmode::plan(
+        let steps = chanmode::steps(
+            &self.store,
+            &self.checklists,
+            &self.modes,
+            &channel,
             pick,
-            header.as_ref(),
-            self.modes.get(&channel),
-            bot.as_deref(),
+            is_bot,
         )
         .map_err(|e| BuzzError::Failed(e.into()))?;
         if steps.is_empty() {
@@ -2551,18 +2551,8 @@ impl Engine {
                     Some(b) => b,
                     None => continue,
                 },
-                Step::Go { to } => {
-                    self.send(channel.clone(), None, chanmode::GO_TEXT.into(), &[], &[to])?;
-                    continue;
-                }
-                Step::AskList { to } => {
-                    self.send(
-                        channel.clone(),
-                        None,
-                        chanmode::ASK_LIST_TEXT.into(),
-                        &[],
-                        &[to],
-                    )?;
+                Step::Send { text, to } => {
+                    self.send(channel.clone(), None, text.into(), &[], &[to])?;
                     continue;
                 }
             };

@@ -1054,19 +1054,18 @@ impl Sync {
         });
     }
 
-    /// A vote on a control request: the action's emoji as a reaction.
     /// `M`'s pick: save it, flip the header, or post the go (or the ask
     /// for a list) from the owner, as `chanmode::plan` says.
     fn set_mode(&mut self, app: &mut App, channel: String, pick: crate::chanmode::ChanMode) {
         use crate::chanmode::{self, Step};
-        let header = app.checklists.header(&channel);
         let is_bot = |pk: &str| crate::needs::is_bot(&app.store, &app.agents, &app.checklists, pk);
-        let bot = chanmode::last_bot(&app.store, &channel, is_bot);
-        let steps = match chanmode::plan(
+        let steps = match chanmode::steps(
+            &app.store,
+            &app.checklists,
+            &app.modes,
+            &channel,
             pick,
-            header.as_ref(),
-            app.modes.get(&channel),
-            bot.as_deref(),
+            is_bot,
         ) {
             Ok(s) => s,
             Err(e) => return app.say(e),
@@ -1075,18 +1074,16 @@ impl Sync {
             return app.say(format!("already {}", pick.label()));
         }
         for step in steps {
-            let (event, text, to) = match step {
-                Step::Save(m) => (Some(chanmode::record(&channel, m)), None, None),
-                Step::Flip => (app.checklists.flip_to_ideating(&channel, now()), None, None),
-                Step::Go { to } => (None, Some(chanmode::GO_TEXT), Some(to)),
-                Step::AskList { to } => (None, Some(chanmode::ASK_LIST_TEXT), Some(to)),
+            let event = match step {
+                Step::Save(m) => Some(chanmode::record(&channel, m)),
+                Step::Flip => app.checklists.flip_to_ideating(&channel, now()),
+                Step::Send { text, to } => {
+                    let mut d = crate::draft::Draft::default();
+                    d.insert(text);
+                    self.send(app, channel.clone(), None, None, d, vec![to]);
+                    continue;
+                }
             };
-            if let (Some(text), Some(to)) = (text, to) {
-                let mut d = crate::draft::Draft::default();
-                d.insert(text);
-                self.send(app, channel.clone(), None, None, d, vec![to]);
-                continue;
-            }
             let Some(ev) = event.map(|b| self.relay.sign(b)) else {
                 continue;
             };
@@ -1104,6 +1101,7 @@ impl Sync {
         app.say(format!("{} {}", pick.icon().unwrap_or("·"), pick.label()));
     }
 
+    /// A vote on a control request: the action's emoji as a reaction.
     fn react(&mut self, app: &mut App, target: String, emoji: String, label: String) {
         let Ok(id) = EventId::from_hex(&target) else {
             app.control_sending.remove(&target);
