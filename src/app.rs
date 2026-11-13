@@ -49,10 +49,6 @@ pub enum Hit {
     Handle,
     /// A row in the checklist pane.
     ChecklistItem(usize),
-    /// Tab 0, Needs you.
-    NeedsTab,
-    /// A row on tab 0.
-    NeedsRow(usize),
     /// A card or outcome line on the routing view.
     RoutingPick(Pick),
 }
@@ -152,15 +148,6 @@ pub enum Action {
         content: String,
         agent: String,
         text: String,
-    },
-    /// A reply written somewhere other than the compose box (tab 0's
-    /// inline reply): into `root`'s thread, or the channel for None.
-    SendDraft {
-        channel: String,
-        root: Option<String>,
-        draft: Draft,
-        /// Notified too, without an @ in the text: the row's asker.
-        to: Vec<String>,
     },
     /// Look up these people's names (the Q agent's, in #quick).
     WantProfiles(Vec<String>),
@@ -311,9 +298,6 @@ pub struct App {
     pub quick_draft: Draft,
     pub quick_include: bool,
     pub loop_: Loop,
-    /// Tab 0, Needs you (`0`): on screen instead of the current tab.
-    pub needs_view: bool,
-    pub needs_cursor: usize,
     /// channel -> when we last sent a typing pulse there (secs).
     pub typed: HashMap<String, u64>,
     /// The owner's saved channel modes (kind 30078 `buzz-mode:`).
@@ -322,18 +306,8 @@ pub struct App {
     pub mode_cursor: usize,
     /// A tab flashes (set by drawing): ticks redraw.
     pub flashing: bool,
-    /// Tab 0's rows as last drawn; the cursor picks from these.
+    /// The needs rows as last drawn; the tab flags come from these.
     pub needs: Vec<Row>,
-    /// The row `!` went to last.
-    pub needs_jump: Option<String>,
-    /// The row an inline reply (`r` on tab 0) answers, and its text.
-    pub reply_to: Option<Row>,
-    pub reply_draft: Draft,
-    /// Sends from the reply box, by event id, and the row each answered:
-    /// a failed one goes back into the box, not a compose box.
-    pub reply_sends: HashMap<String, Row>,
-    /// The row the last reply answered, until sync knows its event id.
-    pub reply_sent: Option<Row>,
     /// The routing view (`w`): how the watcher routed each stop it judged.
     pub routing_view: bool,
     pub routing_window: Window,
@@ -454,18 +428,11 @@ impl App {
             quick_draft: Draft::default(),
             quick_include: false,
             loop_: Loop::default(),
-            needs_view: false,
-            needs_cursor: 0,
             typed: HashMap::new(),
             modes: Overrides::default(),
             mode_cursor: 0,
             flashing: false,
             needs: vec![],
-            needs_jump: None,
-            reply_to: None,
-            reply_draft: Draft::default(),
-            reply_sends: HashMap::new(),
-            reply_sent: None,
             routing_view: false,
             routing_window: Window::Day,
             routing_pick: Pick {
@@ -724,7 +691,6 @@ impl App {
     }
 
     fn switch_tab(&mut self, i: usize) {
-        self.needs_view = false;
         self.routing_view = false;
         self.control_view = false;
         if i < self.tabs.len() && i != self.active {
@@ -752,161 +718,17 @@ impl App {
         }
     }
 
-    // ---------- tab 0: needs you ----------
+    // ---------- needs ----------
 
-    /// Tab 0's rows from what we hold now.
+    /// The needs rows from what we hold now.
     pub fn needs_rows(&self) -> Vec<Row> {
         let bot = |pk: &str| needs::is_bot(&self.store, &self.agents, &self.checklists, pk);
         needs::rows(&self.store, &self.checklists, bot, crate::sync::now())
     }
 
-    fn open_needs(&mut self) {
-        self.needs_view = true;
-        self.routing_view = false;
-        self.control_view = false;
-        self.agents_view = false;
-        self.checklist_view = false;
-        self.needs = self.needs_rows();
-    }
-
-    /// Open a row: its message in its thread (or the thread, or the channel).
-    fn open_row(&mut self, row: &Row) {
-        self.agents_view = false;
-        self.control_view = false;
-        self.checklist_view = false;
-        self.follow(&row.link());
-        self.needs_view = false;
-    }
-
-    fn picked_row(&mut self) -> Option<Row> {
-        self.needs = self.needs_rows();
-        self.needs_cursor = self.needs_cursor.min(self.needs.len().saturating_sub(1));
-        self.needs.get(self.needs_cursor).cloned()
-    }
-
-    /// `!`: the next Needs-an-answer row, oldest first, round again after
-    /// the last, quickfix style.
-    fn next_needs(&mut self) {
-        let rows = self.needs_rows();
-        let Some(r) = needs::next_answer(&rows, self.needs_jump.as_deref()).cloned() else {
-            return self.say("⚑ nothing needs you");
-        };
-        let n = needs::answer_count(&rows);
-        let i = rows.iter().position(|x| x.key == r.key).unwrap_or(0);
-        self.needs_jump = Some(r.key.clone());
-        self.open_row(&r);
-        let who = if r.who.is_empty() {
-            "watcher".to_string()
-        } else {
-            self.store.name_of(&r.who)
-        };
-        self.say(format!("⚑ {}/{n}  {who}: {}", i + 1, r.text));
-    }
-
-    /// `r` on tab 0: a reply box for the picked row, into its thread.
-    fn reply_row(&mut self) {
-        let Some(r) = self.picked_row() else {
-            return self.say("nothing to reply to");
-        };
-        // Text typed for another row doesn't follow to this one.
-        if self.reply_to.as_ref().is_some_and(|o| o.key != r.key) {
-            self.reply_draft.clear();
-        }
-        self.reply_to = Some(r);
-        self.mode = Mode::Reply;
-    }
-
-    fn send_reply(&mut self) {
-        if self.reply_draft.text.trim().is_empty() {
-            return self.say("type a reply first");
-        }
-        let Some(r) = self.reply_to.take() else {
-            self.mode = Mode::Normal;
-            return;
-        };
-        let draft = std::mem::take(&mut self.reply_draft);
-        self.reply_sent = Some(r.clone());
-        let to = (!r.who.is_empty()).then_some(r.who).into_iter().collect();
-        self.actions.push(Action::SendDraft {
-            channel: r.channel,
-            root: r.thread,
-            draft,
-            to,
-        });
-        self.mode = Mode::Normal;
-    }
-
-    fn key_reply(&mut self, k: KeyEvent) {
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = k
-            .modifiers
-            .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT);
-        let d = &mut self.reply_draft;
-        match k.code {
-            // The text stays for next time, on the same row.
-            KeyCode::Esc => self.mode = Mode::Normal,
-            KeyCode::Enter if alt => d.insert("\n"),
-            KeyCode::Char('j') if ctrl => d.insert("\n"),
-            KeyCode::Enter => self.send_reply(),
-            KeyCode::Char('w') if ctrl => d.delete_word(),
-            KeyCode::Char('u') if ctrl => d.clear(),
-            KeyCode::Char('a') if ctrl => d.home(),
-            KeyCode::Char('e') if ctrl => d.end(),
-            KeyCode::Char(c) if !ctrl => d.insert(c.encode_utf8(&mut [0; 4])),
-            KeyCode::Tab => d.insert(&" ".repeat(crate::draft::TAB)),
-            KeyCode::Backspace => d.backspace(),
-            KeyCode::Delete => d.delete(),
-            KeyCode::Left => d.left(),
-            KeyCode::Right => d.right(),
-            KeyCode::Home => d.home(),
-            KeyCode::End => d.end(),
-            KeyCode::Up => {
-                d.vertical(false);
-            }
-            KeyCode::Down => {
-                d.vertical(true);
-            }
-            _ => {}
-        }
-    }
-
-    /// Keys on tab 0. True when the key was its own.
-    fn key_needs(&mut self, k: KeyEvent) -> bool {
-        match k.code {
-            KeyCode::Char('j') | KeyCode::Down => self.needs_cursor += 1,
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.needs_cursor = self.needs_cursor.saturating_sub(1)
-            }
-            KeyCode::Char('g') | KeyCode::Home => self.needs_cursor = 0,
-            KeyCode::Char('G') | KeyCode::End => self.needs_cursor = usize::MAX,
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if let Some(r) = self.picked_row() {
-                    self.needs_jump = Some(r.key.clone());
-                    self.open_row(&r);
-                }
-            }
-            KeyCode::Char('r') => self.reply_row(),
-            KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => self.needs_view = false,
-            // These act on the channel under tab 0, out of sight.
-            KeyCode::Char('i')
-            | KeyCode::Char('+')
-            | KeyCode::Char('o')
-            | KeyCode::Char('O')
-            | KeyCode::Char('n')
-            | KeyCode::Char('d')
-            | KeyCode::Char('u')
-            | KeyCode::Char('<')
-            | KeyCode::Char('>')
-            | KeyCode::PageDown
-            | KeyCode::PageUp => {}
-            _ => return false,
-        }
-        true
-    }
-
     // ---------- channel mode ----------
 
-    /// A channel's tab: its mode and flag, from `rows` (tab 0's rows).
+    /// A channel's tab: its mode and flag, from `rows` (`needs_rows`).
     pub fn chan_tab(&self, rows: &[Row], channel: &str) -> chanmode::Tab {
         let is_bot = |pk: &str| needs::is_bot(&self.store, &self.agents, &self.checklists, pk);
         let working = |c: &str| !self.agents.working(&self.store, c, None).is_empty();
@@ -976,7 +798,6 @@ impl App {
 
     fn open_control(&mut self) {
         self.control_view = true;
-        self.needs_view = false;
         self.routing_view = false;
         self.agents_view = false;
         self.checklist_view = false;
@@ -1264,7 +1085,6 @@ impl App {
     fn open_routing(&mut self) {
         self.routing_view = true;
         self.control_view = false;
-        self.needs_view = false;
         self.agents_view = false;
         self.checklist_view = false;
         self.routing_sample = None;
@@ -1508,7 +1328,6 @@ impl App {
     }
 
     fn goto(&mut self, j: Jump) {
-        self.needs_view = false;
         self.routing_view = false;
         let left = self.current() != Some(j.channel.as_str());
         let i = match self.tabs.iter().position(|t| *t == j.channel) {
@@ -1927,10 +1746,10 @@ impl App {
 
     // ---------- Q ----------
 
-    /// The channel a Q can add: none while tab 0 or the routing view is
-    /// shown, since the tab under it is hidden.
+    /// The channel a Q can add: none while the routing view is shown,
+    /// since the tab under it is hidden.
     pub fn quick_here(&self) -> Option<&str> {
-        if self.needs_view || self.routing_view {
+        if self.routing_view {
             None
         } else {
             self.current()
@@ -2056,10 +1875,6 @@ impl App {
             self.quick_draft.insert(&text);
             return;
         }
-        if self.mode == Mode::Reply {
-            self.reply_draft.insert(&text);
-            return;
-        }
         // Nor does the Control view: a paste there would land in the
         // channel hidden under it (or swap the vote box for Insert).
         if self.control_view {
@@ -2068,10 +1883,6 @@ impl App {
         // Nor does the routing view.
         if self.routing_view {
             return;
-        }
-        // Tab 0 has no compose box: the channel under it mustn't get it.
-        if self.needs_view {
-            return self.say("to paste a reply, pick a row and press r");
         }
         let paths = crate::clip::dropped_paths(&s);
         if let Some(p) = paths.first() {
@@ -2118,14 +1929,6 @@ impl App {
             return;
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl && k.code == KeyCode::Char('c') && self.mode == Mode::Reply {
-            if self.reply_draft.is_empty() {
-                self.mode = Mode::Normal;
-            } else {
-                self.reply_draft.clear();
-            }
-            return;
-        }
         if ctrl && k.code == KeyCode::Char('c') {
             // In the Q box: clear it, then close it; never quit from there.
             if self.mode == Mode::Quick {
@@ -2147,9 +1950,6 @@ impl App {
         if ctrl && k.code == KeyCode::Char('v') && self.routing_view && self.mode == Mode::Normal {
             return;
         }
-        if ctrl && k.code == KeyCode::Char('v') && self.needs_view && self.mode == Mode::Normal {
-            return self.say("to paste a reply, pick a row and press r");
-        }
         if ctrl && k.code == KeyCode::Char('v') && matches!(self.mode, Mode::Normal | Mode::Insert)
         {
             self.paste_clipboard();
@@ -2164,7 +1964,6 @@ impl App {
         }
         match self.mode {
             Mode::Quick => self.key_quick(k),
-            Mode::Reply => self.key_reply(k),
             Mode::Insert => self.key_insert(k),
             Mode::Normal => self.key_normal(k),
             Mode::Sections => self.key_sections(k),
@@ -2307,9 +2106,6 @@ impl App {
 
     fn key_normal(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        if self.needs_view && !ctrl && self.key_needs(k) {
-            return;
-        }
         if self.control_view {
             if !ctrl && self.key_control(k) {
                 return;
@@ -2320,7 +2116,7 @@ impl App {
                 KeyCode::Char(c) if !ctrl => {
                     matches!(
                         c,
-                        'q' | 'Q' | '0'..='9' | '!' | 'L' | 'H' | 'c' | 'a' | 'w' | '?'
+                        'q' | 'Q' | '1'..='9' | '!' | 'L' | 'H' | 'c' | 'a' | 'w' | '?'
                     )
                 }
                 KeyCode::Tab | KeyCode::BackTab => true,
@@ -2340,7 +2136,7 @@ impl App {
             let leaves = match k.code {
                 KeyCode::Char('o') => ctrl,
                 KeyCode::Char(c) if !ctrl => {
-                    matches!(c, 'q' | '0'..='9' | '!' | 'L' | 'H' | 'c' | 'a' | '?' | 'f')
+                    matches!(c, 'q' | '1'..='9' | '!' | 'L' | 'H' | 'c' | 'a' | '?' | 'f')
                 }
                 _ => false,
             };
@@ -2348,35 +2144,15 @@ impl App {
                 return;
             }
         }
-        // ^d ^u page tab 0's rows, not the channel under it.
-        if self.needs_view && ctrl && matches!(k.code, KeyCode::Char('d') | KeyCode::Char('u')) {
-            let step = (self.page / 2).max(1);
-            self.needs_cursor = if k.code == KeyCode::Char('d') {
-                self.needs_cursor.saturating_add(step)
-            } else {
-                self.needs_cursor.saturating_sub(step)
-            };
-            return;
-        }
         let n = self.tabs.len();
         match k.code {
-            // Tab 0 is Needs you; the channels are 1 to 9.
-            KeyCode::Char('0') => self.open_needs(),
             KeyCode::Char(c @ '1'..='9') => self.switch_tab(c as usize - '1' as usize),
             KeyCode::Char('!') => self.next_flagged(),
-            // H and L go round through tab 0.
-            KeyCode::Char('L') | KeyCode::Tab => match (self.needs_view, n) {
-                (_, 0) => self.open_needs(),
-                (true, _) => self.switch_tab(0),
-                (false, _) if self.active + 1 >= n => self.open_needs(),
-                (false, _) => self.switch_tab(self.active + 1),
-            },
-            KeyCode::Char('H') | KeyCode::BackTab => match (self.needs_view, n) {
-                (_, 0) => self.open_needs(),
-                (true, _) => self.switch_tab(n - 1),
-                (false, _) if self.active == 0 => self.open_needs(),
-                (false, _) => self.switch_tab(self.active - 1),
-            },
+            // H and L go round the tabs.
+            KeyCode::Char('L') | KeyCode::Tab if n > 0 => self.switch_tab((self.active + 1) % n),
+            KeyCode::Char('H') | KeyCode::BackTab if n > 0 => {
+                self.switch_tab((self.active + n - 1) % n)
+            }
             // The checklist pages its own list (lucian 2026-11-05), never the
             // timeline under it.
             KeyCode::Char('d') | KeyCode::Char('u') | KeyCode::PageDown | KeyCode::PageUp
@@ -2418,7 +2194,6 @@ impl App {
                 self.checklist_view = false;
             }
             KeyCode::Char('c') => {
-                self.needs_view = false;
                 self.routing_view = false;
                 self.control_view = false;
                 self.checklist_view = true;
@@ -2452,7 +2227,6 @@ impl App {
             }
             KeyCode::Char('i') => self.enter_insert(),
             KeyCode::Char('a') => {
-                self.needs_view = false;
                 self.routing_view = false;
                 self.control_view = false;
                 self.agents_view = !self.agents_view;
@@ -3148,11 +2922,6 @@ impl App {
                 } else {
                     -3
                 };
-                if self.needs_view {
-                    let c = self.needs_cursor as isize + d.signum();
-                    self.needs_cursor = c.max(0) as usize;
-                    return;
-                }
                 // The routing view scrolls nothing; the channel under it stays put.
                 if self.control_view {
                     // The wheel scrolls the note, or moves the list's pick.
@@ -3192,21 +2961,8 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => match hit {
                 // Under the routing view only the tab row and its boxes take clicks.
                 _ if self.routing_view
-                    && !matches!(
-                        hit,
-                        Some(Hit::Tab(_) | Hit::NeedsTab | Hit::RoutingPick(_) | Hit::Handle)
-                    ) => {}
+                    && !matches!(hit, Some(Hit::Tab(_) | Hit::RoutingPick(_) | Hit::Handle)) => {}
                 Some(Hit::Tab(i)) => self.switch_tab(i),
-                Some(Hit::NeedsTab) => self.open_needs(),
-                Some(Hit::NeedsRow(_)) if self.mode != Mode::Normal => {}
-                Some(Hit::NeedsRow(i)) => {
-                    // Click a row to pick it, again to open it.
-                    if self.needs_cursor == i {
-                        self.on_key(KeyEvent::from(KeyCode::Enter));
-                    } else {
-                        self.needs_cursor = i;
-                    }
-                }
                 // Acted on at release: a drag picks text instead.
                 Some(Hit::Message(pane, id)) => self.press = Some(((m.column, m.row), pane, id)),
                 Some(Hit::Compose) => {
@@ -3288,57 +3044,42 @@ mod tests {
         assert_eq!(pulses(&app), 2);
     }
 
-    /// On tab 0 nothing reaches the channel underneath: paging, the wheel,
-    /// paste and ^v stay on tab 0, and row clicks count only in normal mode.
+    /// `!` goes round the flagged tabs, oldest flag first; H and L go
+    /// round the channel tabs, with nothing in between.
     #[test]
-    fn tab_zero_keeps_input_off_the_hidden_channel() {
+    fn bang_cycles_flagged_tabs_and_h_l_wrap() {
         let mut app = App::new("me".into(), None);
-        app.tabs = vec!["a".into()];
-        app.store.channel_mut("a").timeline = vec!["m1".into(), "m2".into()];
-        app.selected.insert("a".into(), "m1".into());
+        app.checklists.trust.owner = "me".into();
+        app.tabs = ["a", "b", "c", "d"].map(String::from).to_vec();
+        let now = crate::sync::now();
+        for (c, ago) in [("b", 300), ("d", 200), ("c", 100)] {
+            let m = crate::model::Message {
+                id: format!("m-{c}"),
+                author: "alice".into(),
+                created_at: now - ago,
+                content: "@me look".into(),
+                mentions: vec!["me".into()],
+                ..Default::default()
+            };
+            app.store.channel_mut(c).messages.insert(m.id.clone(), m);
+        }
+        let mut went = vec![];
+        for _ in 0..4 {
+            app.on_key(KeyEvent::from(KeyCode::Char('!')));
+            went.push(app.current().unwrap().to_string());
+        }
+        assert_eq!(went, ["b", "d", "c", "b"]);
+        app.on_key(KeyEvent::from(KeyCode::Char('1')));
+        app.on_key(KeyEvent::from(KeyCode::Char('H')));
+        assert_eq!(app.current(), Some("d"));
+        app.on_key(KeyEvent::from(KeyCode::Char('L')));
+        assert_eq!(app.current(), Some("a"));
+        app.on_key(KeyEvent::from(KeyCode::BackTab));
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.current(), Some("a"));
+        // 0 is no tab.
         app.on_key(KeyEvent::from(KeyCode::Char('0')));
-        assert!(app.needs_view);
-        app.page = 10;
-        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
-        assert_eq!(app.needs_cursor, 5);
-        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        assert_eq!(app.needs_cursor, 0);
-        app.on_mouse(MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        });
-        assert_eq!(app.needs_cursor, 1);
-        app.on_term(TermEvent::Paste("hello".into()));
-        app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
-        assert_eq!(app.mode, Mode::Normal);
-        assert!(
-            app.draft.is_empty()
-                && app
-                    .actions
-                    .iter()
-                    .all(|a| !matches!(a, Action::ReadAttachment(_)))
-        );
-        assert_eq!(app.selected.get("a").map(String::as_str), Some("m1"));
-        // A row click in another mode does nothing.
-        app.hits = vec![(Rect::new(0, 3, 80, 1), Hit::NeedsRow(4))];
-        app.mode = Mode::Help;
-        app.on_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 1,
-            row: 3,
-            modifiers: KeyModifiers::NONE,
-        });
-        assert_eq!(app.needs_cursor, 1);
-        app.mode = Mode::Normal;
-        app.on_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 1,
-            row: 3,
-            modifiers: KeyModifiers::NONE,
-        });
-        assert_eq!(app.needs_cursor, 4);
+        assert_eq!(app.current(), Some("a"));
     }
 
     #[test]
@@ -3414,9 +3155,9 @@ mod tests {
         assert!(!app.actions.iter().any(|a| matches!(a, Action::Quit)));
     }
 
-    /// On tab 0 the channel under it is hidden: a Q can't add it.
+    /// On the routing view the channel under it is hidden: a Q can't add it.
     #[test]
-    fn q_on_tab_zero_adds_no_channel() {
+    fn q_on_the_routing_view_adds_no_channel() {
         let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
         let mut app = App::new("me".into(), None);
         app.channels_loaded = true;
@@ -3426,8 +3167,8 @@ mod tests {
         qc.name = "quick".into();
         qc.members = vec!["me".into(), "tb".into()];
         app.store.profiles.entry("tb".into()).or_default().name = "taskbot".into();
-        app.on_key(KeyEvent::from(KeyCode::Char('0')));
-        assert!(app.needs_view);
+        app.on_key(KeyEvent::from(KeyCode::Char('w')));
+        assert!(app.routing_view);
         // Lower-case q opens the box too; it no longer quits.
         app.on_key(KeyEvent::from(KeyCode::Char('q')));
         assert_eq!(app.mode, Mode::Quick);

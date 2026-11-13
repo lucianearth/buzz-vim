@@ -25,17 +25,15 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
 
 - `i` write, `Esc` back to normal, `⏎` send, `⇧⏎` (or `⌥⏎`, `^j`) new line
 - `j` `k` move, `d` `u` (or PgDn PgUp) a screen down or up, `^d` `^u` half a screen (in the checklist: a page of
-  items), `1`–`9` jump to a tab, `H` `L` or `⇥` cycle tabs (tab 0 included)
-- `0` is tab 0, **Needs you**, pinned first (it can't be moved, closed or archived). *Needs an answer*: channels
-  the watcher marks stalled, waiting on lucian or waiting on release (the row opens its ping), a contested
-  channel whose lists run ("two lists claim this channel; pick a driver"), and people's @mentions and DMs to the operator (`owner`) that he hasn't answered.
-  *FYI*: bots' @mentions of him the watcher didn't flag. One row each (channel, who, one line, age), oldest
-  first. `⏎` opens the row at its message, `r` answers it in a box that posts into that row's thread. A row
-  goes once he posts in its thread after it (in a DM: anywhere in it), or the watch state or item moves on.
-  It's all from the relay (the last week of mentions), nothing local. Bots are profiles with a NIP-OA `auth`
-  tag or a channel `bot` role, agents we see telemetry from, and the watcher
-- `!` goes to the next row that needs an answer, oldest first and round again, like `:cnext`. Every channel's
-  status line shows how many there are as `⚑ N`
+  items), `1`–`9` jump to a tab, `H` `L` or `⇥` cycle tabs (round again past the last)
+- Tabs show the channel's mode (🧠 ideating, 🚀 running, nothing when off) and flash to 🚩 when the channel
+  needs you (running: the watcher says so or the wrap-up just finished; ideating: a bot posted after you and
+  no agent is working) or to 📣 for a person's @mention or DM. 🚩 outranks 📣. Off channels and DMs show a
+  steady 📣. Running tabs show no unread count. `!` jumps to the next flagged tab, oldest first
+- `M` the mode picker: `j` `k` or arrows move, `M` advances and wraps, `⏎` sets it (no confirm). Running posts
+  a "go" from you @mentioning the list's creator; back to ideating flips the header as the owner; a channel
+  with no list offers to ask a bot to make one. For a channel without a running list the pick is a kind 30078
+  `d=buzz-mode:<channel>` record
 - `n` the bell: the latest message in this tab, read or not. In a thread it opens on your first unread reply
 - `<` `>` move the current tab left or right within its section; `T` opens the tab order list (`J` `K` move
   the picked tab, `a` then `y` archives it for everyone). The order is synced: dragging tabs on the phone moves them here too, and the other way round

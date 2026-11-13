@@ -504,7 +504,7 @@ impl Sync {
         });
     }
 
-    /// Tab 0's data across every channel we're in: mentions of the
+    /// The needs rows' data across every channel we're in: mentions of the
     /// operator, his own posts, DMs and checklist records, the last week
     /// of them and a live tail. Asked again whenever channels load.
     pub fn load_needs(&mut self, store: &model::Store, operator: &str) {
@@ -692,23 +692,6 @@ impl Sync {
             } => {
                 let draft = std::mem::take(app.draft_mut());
                 self.send(app, channel, root, parent, draft, vec![])
-            }
-            Action::SendDraft {
-                channel,
-                root,
-                draft,
-                to,
-            } => {
-                let before: HashSet<String> = app.pending_sends.keys().cloned().collect();
-                self.send(app, channel, root.clone(), root, draft, to);
-                // Remember which send came from the reply box.
-                if let Some(row) = app.reply_sent.take() {
-                    for id in app.pending_sends.keys() {
-                        if !before.contains(id) {
-                            app.reply_sends.insert(id.clone(), row.clone());
-                        }
-                    }
-                }
             }
             Action::ThumbsUp { target } => self.thumbs_up(app, target),
             Action::Reset {

@@ -15,8 +15,6 @@ pub enum Mode {
     Reset,
     /// The Q box: a quick question to #quick.
     Quick,
-    /// A reply box for a tab-0 row, into its thread.
-    Reply,
     /// Asking before archiving the tab picked in the tab menu.
     Archive,
     /// Asking before voting on a control request (a kind-7 reaction).
@@ -40,7 +38,6 @@ impl Mode {
             Mode::Hint => "LINK",
             Mode::Reset => "RESET?",
             Mode::Quick => "Q",
-            Mode::Reply => "REPLY",
             Mode::Archive => "ARCHIVE?",
             Mode::Vote => "VOTE?",
             Mode::Subscription => "SUBSCRIPTION",
@@ -104,7 +101,7 @@ const MESSAGES: Section = (
         ("i", "write", Both),
         ("r", "reply in thread", Help),
         ("+", "👍", Help),
-        ("⏎ l →", "open thread / tab 0 row", Help),
+        ("⏎ l →", "open thread", Help),
         ("o", "image", Both),
         ("O", "images in Preview", Help),
         ("f", "links", Both),
@@ -206,14 +203,6 @@ const QUICK: Section = (
         ("esc", "close (keeps the text)", Footer),
     ],
 );
-const REPLY: Section = (
-    "reply (r on tab 0)",
-    &[
-        ("⏎", "send into its thread", Both),
-        ("⇧⏎ ^j", "new line", Footer),
-        ("esc", "close (keeps the text)", Footer),
-    ],
-);
 const SUBSCRIPTION: Section = (
     "Claude subscription (B)",
     &[
@@ -227,8 +216,8 @@ const CHANMODE: Section = (
     "channel mode (M)",
     &[
         ("j k ↑↓", "pick", Footer),
-        ("M", "next", Both),
-        ("⏎", "set it", Both),
+        ("M", "next", Footer),
+        ("⏎", "set it", Footer),
         ("esc", "close", Footer),
     ],
 );
@@ -251,14 +240,13 @@ const HINT: Section = (
 /// The `?` overlay, left column then right. A short screen clips the
 /// bottom, so the boxes that list their own keys go last.
 pub const HELP: [&[Section]; 2] = [
-    &[MOVE, TABS, MESSAGES, APP, INSERT, REPLY, QUICK],
+    &[MOVE, TABS, MESSAGES, APP, INSERT, QUICK],
     &[
         SCREENS,
         AGENTS,
         ROUTING,
         CONTROL,
         SUBSCRIPTION,
-        CHANMODE,
         SECTIONS,
         ORDER,
         VIEWER,
@@ -279,7 +267,6 @@ pub fn sections(mode: Mode) -> &'static [Section] {
         Mode::Archive => &[("archive", &[("y ⏎", "archive", Footer), NO])],
         Mode::Vote => &[("vote", &[("y ⏎", "send the reaction", Footer), NO])],
         Mode::Quick => &[QUICK],
-        Mode::Reply => &[REPLY],
         Mode::Subscription => &[SUBSCRIPTION],
         Mode::Switch => &[CHANMODE],
         Mode::Viewer => &[VIEWER],
