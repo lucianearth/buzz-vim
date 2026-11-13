@@ -409,6 +409,11 @@ fn handle(app: &mut App, sync: &mut Sync, msg: Msg, restore_active: &mut Option<
             label,
             result,
         } => app.control_voted(&event, &label, result),
+        Msg::ModeSet {
+            stored,
+            label,
+            result,
+        } => app.mode_set(&stored, &label, result),
         Msg::QuickSent { id, result, text } => match result {
             Ok(()) => {
                 let agent = app.loop_.quick_agent.clone();

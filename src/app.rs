@@ -2584,6 +2584,20 @@ impl App {
         }
     }
 
+    /// `M`'s records came back: what the relay stored is shown; a failure
+    /// says so, and what it didn't store never was.
+    pub fn mode_set(&mut self, stored: &[nostr::Event], label: &str, result: anyhow::Result<()>) {
+        let owner = self.checklists.trust.owner.clone();
+        for ev in stored {
+            self.modes.apply(ev, &owner);
+            self.checklists.apply(ev);
+        }
+        match result {
+            Ok(()) => self.say(label),
+            Err(e) => self.say(format!("mode not set: {e}; M to pick again")),
+        }
+    }
+
     fn key_sections(&mut self, k: KeyEvent) {
         let n = self.sections.len();
         match k.code {
@@ -3035,6 +3049,33 @@ mod tests {
         assert_eq!(
             app.status.as_ref().map(|(s, _)| s.as_str()),
             Some("DMs have no mode")
+        );
+    }
+
+    /// Review 8e92062c: a pick shows only once the relay stores it; one it
+    /// refuses (or never sees, offline) changes nothing and says so.
+    #[test]
+    fn a_mode_pick_shows_only_once_the_relay_stores_it() {
+        use nostr::Keys;
+        let k = Keys::generate();
+        let mut app = App::new(k.public_key().to_hex(), None);
+        app.checklists.trust.owner = k.public_key().to_hex();
+        let ev = app
+            .modes
+            .record("a", ChanMode::Ideating, 1_800_000_000)
+            .sign_with_keys(&k)
+            .unwrap();
+        app.mode_set(&[], "🧠 ideating", Err(anyhow::anyhow!("offline")));
+        assert_eq!(app.modes.get("a"), None);
+        assert_eq!(
+            app.status.as_ref().map(|(s, _)| s.as_str()),
+            Some("mode not set: offline; M to pick again")
+        );
+        app.mode_set(&[ev], "🧠 ideating", Ok(()));
+        assert_eq!(app.modes.get("a"), Some(ChanMode::Ideating));
+        assert_eq!(
+            app.status.as_ref().map(|(s, _)| s.as_str()),
+            Some("🧠 ideating")
         );
     }
 

@@ -117,6 +117,12 @@ pub enum Msg {
         label: String,
         result: anyhow::Result<()>,
     },
+    /// `M`'s records the relay stored, in order, and the first failure.
+    ModeSet {
+        stored: Vec<Event>,
+        label: String,
+        result: anyhow::Result<()>,
+    },
     /// A vote went out, or didn't.
     Voted {
         event: Box<Event>,
@@ -1073,10 +1079,14 @@ impl Sync {
         if steps.is_empty() {
             return app.say(format!("already {}", pick.label()));
         }
+        let mut events = vec![];
         for step in steps {
-            let event = match step {
-                Step::Save(m) => Some(app.modes.record(&channel, m, now())),
-                Step::Flip => app.checklists.flip_to_ideating(&channel, now()),
+            let built = match step {
+                Step::Save(m) => app.modes.record(&channel, m, now()),
+                Step::Flip => match app.checklists.flip_to_ideating(&channel, now()) {
+                    Some(b) => b,
+                    None => continue,
+                },
                 Step::Send { text, to } => {
                     let mut d = crate::draft::Draft::default();
                     d.insert(text);
@@ -1084,21 +1094,35 @@ impl Sync {
                     continue;
                 }
             };
-            let Some(ev) = event.map(|b| self.relay.sign(b)) else {
-                continue;
-            };
-            match ev {
-                // Shown at once; the relay's copy changes nothing.
-                Ok(ev) => {
-                    let owner = app.checklists.trust.owner.clone();
-                    app.modes.apply(&ev, &owner);
-                    app.checklists.apply(&ev);
-                    let _ = self.live.send(Cmd::Publish(Box::new(ev)));
-                }
+            match self.relay.sign(built) {
+                Ok(ev) => events.push(ev),
                 Err(e) => return app.say(format!("couldn't sign the mode: {e}")),
             }
         }
-        app.say(format!("{} {}", pick.icon().unwrap_or("·"), pick.label()));
+        let label = format!("{} {}", pick.icon().unwrap_or("·"), pick.label());
+        if events.is_empty() {
+            return app.say(label);
+        }
+        app.say(format!("{label}…"));
+        // Shown once the relay stores it, so a pick that never lands
+        // (offline, refused, or older than the relay's) leaves nothing.
+        let r = self.relay.clone();
+        self.spawn(async move {
+            let mut stored = vec![];
+            let mut result = Ok(());
+            for ev in events {
+                if let Err(e) = r.publish_new(&ev).await {
+                    result = Err(e);
+                    break;
+                }
+                stored.push(ev);
+            }
+            Msg::ModeSet {
+                stored,
+                label,
+                result,
+            }
+        });
     }
 
     /// A vote on a control request: the action's emoji as a reaction.
