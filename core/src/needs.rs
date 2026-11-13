@@ -393,20 +393,6 @@ pub fn answer_count(rows: &[Row]) -> usize {
     rows.iter().filter(|r| r.section == Section::Answer).count()
 }
 
-/// The jump key's next stop: the Needs-an-answer row after `last` (by key),
-/// oldest first, round again at the end.
-pub fn next_answer<'a>(rows: &'a [Row], last: Option<&str>) -> Option<&'a Row> {
-    let answer: Vec<&Row> = rows
-        .iter()
-        .filter(|r| r.section == Section::Answer)
-        .collect();
-    let at = last.and_then(|k| answer.iter().position(|r| r.key == k));
-    match at {
-        Some(i) => answer.get(i + 1).or(answer.first()).copied(),
-        None => answer.first().copied(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,10 +760,6 @@ mod tests {
         assert_eq!(r[0].message.as_deref(), Some(ping.as_str()));
         assert_eq!(r[0].who, bk);
         assert_eq!(r[0].thread.as_deref(), Some(root.as_str()));
-        // The jump comes round to the same row.
-        let first = next_answer(&r, None).unwrap();
-        assert_eq!(first.key, r[0].key);
-        assert_eq!(next_answer(&r, Some(&first.key)).unwrap().key, r[0].key);
         // The watcher moves on: its row goes.
         w.watch("working", NOW - 5, None, Some(&root));
         let r = w.rows();

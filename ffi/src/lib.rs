@@ -1063,11 +1063,6 @@ impl Client {
             .collect()
     }
 
-    /// How many rows need an answer: tab 0's badge, the status line's ⚑ N.
-    pub fn needs_count(&self) -> u32 {
-        needs::answer_count(&self.engine.lock().unwrap().needs_rows()) as u32
-    }
-
     /// Set a channel's mode ("ideating", "running", "off"), as `M` does in
     /// the terminal. Returns what happened, in a few words.
     pub fn set_mode(&self, channel: String, mode: String) -> Result<String, BuzzError> {
@@ -2519,7 +2514,6 @@ impl Engine {
 
     fn chan_tab(&self, rows: &[needs::Row], channel: &str) -> chanmode::Tab {
         let is_bot = |pk: &str| needs::is_bot(&self.store, &self.agents, &self.checklists, pk);
-        let working = |c: &str| !self.agents.working(&self.store, c, None).is_empty();
         chanmode::tab(
             &chanmode::World {
                 store: &self.store,
@@ -2527,9 +2521,9 @@ impl Engine {
                 saved: &self.modes,
                 rows,
                 is_bot: &is_bot,
-                working: &working,
+                working: !self.agents.working(&self.store, channel, None).is_empty(),
                 // The phone sends no typing pulses.
-                typed: &|_| 0,
+                typed: 0,
             },
             channel,
         )
@@ -2907,7 +2901,6 @@ mod tests {
         assert_eq!(r.text, "@lucian ship it?");
         assert_eq!(r.thread.as_deref(), Some(ask.id.to_hex().as_str()));
         assert!(c.follow(r.link.clone()).is_some_and(|f| f.channel == ch));
-        assert_eq!(c.needs_count(), 1);
         // His answer in its thread clears it.
         let reply = EventBuilder::new(Kind::Custom(9), "yes")
             .tags([
@@ -2917,7 +2910,11 @@ mod tests {
             .sign_with_keys(&op)
             .unwrap();
         c.engine.lock().unwrap().fold(&reply, true);
-        assert_eq!(c.needs_count(), 0);
+        assert!(
+            c.needs_you()
+                .iter()
+                .all(|r| r.section != NeedSection::Answer)
+        );
     }
 
     /// Q from the phone: the same core message as the terminal's, the

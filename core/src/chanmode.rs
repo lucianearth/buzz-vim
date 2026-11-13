@@ -241,7 +241,7 @@ impl Tab {
     }
 }
 
-/// Inputs for [`tabs`] beyond the store and the lists.
+/// Inputs for one channel's [`tab`].
 pub struct World<'a> {
     pub store: &'a Store,
     pub lists: &'a Checklists,
@@ -250,9 +250,9 @@ pub struct World<'a> {
     pub rows: &'a [Row],
     pub is_bot: &'a dyn Fn(&str) -> bool,
     /// An agent is working in the channel (the tab's spinner).
-    pub working: &'a dyn Fn(&str) -> bool,
+    pub working: bool,
     /// When the owner last typed there (0: not known).
-    pub typed: &'a dyn Fn(&str) -> u64,
+    pub typed: u64,
 }
 
 /// The wrap-up just finished: the list is back to ideating with its
@@ -289,7 +289,7 @@ pub fn tab(w: &World, channel: &str) -> Tab {
         .map(|m| m.created_at)
         .max()
         .unwrap_or(0)
-        .max((w.typed)(channel));
+        .max(w.typed);
     let mut flags: Vec<(Flag, u64)> = w
         .rows
         .iter()
@@ -304,7 +304,7 @@ pub fn tab(w: &World, channel: &str) -> Tab {
             flags.push((Flag::NeedsYou, at));
         }
     }
-    if mode == ChanMode::Ideating && !(w.working)(channel) {
+    if mode == ChanMode::Ideating && !w.working {
         let bot_last = ch
             .into_iter()
             .flat_map(|c| c.messages.values())
@@ -320,14 +320,10 @@ pub fn tab(w: &World, channel: &str) -> Tab {
         flags.retain(|(f, _)| *f == Flag::Mention);
     }
     // The strongest flag, since its oldest cause.
-    let flag = flags.iter().map(|(f, _)| *f).max().map(|top| {
-        let at = flags
-            .iter()
-            .filter(|(f, _)| *f == top)
-            .map(|(_, a)| *a)
-            .min();
-        (top, at.unwrap_or(0))
-    });
+    let flag = flags
+        .iter()
+        .copied()
+        .min_by_key(|&(f, at)| (std::cmp::Reverse(f), at));
     Tab { mode, flag }
 }
 
@@ -473,7 +469,6 @@ mod tests {
             let bots = [pk(&self.bot), pk(&self.watcher)];
             let is_bot = |p: &str| bots.iter().any(|b| b == p);
             let rows = crate::needs::rows(&self.store, &self.lists, is_bot, NOW);
-            let working = |_: &str| self.working;
             tab(
                 &World {
                     store: &self.store,
@@ -481,8 +476,8 @@ mod tests {
                     saved: &self.saved,
                     rows: &rows,
                     is_bot: &is_bot,
-                    working: &working,
-                    typed: &|_| 0,
+                    working: self.working,
+                    typed: 0,
                 },
                 ch,
             )

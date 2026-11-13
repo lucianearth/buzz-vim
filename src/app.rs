@@ -731,8 +731,6 @@ impl App {
     /// A channel's tab: its mode and flag, from `rows` (`needs_rows`).
     pub fn chan_tab(&self, rows: &[Row], channel: &str) -> chanmode::Tab {
         let is_bot = |pk: &str| needs::is_bot(&self.store, &self.agents, &self.checklists, pk);
-        let working = |c: &str| !self.agents.working(&self.store, c, None).is_empty();
-        let typed = |c: &str| self.typed.get(c).copied().unwrap_or(0);
         chanmode::tab(
             &chanmode::World {
                 store: &self.store,
@@ -740,8 +738,8 @@ impl App {
                 saved: &self.modes,
                 rows,
                 is_bot: &is_bot,
-                working: &working,
-                typed: &typed,
+                working: !self.agents.working(&self.store, channel, None).is_empty(),
+                typed: self.typed.get(channel).copied().unwrap_or(0),
             },
             channel,
         )
