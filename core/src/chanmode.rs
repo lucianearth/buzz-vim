@@ -107,17 +107,20 @@ pub fn record(channel: &str, mode: ChanMode) -> EventBuilder {
     EventBuilder::new(Kind::Custom(KIND), mode.label()).tags(tags)
 }
 
-/// Has the owner @mentioned a bot in this channel (in what we hold)?
+/// Has the owner @mentioned a bot in this channel (in what we hold)? A
+/// watcher is not one: answering its ping does not make a channel ideating.
 pub fn mentioned_bot(
     store: &Store,
     owner: &str,
     channel: &str,
+    watchers: &[String],
     is_bot: impl Fn(&str) -> bool,
 ) -> bool {
+    let bot = |p: &str| is_bot(p) && !watchers.iter().any(|w| w == p);
     store.channels.get(channel).is_some_and(|c| {
         c.messages
             .values()
-            .any(|m| m.author == owner && m.mentions.iter().any(|p| is_bot(p)))
+            .any(|m| m.author == owner && m.mentions.iter().any(|p| bot(p)))
     })
 }
 
@@ -162,7 +165,7 @@ pub fn steps(
     is_bot: impl Fn(&str) -> bool,
 ) -> Result<Vec<Step>, &'static str> {
     let header = lists.header(channel);
-    let bot = last_bot(store, channel, is_bot);
+    let bot = last_bot(store, channel, &lists.trust.watchers, is_bot);
     plan(pick, header.as_ref(), saved.get(channel), bot.as_deref())
 }
 
@@ -208,14 +211,19 @@ pub fn plan(
 pub const GO_TEXT: &str = "go";
 pub const ASK_LIST_TEXT: &str = "make a checklist for this channel";
 
-/// The newest bot in a channel: who a list request goes to.
-pub fn last_bot(store: &Store, channel: &str, is_bot: impl Fn(&str) -> bool) -> Option<String> {
+/// The newest bot in a channel, not a watcher: who a list request goes to.
+pub fn last_bot(
+    store: &Store,
+    channel: &str,
+    watchers: &[String],
+    is_bot: impl Fn(&str) -> bool,
+) -> Option<String> {
     store
         .channels
         .get(channel)?
         .messages
         .values()
-        .filter(|m| !m.deleted && is_bot(&m.author))
+        .filter(|m| !m.deleted && is_bot(&m.author) && !watchers.contains(&m.author))
         .max_by_key(|m| (m.created_at, &m.id))
         .map(|m| m.author.clone())
 }
@@ -298,7 +306,7 @@ pub fn tab(w: &World, channel: &str) -> Tab {
         header.as_ref(),
         w.saved.get(channel),
         dm,
-        mentioned_bot(w.store, op, channel, w.is_bot),
+        mentioned_bot(w.store, op, channel, &w.lists.trust.watchers, w.is_bot),
     );
     // He's been back: posted or typed there.
     let back = ch
@@ -637,6 +645,24 @@ mod tests {
             json!({"state": "stalled", "since": NOW - 100, "ping": ping}),
         );
         assert_eq!(t.tab(CH).flag, Some((Flag::NeedsYou, NOW - 100)));
+    }
+
+    #[test]
+    fn watchers_are_not_the_bots_mode_and_list_asks_look_for() {
+        // Review 94dc1a6f: is_bot counts watchers; these two must not.
+        let mut t = T::new();
+        let (op, bot, w) = (t.op.clone(), t.bot.clone(), t.watcher.clone());
+        t.post(&op, CH, Some(&w), NOW - 100);
+        assert_eq!(t.tab(CH).mode, ChanMode::Off, "answering the watcher");
+        t.post(&bot, CH, None, NOW - 90);
+        t.post(&w, CH, None, NOW - 80);
+        let bots = [pk(&bot), pk(&w)];
+        let is_bot = |p: &str| bots.iter().any(|b| b == p);
+        let watchers = &t.lists.trust.watchers.clone();
+        assert_eq!(last_bot(&t.store, CH, watchers, is_bot), Some(pk(&bot)));
+        assert!(!mentioned_bot(&t.store, &pk(&op), CH, watchers, is_bot));
+        t.post(&op, CH, Some(&bot), NOW - 70);
+        assert!(mentioned_bot(&t.store, &pk(&op), CH, watchers, is_bot));
     }
 
     #[test]

@@ -115,9 +115,10 @@ fn draw_chanmode(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let now = app.chan_tab(&app.needs, &channel).mode;
     let has_list = app.checklists.header(&channel).is_some();
-    let bot = crate::chanmode::last_bot(&app.store, &channel, |pk| {
-        crate::needs::is_bot(&app.store, &app.agents, &app.checklists, pk)
-    });
+    let bot =
+        crate::chanmode::last_bot(&app.store, &channel, &app.checklists.trust.watchers, |pk| {
+            crate::needs::is_bot(&app.store, &app.agents, &app.checklists, pk)
+        });
     let legend = crate::keys::legend(Mode::Switch);
     let r = centered(area, 64, 8);
     clear(f, r);
