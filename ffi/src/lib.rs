@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
+use buzz_vim_core::chanmode::{self, ChanMode, Overrides};
 use buzz_vim_core::checklist::{self, Checklists};
 use buzz_vim_core::control::{self as ctl, Board};
 use buzz_vim_core::links;
@@ -110,6 +111,17 @@ pub struct ChannelTab {
     pub is_dm: bool,
     /// The section this tab came from; tabs reorder within their section.
     pub section: String,
+    /// The channel's mode: "ideating", "running" or "off"
+    /// (see `buzz_vim_core::chanmode`). A running tab shows no unread count.
+    pub mode: String,
+    /// 🧠 or 🚀; None when off.
+    pub icon: Option<String>,
+    /// 🚩 needs you, 📣 a person's mention or DM; None when nothing waits.
+    pub flag: Option<String>,
+    /// Flash icon <-> flag; false with a flag: show it steady (off, DMs).
+    pub flashes: bool,
+    /// Since when the flag is up: oldest first.
+    pub flag_since: Option<u64>,
 }
 
 /// Where a tapped `buzz://` message or channel link lands.
@@ -570,6 +582,8 @@ struct Engine {
     failed: HashMap<String, Event>,
     notices: Vec<String>,
     checklists: Checklists,
+    /// The owner's saved channel modes (kind 30078 `buzz-mode:`).
+    modes: Overrides,
     /// The channel whose checklist records are tailed live.
     checklist_for: Option<String>,
     /// The Control page's notes (`control.rs`), and whether it has been
@@ -663,6 +677,7 @@ impl Client {
             failed: HashMap::new(),
             notices: vec![],
             checklists: Checklists::default(),
+            modes: Overrides::default(),
             checklist_for: None,
             control: Board::new(ctl::DEFAULT_CHANNEL),
             control_open: false,
@@ -715,9 +730,16 @@ impl Client {
 
     pub fn tabs(&self) -> Vec<ChannelTab> {
         let e = self.engine.lock().unwrap();
+        let rows = e.needs_rows();
         e.tabs
             .iter()
-            .map(|id| e.tab(id, e.tab_section.get(id).cloned().unwrap_or_default()))
+            .map(|id| {
+                e.tab(
+                    &rows,
+                    id,
+                    e.tab_section.get(id).cloned().unwrap_or_default(),
+                )
+            })
             .collect()
     }
 
@@ -727,10 +749,11 @@ impl Client {
         let Some(s) = e.sections.iter().find(|s| s.id == section) else {
             return vec![];
         };
+        let rows = e.needs_rows();
         s.channels
             .iter()
             .filter(|c| e.store.channels.get(*c).is_none_or(|ch| !ch.archived))
-            .map(|c| e.tab(c, section.clone()))
+            .map(|c| e.tab(&rows, c, section.clone()))
             .collect()
     }
 
@@ -1043,6 +1066,16 @@ impl Client {
     /// How many rows need an answer: tab 0's badge, the status line's ⚑ N.
     pub fn needs_count(&self) -> u32 {
         needs::answer_count(&self.engine.lock().unwrap().needs_rows()) as u32
+    }
+
+    /// Set a channel's mode ("ideating", "running", "off"), as `M` does in
+    /// the terminal. Returns what happened, in a few words.
+    pub fn set_mode(&self, channel: String, mode: String) -> Result<String, BuzzError> {
+        let pick = ChanMode::ALL
+            .into_iter()
+            .find(|m| m.label() == mode)
+            .ok_or_else(|| BuzzError::Failed(format!("no mode {mode}")))?;
+        self.engine.lock().unwrap().set_mode(channel, pick)
     }
 
     /// Ids of our messages the relay hasn't confirmed yet (sending or failed).
@@ -1515,11 +1548,17 @@ impl Engine {
         });
     }
 
-    fn tab(&self, id: &str, section: String) -> ChannelTab {
+    fn tab(&self, rows: &[needs::Row], id: &str, section: String) -> ChannelTab {
         let ch = self.store.channels.get(id);
+        let t = self.chan_tab(rows, id);
         ChannelTab {
             id: id.to_string(),
             label: self.label(id),
+            mode: t.mode.label().into(),
+            icon: t.mode.icon().map(String::from),
+            flag: t.flag.map(|(f, _)| f.icon().into()),
+            flashes: t.flashes(),
+            flag_since: t.flag.map(|(_, at)| at),
             unread: ch.map_or(0, |c| c.unread.len() as u32),
             mentions: ch.map_or(0, |c| {
                 (if c.is_dm {
@@ -2237,6 +2276,10 @@ impl Engine {
                 self.agents.presence(&ev.pubkey.to_hex(), &ev.content);
                 return vec![];
             }
+            30078 if chanmode::is_record(ev) => {
+                self.modes.apply(ev, &self.checklists.trust.owner);
+                return vec![];
+            }
             30078 if readstate::is_read_state(ev) => {
                 if self.read.apply(&self.relay.keys, ev) {
                     self.prune_unread();
@@ -2472,6 +2515,79 @@ impl Engine {
             }
         }
         out
+    }
+
+    fn chan_tab(&self, rows: &[needs::Row], channel: &str) -> chanmode::Tab {
+        let is_bot = |pk: &str| needs::is_bot(&self.store, &self.agents, &self.checklists, pk);
+        let working = |c: &str| !self.agents.working(&self.store, c, None).is_empty();
+        chanmode::tab(
+            &chanmode::World {
+                store: &self.store,
+                lists: &self.checklists,
+                saved: &self.modes,
+                rows,
+                is_bot: &is_bot,
+                working: &working,
+                // The phone sends no typing pulses.
+                typed: &|_| 0,
+            },
+            channel,
+        )
+    }
+
+    fn set_mode(&mut self, channel: String, pick: ChanMode) -> Result<String, BuzzError> {
+        use chanmode::Step;
+        let header = self.checklists.header(&channel);
+        let is_bot = |pk: &str| needs::is_bot(&self.store, &self.agents, &self.checklists, pk);
+        let bot = chanmode::last_bot(&self.store, &channel, is_bot);
+        let steps = chanmode::plan(
+            pick,
+            header.as_ref(),
+            self.modes.get(&channel),
+            bot.as_deref(),
+        )
+        .map_err(|e| BuzzError::Failed(e.into()))?;
+        if steps.is_empty() {
+            return Ok(format!("already {}", pick.label()));
+        }
+        for step in steps {
+            let built = match step {
+                Step::Save(m) => chanmode::record(&channel, m),
+                Step::Flip => match self.checklists.flip_to_ideating(&channel, now()) {
+                    Some(b) => b,
+                    None => continue,
+                },
+                Step::Go { to } => {
+                    self.send(channel.clone(), None, chanmode::GO_TEXT.into(), &[], &[to])?;
+                    continue;
+                }
+                Step::AskList { to } => {
+                    self.send(
+                        channel.clone(),
+                        None,
+                        chanmode::ASK_LIST_TEXT.into(),
+                        &[],
+                        &[to],
+                    )?;
+                    continue;
+                }
+            };
+            let ev = self
+                .relay
+                .sign(built)
+                .map_err(|e| BuzzError::Failed(format!("couldn't sign the mode: {e}")))?;
+            // Shown at once; the relay's copy changes nothing.
+            self.modes.apply(&ev, &self.checklists.trust.owner);
+            self.checklists.apply(&ev);
+            let r = self.relay.clone();
+            let tx = self.tx.clone();
+            RT.spawn(async move {
+                if let Err(e) = r.publish(&ev).await {
+                    let _ = tx.send(Msg::Events(Err(e.context("the mode didn't go through"))));
+                }
+            });
+        }
+        Ok(pick.label().into())
     }
 
     fn thumbs_up(&mut self, target: &str) {
@@ -2713,10 +2829,47 @@ mod tests {
             failed: HashMap::new(),
             notices: vec![],
             checklists: Checklists::default(),
+            modes: Overrides::default(),
             checklist_for: None,
             control: Board::new(ctl::DEFAULT_CHANNEL),
             control_open: false,
         }
+    }
+
+    /// The phone's mode picker takes the core's paths: a saved pick shows
+    /// on the tab at once, and folds back in from the relay.
+    #[test]
+    fn set_mode_saves_the_pick_and_tabs_show_it() {
+        let ch = "2130646b-d6c8-4ec3-93e3-36f77bee1a37";
+        let mut e = engine();
+        e.checklists.trust.owner = e.relay.keys.public_key().to_hex();
+        e.store.channel_mut(ch).name = "beacon".into();
+        e.tabs = vec![ch.into()];
+        let c = Client {
+            engine: Arc::new(Mutex::new(e)),
+            stop: Arc::new(tokio::sync::Notify::new()),
+        };
+        let tab = |c: &Client| {
+            let t = c.tabs().remove(0);
+            (t.mode, t.icon, t.flag)
+        };
+        assert_eq!(tab(&c), ("off".into(), None, None));
+        assert!(
+            c.set_mode(ch.into(), "running".into()).is_err(),
+            "no list, no bot"
+        );
+        assert_eq!(
+            c.set_mode(ch.into(), "ideating".into()).ok().as_deref(),
+            Some("ideating")
+        );
+        assert_eq!(tab(&c), ("ideating".into(), Some("🧠".into()), None));
+        let keys = c.engine.lock().unwrap().relay.keys.clone();
+        let off = chanmode::record(ch, ChanMode::Off)
+            .custom_created_at(nostr::Timestamp::from(now() + 5))
+            .sign_with_keys(&keys)
+            .unwrap();
+        c.engine.lock().unwrap().fold(&off, true);
+        assert_eq!(tab(&c).0, "off");
     }
 
     /// Tab 0's rows come from folded events, with what Swift shows, and a
