@@ -1,12 +1,11 @@
-//! Tab 0, "Needs you": what waits on the operator, derived from relay data
+//! "Needs you": what waits on the operator, derived from relay data
 //! only (messages, profiles, checklist records), so both apps show the same
 //! rows and nothing is a local flag.
 //!
 //! Needs an answer: channels the watcher says wait on him (stalled, waiting
 //! on lucian, waiting on release), a contested
 //! channel whose lists run, and people's @mentions and DMs he hasn't
-//! answered. FYI: bots' @mentions of
-//! him the watcher didn't flag. A message row clears once he posts in its
+//! answered. Bots' @mentions don't count. A message row clears once he posts in its
 //! thread (in a DM: anywhere in it) after the message; a watch or item row
 //! once the record moves on.
 
@@ -19,14 +18,6 @@ use crate::telemetry::Agents;
 /// How far back an unanswered mention still counts.
 pub const HORIZON: u64 = crate::unread::HORIZON;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Section {
-    /// Waits on the operator.
-    Answer,
-    /// Bots mentioned him; nothing waits.
-    Fyi,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reason {
     /// The watcher's state for the channel.
@@ -38,13 +29,10 @@ pub enum Reason {
     Mention,
     /// A person wrote to him in a DM.
     Dm,
-    /// A bot @mentioned him.
-    Bot,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
-    pub section: Section,
     pub reason: Reason,
     pub channel: String,
     /// Pubkey of whoever asks; "" when nobody is known (the watcher alone).
@@ -82,7 +70,6 @@ impl Row {
             Reason::Contested(_) => "contested".into(),
             Reason::Mention => "mention".into(),
             Reason::Dm => "dm".into(),
-            Reason::Bot => "bot".into(),
         }
     }
 }
@@ -104,7 +91,7 @@ pub fn one_line(s: &str) -> String {
         .to_string()
 }
 
-/// What tab 0 reads, across `channels` (the ones we're in): mentions of
+/// What the rows read, across `channels` (the ones we're in): mentions of
 /// the operator, his own posts (they answer), every DM message (not every
 /// client p-tags DMs) and the checklist records. `since` = None asks for
 /// history over the horizon; Some(now) is the live tail. The relay only
@@ -201,8 +188,7 @@ pub async fn fill_busy_lists(
     events
 }
 
-/// Every row, Needs an answer first (oldest first), then FYI (newest
-/// first, the latest `FYI_MAX` only).
+/// Every row, oldest first.
 /// The operator is the checklist owner (config `owner`, default lucian).
 pub fn rows(
     store: &Store,
@@ -236,9 +222,6 @@ pub fn rows(
         })
     };
     let mut out = vec![];
-    // Threads the watcher has an ask out in: bots' mentions there are the
-    // same ask, not FYI.
-    let mut flagged: Vec<(String, Option<String>)> = vec![];
     let mut pings: Vec<String> = vec![];
     for channel in lists.channels() {
         let header = lists.header(channel);
@@ -272,7 +255,6 @@ pub fn rows(
                 pings.push(p.clone());
             }
             if !answered(channel, thread.as_deref(), anchor) {
-                flagged.push((channel.to_string(), thread.clone()));
                 let detail = if !w.reason.trim().is_empty() {
                     one_line(&w.reason)
                 } else {
@@ -280,7 +262,6 @@ pub fn rows(
                 };
                 let label = w.state.label();
                 out.push(Row {
-                    section: Section::Answer,
                     reason: Reason::Watch(w.state.clone()),
                     channel: channel.to_string(),
                     who: header
@@ -311,7 +292,6 @@ pub fn rows(
         if driver.contested_running {
             let n = driver.contested.len();
             out.push(Row {
-                section: Section::Answer,
                 reason: Reason::Contested(driver.contested.clone()),
                 channel: channel.to_string(),
                 who: String::new(),
@@ -342,6 +322,7 @@ pub fn rows(
                 || !(dm || m.mentions.iter().any(|p| p == op))
                 || watchers.contains(&m.author)
                 || pings.contains(&m.id)
+                || is_bot(&m.author)
             {
                 continue;
             }
@@ -349,21 +330,8 @@ pub fn rows(
             if answered(id, Some(&thread), m.created_at) {
                 continue;
             }
-            let bot = is_bot(&m.author);
-            if bot
-                && flagged
-                    .iter()
-                    .any(|(c, t)| c == id && t.as_deref() == Some(thread.as_str()))
-            {
-                continue;
-            }
             out.push(Row {
-                section: if bot { Section::Fyi } else { Section::Answer },
-                reason: match (bot, dm) {
-                    (true, _) => Reason::Bot,
-                    (false, true) => Reason::Dm,
-                    (false, false) => Reason::Mention,
-                },
+                reason: if dm { Reason::Dm } else { Reason::Mention },
                 channel: id.clone(),
                 who: m.author.clone(),
                 text: one_line(&m.content),
@@ -374,23 +342,8 @@ pub fn rows(
             });
         }
     }
-    out.sort_by(|a, b| {
-        a.section.cmp(&b.section).then_with(|| match a.section {
-            Section::Answer => (a.at, &a.key).cmp(&(b.at, &b.key)),
-            Section::Fyi => (b.at, &b.key).cmp(&(a.at, &a.key)),
-        })
-    });
-    let answers = answer_count(&out);
-    out.truncate(answers + FYI_MAX);
+    out.sort_by(|a, b| (a.at, &a.key).cmp(&(b.at, &b.key)));
     out
-}
-
-/// FYI rows kept: the newest ones.
-pub const FYI_MAX: usize = 20;
-
-/// How many rows need an answer: the "⚑ N".
-pub fn answer_count(rows: &[Row]) -> usize {
-    rows.iter().filter(|r| r.section == Section::Answer).count()
 }
 
 #[cfg(test)]
@@ -531,8 +484,8 @@ mod tests {
         }
     }
 
-    fn keys(rows: &[Row]) -> Vec<(Section, String)> {
-        rows.iter().map(|r| (r.section, r.label())).collect()
+    fn keys(rows: &[Row]) -> Vec<String> {
+        rows.iter().map(Row::label).collect()
     }
 
     #[test]
@@ -586,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn people_need_an_answer_bots_are_fyi() {
+    fn people_need_an_answer_bots_do_not() {
         let mut w = World::new();
         let (op, human, bot) = (w.op.clone(), w.human.clone(), w.bot.clone());
         w.post(
@@ -618,41 +571,13 @@ mod tests {
             NOW - HORIZON - 5,
         );
         let r = w.rows();
-        assert_eq!(
-            keys(&r),
-            [
-                (Section::Answer, "mention".to_string()),
-                (Section::Answer, "dm".into()),
-                (Section::Fyi, "bot".into()),
-            ]
-        );
+        assert_eq!(keys(&r), ["mention", "dm"]);
         assert_eq!(r[0].text, "@lucian can we ship today?");
         assert_eq!(r[0].who, World::pk(&human));
-        assert_eq!(answer_count(&r), 2);
         // An unknown author counts as a person until a profile says bot.
         let stranger = Keys::generate();
         w.post(&stranger, CH, "@lucian hi", Some(&op), None, NOW - 20);
-        assert_eq!(answer_count(&w.rows()), 3);
-    }
-
-    #[test]
-    fn fyi_is_newest_first_and_capped() {
-        let mut w = World::new();
-        let (op, bot) = (w.op.clone(), w.bot.clone());
-        for i in 0..(FYI_MAX as u64 + 5) {
-            w.post(
-                &bot,
-                CH,
-                &format!("@lucian fyi {i}"),
-                Some(&op),
-                None,
-                NOW - 1000 + i,
-            );
-        }
-        let r = w.rows();
-        assert_eq!(r.len(), FYI_MAX);
-        assert_eq!(r[0].text, format!("@lucian fyi {}", FYI_MAX + 4));
-        assert!(r.windows(2).all(|p| p[0].at >= p[1].at));
+        assert_eq!(w.rows().len(), 3);
     }
 
     #[test]
@@ -752,10 +677,7 @@ mod tests {
         let r = w.rows();
         // The watch row only; the ping and the agent's mention in that
         // thread aren't rows of their own.
-        assert_eq!(
-            keys(&r),
-            [(Section::Answer, "waiting on lucian".to_string())]
-        );
+        assert_eq!(keys(&r), ["waiting on lucian"]);
         assert_eq!(r[0].text, "waiting on lucian: which relay image?");
         assert_eq!(r[0].message.as_deref(), Some(ping.as_str()));
         assert_eq!(r[0].who, bk);
@@ -763,8 +685,8 @@ mod tests {
         // The watcher moves on: its row goes.
         w.watch("working", NOW - 5, None, Some(&root));
         let r = w.rows();
-        // With no ask out, the agent's mention is plain FYI.
-        assert_eq!(keys(&r), [(Section::Fyi, "bot".to_string())]);
+        // With no ask out, the agent's mention is no row either.
+        assert!(r.is_empty());
     }
 
     #[test]
@@ -854,10 +776,7 @@ mod tests {
         w.watch("stalled", NOW - 900, Some(&ping), Some(&root));
         w.watch("waiting_on_release", NOW - 600, Some(&ping), Some(&root));
         let r = w.rows();
-        assert_eq!(
-            keys(&r),
-            [(Section::Answer, "waiting on release".to_string())]
-        );
+        assert_eq!(keys(&r), ["waiting on release"]);
         assert_eq!(r[0].at, NOW - 600);
         w.post(&op, CH, "released", None, Some(&root), NOW - 60);
         assert!(w.rows().is_empty());
@@ -908,7 +827,7 @@ mod tests {
         assert!(w.rows().is_empty());
         head(&mut w, &human, &hk, "running", NOW - 300);
         let r = w.rows();
-        assert_eq!(keys(&r), [(Section::Answer, "contested".to_string())]);
+        assert_eq!(keys(&r), ["contested"]);
         assert_eq!(r[0].text, "two lists claim this channel; pick a driver");
         let mut both = vec![bk.clone(), hk.clone()];
         both.sort();

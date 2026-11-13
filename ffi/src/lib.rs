@@ -440,20 +440,11 @@ pub struct LoopStatus {
     pub contested: Option<String>,
 }
 
-#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq)]
-pub enum NeedSection {
-    /// Waits on the operator.
-    Answer,
-    /// Bots mentioned him; nothing waits.
-    Fyi,
-}
-
 /// A row on tab 0, Needs you (see `buzz_vim_core::needs`).
 #[derive(uniffi::Record, Clone)]
 pub struct NeedRow {
     /// Stable while the row stands for the same thing: notifications go by it.
     pub key: String,
-    pub section: NeedSection,
     /// "waiting on lucian", "stalled", "contested", "mention",
     /// "dm", "bot".
     pub kind: String,
@@ -1036,10 +1027,6 @@ impl Client {
         e.needs_rows()
             .into_iter()
             .map(|r| NeedRow {
-                section: match r.section {
-                    needs::Section::Answer => NeedSection::Answer,
-                    needs::Section::Fyi => NeedSection::Fyi,
-                },
                 kind: r.label(),
                 watcher: matches!(r.reason, needs::Reason::Watch(_)),
                 pushed: matches!(r.reason, needs::Reason::Watch(_)) && r.message.is_some(),
@@ -2883,7 +2870,6 @@ mod tests {
         let rows = c.needs_you();
         assert_eq!(rows.len(), 1);
         let r = &rows[0];
-        assert!(r.section == NeedSection::Answer);
         assert_eq!(
             (r.kind.as_str(), r.channel_label.as_str()),
             ("mention", "#beacon")
@@ -2900,11 +2886,7 @@ mod tests {
             .sign_with_keys(&op)
             .unwrap();
         c.engine.lock().unwrap().fold(&reply, true);
-        assert!(
-            c.needs_you()
-                .iter()
-                .all(|r| r.section != NeedSection::Answer)
-        );
+        assert!(c.needs_you().is_empty());
     }
 
     /// Q from the phone: the same core message as the terminal's, the

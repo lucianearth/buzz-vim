@@ -20,7 +20,7 @@ use nostr::{Event, EventBuilder, Kind, Tag};
 
 use crate::checklist::{Checklists, Header, Mode};
 use crate::model::{Store, tag};
-use crate::needs::{Reason, Row, Section};
+use crate::needs::{Reason, Row};
 
 pub const KIND: u16 = 30078;
 pub const D_PREFIX: &str = "buzz-mode:";
@@ -263,7 +263,7 @@ pub struct World<'a> {
     pub store: &'a Store,
     pub lists: &'a Checklists,
     pub saved: &'a Overrides,
-    /// Tab 0's rows (`needs::rows`).
+    /// The needs rows (`needs::rows`).
     pub rows: &'a [Row],
     pub is_bot: &'a dyn Fn(&str) -> bool,
     /// An agent is working in the channel (the tab's spinner).
@@ -310,7 +310,7 @@ pub fn tab(w: &World, channel: &str) -> Tab {
     let mut flags: Vec<(Flag, u64)> = w
         .rows
         .iter()
-        .filter(|r| r.section == Section::Answer && r.channel == channel && r.at > back)
+        .filter(|r| r.channel == channel && r.at > back)
         .map(|r| match r.reason {
             Reason::Mention | Reason::Dm => (Flag::Mention, r.at),
             _ => (Flag::NeedsYou, r.at),
