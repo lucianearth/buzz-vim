@@ -125,18 +125,18 @@ fn draw_subscription(f: &mut Frame, app: &mut App, area: Rect) {
     let subs = &app.subscriptions;
     let map = subs.map();
     let tab_on = app.sub_tab;
-    // Each tab: its rows (text, value), the value set now, and its hint.
+    // Each tab: its row labels and its hint; the values and what's set now
+    // come from the app, so the cursor and the drawn rows can't drift.
     let people = app.sub_people();
-    let (rows, now, hint) = match tab_on {
+    let (labels, hint): (Vec<String>, &[&str]) = match tab_on {
         SubTab::Model => (
-            std::iter::once(("each agent's default".to_string(), None))
+            std::iter::once("each agent's default".to_string())
                 .chain(
                     crate::subscription::MODELS
                         .iter()
-                        .map(|m| (format!("{}  {}", m.1, m.2), Some(m.0.to_string()))),
+                        .map(|m| format!("{}  {}", m.1, m.2)),
                 )
-                .collect::<Vec<_>>(),
-            subs.model_for(&channel).map(str::to_string),
+                .collect(),
             [
                 " Claude agents only; applies from this channel's next session",
                 " (rotate or restart)",
@@ -152,25 +152,16 @@ fn draw_subscription(f: &mut Frame, app: &mut App, area: Rect) {
                     .map_or_else(|| "each agent's owner".to_string(), |p| subs.label(p));
                 format!("follow the default ({who})")
             };
-            let now = if tab_on == SubTab::Default {
-                map.and_then(|m| m.default.clone())
-            } else {
-                map.and_then(|m| m.channels.get(&channel).cloned())
-            };
-            let rows = std::iter::once((first, None))
-                .chain(
-                    people
-                        .iter()
-                        .map(|p| (format!("{}  {}", p.label, p.id), Some(p.id.clone()))),
-                )
-                .collect();
             (
-                rows,
-                now,
+                std::iter::once(first)
+                    .chain(people.iter().map(|p| format!("{}  {}", p.label, p.id)))
+                    .collect(),
                 [" takes effect at each session's next start"].as_slice(),
             )
         }
     };
+    let rows: Vec<(String, Option<String>)> = labels.into_iter().zip(app.sub_values()).collect();
+    let now = app.sub_now();
     let legend = crate::keys::legend(Mode::Subscription);
     let h = (rows.len() as u16 + legend.len() as u16 + 9).clamp(14, area.height.max(14));
     let r = centered(area, 64, h);

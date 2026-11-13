@@ -2527,12 +2527,12 @@ impl App {
 
     /// `B` in a channel: the subscription picker, on what it uses now.
     fn open_subscription(&mut self) {
-        let Some(channel) = self.current().map(str::to_string) else {
+        if self.current().is_none() {
             return self.say("open a channel first");
-        };
+        }
         self.sub_tab = SubTab::Channel;
         self.sub_confirm = false;
-        self.sub_cursor = self.sub_row_of(&channel);
+        self.sub_cursor = self.sub_row_of();
         self.sub_expect = self.sub_row_id(self.sub_cursor);
         self.mode = Mode::Subscription;
     }
@@ -2558,45 +2558,53 @@ impl App {
         out
     }
 
-    /// What a picker row stands for: Some(None) follow the default (or the
-    /// owner), Some(Some(id)) a person, None past the end.
-    pub fn sub_row_id(&self, row: usize) -> Option<Option<String>> {
-        let Some(i) = row.checked_sub(1) else {
-            return Some(None);
-        };
-        match self.sub_tab {
-            SubTab::Model => subscription::MODELS.get(i).map(|m| Some(m.0.to_string())),
+    /// The picker's rows in its current tab, by what each stands for:
+    /// None first (follow the default, or the owner), then the models or
+    /// the people.
+    pub fn sub_values(&self) -> Vec<Option<String>> {
+        let rest: Vec<String> = match self.sub_tab {
+            SubTab::Model => subscription::MODELS
+                .iter()
+                .map(|m| m.0.to_string())
+                .collect(),
             SubTab::Channel | SubTab::Default => {
-                self.sub_people().get(i).map(|p| Some(p.id.clone()))
+                self.sub_people().into_iter().map(|p| p.id).collect()
             }
+        };
+        std::iter::once(None)
+            .chain(rest.into_iter().map(Some))
+            .collect()
+    }
+
+    /// What's set now in the picker's current tab, for this channel.
+    pub fn sub_now(&self) -> Option<String> {
+        let channel = self.current()?;
+        let m = self.subscriptions.map();
+        match self.sub_tab {
+            SubTab::Model => self.subscriptions.model_for(channel).map(str::to_string),
+            SubTab::Default => m.and_then(|m| m.default.clone()),
+            SubTab::Channel => m.and_then(|m| m.channels.get(channel).cloned()),
         }
+    }
+
+    /// What a picker row stands for: Some(None) follow the default (or the
+    /// owner), Some(Some(id)) a person or model, None past the end.
+    pub fn sub_row_id(&self, row: usize) -> Option<Option<String>> {
+        self.sub_values().get(row).cloned()
     }
 
     /// How many rows the picker's current tab has.
     fn sub_rows(&self) -> usize {
-        1 + match self.sub_tab {
-            SubTab::Model => subscription::MODELS.len(),
-            SubTab::Channel | SubTab::Default => self.sub_people().len(),
-        }
+        self.sub_values().len()
     }
 
-    /// The row for what's set now, in the picker's current scope.
-    fn sub_row_of(&self, channel: &str) -> usize {
-        let m = self.subscriptions.map();
-        let set = match self.sub_tab {
-            SubTab::Model => {
-                return self.subscriptions.model_for(channel).map_or(0, |v| {
-                    subscription::MODELS
-                        .iter()
-                        .position(|m| m.0 == v)
-                        .map_or(0, |i| i + 1)
-                });
-            }
-            SubTab::Default => m.and_then(|m| m.default.clone()),
-            SubTab::Channel => m.and_then(|m| m.channels.get(channel).cloned()),
-        };
-        set.and_then(|p| self.sub_people().iter().position(|x| x.id == p))
-            .map_or(0, |i| i + 1)
+    /// The row for what's set now, in the picker's current tab.
+    fn sub_row_of(&self) -> usize {
+        let now = self.sub_now();
+        self.sub_values()
+            .iter()
+            .position(|v| *v == now)
+            .unwrap_or(0)
     }
 
     fn key_subscription(&mut self, k: KeyEvent) {
@@ -2622,8 +2630,8 @@ impl App {
                     KeyCode::BackTab | KeyCode::Char('h') | KeyCode::Left
                 );
                 self.sub_tab = self.sub_tab.step(back);
-                if let Some(c) = self.current().map(str::to_string) {
-                    self.sub_cursor = self.sub_row_of(&c);
+                if self.current().is_some() {
+                    self.sub_cursor = self.sub_row_of();
                 }
             }
             KeyCode::Enter => return self.choose_subscription(),
