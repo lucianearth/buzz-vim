@@ -177,6 +177,11 @@ pub enum Action {
         edit: subscription::Edit,
         label: String,
     },
+    /// A typing pulse (kind 20002) in a channel or thread.
+    Typing {
+        channel: String,
+        root: Option<String>,
+    },
     SaveState,
     Quit,
 }
@@ -303,6 +308,8 @@ pub struct App {
     /// Tab 0, Needs you (`0`): on screen instead of the current tab.
     pub needs_view: bool,
     pub needs_cursor: usize,
+    /// channel -> when we last sent a typing pulse there (secs).
+    pub typed: HashMap<String, u64>,
     /// Tab 0's rows as last drawn; the cursor picks from these.
     pub needs: Vec<Row>,
     /// The row `!` went to last.
@@ -437,6 +444,7 @@ impl App {
             loop_: Loop::default(),
             needs_view: false,
             needs_cursor: 0,
+            typed: HashMap::new(),
             needs: vec![],
             needs_jump: None,
             reply_to: None,
@@ -566,6 +574,21 @@ impl App {
             None if self.current() == Some(channel) => Some(&mut self.draft),
             None => None,
         }
+    }
+
+    /// A keypress in the compose box: a typing pulse, at most one per
+    /// channel every few seconds, as Desktop sends them.
+    fn typing(&mut self) {
+        let Some((channel, root)) = self.draft_target() else {
+            return;
+        };
+        let now = crate::sync::now();
+        let last = self.typed.get(&channel).copied().unwrap_or(0);
+        if now < last + crate::model::TYPING_EVERY {
+            return;
+        }
+        self.typed.insert(channel.clone(), now);
+        self.actions.push(Action::Typing { channel, root });
     }
 
     pub fn draft_ref(&self) -> &Draft {
@@ -2176,8 +2199,12 @@ impl App {
             KeyCode::Char(c) if !ctrl => {
                 self.draft_mut().insert(c.encode_utf8(&mut [0; 4]));
                 self.mention_pick = 0;
+                self.typing();
             }
-            KeyCode::Backspace => self.draft_mut().backspace(),
+            KeyCode::Backspace => {
+                self.draft_mut().backspace();
+                self.typing();
+            }
             KeyCode::Delete => self.draft_mut().delete(),
             KeyCode::Left => self.draft_mut().left(),
             KeyCode::Right => self.draft_mut().right(),
@@ -3130,6 +3157,27 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Typing sends one pulse per channel every few seconds, not one per key.
+    #[test]
+    fn typing_pulses_are_throttled() {
+        let mut app = App::new("me".into(), None);
+        app.tabs = vec!["a".into()];
+        app.on_key(KeyEvent::from(KeyCode::Char('i')));
+        for c in "hello".chars() {
+            app.on_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        let pulses = |app: &App| {
+            app.actions
+                .iter()
+                .filter(|a| matches!(a, Action::Typing { channel, root: None } if channel == "a"))
+                .count()
+        };
+        assert_eq!(pulses(&app), 1);
+        app.typed.insert("a".into(), 0);
+        app.on_key(KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(pulses(&app), 2);
+    }
 
     /// On tab 0 nothing reaches the channel underneath: paging, the wheel,
     /// paste and ^v stay on tab 0, and row clicks count only in normal mode.

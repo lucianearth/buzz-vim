@@ -805,6 +805,14 @@ impl Sync {
                 agent,
                 text,
             } => self.send_quick(app, channel, content, agent, text),
+            Action::Typing { channel, root } => {
+                if let Ok(ev) = self
+                    .relay
+                    .sign(crate::model::typing(&channel, root.as_deref()))
+                {
+                    let _ = self.live.send(Cmd::Publish(Box::new(ev)));
+                }
+            }
             Action::SaveState | Action::Quit => {}
         }
     }

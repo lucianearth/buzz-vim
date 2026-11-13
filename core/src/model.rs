@@ -36,6 +36,22 @@ pub const LIVE_KINDS: &[u16] = &[
 pub const UNREAD_KINDS: &[u16] = &[KIND_MESSAGE, KIND_MESSAGE_V2];
 
 pub const THUMBS_UP: &str = "👍";
+/// Ephemeral "is typing", as Buzz Desktop sends it.
+pub const KIND_TYPING: u16 = 20002;
+/// Desktop's throttle: one pulse per channel every 3 s
+/// (desktop/src/features/messages/useTypingBroadcast.ts).
+pub const TYPING_EVERY: u64 = 3;
+
+/// A typing pulse in Desktop's shape (relayClientSession.ts
+/// sendTypingIndicator, threading.ts buildThreadReferenceTags): empty
+/// content, `h`, and in a thread the root as the `reply` it answers.
+pub fn typing(channel: &str, root: Option<&str>) -> nostr::EventBuilder {
+    let mut tags = vec![nostr::Tag::parse(["h", channel]).expect("tag")];
+    if let Some(r) = root {
+        tags.push(nostr::Tag::parse(["e", r, "", "reply"]).expect("tag"));
+    }
+    nostr::EventBuilder::new(nostr::Kind::Custom(KIND_TYPING), "").tags(tags)
+}
 
 pub fn tag<'a>(ev: &'a Event, name: &str) -> Option<&'a str> {
     ev.tags.iter().find_map(|t| {
@@ -601,6 +617,24 @@ mod tests {
             .custom_created_at(nostr::Timestamp::from(at))
             .sign_with_keys(keys)
             .unwrap()
+    }
+
+    #[test]
+    fn typing_is_desktops_shape() {
+        let k = Keys::generate();
+        let tags = |root| {
+            let e = typing("c", root).sign_with_keys(&k).unwrap();
+            assert_eq!((e.kind.as_u16(), e.content.as_str()), (20002, ""));
+            e.tags
+                .iter()
+                .map(|t| t.as_slice().to_vec())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tags(None), [["h", "c"]]);
+        assert_eq!(
+            tags(Some("r")),
+            [vec!["h", "c"], vec!["e", "r", "", "reply"]]
+        );
     }
 
     #[test]
