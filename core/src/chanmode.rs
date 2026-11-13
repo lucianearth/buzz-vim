@@ -156,6 +156,9 @@ pub enum Step {
     Save(ChanMode),
     /// The owner signs the running header back to ideating.
     Flip,
+    /// The owner signs the header to running, its `go` the id of the go
+    /// [`Step::Send`] before it; published once the relay stores the go.
+    FlipRunning,
     /// A message from the owner @mentioning `to`: the go to the list's
     /// creator ([`GO_TEXT`]), or with no list, the ask for one
     /// ([`ASK_LIST_TEXT`]).
@@ -210,10 +213,13 @@ pub fn plan(
             }
             Some(_) if running => vec![],
             Some(h) => {
-                let mut s = vec![Step::Send {
-                    text: GO_TEXT,
-                    to: h.creator.clone(),
-                }];
+                let mut s = vec![
+                    Step::Send {
+                        text: GO_TEXT,
+                        to: h.creator.clone(),
+                    },
+                    Step::FlipRunning,
+                ];
                 // The saved pick would outlive the run.
                 if saved.is_some() {
                     s.push(Step::Save(ChanMode::Ideating));
@@ -227,6 +233,14 @@ pub fn plan(
             s
         }
     })
+}
+
+/// A [`Step::Send`] as the owner's top-level message p-tagging `to`, as
+/// a send from the box builds it: signed by the caller so a
+/// [`Step::FlipRunning`] after it can name its id.
+pub fn message(channel: &str, text: &str, to: &str) -> Result<EventBuilder, String> {
+    let uuid = uuid::Uuid::parse_str(channel).map_err(|_| "bad channel id".to_string())?;
+    buzz_sdk::build_message(uuid, text, None, &[to], false, &[], &[]).map_err(|e| e.to_string())
 }
 
 /// The go message's text and the ask for a list.
@@ -821,6 +835,38 @@ mod tests {
     }
 
     #[test]
+    fn the_owner_flips_the_drivers_header_to_running_with_his_go() {
+        let mut t = T::new();
+        t.list("ideating", NOW - 10);
+        let go = message(CH, GO_TEXT, &pk(&t.bot))
+            .unwrap()
+            .sign_with_keys(&t.op)
+            .unwrap();
+        assert_eq!(tag(&go, "h"), Some(CH));
+        assert_eq!(tag(&go, "p").map(str::to_string), Some(pk(&t.bot)));
+        let id = go.id.to_hex();
+        let flip = t.lists.flip_to_running(CH, &id, NOW - 20).unwrap();
+        let ev = flip.sign_with_keys(&t.op).unwrap();
+        assert_eq!(ev.created_at.as_secs(), NOW - 9);
+        assert_eq!(
+            tag(&ev, "d").map(str::to_string),
+            Some(format!("buzz-checklist/header/{CH}/{}", pk(&t.bot))),
+            "the driver's address, not the owner's"
+        );
+        assert!(t.lists.apply(&ev));
+        let h = t.lists.header(CH).unwrap();
+        assert_eq!(
+            (h.mode, h.go.clone(), h.creator.clone(), h.title.as_str()),
+            (Mode::Running, Some(id), pk(&t.bot), "t")
+        );
+        assert_eq!(
+            plan(ChanMode::Running, Some(&h), None, None),
+            Ok(vec![]),
+            "already running"
+        );
+    }
+
+    #[test]
     fn picking_a_mode_plans_what_to_publish() {
         use ChanMode::*;
         let mut t = T::new();
@@ -850,12 +896,16 @@ mod tests {
         );
         t.list("ideating", NOW);
         let h = t.lists.header(CH);
+        // The go, then the header to running with it (lucian 2026-11-13).
         assert_eq!(
             plan(Running, h.as_ref(), None, None),
-            Ok(vec![Step::Send {
-                text: GO_TEXT,
-                to: bot.clone()
-            }])
+            Ok(vec![
+                Step::Send {
+                    text: GO_TEXT,
+                    to: bot.clone()
+                },
+                Step::FlipRunning
+            ])
         );
         assert_eq!(
             plan(Running, h.as_ref(), Some(Off), None),
@@ -864,6 +914,7 @@ mod tests {
                     text: GO_TEXT,
                     to: bot.clone()
                 },
+                Step::FlipRunning,
                 Step::Save(Ideating)
             ])
         );
