@@ -440,25 +440,21 @@ pub struct LoopStatus {
     pub contested: Option<String>,
 }
 
-/// A row on tab 0, Needs you (see `buzz_vim_core::needs`).
+/// A Needs-you row (see `buzz_vim_core::needs`): what the local
+/// notifications post.
 #[derive(uniffi::Record, Clone)]
 pub struct NeedRow {
     /// Stable while the row stands for the same thing: notifications go by it.
     pub key: String,
-    /// "waiting on lucian", "stalled", "contested", "mention",
-    /// "dm", "bot".
-    pub kind: String,
     /// The watcher flagged it: the only rows that notify (push and local).
     pub watcher: bool,
     /// A watcher row with its ping out: the push lease wakes the phone for
     /// that message, so a live lease covers it. Other watcher rows notify
     /// locally even then.
     pub pushed: bool,
-    pub channel: String,
     /// "#name", or "@name" for a DM.
     pub channel_label: String,
-    /// Pubkey of whoever asks, "" for the watcher alone.
-    pub who: String,
+    /// Whoever asks; "watcher" for the watcher alone.
     pub who_name: String,
     /// One line.
     pub text: String,
@@ -466,8 +462,6 @@ pub struct NeedRow {
     /// Opens the row (`follow`): its message in its thread, else the
     /// thread, else the channel.
     pub link: String,
-    /// The thread a reply goes into (`send`'s root); None: the channel.
-    pub thread: Option<String>,
 }
 
 /// The Q box as it opens: where the question goes, and what a second tap
@@ -1021,13 +1015,12 @@ impl Client {
         })
     }
 
-    /// Tab 0: what needs an answer (oldest first), then FYI (newest first).
+    /// What needs an answer, oldest first.
     pub fn needs_you(&self) -> Vec<NeedRow> {
         let e = self.engine.lock().unwrap();
         e.needs_rows()
             .into_iter()
             .map(|r| NeedRow {
-                kind: r.label(),
                 watcher: matches!(r.reason, needs::Reason::Watch(_)),
                 pushed: matches!(r.reason, needs::Reason::Watch(_)) && r.message.is_some(),
                 channel_label: e.label(&r.channel),
@@ -1041,11 +1034,8 @@ impl Client {
                 },
                 link: r.link(),
                 key: r.key,
-                channel: r.channel,
-                who: r.who,
                 text: r.text,
                 at: r.at,
-                thread: r.thread,
             })
             .collect()
     }
@@ -1884,7 +1874,7 @@ impl Engine {
         needs::rows(&self.store, &self.checklists, bot, now())
     }
 
-    /// Tab 0's data across every channel we're in (see the terminal app's
+    /// The needs rows' data across every channel we're in (see the terminal app's
     /// `load_needs`): the last week as history, and a live tail.
     fn load_needs(&mut self) {
         let mine: Vec<&model::Channel> = self
@@ -2189,7 +2179,7 @@ impl Engine {
         match l {
             Live::Event { sub, event } if sub == "control" => self.on_control_live(&event),
             Live::Event { sub, event } => {
-                // Tab 0's tail carries tabs' messages too: count them as the tab's.
+                // The needs tail carries tabs' messages too: count them as the tab's.
                 let tab = sub == "needs"
                     && model::tag(&event, "h").is_some_and(|h| self.subscribed.contains(h));
                 let want = self.fold(&event, sub.starts_with("ch:") || tab);
@@ -2843,7 +2833,7 @@ mod tests {
         assert_eq!(tab(&c).0, "off");
     }
 
-    /// Tab 0's rows come from folded events, with what Swift shows, and a
+    /// Needs-you rows come from folded events, with what Swift shows, and a
     /// reply in the thread clears them.
     #[test]
     fn needs_you_rows_from_folded_events() {
@@ -2870,12 +2860,9 @@ mod tests {
         let rows = c.needs_you();
         assert_eq!(rows.len(), 1);
         let r = &rows[0];
-        assert_eq!(
-            (r.kind.as_str(), r.channel_label.as_str()),
-            ("mention", "#beacon")
-        );
+        assert!(!r.watcher);
+        assert_eq!(r.channel_label, "#beacon");
         assert_eq!(r.text, "@lucian ship it?");
-        assert_eq!(r.thread.as_deref(), Some(ask.id.to_hex().as_str()));
         assert!(c.follow(r.link.clone()).is_some_and(|f| f.channel == ch));
         // His answer in its thread clears it.
         let reply = EventBuilder::new(Kind::Custom(9), "yes")
@@ -3107,7 +3094,7 @@ mod tests {
         let rows = c.needs_you();
         assert!(
             rows.iter()
-                .any(|r| r.watcher && !r.pushed && r.kind == "stalled")
+                .any(|r| r.watcher && !r.pushed && r.text.starts_with("stalled"))
         );
         assert_eq!((s.open, s.done, s.crashes_today), (2, 1, 1));
         assert!(c.loop_status("other".into()).is_none());

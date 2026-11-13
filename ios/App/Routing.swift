@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// The Routing page: pinned after the channels (Control follows it),
-/// never in the switcher (like tab 0).
+/// never in the switcher.
 enum Routing {
     static let id = "routing"
 }
