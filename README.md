@@ -93,12 +93,15 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
 
 ## iPhone
 
-The iPhone app (`ios/`, on the same core through `ffi/`) has the same tab 0: a ⚑ needs you chip first in the
-tab row with the Needs-an-answer count as its badge, the same rows (tap one to open it, Reply to answer it in
-its thread), and ⚑ N on every channel's status line. It posts a local notification for each new watcher
-row its sync sees (stalled, waiting on lucian, waiting on release), once per row, and only for rows that
-began after the phone started watching. People's @mentions and DMs and FYI wait in tab 0
-without one. That works while the app runs.
+The iPhone app (`ios/`, on the same core through `ffi/`) shows each channel's mode in its tab chip the way
+the terminal does: 🧠 ideating, 🚀 running, nothing when off, flashing to 🚩 when the channel needs you or to
+📣 for a person's @mention or DM (🚩 outranks 📣; off channels and DMs hold a steady 📣). Running chips show
+no unread count. Tab 0 is gone: every channel's status line carries ⚑ N, the number of flagged tabs, and
+tapping it opens the oldest flagged one, as `!` does. The mode button at the top, beside the online line, is
+the `M` picker: ideating, running (posts the go; a channel with no list asks a bot for one) or off, set at once.
+The app posts a local notification for each new watcher row its sync sees (stalled, waiting on lucian,
+waiting on release), once per row, and only for rows that began after the phone started watching. That
+works while the app runs.
 
 Q is the button at the top right, beside the online line. It opens the same Q as the terminal's (the same
 core function builds the message): a new top-level message in #quick, starting with `[Q]` and @mentioning
@@ -118,7 +121,8 @@ Closed, it gets real pushes through upstream Buzz's push (`buzz-push-v1`): the p
 with the push gateway (`Push.gateway` in `ios/App/Push.swift`, App Attest), delegates to the relay's push
 key, and publishes a lease (kind 30350, encrypted to the relay) for one thing only: the watcher's messages
 that @mention you. @mentions and DMs from anyone else never push. The push itself says nothing;
-the notification extension fetches the message and shows it like a tab 0 row. The lease follows the
+the notification extension fetches the message and shows it: a watcher ping starting `Your turn:` or
+`Dropped out:` is titled `Your turn · #channel` or `Dropped out · #channel`, anything else `#channel · who`. The lease follows the
 watcher's keys, renews while the app runs, and goes on logout (a logout offline finishes at the next
 launch or foreground: the gateway forgets the relay key, and no new lease goes out before that). While it
 is live the app posts no local notification for a watcher row with its ping out, so nothing comes twice;
