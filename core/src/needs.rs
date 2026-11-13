@@ -146,10 +146,15 @@ pub fn filters(
             f.push(json!({"kinds": checklist, "#h": [c], "#t": [tag], "since": 0, "limit": 500}));
         }
     }
-    // His mode picks (chanmode): one replaceable record per channel.
+    // His mode picks (chanmode): one replaceable record per channel. The
+    // relay keeps 30078 global, so `#h` never matches it: ask by `#d`.
     let (mode_since, mode_limit) = if live { (now, 0) } else { (0, 500) };
+    let ds: Vec<String> = chans
+        .iter()
+        .map(|c| format!("{}{c}", crate::chanmode::D_PREFIX))
+        .collect();
     f.push(
-        json!({"kinds": [crate::chanmode::KIND], "#h": chans, "authors": [operator],
+        json!({"kinds": [crate::chanmode::KIND], "#d": ds, "authors": [operator],
         "since": mode_since, "limit": mode_limit}),
     );
     if !dms.is_empty() {
@@ -572,8 +577,10 @@ mod tests {
         assert_eq!(f[5]["authors"][0], "op");
         assert!(
             f.iter()
+                .filter(|f| f["kinds"] != serde_json::json!([30078]))
                 .all(|f| f["#h"].as_array().is_some_and(|h| !h.is_empty()))
         );
+        assert_eq!(f[5]["#d"][0], format!("buzz-mode:{CH}"));
         assert_eq!(f[0]["#p"][0], "op");
         assert_eq!(f[0]["since"], NOW - HORIZON);
         // History: his posts and the records one channel at a time.

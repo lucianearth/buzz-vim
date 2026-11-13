@@ -4,7 +4,8 @@
 //! The mode: a running list's header says running; else the owner's saved
 //! pick for the channel (a plain kind 30078, `d` = `buzz-mode:<channel>`,
 //! content `ideating` or `off`, `h` = the channel; the aei watcher reads the
-//! same record); else a list makes it ideating; else ideating once the
+//! same record; the relay keeps 30078 global, so read it by `#d`, never
+//! `#h`); else a list makes it ideating; else ideating once the
 //! owner has @mentioned a bot there, otherwise off. DMs are always off.
 //!
 //! Needs you: running, the watcher says so (tab 0's watch rows) or the
