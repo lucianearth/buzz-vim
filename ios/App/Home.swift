@@ -383,7 +383,8 @@ struct Header: View {
                     .onTapGesture { showAgents = true }
                     .onLongPressGesture { openSwitcher() }
                 Spacer()
-                if let s = channelPage(selected) {
+                // DMs have no mode (chanmode::steps refuses them too).
+                if let s = channelPage(selected), tabs.first(where: { $0.id == s })?.isDm != true {
                     modeMenu(s)
                 }
                 // Q: a quick question to taskbot in #quick.

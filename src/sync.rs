@@ -1075,7 +1075,7 @@ impl Sync {
         }
         for step in steps {
             let event = match step {
-                Step::Save(m) => Some(chanmode::record(&channel, m)),
+                Step::Save(m) => Some(app.modes.record(&channel, m, now())),
                 Step::Flip => app.checklists.flip_to_ideating(&channel, now()),
                 Step::Send { text, to } => {
                     let mut d = crate::draft::Draft::default();

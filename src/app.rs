@@ -757,6 +757,9 @@ impl App {
         let Some(c) = self.current().map(str::to_string) else {
             return;
         };
+        if self.store.channels.get(&c).is_some_and(|ch| ch.is_dm) {
+            return self.say("DMs have no mode");
+        }
         let now = self.chan_tab(&self.needs_rows(), &c).mode;
         self.mode_cursor = ChanMode::ALL.iter().position(|m| *m == now).unwrap_or(0);
         self.mode = Mode::Switch;
@@ -3019,6 +3022,20 @@ mod tests {
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.actions.iter().any(|a| matches!(a,
             Action::SetMode { channel, pick: ChanMode::Running } if channel == "a")));
+    }
+
+    /// A DM has no mode: M says so and opens nothing.
+    #[test]
+    fn m_in_a_dm_refuses() {
+        let mut app = App::new("me".into(), None);
+        app.store.channel_mut("d").is_dm = true;
+        app.tabs = vec!["d".into()];
+        app.on_key(KeyEvent::from(KeyCode::Char('M')));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(
+            app.status.as_ref().map(|(s, _)| s.as_str()),
+            Some("DMs have no mode")
+        );
     }
 
     /// Typing sends one pulse per channel every few seconds, not one per key.

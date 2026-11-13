@@ -2523,7 +2523,7 @@ impl Engine {
         }
         for step in steps {
             let built = match step {
-                Step::Save(m) => chanmode::record(&channel, m),
+                Step::Save(m) => self.modes.record(&channel, m, now()),
                 Step::Flip => match self.checklists.flip_to_ideating(&channel, now()) {
                     Some(b) => b,
                     None => continue,
@@ -2805,6 +2805,7 @@ mod tests {
         let mut e = engine();
         e.checklists.trust.owner = e.relay.keys.public_key().to_hex();
         e.store.channel_mut(ch).name = "beacon".into();
+        e.store.channel_mut("dm").is_dm = true;
         e.tabs = vec![ch.into()];
         let c = Client {
             engine: Arc::new(Mutex::new(e)),
@@ -2815,6 +2816,10 @@ mod tests {
             (t.mode, t.icon, t.flag)
         };
         assert_eq!(tab(&c), ("off".into(), None, None));
+        assert!(
+            c.set_mode("dm".into(), "ideating".into()).is_err(),
+            "DMs have no mode"
+        );
         assert!(
             c.set_mode(ch.into(), "running".into()).is_err(),
             "no list, no bot"

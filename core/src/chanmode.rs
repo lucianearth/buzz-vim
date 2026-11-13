@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 
-use nostr::{Event, EventBuilder, Kind, Tag};
+use nostr::{Event, EventBuilder, Kind, Tag, Timestamp};
 
 use crate::checklist::{Checklists, Header, Mode};
 use crate::model::{Store, tag};
@@ -98,6 +98,14 @@ impl Overrides {
     pub fn get(&self, channel: &str) -> Option<ChanMode> {
         self.by.get(channel).map(|(_, m)| *m)
     }
+
+    /// [`record`] dated `now`, or a second after the previous pick when
+    /// that is not older: two picks in one second must not tie, since the
+    /// relay keeps the lowest id on a same-second replace.
+    pub fn record(&self, channel: &str, mode: ChanMode, now: u64) -> EventBuilder {
+        let after = self.by.get(channel).map_or(0, |(at, _)| at + 1);
+        record(channel, mode).custom_created_at(Timestamp::from(now.max(after)))
+    }
 }
 
 /// The owner's pick for a channel with no running list.
@@ -155,7 +163,8 @@ pub enum Step {
 }
 
 /// The steps for picking `pick` in `channel`, from what we hold: [`plan`]
-/// with the list's header, the saved pick and the newest bot.
+/// with the list's header, the saved pick and the newest bot. DMs have no
+/// mode, and a contested channel waits for the owner to pick a driver.
 pub fn steps(
     store: &Store,
     lists: &Checklists,
@@ -164,6 +173,12 @@ pub fn steps(
     pick: ChanMode,
     is_bot: impl Fn(&str) -> bool,
 ) -> Result<Vec<Step>, &'static str> {
+    if store.channels.get(channel).is_some_and(|c| c.is_dm) {
+        return Err("DMs have no mode");
+    }
+    if !lists.driver(channel).contested.is_empty() {
+        return Err("two lists claim this channel; pick a driver first (checklist mode --driver)");
+    }
     let header = lists.header(channel);
     let bot = last_bot(store, channel, &lists.trust.watchers, is_bot);
     plan(pick, header.as_ref(), saved.get(channel), bot.as_deref())
@@ -180,12 +195,19 @@ pub fn plan(
     let running = header.is_some_and(|h| h.mode == Mode::Running);
     Ok(match pick {
         ChanMode::Running => match header {
-            None => vec![Step::Send {
-                text: ASK_LIST_TEXT,
-                to: bot
-                    .ok_or("no list here, and no bot to ask for one")?
-                    .to_string(),
-            }],
+            None => {
+                let mut s = vec![Step::Send {
+                    text: ASK_LIST_TEXT,
+                    to: bot
+                        .ok_or("no list here, and no bot to ask for one")?
+                        .to_string(),
+                }];
+                // A saved off would hide the list the bot makes.
+                if saved.is_some() {
+                    s.push(Step::Save(ChanMode::Ideating));
+                }
+                s
+            }
             Some(_) if running => vec![],
             Some(h) => {
                 let mut s = vec![Step::Send {
@@ -666,6 +688,52 @@ mod tests {
     }
 
     #[test]
+    fn dms_and_contested_channels_refuse_a_pick() {
+        let mut t = T::new();
+        let is_bot = |_: &str| false;
+        let pick =
+            |t: &T, ch: &str| steps(&t.store, &t.lists, &t.saved, ch, ChanMode::Ideating, is_bot);
+        assert_eq!(pick(&t, DM), Err("DMs have no mode"));
+        assert_eq!(pick(&t, CH), Ok(vec![Step::Save(ChanMode::Ideating)]));
+        t.list("running", NOW - 10);
+        let h = t.human.clone();
+        let d = format!("buzz-checklist/header/{CH}/{}", pk(&h));
+        t.record(
+            &h,
+            30471,
+            d,
+            NOW - 5,
+            json!({"v": 1, "title": "u", "mode": "ideating"}),
+        );
+        assert!(!t.lists.driver(CH).contested.is_empty());
+        assert!(pick(&t, CH).unwrap_err().contains("pick a driver"));
+    }
+
+    #[test]
+    fn a_pick_is_dated_after_the_previous_one() {
+        let mut t = T::new();
+        let op = t.op.clone();
+        let at = |b: EventBuilder| b.sign_with_keys(&op).unwrap().created_at.as_secs();
+        assert_eq!(at(t.saved.record(CH, ChanMode::Off, NOW)), NOW);
+        let first = t
+            .saved
+            .record(CH, ChanMode::Off, NOW)
+            .sign_with_keys(&op)
+            .unwrap();
+        assert!(t.saved.apply(&first, &pk(&op)));
+        // Same second: a second later, so the newer pick wins.
+        let next = t
+            .saved
+            .record(CH, ChanMode::Ideating, NOW)
+            .sign_with_keys(&op)
+            .unwrap();
+        assert_eq!(next.created_at.as_secs(), NOW + 1);
+        assert!(t.saved.apply(&next, &pk(&op)));
+        assert_eq!(t.saved.get(CH), Some(ChanMode::Ideating));
+        assert_eq!(at(t.saved.record(CH, ChanMode::Off, NOW + 50)), NOW + 50);
+    }
+
+    #[test]
     fn the_owner_flips_the_drivers_header_to_ideating() {
         let mut t = T::new();
         t.list("running", NOW - 10);
@@ -701,6 +769,17 @@ mod tests {
             }])
         );
         assert_eq!(plan(Off, None, None, None), Ok(vec![Step::Save(Off)]));
+        // Review 53509a4d: a saved off would hide the list the bot makes.
+        assert_eq!(
+            plan(Running, None, Some(Off), Some(&bot)),
+            Ok(vec![
+                Step::Send {
+                    text: ASK_LIST_TEXT,
+                    to: bot.clone()
+                },
+                Step::Save(Ideating)
+            ])
+        );
         t.list("ideating", NOW);
         let h = t.lists.header(CH);
         assert_eq!(
