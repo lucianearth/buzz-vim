@@ -538,16 +538,20 @@ pub fn newest<'a>(events: &'a [Event], subs: &[Value]) -> Option<&'a Event> {
 
 /// The note for `ev`, named from what `store` knows (its author's profile,
 /// its channel's metadata), as tab 0 and the local notifications put it.
-pub fn note(store: &Store, ev: &Event) -> Note {
+/// `watchers`: whose posts may title themselves "Your turn" / "Dropped out".
+pub fn note(store: &Store, ev: &Event, watchers: &[String]) -> Note {
     let m = Message::from_event(ev);
     let who = store.name_of(&m.author);
     let channel = crate::model::tag(ev, "h").unwrap_or_default();
     let label = store.label(channel);
     let text = crate::needs::one_line(&m.content);
     // The watcher's pings say which kind they are (aei contract): the
-    // title carries it, the body the rest.
+    // title carries it, the body the rest. Only the watcher's: anyone else
+    // starting a message so is just talking.
+    let watcher = watchers.contains(&m.author);
     let ping = ["Your turn:", "Dropped out:"]
         .into_iter()
+        .filter(|_| watcher)
         .find_map(|p| Some((p.trim_end_matches(':'), text.strip_prefix(p)?.trim())));
     let (title, body) = match ping {
         Some((kind, rest)) => (format!("{kind} · {label}"), rest.to_string()),
@@ -582,7 +586,14 @@ pub async fn resolve(relay: &Relay, subs: &[Value], now: u64) -> Result<Option<N
     for meta in relay.query(&want).await.unwrap_or_default() {
         store.apply(&meta);
     }
-    Ok(Some(note(&store, ev)))
+    // The lease's authors are the watchers (`subscriptions`).
+    let watchers: Vec<String> = subs
+        .iter()
+        .filter_map(|s| s["filter"]["authors"].as_array())
+        .flatten()
+        .filter_map(|a| a.as_str().map(str::to_string))
+        .collect();
+    Ok(Some(note(&store, ev, &watchers)))
 }
 
 /// A lease's subscriptions back from the JSON we keep for the extension.
@@ -901,7 +912,7 @@ mod tests {
         dm.members = vec![pk(&me), pk(&alice)];
         let ev = message(&alice, CH, "\n  can you look?\nmore", Some(&pk(&me)), NOW);
         assert_eq!(
-            note(&store, &ev),
+            note(&store, &ev, &[]),
             Note {
                 title: "#general · alice".into(),
                 body: "can you look?".into(),
@@ -909,7 +920,7 @@ mod tests {
             }
         );
         let ev = message(&alice, DM1, "", None, NOW);
-        let n = note(&store, &ev);
+        let n = note(&store, &ev, &[]);
         assert_eq!(
             (n.title.as_str(), n.body.as_str()),
             ("@alice · alice", "sent an attachment")
@@ -922,7 +933,11 @@ mod tests {
         let mut store = Store::new(pk(&me));
         store.channel_mut(CH).name = "general".into();
         let n = |text: &str| {
-            let n = note(&store, &message(&watcher, CH, text, Some(&pk(&me)), NOW));
+            let n = note(
+                &store,
+                &message(&watcher, CH, text, Some(&pk(&me)), NOW),
+                &[pk(&watcher)],
+            );
             (n.title, n.body)
         };
         assert_eq!(
@@ -941,5 +956,19 @@ mod tests {
             n("waiting on you"),
             (format!("#general · {who}"), "waiting on you".into())
         );
+        // What aei stall-judge posts: PUSH_PREFIX + "@lucian #label: ...".
+        assert_eq!(
+            n("Your turn: @lucian #general: taskbot spoke last and is waiting on you.").0,
+            "Your turn · #general"
+        );
+        // Review 20446039: only the watcher's posts title themselves so.
+        let alice = Keys::generate();
+        let n = note(
+            &store,
+            &message(&alice, CH, "Your turn: pick one", Some(&pk(&me)), NOW),
+            &[pk(&watcher)],
+        );
+        assert_eq!(n.body, "Your turn: pick one");
+        assert!(n.title.starts_with("#general · "), "{}", n.title);
     }
 }
