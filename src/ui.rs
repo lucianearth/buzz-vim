@@ -422,13 +422,10 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
             let state = states[i];
             // A running tab shows no unread count: its flag says enough.
             let running = state.mode == crate::chanmode::ChanMode::Running;
-            let unread = if running {
-                0
-            } else {
-                ch.map_or(0, |c| c.unread.len())
-            };
+            let ch = ch.filter(|_| !running);
+            let unread = ch.map_or(0, |c| c.unread.len());
             // In a DM every message is to you.
-            let mentions = ch.filter(|_| !running).map_or(0, |c| {
+            let mentions = ch.map_or(0, |c| {
                 if c.is_dm {
                     c.unread.len()
                 } else {
