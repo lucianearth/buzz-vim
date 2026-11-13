@@ -11,8 +11,10 @@
 //! Needs you: running, the watcher says so (tab 0's watch rows) or the
 //! wrap-up just finished; ideating, a bot posted after the owner and no
 //! agent is working there. A person's mention or DM is 📣; 🚩 outranks it.
-//! Both clear once the owner posts (or types) there. Off channels and DMs
-//! keep 📣 only.
+//! Both clear once the owner posts (or types) there, except a watcher row,
+//! which clears when he answers its ping (needs::rows), and a contested
+//! one, which clears when he picks a driver. Off channels and DMs keep 📣
+//! only.
 
 use std::collections::HashMap;
 
@@ -310,10 +312,14 @@ pub fn tab(w: &World, channel: &str) -> Tab {
     let mut flags: Vec<(Flag, u64)> = w
         .rows
         .iter()
-        .filter(|r| r.channel == channel && r.at > back)
-        .map(|r| match r.reason {
-            Reason::Mention | Reason::Dm => (Flag::Mention, r.at),
-            _ => (Flag::NeedsYou, r.at),
+        .filter(|r| r.channel == channel)
+        .filter_map(|r| match r.reason {
+            // 📣 clears once he has been back to the channel.
+            Reason::Mention | Reason::Dm => (r.at > back).then_some((Flag::Mention, r.at)),
+            // A watch row's `at` is the stall's `since`, which can predate
+            // his last post; needs::rows already cleared it if he answered
+            // the ping, and a contested row stays until he picks a driver.
+            Reason::Watch(_) | Reason::Contested(_) => Some((Flag::NeedsYou, r.at)),
         })
         .collect();
     if let Some(at) = wrap_up_done(w.lists, channel).filter(|at| *at > back) {
@@ -612,6 +618,25 @@ mod tests {
         );
         t.post(&op, CH, None, NOW - 10);
         assert_eq!(t.tab(CH).flag, None);
+    }
+
+    #[test]
+    fn a_stall_older_than_his_last_post_still_flags_until_he_answers_the_ping() {
+        // Review 977beced: the watch row's `at` is the stall's `since`; his
+        // post elsewhere after it, before the ping, must not hide the 🚩.
+        let mut t = T::new();
+        let (op, w) = (t.op.clone(), t.watcher.clone());
+        t.list("running", NOW - 150);
+        t.post(&op, CH, None, NOW - 80);
+        let ping = t.post(&w, CH, Some(&op), NOW - 50);
+        t.record(
+            &w,
+            30472,
+            format!("buzz-checklist/watch/{CH}"),
+            NOW - 50,
+            json!({"state": "stalled", "since": NOW - 100, "ping": ping}),
+        );
+        assert_eq!(t.tab(CH).flag, Some((Flag::NeedsYou, NOW - 100)));
     }
 
     #[test]
