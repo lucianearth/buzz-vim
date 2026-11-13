@@ -194,6 +194,8 @@ pub struct Message {
     pub deleted: bool,
     pub system: bool,
     pub state: SendState,
+    /// The agent's Claude model, short (`fable`), "" when untagged.
+    pub model: String,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -2594,6 +2596,10 @@ impl Engine {
             deleted: m.deleted,
             system: m.system,
             state,
+            model: m
+                .model
+                .as_deref()
+                .map_or_else(String::new, |id| model::short_model(id).to_string()),
         }
     }
 }
@@ -3064,6 +3070,14 @@ mod tests {
         e.store.channel_mut("c").summary_replies.remove("root");
         e.read.mark("thread:root", t + 155);
         assert_eq!(view(&e).new_replies, 0);
+        assert_eq!(view(&e).model, "", "untagged");
+        e.store
+            .channel_mut("c")
+            .messages
+            .get_mut("root")
+            .unwrap()
+            .model = Some("claude-fable-5-2".into());
+        assert_eq!(view(&e).model, "fable");
     }
 
     #[test]
