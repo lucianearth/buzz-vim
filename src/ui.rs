@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui_image::Image;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Hit, Pane};
+use crate::app::{App, Hit, Pane, SubTab};
 use crate::art;
 use crate::garden;
 use crate::keys::{Mode, legend};
@@ -122,11 +122,57 @@ fn draw_subscription(f: &mut Frame, app: &mut App, area: Rect) {
         .channels
         .get(&channel)
         .map_or_else(|| channel.chars().take(8).collect(), channel_label);
-    let people = app.sub_people();
     let subs = &app.subscriptions;
     let map = subs.map();
+    let tab_on = app.sub_tab;
+    // Each tab: its rows (text, value), the value set now, and its hint.
+    let people = app.sub_people();
+    let (rows, now, hint) = match tab_on {
+        SubTab::Model => (
+            std::iter::once(("each agent's default".to_string(), None))
+                .chain(
+                    crate::subscription::MODELS
+                        .iter()
+                        .map(|m| (format!("{}  {}", m.1, m.2), Some(m.0.to_string()))),
+                )
+                .collect::<Vec<_>>(),
+            subs.model_for(&channel).map(str::to_string),
+            [
+                " Claude agents only; applies from this channel's next session",
+                " (rotate or restart)",
+            ]
+            .as_slice(),
+        ),
+        SubTab::Channel | SubTab::Default => {
+            let first = if tab_on == SubTab::Default {
+                "each agent's owner".to_string()
+            } else {
+                let who = map
+                    .and_then(|m| m.default.as_deref())
+                    .map_or_else(|| "each agent's owner".to_string(), |p| subs.label(p));
+                format!("follow the default ({who})")
+            };
+            let now = if tab_on == SubTab::Default {
+                map.and_then(|m| m.default.clone())
+            } else {
+                map.and_then(|m| m.channels.get(&channel).cloned())
+            };
+            let rows = std::iter::once((first, None))
+                .chain(
+                    people
+                        .iter()
+                        .map(|p| (format!("{}  {}", p.label, p.id), Some(p.id.clone()))),
+                )
+                .collect();
+            (
+                rows,
+                now,
+                [" takes effect at each session's next start"].as_slice(),
+            )
+        }
+    };
     let legend = crate::keys::legend(Mode::Subscription);
-    let h = (people.len() as u16 + legend.len() as u16 + 10).clamp(14, area.height.max(14));
+    let h = (rows.len() as u16 + legend.len() as u16 + 9).clamp(14, area.height.max(14));
     let r = centered(area, 64, h);
     clear(f, r);
     let block = Block::bordered()
@@ -134,10 +180,10 @@ fn draw_subscription(f: &mut Frame, app: &mut App, area: Rect) {
         .title(Span::styled(" Claude subscription ", theme::bright()));
     let inner = block.inner(r);
     f.render_widget(block, r);
-    let tab = |on: bool, s: String| {
+    let tab = |on: SubTab, s: String| {
         Span::styled(
             format!(" {s} "),
-            if on {
+            if on == tab_on {
                 theme::tab_active()
             } else {
                 theme::tab_idle()
@@ -147,75 +193,16 @@ fn draw_subscription(f: &mut Frame, app: &mut App, area: Rect) {
     let mut lines = vec![
         Line::from(vec![
             Span::raw(" "),
-            tab(!app.sub_all && !app.sub_model, name.clone()),
+            tab(SubTab::Channel, name),
             Span::raw(" "),
-            tab(app.sub_all && !app.sub_model, "default for all".into()),
+            tab(SubTab::Default, "default for all".into()),
             Span::raw(" "),
-            tab(app.sub_model, "model".into()),
+            tab(SubTab::Model, "model".into()),
         ]),
         Line::raw(""),
     ];
-    if app.sub_model {
-        let now = subs.model_for(&channel);
-        let rows = std::iter::once((None, "each agent's default".to_string())).chain(
-            crate::subscription::MODELS
-                .iter()
-                .map(|m| (Some(m.0), format!("{}  {}", m.1, m.2))),
-        );
-        for (i, (v, text)) in rows.enumerate() {
-            let mark = if v == now { "●" } else { " " };
-            let st = if i == app.sub_cursor {
-                theme::tab_active()
-            } else {
-                theme::text()
-            };
-            lines.push(Line::from(vec![
-                Span::styled(format!(" {mark} "), theme::bright()),
-                Span::styled(format!("{text} "), st),
-            ]));
-        }
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            if subs.is_operator(&app.store.me) {
-                " Claude agents only; applies from this channel's next session"
-            } else {
-                " you are not an operator: your pick would not count"
-            },
-            theme::faint(),
-        ));
-        if subs.is_operator(&app.store.me) {
-            lines.push(Line::styled(" (rotate or restart)", theme::faint()));
-        }
-        for (i, (k, what, _)) in legend.iter().enumerate() {
-            lines.push(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(format!(" {k} "), theme::chip(theme::nth(i))),
-                Span::styled(format!("  {what}"), theme::muted()),
-            ]));
-        }
-        return f.render_widget(Paragraph::new(lines), inner);
-    }
-    let now = if app.sub_all {
-        map.and_then(|m| m.default.clone())
-    } else {
-        map.and_then(|m| m.channels.get(&channel).cloned())
-    };
-    let default_who = map
-        .and_then(|m| m.default.as_deref())
-        .map_or_else(|| "each agent's owner".to_string(), |p| subs.label(p));
-    let first = if app.sub_all {
-        "each agent's owner".to_string()
-    } else {
-        format!("follow the default ({default_who})")
-    };
-    let mut rows = vec![(first, None::<String>)];
-    rows.extend(
-        people
-            .iter()
-            .map(|p| (format!("{}  {}", p.label, p.id), Some(p.id.clone()))),
-    );
-    for (i, (text, id)) in rows.iter().enumerate() {
-        let mark = if *id == now { "●" } else { " " };
+    for (i, (text, v)) in rows.iter().enumerate() {
+        let mark = if *v == now { "●" } else { " " };
         let st = if i == app.sub_cursor {
             theme::tab_active()
         } else {
@@ -226,7 +213,7 @@ fn draw_subscription(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(format!("{text} "), st),
         ]));
     }
-    if people.is_empty() {
+    if tab_on != SubTab::Model && people.is_empty() {
         lines.push(Line::styled(
             "   no people published yet (the box lists them each minute)",
             theme::faint(),
@@ -253,10 +240,7 @@ fn draw_subscription(f: &mut Frame, app: &mut App, area: Rect) {
             theme::bright(),
         ));
     } else {
-        lines.push(Line::styled(
-            " takes effect at each session's next start",
-            theme::faint(),
-        ));
+        lines.extend(hint.iter().map(|l| Line::styled(*l, theme::faint())));
     }
     for (i, (k, what, _)) in legend.iter().enumerate() {
         lines.push(Line::from(vec![
@@ -6218,7 +6202,7 @@ mod tests {
         key(&mut app, KeyCode::Char('B'));
         key(&mut app, KeyCode::BackTab);
         assert!(
-            app.sub_model && !app.sub_all,
+            app.sub_tab == SubTab::Model,
             "h/⇤ from the channel tab wraps to model"
         );
         assert_eq!(app.sub_cursor, 2, "on the current pick, Opus");
@@ -6238,9 +6222,40 @@ mod tests {
         key(&mut app, KeyCode::Char('B'));
         key(&mut app, KeyCode::Tab);
         key(&mut app, KeyCode::Tab);
-        assert!(app.sub_model);
+        assert_eq!(app.sub_tab, SubTab::Model);
         key(&mut app, KeyCode::Tab);
-        assert!(!app.sub_model && !app.sub_all);
+        assert_eq!(app.sub_tab, SubTab::Channel);
+    }
+
+    /// `B`, Model tab, no relay map yet: the panel warns that the first
+    /// pick replaces the dashboard's whole map, and ⏎ asks once more.
+    #[test]
+    fn b_model_tab_warns_before_the_first_map() {
+        use crate::subscription::{Subscriptions, Trust};
+        use crossterm::event::{Event, KeyEvent};
+        let me = nostr::Keys::generate();
+        let mut app = App::new(me.public_key().to_hex(), None);
+        let ch = "5e8e98d5-b696-49e2-8c6c-c0bc8faa831a";
+        app.store.channel_mut(ch).name = "model-switch".into();
+        app.store.channel_mut(ch).loaded = true;
+        app.tabs = vec![ch.into()];
+        app.subscriptions = Subscriptions::new(Trust {
+            operators: vec![me.public_key().to_hex()],
+            publishers: vec![],
+        });
+        let key = |app: &mut App, c| app.on_term(Event::Key(KeyEvent::from(c)));
+        key(&mut app, KeyCode::Char('B'));
+        key(&mut app, KeyCode::BackTab);
+        assert_eq!(app.sub_tab, SubTab::Model);
+        let s = screen_text(&mut app, 100, 30);
+        assert!(s.contains("replaces the dashboard's whole map"), "{s}");
+        assert!(s.contains("asks once more"), "{s}");
+        assert!(!s.contains("next session"), "{s}");
+        key(&mut app, KeyCode::Char('j'));
+        key(&mut app, KeyCode::Enter);
+        assert!(app.actions.is_empty(), "one ⏎ sends nothing");
+        let s = screen_text(&mut app, 100, 30);
+        assert!(s.contains("⏎ again to publish, Esc not"), "{s}");
     }
 
     /// `B` in a channel: the picker lists follow-the-default and the
@@ -6333,7 +6348,7 @@ mod tests {
         app.on_term(crossterm::event::Event::Key(
             crossterm::event::KeyEvent::from(KeyCode::Tab),
         ));
-        assert!(app.sub_all);
+        assert_eq!(app.sub_tab, SubTab::Default);
         assert_eq!(app.sub_cursor, 2, "on the current default, lucian");
         app.on_term(crossterm::event::Event::Key(
             crossterm::event::KeyEvent::from(KeyCode::Char('k')),
