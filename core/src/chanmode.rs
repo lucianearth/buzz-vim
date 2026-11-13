@@ -369,6 +369,14 @@ pub fn tab(w: &World, channel: &str) -> Tab {
     }
     if mode == ChanMode::Off {
         flags.retain(|(f, _)| *f == Flag::Mention);
+        // A contested channel has no header, so it can read Off; its 🚩
+        // stays until he picks a driver.
+        flags.extend(
+            w.rows
+                .iter()
+                .filter(|r| r.channel == channel && matches!(r.reason, Reason::Contested(_)))
+                .map(|r| (Flag::NeedsYou, r.at)),
+        );
     }
     // The strongest flag, since its oldest cause.
     let flag = flags
@@ -707,6 +715,27 @@ mod tests {
         );
         assert!(!t.lists.driver(CH).contested.is_empty());
         assert!(pick(&t, CH).unwrap_err().contains("pick a driver"));
+    }
+
+    #[test]
+    fn a_contested_tab_keeps_its_flag_with_no_mode() {
+        // Review 755d1328: two lists, no saved pick, no bot mention: the
+        // mode is Off, yet the contested 🚩 must stay for `!` and ⚑ N.
+        let mut t = T::new();
+        t.list("running", NOW - 10);
+        let h = t.human.clone();
+        let d = format!("buzz-checklist/header/{CH}/{}", pk(&h));
+        t.record(
+            &h,
+            30471,
+            d,
+            NOW - 5,
+            json!({"v": 1, "title": "u", "mode": "ideating"}),
+        );
+        let tab = t.tab(CH);
+        assert_eq!(tab.mode, ChanMode::Off);
+        assert_eq!(tab.flag.map(|(f, _)| f), Some(Flag::NeedsYou));
+        assert_eq!((tab.icon(true), tab.icon(false)), (Some("🚩"), Some("🚩")));
     }
 
     #[test]
