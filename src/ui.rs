@@ -613,7 +613,8 @@ fn message_block(
     if is_agent {
         head.push(Span::styled(" ⚙", theme::faint()));
     }
-    if let Some(model) = m.model.as_deref() {
+    // Only beside agents: anyone can put a model tag on a message.
+    if let Some(model) = m.model.as_deref().filter(|_| is_agent) {
         head.push(Span::styled(
             format!(" · {}", crate::model::short_model(model)),
             theme::muted(),
@@ -5493,6 +5494,14 @@ mod tests {
                 "payload": {"threadRootEventId": rid}}),
         );
         app.thread = Some(("c1".into(), rid));
+        // Not shown until the author is known as an agent: anyone can tag.
+        let s = screen_text(&mut app, 100, 20);
+        assert!(!s.lines().any(|r| r.contains("· fable  ")), "{s}");
+        app.store
+            .profiles
+            .entry(bot_pk.clone())
+            .or_default()
+            .is_agent = true;
         let s = screen_text(&mut app, 100, 20);
         let rows: Vec<&str> = s.lines().collect();
         assert!(rows[1].contains("taskbot · fable thinking"), "{s}");

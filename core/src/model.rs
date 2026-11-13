@@ -151,9 +151,9 @@ impl Message {
                 }),
             media,
             system: ev.kind.as_u16() == KIND_SYSTEM,
-            model: tags(ev, "model")
-                .find_map(|t| t.get(1).cloned())
-                .filter(|m| !m.trim().is_empty()),
+            model: tag(ev, "model")
+                .filter(|m| !m.trim().is_empty())
+                .map(str::to_string),
         }
     }
 }

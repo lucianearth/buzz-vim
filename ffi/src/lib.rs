@@ -2596,9 +2596,11 @@ impl Engine {
             deleted: m.deleted,
             system: m.system,
             state,
+            // Only beside agents: anyone can put a model tag on a message.
             model: m
                 .model
                 .as_deref()
+                .filter(|_| self.is_agent(&m.author))
                 .map_or_else(String::new, |id| model::short_model(id).to_string()),
         }
     }
@@ -3077,6 +3079,8 @@ mod tests {
             .get_mut("root")
             .unwrap()
             .model = Some("claude-fable-5-2".into());
+        assert_eq!(view(&e).model, "", "tagged, but not by an agent");
+        e.store.profiles.entry("a".into()).or_default().is_agent = true;
         assert_eq!(view(&e).model, "fable");
     }
 
