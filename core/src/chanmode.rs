@@ -258,7 +258,11 @@ pub fn sign_steps(
                 Some(b) => b,
                 None => continue,
             },
-            Step::Send { text, to } if inline => message(channel, text, &to)?,
+            // As a send from the box: no p tag for himself.
+            Step::Send { text, to } if inline => {
+                let to = Some(to.as_str()).filter(|t| *t != lists.trust.owner);
+                message(channel, text, to)?
+            }
             Step::Send { text, to } => {
                 out.sends.push((text, to));
                 continue;
@@ -292,9 +296,10 @@ pub struct Signed {
 /// A [`Step::Send`] as the owner's top-level message p-tagging `to`, as
 /// a send from the box builds it: signed by the caller so a
 /// [`Step::FlipRunning`] after it can name its id.
-pub fn message(channel: &str, text: &str, to: &str) -> Result<EventBuilder, String> {
+pub fn message(channel: &str, text: &str, to: Option<&str>) -> Result<EventBuilder, String> {
     let uuid = uuid::Uuid::parse_str(channel).map_err(|_| "bad channel id".to_string())?;
-    buzz_sdk::build_message(uuid, text, None, &[to], false, &[], &[]).map_err(|e| e.to_string())
+    let to: Vec<&str> = to.into_iter().collect();
+    buzz_sdk::build_message(uuid, text, None, &to, false, &[], &[]).map_err(|e| e.to_string())
 }
 
 /// The go message's text and the ask for a list.
@@ -892,7 +897,7 @@ mod tests {
     fn the_owner_flips_the_drivers_header_to_running_with_his_go() {
         let mut t = T::new();
         t.list("ideating", NOW - 10);
-        let go = message(CH, GO_TEXT, &pk(&t.bot))
+        let go = message(CH, GO_TEXT, Some(&pk(&t.bot)))
             .unwrap()
             .sign_with_keys(&t.op)
             .unwrap();
@@ -918,6 +923,51 @@ mod tests {
             Ok(vec![]),
             "already running"
         );
+    }
+
+    #[test]
+    fn a_pick_signs_in_publish_order_and_leaves_the_ask_to_send() {
+        use ChanMode::*;
+        let mut t = T::new();
+        let bot = pk(&t.bot);
+        let op = t.op.clone();
+        let sign = |b: EventBuilder| b.sign_with_keys(&op).map_err(|e| e.to_string());
+        // No list: the ask goes out as his own message, the save is signed.
+        let ask = vec![
+            Step::Send {
+                text: ASK_LIST_TEXT,
+                to: bot.clone(),
+            },
+            Step::Save(Ideating),
+        ];
+        let s = sign_steps(ask, CH, &t.lists, &t.saved, NOW, sign).unwrap();
+        assert_eq!(s.sends, vec![(ASK_LIST_TEXT, bot.clone())]);
+        assert_eq!(s.events.len(), 1);
+        assert!(is_record(&s.events[0]));
+        // A list and a saved pick: the go, the header naming it, the save.
+        t.list("ideating", NOW - 10);
+        let h = t.lists.header(CH);
+        let steps = plan(Running, h.as_ref(), Some(Off), None).unwrap();
+        let s = sign_steps(steps, CH, &t.lists, &t.saved, NOW, sign).unwrap();
+        assert!(s.sends.is_empty());
+        let [go, flip, save] = s.events.as_slice() else {
+            panic!("{:?}", s.events);
+        };
+        assert_eq!(go.kind.as_u16(), 9);
+        assert!(t.lists.apply(flip));
+        assert_eq!(t.lists.header(CH).unwrap().go, Some(go.id.to_hex()));
+        assert!(is_record(save));
+        // His own list: the go p-tags nobody.
+        let me = pk(&op);
+        let steps = vec![
+            Step::Send {
+                text: GO_TEXT,
+                to: me,
+            },
+            Step::FlipRunning,
+        ];
+        let s = sign_steps(steps, CH, &t.lists, &t.saved, NOW, sign).unwrap();
+        assert_eq!(tag(&s.events[0], "p"), None);
     }
 
     #[test]

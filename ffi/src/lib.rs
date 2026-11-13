@@ -2539,7 +2539,14 @@ impl Engine {
         let tx = self.tx.clone();
         RT.spawn(async move {
             for ev in events {
-                if let Err(e) = r.publish(&ev).await {
+                // Held: a record the relay calls a duplicate was dropped,
+                // not stored, so the go chain stops there.
+                let res = if held {
+                    r.publish_new(&ev).await
+                } else {
+                    r.publish(&ev).await
+                };
+                if let Err(e) = res {
                     let _ = tx.send(if held {
                         Msg::Notice(format!("mode not set: {e}; pick again"))
                     } else {
