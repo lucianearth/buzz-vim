@@ -7,6 +7,7 @@
 // Nested `if`s read better than let-chains here, as in the terminal app.
 #![allow(clippy::collapsible_if, clippy::collapsible_match)]
 
+pub mod chanmode;
 pub mod checklist;
 pub mod control;
 pub mod draft;

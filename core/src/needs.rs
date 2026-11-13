@@ -146,6 +146,12 @@ pub fn filters(
             f.push(json!({"kinds": checklist, "#h": [c], "#t": [tag], "since": 0, "limit": 500}));
         }
     }
+    // His mode picks (chanmode): one replaceable record per channel.
+    let (mode_since, mode_limit) = if live { (now, 0) } else { (0, 500) };
+    f.push(
+        json!({"kinds": [crate::chanmode::KIND], "#h": chans, "authors": [operator],
+        "since": mode_since, "limit": mode_limit}),
+    );
     if !dms.is_empty() {
         f.push(json!({"kinds": kinds, "#h": dms, "since": since, "limit": limit}));
     }
@@ -561,7 +567,9 @@ mod tests {
     fn filters_scope_every_request_to_our_channels() {
         let chans = vec![CH.to_string(), DM.to_string()];
         let f = filters(&chans, &[DM.to_string()], "op", NOW, false);
-        assert_eq!(f.len(), 6);
+        assert_eq!(f.len(), 7);
+        assert_eq!(f[5]["kinds"], serde_json::json!([30078]));
+        assert_eq!(f[5]["authors"][0], "op");
         assert!(
             f.iter()
                 .all(|f| f["#h"].as_array().is_some_and(|h| !h.is_empty()))
@@ -579,7 +587,7 @@ mod tests {
         let live = filters(&chans, &[], "op", NOW, true);
         assert_eq!(
             (live.len(), &live[2]["since"], &live[2]["limit"]),
-            (3, &serde_json::json!(NOW), &serde_json::json!(0))
+            (4, &serde_json::json!(NOW), &serde_json::json!(0))
         );
         assert!(filters(&[], &[], "op", NOW, false).is_empty());
     }

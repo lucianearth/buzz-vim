@@ -753,6 +753,32 @@ impl Checklists {
         })
     }
 
+    /// The owner's flip of the driver's header back to ideating: the same
+    /// address, tags and content but the mode, signed by him (the CLI and
+    /// stall-judge accept an owner-signed header). None without a list.
+    pub fn flip_to_ideating(&self, channel: &str, now: u64) -> Option<nostr::EventBuilder> {
+        let recs = self.channels.get(channel)?;
+        let creator = self.driver_in(recs).driver?;
+        let v = accepted(recs.headers.get(&creator)?, &creator, &self.trust.owner)?;
+        let mut content = v.content.clone();
+        content["mode"] = "ideating".into();
+        let d = format!("{TAG}/header/{channel}/{creator}");
+        let tags = [
+            ["d", d.as_str()],
+            ["h", channel],
+            ["t", TAG],
+            ["channel", channel],
+            ["checklist-type", "header"],
+        ]
+        .map(|t| nostr::Tag::parse(t).expect("tag"));
+        // Replaceable: it must be newer than the version it replaces.
+        Some(
+            nostr::EventBuilder::new(nostr::Kind::Custom(KIND_HEADER), content.to_string())
+                .tags(tags)
+                .custom_created_at(nostr::Timestamp::from(now.max(v.at + 1))),
+        )
+    }
+
     /// The channel's items in the one display order (NIP-CK, Display
     /// order): the standing first item; unfinished
     /// started items, oldest start first; never-started items; open release
