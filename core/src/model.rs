@@ -31,6 +31,7 @@ pub const LIVE_KINDS: &[u16] = &[
     KIND_EDIT,
     KIND_SYSTEM,
     KIND_THREAD_SUMMARY,
+    KIND_TYPING,
 ];
 /// Kinds that count as unread (no system rows).
 pub const UNREAD_KINDS: &[u16] = &[KIND_MESSAGE, KIND_MESSAGE_V2];
@@ -194,6 +195,8 @@ pub struct Channel {
     pub mentioned: HashSet<String>,
     pub oldest: Option<u64>,
     pub exhausted: bool,
+    /// Typing pulses (kind 20002): pubkey -> the newest one's created_at.
+    pub typing: HashMap<String, u64>,
 }
 
 impl Channel {
@@ -319,6 +322,19 @@ impl Store {
             kind,
             KIND_PROFILE | KIND_CHANNEL_META | KIND_CHANNEL_MEMBERS
         );
+        // A pulse every few seconds per typist: kept as the newest, not seen.
+        if kind == KIND_TYPING {
+            if let Some(h) = tag(ev, "h").map(str::to_string) {
+                let at = ev.created_at.as_secs();
+                let t = self
+                    .channel_mut(&h)
+                    .typing
+                    .entry(ev.pubkey.to_hex())
+                    .or_default();
+                *t = (*t).max(at);
+            }
+            return Applied::Nothing;
+        }
         if !replaceable && !self.seen.insert(ev.id.to_hex()) {
             return Applied::Nothing;
         }

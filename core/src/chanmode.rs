@@ -302,6 +302,21 @@ pub struct World<'a> {
     pub working: bool,
     /// When the owner last typed there (0: not known).
     pub typed: u64,
+    /// Now (secs): a bot's typing pulse this recent is working too.
+    pub now: u64,
+}
+
+/// How long a bot's typing pulse counts as working: the watcher's idle
+/// window (aei stall-judge IDLE_SECONDS).
+pub const TYPING_IDLE: u64 = 210;
+
+/// A bot, anyone's, sent a typing pulse in `channel` within [`TYPING_IDLE`].
+pub fn bot_typing(store: &Store, channel: &str, is_bot: impl Fn(&str) -> bool, now: u64) -> bool {
+    store.channels.get(channel).is_some_and(|c| {
+        c.typing
+            .iter()
+            .any(|(pk, at)| *at + TYPING_IDLE > now && is_bot(pk))
+    })
 }
 
 /// The wrap-up just finished: the list is back to ideating with its
@@ -355,7 +370,8 @@ pub fn tab(w: &World, channel: &str) -> Tab {
     if let Some(at) = wrap_up_done(w.lists, channel).filter(|at| *at > back) {
         flags.push((Flag::NeedsYou, at));
     }
-    if mode == ChanMode::Ideating && !w.working {
+    let working = w.working || bot_typing(w.store, channel, w.is_bot, w.now);
+    if mode == ChanMode::Ideating && !working {
         let bot_last = ch
             .into_iter()
             .flat_map(|c| c.messages.values())
@@ -537,6 +553,7 @@ mod tests {
                     is_bot: &is_bot,
                     working: self.working,
                     typed: 0,
+                    now: NOW,
                 },
                 ch,
             )
@@ -589,6 +606,28 @@ mod tests {
         t.working = false;
         t.post(&op, CH, None, NOW - 70);
         assert_eq!(t.tab(CH).flag, None);
+    }
+
+    #[test]
+    fn another_owners_bot_typing_is_working() {
+        // Review 6877cd69: a bot we don't own mid-turn sends only kind
+        // 20002; within the idle window it holds the 🚩 back.
+        let mut t = T::new();
+        let (op, bot) = (t.op.clone(), t.bot.clone());
+        t.post(&op, CH, Some(&bot), NOW - 300);
+        t.post(&bot, CH, None, NOW - 290);
+        assert_eq!(t.tab(CH).flag, Some((Flag::NeedsYou, NOW - 290)));
+        let pulse = |at| sign(&bot, crate::model::typing(CH, None), at);
+        t.store.apply(&pulse(NOW - TYPING_IDLE - 1));
+        assert!(t.tab(CH).flag.is_some(), "too old");
+        t.store.apply(&pulse(NOW - 10));
+        assert_eq!(t.tab(CH).flag, None);
+        // A person typing is not a bot working.
+        let h = t.human.clone();
+        t.store.channel_mut(CH).typing.clear();
+        t.store
+            .apply(&sign(&h, crate::model::typing(CH, None), NOW - 5));
+        assert!(t.tab(CH).flag.is_some());
     }
 
     #[test]

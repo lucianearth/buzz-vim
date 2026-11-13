@@ -2501,6 +2501,7 @@ impl Engine {
                 working: !self.agents.working(&self.store, channel, None).is_empty(),
                 // The phone sends no typing pulses.
                 typed: 0,
+                now: now(),
             },
             channel,
         )

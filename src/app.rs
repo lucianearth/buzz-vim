@@ -740,6 +740,7 @@ impl App {
                 is_bot: &is_bot,
                 working: !self.agents.working(&self.store, channel, None).is_empty(),
                 typed: self.typed.get(channel).copied().unwrap_or(0),
+                now: crate::sync::now(),
             },
             channel,
         )
