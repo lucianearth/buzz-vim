@@ -316,10 +316,8 @@ pub fn tab(w: &World, channel: &str) -> Tab {
             _ => (Flag::NeedsYou, r.at),
         })
         .collect();
-    if mode != ChanMode::Off {
-        if let Some(at) = wrap_up_done(w.lists, channel).filter(|at| *at > back) {
-            flags.push((Flag::NeedsYou, at));
-        }
+    if let Some(at) = wrap_up_done(w.lists, channel).filter(|at| *at > back) {
+        flags.push((Flag::NeedsYou, at));
     }
     if mode == ChanMode::Ideating && !w.working {
         let bot_last = ch
