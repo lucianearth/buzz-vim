@@ -28,12 +28,10 @@ final class Push {
     private var checked = Date.distantPast
     /// Bumped on logout, so a lease already on its way isn't published after.
     private var session = 0
-    /// The step a refresh is on, and the last failure with its step; tab 0
-    /// shows the failure until a refresh gets through.
+    /// The step a refresh is on, for the log when it fails.
     private var step = ""
-    private(set) var failure: String?
 
-    /// A lease the relay took is in force: tab 0 posts no local
+    /// A lease the relay took is in force: the Notifier posts no local
     /// notifications then for watcher rows with a ping out, the push
     /// covers those.
     var live: Bool {
@@ -65,7 +63,7 @@ final class Push {
             guard let s = try client.pushSubscriptions() else { return }
             subs = s
         } catch {
-            failure = "subscriptions: \(error)"
+            NSLog("push: subscriptions: \(error)")
             return
         }
         checked = Date()
@@ -74,7 +72,6 @@ final class Push {
         let renew = state.grant == nil || state.endpoint != endpoint || state.grantExpires < now + 7 * 86_400
         guard renew || state.leased != subs || !live else { return }
         busy = true
-        failure = nil
         let session = self.session
         Task { @MainActor in
             defer { busy = false }
@@ -95,12 +92,10 @@ final class Push {
                 state.leased = subs
                 state.leaseExpires = min(state.grantExpires, Self.now() + Int64(r.maxTtl))
                 state.save()
-                failure = nil
             } catch {
                 // Not again for ten minutes (a relay without push, no network).
                 checked = Date().addingTimeInterval(600)
-                failure = [failure, "\(step): \(error)"].compactMap { $0 }.joined(separator: "; then ")
-                NSLog("push: \(failure ?? "")")
+                NSLog("push: \(step): \(error)")
             }
         }
     }
@@ -112,7 +107,6 @@ final class Push {
     /// foreground, and no lease goes out before it.
     func stop(_ client: Client, relay: String) {
         session += 1
-        failure = nil
         guard state.leased != nil || state.grant != nil else { return }
         state.stopPending = true
         state.save()
@@ -199,7 +193,7 @@ final class Push {
             state.grant = try await pushDelegate(gateway: Self.gateway, challenge: c, delegation: d,
                                                  assertion: assertion)
         } catch let e where again && Self.lost(e) {
-            failure = "\(step): \(e), enrolling again"
+            NSLog("push: \(step): \(e), enrolling again")
             state.installation = nil
             try await delegate(to: r, endpoint: endpoint, again: false)
             return
