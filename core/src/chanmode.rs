@@ -156,6 +156,9 @@ pub enum Step {
     Save(ChanMode),
     /// The owner signs the running header back to ideating.
     Flip,
+    /// The owner signs the header to running, its `go` the id of the go
+    /// [`Step::Send`] before it; published once the relay stores the go.
+    FlipRunning,
     /// A message from the owner @mentioning `to`: the go to the list's
     /// creator ([`GO_TEXT`]), or with no list, the ask for one
     /// ([`ASK_LIST_TEXT`]).
@@ -210,10 +213,13 @@ pub fn plan(
             }
             Some(_) if running => vec![],
             Some(h) => {
-                let mut s = vec![Step::Send {
-                    text: GO_TEXT,
-                    to: h.creator.clone(),
-                }];
+                let mut s = vec![
+                    Step::Send {
+                        text: GO_TEXT,
+                        to: h.creator.clone(),
+                    },
+                    Step::FlipRunning,
+                ];
                 // The saved pick would outlive the run.
                 if saved.is_some() {
                     s.push(Step::Save(ChanMode::Ideating));
@@ -227,6 +233,73 @@ pub fn plan(
             s
         }
     })
+}
+
+/// A pick's steps, signed in publish order by `sign`: the saved picks,
+/// the header flips, and a go that a [`Step::FlipRunning`] names, before
+/// it. A Send with no FlipRunning (the ask for a list) is left in `sends`,
+/// for the caller to send as his own message.
+pub fn sign_steps(
+    steps: Vec<Step>,
+    channel: &str,
+    lists: &Checklists,
+    saved: &Overrides,
+    now: u64,
+    mut sign: impl FnMut(EventBuilder) -> Result<Event, String>,
+) -> Result<Signed, String> {
+    let inline = steps.contains(&Step::FlipRunning);
+    let mut out = Signed::default();
+    let mut go = None;
+    for step in steps {
+        let is_go = matches!(step, Step::Send { .. });
+        let built = match step {
+            Step::Save(m) => saved.record(channel, m, now),
+            Step::Flip => match lists.flip_to_ideating(channel, now) {
+                Some(b) => b,
+                None => continue,
+            },
+            // As a send from the box: no p tag for himself.
+            Step::Send { text, to } if inline => {
+                let to = Some(to.as_str()).filter(|t| *t != lists.trust.owner);
+                message(channel, text, to)?
+            }
+            Step::Send { text, to } => {
+                out.sends.push((text, to));
+                continue;
+            }
+            Step::FlipRunning => match go
+                .as_deref()
+                .and_then(|g| lists.flip_to_running(channel, g, now))
+            {
+                Some(b) => b,
+                None => continue,
+            },
+        };
+        let ev = sign(built)?;
+        if is_go {
+            go = Some(ev.id.to_hex());
+        }
+        out.events.push(ev);
+    }
+    Ok(out)
+}
+
+/// [`sign_steps`]' result.
+#[derive(Debug, Default)]
+pub struct Signed {
+    /// To publish in order, each once the relay stores the one before.
+    pub events: Vec<Event>,
+    /// Messages to send as the owner's own: (text, to).
+    pub sends: Vec<(&'static str, String)>,
+}
+
+/// A [`Step::Send`] as the owner's top-level message p-tagging `to`, as
+/// a send from the box builds it: signed by the caller so a
+/// [`Step::FlipRunning`] after it can name its id.
+pub fn message(channel: &str, text: &str, to: Option<&str>) -> Result<EventBuilder, String> {
+    let uuid = uuid::Uuid::parse_str(channel).map_err(|_| "bad channel id".to_string())?;
+    let to: Vec<&str> = to.into_iter().collect();
+    buzz_sdk::build_message(uuid, text, None, &to, false, &[], &[]).map_err(|e| e.to_string())
 }
 
 /// The go message's text and the ask for a list.
@@ -821,6 +894,83 @@ mod tests {
     }
 
     #[test]
+    fn the_owner_flips_the_drivers_header_to_running_with_his_go() {
+        let mut t = T::new();
+        t.list("ideating", NOW - 10);
+        let go = message(CH, GO_TEXT, Some(&pk(&t.bot)))
+            .unwrap()
+            .sign_with_keys(&t.op)
+            .unwrap();
+        assert_eq!(tag(&go, "h"), Some(CH));
+        assert_eq!(tag(&go, "p").map(str::to_string), Some(pk(&t.bot)));
+        let id = go.id.to_hex();
+        let flip = t.lists.flip_to_running(CH, &id, NOW - 20).unwrap();
+        let ev = flip.sign_with_keys(&t.op).unwrap();
+        assert_eq!(ev.created_at.as_secs(), NOW - 9);
+        assert_eq!(
+            tag(&ev, "d").map(str::to_string),
+            Some(format!("buzz-checklist/header/{CH}/{}", pk(&t.bot))),
+            "the driver's address, not the owner's"
+        );
+        assert!(t.lists.apply(&ev));
+        let h = t.lists.header(CH).unwrap();
+        assert_eq!(
+            (h.mode, h.go.clone(), h.creator.clone(), h.title.as_str()),
+            (Mode::Running, Some(id), pk(&t.bot), "t")
+        );
+        assert_eq!(
+            plan(ChanMode::Running, Some(&h), None, None),
+            Ok(vec![]),
+            "already running"
+        );
+    }
+
+    #[test]
+    fn a_pick_signs_in_publish_order_and_leaves_the_ask_to_send() {
+        use ChanMode::*;
+        let mut t = T::new();
+        let bot = pk(&t.bot);
+        let op = t.op.clone();
+        let sign = |b: EventBuilder| b.sign_with_keys(&op).map_err(|e| e.to_string());
+        // No list: the ask goes out as his own message, the save is signed.
+        let ask = vec![
+            Step::Send {
+                text: ASK_LIST_TEXT,
+                to: bot.clone(),
+            },
+            Step::Save(Ideating),
+        ];
+        let s = sign_steps(ask, CH, &t.lists, &t.saved, NOW, sign).unwrap();
+        assert_eq!(s.sends, vec![(ASK_LIST_TEXT, bot.clone())]);
+        assert_eq!(s.events.len(), 1);
+        assert!(is_record(&s.events[0]));
+        // A list and a saved pick: the go, the header naming it, the save.
+        t.list("ideating", NOW - 10);
+        let h = t.lists.header(CH);
+        let steps = plan(Running, h.as_ref(), Some(Off), None).unwrap();
+        let s = sign_steps(steps, CH, &t.lists, &t.saved, NOW, sign).unwrap();
+        assert!(s.sends.is_empty());
+        let [go, flip, save] = s.events.as_slice() else {
+            panic!("{:?}", s.events);
+        };
+        assert_eq!(go.kind.as_u16(), 9);
+        assert!(t.lists.apply(flip));
+        assert_eq!(t.lists.header(CH).unwrap().go, Some(go.id.to_hex()));
+        assert!(is_record(save));
+        // His own list: the go p-tags nobody.
+        let me = pk(&op);
+        let steps = vec![
+            Step::Send {
+                text: GO_TEXT,
+                to: me,
+            },
+            Step::FlipRunning,
+        ];
+        let s = sign_steps(steps, CH, &t.lists, &t.saved, NOW, sign).unwrap();
+        assert_eq!(tag(&s.events[0], "p"), None);
+    }
+
+    #[test]
     fn picking_a_mode_plans_what_to_publish() {
         use ChanMode::*;
         let mut t = T::new();
@@ -850,12 +1000,16 @@ mod tests {
         );
         t.list("ideating", NOW);
         let h = t.lists.header(CH);
+        // The go, then the header to running with it (lucian 2026-11-13).
         assert_eq!(
             plan(Running, h.as_ref(), None, None),
-            Ok(vec![Step::Send {
-                text: GO_TEXT,
-                to: bot.clone()
-            }])
+            Ok(vec![
+                Step::Send {
+                    text: GO_TEXT,
+                    to: bot.clone()
+                },
+                Step::FlipRunning
+            ])
         );
         assert_eq!(
             plan(Running, h.as_ref(), Some(Off), None),
@@ -864,6 +1018,7 @@ mod tests {
                     text: GO_TEXT,
                     to: bot.clone()
                 },
+                Step::FlipRunning,
                 Step::Save(Ideating)
             ])
         );

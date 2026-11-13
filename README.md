@@ -31,7 +31,8 @@ Normal mode shows the common keys in the footer. Press `?` for all of them.
   no agent is working) or to 📣 for a person's @mention or DM. 🚩 outranks 📣. Off channels and DMs show a
   steady 📣. Running tabs show no unread count. `!` jumps to the next flagged tab, oldest first
 - `M` the mode picker: `j` `k` or arrows move, `M` advances and wraps, `⏎` sets it (no confirm). Running posts
-  a "go" from you @mentioning the list's creator; back to ideating flips the header as the owner; a channel
+  a "go" from you @mentioning the list's creator, then, once the relay stores it, flips the header to running
+  as the owner with that go; back to ideating flips the header as the owner; a channel
   with no list offers to ask a bot to make one. For a channel without a running list the pick is a kind 30078
   `d=buzz-mode:<channel>` record
 - `n` the bell: the latest message in this tab, read or not. In a thread it opens on your first unread reply
@@ -98,7 +99,7 @@ the terminal does: 🧠 ideating, 🚀 running, nothing when off, flashing to �
 📣 for a person's @mention or DM (🚩 outranks 📣; off channels and DMs hold a steady 📣). Running chips show
 no unread count. Tab 0 is gone: every channel's status line carries ⚑ N, the number of flagged tabs, and
 tapping it opens the next flagged one, oldest first and round again, as `!` does. The mode button at the top, beside the online line, is
-the `M` picker: ideating, running (posts the go; a channel with no list asks a bot for one) or off, set at once.
+the `M` picker: ideating, running (posts the go, then flips the header to running with it; a channel with no list asks a bot for one) or off, set at once.
 The app posts a local notification for each new watcher row its sync sees (stalled, waiting on lucian,
 waiting on release), once per row, and only for rows that began after the phone started watching. That
 works while the app runs.

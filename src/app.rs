@@ -2652,6 +2652,8 @@ impl App {
     pub fn mode_set(&mut self, stored: &[nostr::Event], label: &str, result: anyhow::Result<()>) {
         let owner = self.checklists.trust.owner.clone();
         for ev in stored {
+            // The go shows in the timeline as a sent message does.
+            self.store.apply(ev);
             self.modes.apply(ev, &owner);
             self.checklists.apply(ev);
         }
@@ -3139,6 +3141,83 @@ mod tests {
         assert_eq!(
             app.status.as_ref().map(|(s, _)| s.as_str()),
             Some("🧠 ideating")
+        );
+    }
+
+    /// Picking running with a list posts the go, then the owner's header
+    /// to running naming it; nothing shows as running until the relay has
+    /// stored both (lucian 2026-11-13).
+    #[test]
+    fn picking_running_stores_the_go_then_the_header_with_it() {
+        use crate::chanmode::{self, Step};
+        use crate::checklist::Mode as ListMode;
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+        let ch = "2130646b-d6c8-4ec3-93e3-36f77bee1a37";
+        let (k, bot) = (Keys::generate(), Keys::generate());
+        let mut app = App::new(k.public_key().to_hex(), None);
+        app.checklists.trust.owner = k.public_key().to_hex();
+        let bk = bot.public_key().to_hex();
+        let d = format!("buzz-checklist/header/{ch}/{bk}");
+        let tags = [
+            ["d", d.as_str()],
+            ["h", ch],
+            ["t", "buzz-checklist"],
+            ["channel", ch],
+            ["checklist-type", "header"],
+        ]
+        .map(|t| Tag::parse(t).unwrap());
+        let header = EventBuilder::new(
+            Kind::Custom(30471),
+            r#"{"v":1,"title":"t","mode":"ideating"}"#,
+        )
+        .tags(tags)
+        .custom_created_at(Timestamp::from(1_800_000_000))
+        .sign_with_keys(&bot)
+        .unwrap();
+        assert!(app.checklists.apply(&header));
+        let steps = chanmode::steps(
+            &app.store,
+            &app.checklists,
+            &app.modes,
+            ch,
+            ChanMode::Running,
+            |_| false,
+        )
+        .unwrap();
+        assert_eq!(steps.last(), Some(&Step::FlipRunning));
+        let signed =
+            chanmode::sign_steps(steps, ch, &app.checklists, &app.modes, 1_800_000_100, |b| {
+                b.sign_with_keys(&k).map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert!(signed.sends.is_empty(), "the go is signed here, not sent");
+        let [go, flip] = signed.events.as_slice() else {
+            panic!("the go, then the header: {:?}", signed.events);
+        };
+        assert_eq!(go.content, chanmode::GO_TEXT);
+        assert_eq!(crate::model::tag(go, "p"), Some(bk.as_str()));
+        let id = go.id.to_hex();
+        // The relay refused the header: the go shows, the list isn't running.
+        app.mode_set(
+            std::slice::from_ref(go),
+            "🚀 running",
+            Err(anyhow::anyhow!("refused")),
+        );
+        assert!(app.store.channels[ch].messages.contains_key(&id));
+        assert_eq!(app.checklists.header(ch).unwrap().mode, ListMode::Ideating);
+        assert_eq!(
+            app.status.as_ref().map(|(s, _)| s.as_str()),
+            Some("mode not set: refused; M to pick again")
+        );
+        app.mode_set(&[go.clone(), flip.clone()], "🚀 running", Ok(()));
+        let h = app.checklists.header(ch).unwrap();
+        assert_eq!(
+            (h.mode, h.go.as_deref(), h.creator.as_str()),
+            (ListMode::Running, Some(id.as_str()), bk.as_str())
+        );
+        assert_eq!(
+            app.status.as_ref().map(|(s, _)| s.as_str()),
+            Some("🚀 running")
         );
     }
 

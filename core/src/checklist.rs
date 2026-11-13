@@ -757,11 +757,36 @@ impl Checklists {
     /// address, tags and content but the mode, signed by him (the CLI and
     /// stall-judge accept an owner-signed header). None without a list.
     pub fn flip_to_ideating(&self, channel: &str, now: u64) -> Option<nostr::EventBuilder> {
+        self.flip(channel, "ideating", None, now)
+    }
+
+    /// [`Self::flip_to_ideating`]'s twin for a go: mode running and `go` =
+    /// the owner's go message in the channel, as `checklist mode running
+    /// --go` writes it.
+    pub fn flip_to_running(
+        &self,
+        channel: &str,
+        go: &str,
+        now: u64,
+    ) -> Option<nostr::EventBuilder> {
+        self.flip(channel, "running", Some(go), now)
+    }
+
+    fn flip(
+        &self,
+        channel: &str,
+        mode: &str,
+        go: Option<&str>,
+        now: u64,
+    ) -> Option<nostr::EventBuilder> {
         let recs = self.channels.get(channel)?;
         let creator = self.driver_in(recs).driver?;
         let v = accepted(recs.headers.get(&creator)?, &creator, &self.trust.owner)?;
         let mut content = v.content.clone();
-        content["mode"] = "ideating".into();
+        content["mode"] = mode.into();
+        if let Some(go) = go {
+            content["go"] = go.into();
+        }
         let d = format!("{TAG}/header/{channel}/{creator}");
         let tags = [
             ["d", d.as_str()],
