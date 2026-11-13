@@ -97,7 +97,7 @@ The iPhone app (`ios/`, on the same core through `ffi/`) shows each channel's mo
 the terminal does: 🧠 ideating, 🚀 running, nothing when off, flashing to 🚩 when the channel needs you or to
 📣 for a person's @mention or DM (🚩 outranks 📣; off channels and DMs hold a steady 📣). Running chips show
 no unread count. Tab 0 is gone: every channel's status line carries ⚑ N, the number of flagged tabs, and
-tapping it opens the oldest flagged one, as `!` does. The mode button at the top, beside the online line, is
+tapping it opens the next flagged one, oldest first and round again, as `!` does. The mode button at the top, beside the online line, is
 the `M` picker: ideating, running (posts the go; a channel with no list asks a bot for one) or off, set at once.
 The app posts a local notification for each new watcher row its sync sees (stalled, waiting on lucian,
 waiting on release), once per row, and only for rows that began after the phone started watching. That

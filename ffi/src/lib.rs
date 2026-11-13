@@ -728,6 +728,19 @@ impl Client {
             .collect()
     }
 
+    /// ⚑ N's tap, as `!` in the terminal: the next flagged tab after
+    /// `current`, oldest flag first, round again at the end.
+    pub fn next_flagged(&self, current: Option<String>) -> Option<String> {
+        let e = self.engine.lock().unwrap();
+        let rows = e.needs_rows();
+        let flagged: Vec<(String, u64)> = e
+            .tabs
+            .iter()
+            .filter_map(|id| Some((id.clone(), e.chan_tab(&rows, id).flag?.1)))
+            .collect();
+        chanmode::next_flagged(&flagged, current.as_deref()).map(String::from)
+    }
+
     /// Any section's channels as tabs, whether or not it is the one showing.
     pub fn section_tabs(&self, section: String) -> Vec<ChannelTab> {
         let e = self.engine.lock().unwrap();
@@ -2837,6 +2850,39 @@ mod tests {
             .unwrap();
         c.engine.lock().unwrap().fold(&off, true);
         assert_eq!(tab(&c).0, "off");
+    }
+
+    /// ⚑ N's tap goes round the flagged tabs, oldest first (review ecfa8439).
+    #[test]
+    fn next_flagged_goes_round_oldest_first() {
+        use nostr::{EventBuilder, Kind, Timestamp};
+        let (a, b, quiet) = ("ch-a", "ch-b", "ch-c");
+        let mut e = engine();
+        let me = e.relay.keys.public_key().to_hex();
+        e.checklists.trust.owner = me.clone();
+        let human = Keys::generate();
+        for (ch, at) in [(b, now() - 50), (a, now() - 100)] {
+            let ev = EventBuilder::new(Kind::Custom(9), "hey")
+                .tags([
+                    nostr::Tag::parse(["h", ch]).unwrap(),
+                    nostr::Tag::parse(["p", &me]).unwrap(),
+                ])
+                .custom_created_at(Timestamp::from(at))
+                .sign_with_keys(&human)
+                .unwrap();
+            e.fold(&ev, true);
+        }
+        e.store.channel_mut(quiet);
+        e.tabs = vec![b.into(), quiet.into(), a.into()];
+        let c = Client {
+            engine: Arc::new(Mutex::new(e)),
+            stop: Arc::new(tokio::sync::Notify::new()),
+        };
+        let next = |cur: Option<&str>| c.next_flagged(cur.map(String::from));
+        assert_eq!(next(None).as_deref(), Some(a));
+        assert_eq!(next(Some(a)).as_deref(), Some(b));
+        assert_eq!(next(Some(b)).as_deref(), Some(a));
+        assert_eq!(next(Some(quiet)).as_deref(), Some(a));
     }
 
     /// Needs-you rows come from folded events, with what Swift shows, and a

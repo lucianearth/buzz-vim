@@ -401,8 +401,7 @@ struct Header: View {
             .padding(.horizontal, 22)
             // The operator loop's line for the open channel, when it has
             // one; ⚑ N (flagged tabs) in every channel's.
-            let flagged = tabs.filter { $0.flag != nil }
-            let flags = UInt32(flagged.count)
+            let flags = UInt32(tabs.filter { $0.flag != nil }.count)
             if let s = channelPage(selected), let loop = client.loopStatus(channel: s) {
                 LoopLine(status: loop, flags: flags)
                     .padding(.horizontal, 22)
@@ -417,9 +416,9 @@ struct Header: View {
                     .padding(.top, -8)
                     .contentShape(Rectangle())
                     .onTapGesture {
-                        // The oldest flag first, as `!` in the terminal.
-                        let oldest = flagged.min { ($0.flagSince ?? 0) < ($1.flagSince ?? 0) }
-                        withAnimation(.easeOut(duration: 0.2)) { selected = oldest?.id ?? selected }
+                        // The next flagged tab, oldest first and round, as `!`.
+                        let next = client.nextFlagged(current: selected)
+                        withAnimation(.easeOut(duration: 0.2)) { selected = next ?? selected }
                     }
             }
             ScrollViewReader { proxy in
