@@ -5,7 +5,7 @@ import UIKit
 /// state, item counts, crashes today. Tap it for the checklist.
 struct LoopLine: View {
     let status: LoopStatus
-    /// Tab 0's Needs-an-answer rows, shown as ⚑ N.
+    /// Flagged tabs, shown as ⚑ N.
     var flags: UInt32 = 0
     @Environment(\.theme) private var theme
 

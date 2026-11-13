@@ -31,11 +31,28 @@ pub const LIVE_KINDS: &[u16] = &[
     KIND_EDIT,
     KIND_SYSTEM,
     KIND_THREAD_SUMMARY,
+    KIND_TYPING,
 ];
 /// Kinds that count as unread (no system rows).
 pub const UNREAD_KINDS: &[u16] = &[KIND_MESSAGE, KIND_MESSAGE_V2];
 
 pub const THUMBS_UP: &str = "👍";
+/// Ephemeral "is typing", as Buzz Desktop sends it.
+pub const KIND_TYPING: u16 = 20002;
+/// Desktop's throttle: one pulse per channel every 3 s
+/// (desktop/src/features/messages/useTypingBroadcast.ts).
+pub const TYPING_EVERY: u64 = 3;
+
+/// A typing pulse in Desktop's shape (relayClientSession.ts
+/// sendTypingIndicator, threading.ts buildThreadReferenceTags): empty
+/// content, `h`, and in a thread the root as the `reply` it answers.
+pub fn typing(channel: &str, root: Option<&str>) -> nostr::EventBuilder {
+    let mut tags = vec![nostr::Tag::parse(["h", channel]).expect("tag")];
+    if let Some(r) = root {
+        tags.push(nostr::Tag::parse(["e", r, "", "reply"]).expect("tag"));
+    }
+    nostr::EventBuilder::new(nostr::Kind::Custom(KIND_TYPING), "").tags(tags)
+}
 
 pub fn tag<'a>(ev: &'a Event, name: &str) -> Option<&'a str> {
     ev.tags.iter().find_map(|t| {
@@ -193,6 +210,8 @@ pub struct Channel {
     pub mentioned: HashSet<String>,
     pub oldest: Option<u64>,
     pub exhausted: bool,
+    /// Typing pulses (kind 20002): pubkey -> the newest one's created_at.
+    pub typing: HashMap<String, u64>,
 }
 
 impl Channel {
@@ -327,6 +346,19 @@ impl Store {
             kind,
             KIND_PROFILE | KIND_CHANNEL_META | KIND_CHANNEL_MEMBERS
         );
+        // A pulse every few seconds per typist: kept as the newest, not seen.
+        if kind == KIND_TYPING {
+            if let Some(h) = tag(ev, "h").map(str::to_string) {
+                let at = ev.created_at.as_secs();
+                let t = self
+                    .channel_mut(&h)
+                    .typing
+                    .entry(ev.pubkey.to_hex())
+                    .or_default();
+                *t = (*t).max(at);
+            }
+            return Applied::Nothing;
+        }
         if !replaceable && !self.seen.insert(ev.id.to_hex()) {
             return Applied::Nothing;
         }
@@ -661,6 +693,24 @@ mod tests {
             "newest tagged"
         );
         assert_eq!(ch.model_of("someone"), None);
+    }
+
+    #[test]
+    fn typing_is_desktops_shape() {
+        let k = Keys::generate();
+        let tags = |root| {
+            let e = typing("c", root).sign_with_keys(&k).unwrap();
+            assert_eq!((e.kind.as_u16(), e.content.as_str()), (20002, ""));
+            e.tags
+                .iter()
+                .map(|t| t.as_slice().to_vec())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tags(None), [["h", "c"]]);
+        assert_eq!(
+            tags(Some("r")),
+            [vec!["h", "c"], vec!["e", "r", "", "reply"]]
+        );
     }
 
     #[test]

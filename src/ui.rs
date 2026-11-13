@@ -47,9 +47,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // goes back up.
     let main = slider(f, app, body);
     let mut images = vec![];
-    if app.needs_view {
-        draw_needs(f, app, main);
-    } else if app.routing_view {
+    if app.routing_view {
         draw_routing(f, app, main);
     } else if app.control_view {
         control::draw_control(f, app, main, &mut images);
@@ -85,9 +83,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             | Mode::Help
             | Mode::Viewer
             | Mode::Quick
-            | Mode::Reply
             | Mode::Vote
             | Mode::Subscription
+            | Mode::Switch
     ) || (app.mode == Mode::Insert && !app.mention_candidates().is_empty());
     for (rect, key) in images.into_iter().filter(|_| !overlay) {
         if let Some(p) = app.media.encoded.get(&key) {
@@ -102,11 +100,63 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Viewer => draw_viewer(f, app, area),
         Mode::Hint => draw_hints(f, app),
         Mode::Quick => draw_quick(f, app, area),
-        Mode::Reply => draw_reply(f, app, area),
         Mode::Vote => draw_vote(f, app, area),
         Mode::Subscription => draw_subscription(f, app, area),
+        Mode::Switch => draw_chanmode(f, app, area),
         _ => {}
     }
+}
+
+/// `M`: the channel's mode. With no list, running asks a bot for one.
+fn draw_chanmode(f: &mut Frame, app: &mut App, area: Rect) {
+    use crate::chanmode::ChanMode;
+    let Some(channel) = app.current().map(str::to_string) else {
+        return;
+    };
+    let now = app.chan_tab(&app.needs, &channel).mode;
+    let has_list = app.checklists.header(&channel).is_some();
+    let bot =
+        crate::chanmode::last_bot(&app.store, &channel, &app.checklists.trust.watchers, |pk| {
+            crate::needs::is_bot(&app.store, &app.agents, &app.checklists, pk)
+        });
+    let legend = crate::keys::legend(Mode::Switch);
+    let r = centered(area, 64, 8);
+    clear(f, r);
+    let block = Block::bordered()
+        .border_style(theme::text())
+        .title(Span::styled(" channel mode ", theme::bright()));
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    let mut lines = vec![Line::raw("")];
+    for (i, m) in ChanMode::ALL.into_iter().enumerate() {
+        let text = match (m, has_list, &bot) {
+            (ChanMode::Running, false, Some(b)) => {
+                format!("running: ask {} to make a list", app.store.name_of(b))
+            }
+            (ChanMode::Running, false, None) => "running: no list here".to_string(),
+            _ => m.label().to_string(),
+        };
+        let st = if i == app.mode_cursor {
+            theme::tab_active()
+        } else {
+            theme::text()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {} ", if m == now { "●" } else { " " }),
+                theme::bright(),
+            ),
+            Span::styled(format!("{} {text} ", m.icon().unwrap_or("  ")), st),
+        ]));
+    }
+    let mut keys = vec![Span::raw(" ")];
+    for (i, (k, what, _)) in legend.iter().enumerate() {
+        keys.push(Span::styled(format!(" {k} "), theme::chip(theme::nth(i))));
+        keys.push(Span::styled(format!(" {what} "), theme::muted()));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(keys));
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// `B`: whose Claude subscription this channel's agents spend. Two
@@ -373,30 +423,14 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
     };
     // Tabs get the whole row up to the count.
     let limit = area.x + area.width.saturating_sub(right.width() as u16 + 1);
-    // Tab 0, Needs you, pinned first: it never scrolls away or closes.
-    let n = crate::needs::answer_count(&app.needs);
-    let label = if n > 0 {
-        format!(" 0 ⚑ needs you {n} ")
-    } else {
-        " 0 needs you ".to_string()
-    };
-    let w = (label.width() as u16).min(limit.saturating_sub(x));
-    let style = if app.needs_view {
-        theme::tab_active()
-    } else if n > 0 {
-        theme::tab_idle().add_modifier(Modifier::BOLD)
-    } else {
-        theme::tab_idle()
-    };
-    let r = Rect {
-        x,
-        y: area.y,
-        width: w,
-        height: 1,
-    };
-    f.render_widget(Paragraph::new(Span::styled(label, style)), r);
-    app.hits.push((r, Hit::NeedsTab));
-    x += w + 1;
+    // Flags flash on a 600 ms beat.
+    let on = (app.tick / 4).is_multiple_of(2);
+    let states: Vec<crate::chanmode::Tab> = app
+        .tabs
+        .iter()
+        .map(|c| app.chan_tab(&app.needs, c))
+        .collect();
+    app.flashing = states.iter().any(|t| t.flashes());
     let labels: Vec<(String, usize)> = app
         .tabs
         .iter()
@@ -404,6 +438,10 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|(i, id)| {
             let ch = app.store.channels.get(id);
             let name = ch.map(channel_label).unwrap_or_else(|| "…".into());
+            let state = states[i];
+            // A running tab shows no unread count: its flag says enough.
+            let running = state.mode == crate::chanmode::ChanMode::Running;
+            let ch = ch.filter(|_| !running);
             let unread = ch.map_or(0, |c| c.unread.len());
             // In a DM every message is to you.
             let mentions = ch.map_or(0, |c| {
@@ -428,10 +466,12 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 SPIN[app.tick as usize % SPIN.len()]
             };
+            // Two columns always, so tabs keep their width as it flashes.
+            let icon = state.icon(on).unwrap_or("  ");
             let label = if i < 9 {
-                format!(" {} {name} {dot}{spin}", i + 1)
+                format!(" {} {icon} {name} {dot}{spin}", i + 1)
             } else {
-                format!(" {name} {dot}{spin}")
+                format!(" {icon} {name} {dot}{spin}")
             };
             (label, unread)
         })
@@ -475,7 +515,7 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
             break;
         }
         let hue = theme::hue(&app.tabs[i]);
-        let style = if i == app.active && !app.needs_view {
+        let style = if i == app.active {
             theme::chip(hue)
         } else if unread > 0 {
             theme::tab_idle()
@@ -1557,7 +1597,7 @@ fn draw_status(f: &mut Frame, app: &mut App, row: Rect, channel: &str, hint: boo
     let sum = app
         .checklists
         .summary(channel, crate::checklist::local_midnight(now));
-    let flags = crate::needs::answer_count(&app.needs);
+    let flags = app.flagged_tabs(&app.needs).len();
     // The channel's Claude subscription (`B`), at the right end; the
     // summary gets the rest of the row so it never writes over it.
     let mut row = row;
@@ -1580,7 +1620,7 @@ fn draw_status(f: &mut Frame, app: &mut App, row: Rect, channel: &str, hint: boo
         return;
     }
     let sep = || Span::styled("  ·  ", theme::faint());
-    // ⚑ N: what needs an answer, in every channel; `!` goes through it.
+    // ⚑ N: the flagged tabs; `!` goes through them.
     let flag = |spans: &mut Vec<Span<'static>>| {
         spans.push(Span::styled(format!("⚑ {flags}"), theme::bright()));
     };
@@ -1588,10 +1628,7 @@ fn draw_status(f: &mut Frame, app: &mut App, row: Rect, channel: &str, hint: boo
         let mut spans = vec![Span::raw(" ")];
         flag(&mut spans);
         if hint {
-            spans.push(Span::styled(
-                "  need you · 0 to see · ! next",
-                theme::faint(),
-            ));
+            spans.push(Span::styled("  need you · ! next", theme::faint()));
         }
         f.render_widget(Paragraph::new(Line::from(spans)), row);
         return;
@@ -1986,45 +2023,6 @@ fn draw_quick(f: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
-/// `r` on tab 0: a reply to the picked row, into its thread.
-fn draw_reply(f: &mut Frame, app: &mut App, area: Rect) {
-    let Some(r) = app.reply_to.clone() else {
-        return;
-    };
-    let ch = app
-        .store
-        .channels
-        .get(&r.channel)
-        .map(channel_label)
-        .unwrap_or_else(|| "#…".into());
-    let title = if r.thread.is_some() {
-        format!(" reply in {ch} › thread ")
-    } else {
-        format!(" message {ch} ")
-    };
-    let who = needs_who(app, &r);
-    let head = Line::from(vec![
-        Span::styled(format!(" {who}: "), theme::muted()),
-        Span::styled(
-            clip(
-                &r.text,
-                (area.width as usize).saturating_sub(who.width() + 12),
-            ),
-            theme::text(),
-        ),
-    ]);
-    let short = [("⏎", "send"), ("⇧⏎", "new line"), ("esc", "close")];
-    draw_box(
-        f,
-        area,
-        title,
-        head,
-        &app.reply_draft,
-        "type your reply",
-        &short,
-    );
-}
-
 /// A box over everything for a short text: a line saying where it goes,
 /// the text, and its keys.
 fn draw_box(
@@ -2096,128 +2094,6 @@ fn draw_box(
         (inner.x + 1 + cc as u16).min(inner.right().saturating_sub(1)),
         (text_top + cl.saturating_sub(skip) as u16).min(inner.bottom().saturating_sub(1)),
     ));
-}
-
-/// Who a tab-0 row is from: their name, or the watcher's when nobody is.
-fn needs_who(app: &App, r: &crate::needs::Row) -> String {
-    if let crate::needs::Reason::Contested(c) = &r.reason {
-        contested_names(app, c)
-    } else if r.who.is_empty() {
-        "watcher".into()
-    } else {
-        app.store.name_of(&r.who)
-    }
-}
-
-/// Tab 0, Needs you: what waits on the operator, then FYI (newest first, latest 20).
-/// One row each: age, channel, who, one line.
-fn draw_needs(f: &mut Frame, app: &mut App, area: Rect) {
-    use crate::needs::{Reason, Section};
-    let now = crate::sync::now();
-    let rows = app.needs.clone();
-    let answer = crate::needs::answer_count(&rows);
-    let [title, rule, body] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .areas(area);
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" ⚑ needs you", theme::bright()),
-            Span::styled(
-                format!("   {answer} need an answer · {} FYI", rows.len() - answer),
-                theme::muted(),
-            ),
-            Span::styled("    ⏎ open  r reply  ! next", theme::faint()),
-        ])),
-        title,
-    );
-    f.render_widget(
-        Block::new()
-            .borders(Borders::TOP)
-            .border_style(theme::rule()),
-        rule,
-    );
-    if rows.is_empty() {
-        draw_empty(f, app, body, "nothing needs you");
-        return;
-    }
-    app.needs_cursor = app.needs_cursor.min(rows.len() - 1);
-    let cur = app.needs_cursor;
-    let width = body.width as usize;
-    // (line, row index) with the section headings in between.
-    let mut lines: Vec<(Line<'static>, Option<usize>)> = vec![];
-    let mut last = None;
-    for (i, r) in rows.iter().enumerate() {
-        if last != Some(r.section) {
-            if last.is_some() {
-                lines.push((Line::raw(""), None));
-            }
-            let (name, n) = match r.section {
-                Section::Answer => ("needs an answer", answer),
-                Section::Fyi => ("FYI", rows.len() - answer),
-            };
-            lines.push((
-                Line::styled(format!(" {name} ({n})"), theme::bright()),
-                None,
-            ));
-            last = Some(r.section);
-        }
-        let mark = match &r.reason {
-            Reason::Watch(crate::checklist::WatchState::Stalled) => "⚠",
-            Reason::Watch(_) => "⚑",
-            Reason::Contested(_) => "⚑",
-            Reason::Mention => "@",
-            Reason::Dm => "✉",
-            Reason::Bot => "·",
-        };
-        let ch = app
-            .store
-            .channels
-            .get(&r.channel)
-            .map(channel_label)
-            .unwrap_or_else(|| format!("#{}", r.channel.chars().take(8).collect::<String>()));
-        let head = format!(
-            " {mark} {:>5}  {}  {}  ",
-            ago(now.saturating_sub(r.at)),
-            pad_to(&clip(&ch, 20), 19),
-            pad_to(&clip(&needs_who(app, r), 13), 12),
-        );
-        let text = clip(&r.text, width.saturating_sub(head.width()));
-        let (hs, ts) = if i == cur {
-            (theme::tab_active(), theme::tab_active())
-        } else if r.section == Section::Answer {
-            (theme::muted(), theme::text())
-        } else {
-            (theme::faint(), theme::muted())
-        };
-        lines.push((
-            Line::from(vec![
-                Span::styled(head, hs),
-                Span::styled(pad_to(&text, width.saturating_sub(0)), ts),
-            ]),
-            Some(i),
-        ));
-    }
-    let h = body.height as usize;
-    let at = lines.iter().position(|(_, i)| *i == Some(cur)).unwrap_or(0);
-    let first = at.saturating_sub(h.saturating_sub(1));
-    let mut out = vec![];
-    for (y, (l, i)) in lines.into_iter().skip(first).take(h).enumerate() {
-        if let Some(i) = i {
-            app.hits.push((
-                Rect {
-                    y: body.y + y as u16,
-                    height: 1,
-                    ..body
-                },
-                Hit::NeedsRow(i),
-            ));
-        }
-        out.push(l);
-    }
-    f.render_widget(Paragraph::new(out), body);
 }
 
 // ---------- routing ----------
@@ -4124,7 +4000,7 @@ mod tests {
     }
 
     /// A second list in the loop channel: the status line says contested
-    /// with both creators, no list shows, and tab 0 asks for a driver.
+    /// with both creators, no list shows, and a needs row asks for a driver.
     #[test]
     fn a_contested_channel_says_so() {
         use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
@@ -4409,134 +4285,6 @@ mod tests {
         app.on_term(crossterm::event::Event::Key(KeyCode::Char('L').into()));
         let s = screen_text(&mut app, 120, 34);
         assert!(s.contains("no checklist in this channel"), "{s}");
-    }
-
-    /// Tab 0: what needs an answer, then FYI, newest first; ⏎ opens a row,
-    /// r answers it in its thread (and the row goes), ! goes round them.
-    #[test]
-    fn tab_zero_lists_what_needs_you() {
-        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
-        let ch = "2130646b-d6c8-4ec3-93e3-36f77bee1a37";
-        let mut app = loop_fixture();
-        let lucian = app.store.me.clone();
-        let (alice, judge) = (Keys::generate(), Keys::generate());
-        for (k, name, agent) in [(&alice, "alice", false), (&judge, "judgebot", true)] {
-            app.store.profiles.insert(
-                k.public_key().to_hex(),
-                crate::model::Profile {
-                    name: name.into(),
-                    is_agent: agent,
-                    ..Default::default()
-                },
-            );
-        }
-        let now = crate::sync::now();
-        let post = |app: &mut App, k: &Keys, text: &str, root: Option<&str>, at: u64| {
-            let mut tags = vec![
-                Tag::parse(["h", "c2"]).unwrap(),
-                Tag::parse(["p", &lucian]).unwrap(),
-            ];
-            if let Some(r) = root {
-                tags.push(Tag::parse(["e", r, "", "reply"]).unwrap());
-            }
-            let ev = EventBuilder::new(Kind::Custom(9), text)
-                .tags(tags)
-                .custom_created_at(Timestamp::from(at))
-                .sign_with_keys(k)
-                .unwrap();
-            app.store.apply(&ev);
-            ev.id.to_hex()
-        };
-        let ask = post(
-            &mut app,
-            &alice,
-            "@lucian can you review the beacon PR?",
-            None,
-            now - 3600,
-        );
-        post(
-            &mut app,
-            &judge,
-            "@lucian deployed beacon v2",
-            None,
-            now - 120,
-        );
-        app.store.channel_mut("c2").loaded = true;
-        // A channel with no list still shows the count.
-        app.on_term(crossterm::event::Event::Key(KeyCode::Char('2').into()));
-        let s = screen_text(&mut app, 120, 34);
-        assert!(s.contains("⚑ 2  need you · 0 to see · ! next"), "{s}");
-        assert!(s.contains("0 ⚑ needs you 2"), "{s}");
-        app.on_term(crossterm::event::Event::Key(KeyCode::Char('0').into()));
-        let s = screen_text(&mut app, 120, 34);
-        assert!(
-            s.contains("needs an answer (2)") && s.contains("FYI (1)"),
-            "{s}"
-        );
-        let at = |t: &str| s.find(t).unwrap_or_else(|| panic!("{t}: {s}"));
-        // Oldest first: alice an hour ago, then the watcher's ask.
-        assert!(at("can you review the beacon PR?") < at("waiting on lucian"));
-        assert!(
-            at("waiting on lucian") < at("FYI (1)") && at("FYI (1)") < at("deployed beacon v2")
-        );
-        assert!(
-            s.contains("#beacon") && s.contains("alice") && s.contains("judgebot"),
-            "{s}"
-        );
-        // ⏎ opens alice's message.
-        app.on_term(crossterm::event::Event::Key(KeyCode::Enter.into()));
-        assert!(!app.needs_view);
-        assert_eq!(
-            (app.current(), app.selected.get("c2")),
-            (Some("c2"), Some(&ask))
-        );
-        // r on her row: a reply into her thread.
-        app.on_term(crossterm::event::Event::Key(KeyCode::Char('0').into()));
-        app.on_term(crossterm::event::Event::Key(KeyCode::Char('r').into()));
-        for c in "on it".chars() {
-            app.on_term(crossterm::event::Event::Key(KeyCode::Char(c).into()));
-        }
-        let s = screen_text(&mut app, 120, 34);
-        assert!(
-            s.contains("reply in #beacon › thread") && s.contains("alice: @lucian can you review"),
-            "{s}"
-        );
-        app.actions.clear();
-        app.on_term(crossterm::event::Event::Key(KeyCode::Enter.into()));
-        assert!(matches!(app.actions.first(),
-            Some(crate::app::Action::SendDraft { channel, root, draft, to })
-                if channel == "c2" && root.as_ref() == Some(&ask) && draft.text == "on it"
-                    && to == &vec![alice.public_key().to_hex()]));
-        // Once the reply is in the store, her row is gone.
-        let m = crate::model::Message {
-            id: "lucian-reply".into(),
-            author: lucian.clone(),
-            created_at: now - 1,
-            content: "on it".into(),
-            root: Some(ask.clone()),
-            ..Default::default()
-        };
-        app.store.channel_mut("c2").messages.insert(m.id.clone(), m);
-        let s = screen_text(&mut app, 120, 34);
-        assert!(
-            s.contains("needs an answer (1)") && !s.contains("can you review the beacon"),
-            "{s}"
-        );
-        // ! goes to the watcher's ping, in its thread.
-        app.on_term(crossterm::event::Event::Key(KeyCode::Char('!').into()));
-        assert_eq!(app.thread, Some((ch.to_string(), "5dbdf585".to_string())));
-        assert_eq!(app.thread_selected.as_deref(), Some("c0ffee01"));
-        assert!(app.status.as_ref().unwrap().0.starts_with("⚑ 1/1"));
-        // H from the first channel tab comes round to tab 0.
-        app.on_term(crossterm::event::Event::Key(KeyCode::Char('1').into()));
-        app.on_term(crossterm::event::Event::Key(KeyCode::Char('H').into()));
-        assert!(app.needs_view);
-        app.mode = Mode::Help;
-        let s = screen_text(&mut app, 120, 60);
-        assert!(
-            s.contains("next ⚑, oldest first") && s.contains("reply (r on tab 0)"),
-            "{s}"
-        );
     }
 
     #[test]
@@ -5119,8 +4867,8 @@ mod tests {
         key(&mut app, KeyCode::Esc);
         // Opening another view closes it.
         key(&mut app, KeyCode::Char('w'));
-        key(&mut app, KeyCode::Char('0'));
-        assert!(app.needs_view && !app.routing_view);
+        key(&mut app, KeyCode::Char('c'));
+        assert!(app.checklist_view && !app.routing_view);
     }
 
     #[test]
@@ -5349,10 +5097,10 @@ mod tests {
             Hint,
             Reset,
             Quick,
-            Reply,
             Archive,
             Vote,
             Subscription,
+            Switch,
         ];
         for m in modes {
             for s in sections(m)

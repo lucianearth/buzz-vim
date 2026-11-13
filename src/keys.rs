@@ -15,14 +15,14 @@ pub enum Mode {
     Reset,
     /// The Q box: a quick question to #quick.
     Quick,
-    /// A reply box for a tab-0 row, into its thread.
-    Reply,
     /// Asking before archiving the tab picked in the tab menu.
     Archive,
     /// Asking before voting on a control request (a kind-7 reaction).
     Vote,
     /// `B`: whose Claude subscription this channel's agents spend.
     Subscription,
+    /// `M`: the channel's mode (ideating, running, off).
+    Switch,
 }
 
 impl Mode {
@@ -38,10 +38,10 @@ impl Mode {
             Mode::Hint => "LINK",
             Mode::Reset => "RESET?",
             Mode::Quick => "Q",
-            Mode::Reply => "REPLY",
             Mode::Archive => "ARCHIVE?",
             Mode::Vote => "VOTE?",
             Mode::Subscription => "SUBSCRIPTION",
+            Mode::Switch => "MODE",
         }
     }
 }
@@ -87,11 +87,12 @@ const MOVE: Section = (
 const TABS: Section = (
     "tabs",
     &[
-        ("0-9", "go to tab (0 needs you)", Help),
+        ("1-9", "go to tab", Help),
         ("H L ⇥", "prev / next tab", Help),
         ("< >", "move tab left / right", Help),
         ("T", "tab order", Help),
-        ("!", "next ⚑, oldest first", Help),
+        ("!", "next 🚩 📣 tab, oldest first", Help),
+        ("M", "channel mode: 🧠 🚀 off", Help),
     ],
 );
 const MESSAGES: Section = (
@@ -100,7 +101,7 @@ const MESSAGES: Section = (
         ("i", "write", Both),
         ("r", "reply in thread", Help),
         ("+", "👍", Help),
-        ("⏎ l →", "open thread / tab 0 row", Help),
+        ("⏎ l →", "open thread", Help),
         ("o", "image", Both),
         ("O", "images in Preview", Help),
         ("f", "links", Both),
@@ -202,20 +203,21 @@ const QUICK: Section = (
         ("esc", "close (keeps the text)", Footer),
     ],
 );
-const REPLY: Section = (
-    "reply (r on tab 0)",
-    &[
-        ("⏎", "send into its thread", Both),
-        ("⇧⏎ ^j", "new line", Footer),
-        ("esc", "close (keeps the text)", Footer),
-    ],
-);
 const SUBSCRIPTION: Section = (
     "Claude subscription (B)",
     &[
         ("j k", "pick", Footer),
         ("⇥ h l", "channel / default / model", Both),
         ("⏎", "use it (signs, publishes)", Both),
+        ("esc", "close", Footer),
+    ],
+);
+const CHANMODE: Section = (
+    "channel mode (M)",
+    &[
+        ("j k ↑↓", "pick", Footer),
+        ("M", "next", Footer),
+        ("⏎", "set it", Footer),
         ("esc", "close", Footer),
     ],
 );
@@ -238,7 +240,7 @@ const HINT: Section = (
 /// The `?` overlay, left column then right. A short screen clips the
 /// bottom, so the boxes that list their own keys go last.
 pub const HELP: [&[Section]; 2] = [
-    &[MOVE, TABS, MESSAGES, APP, INSERT, REPLY, QUICK],
+    &[MOVE, TABS, MESSAGES, APP, INSERT, QUICK],
     &[
         SCREENS,
         AGENTS,
@@ -265,8 +267,8 @@ pub fn sections(mode: Mode) -> &'static [Section] {
         Mode::Archive => &[("archive", &[("y ⏎", "archive", Footer), NO])],
         Mode::Vote => &[("vote", &[("y ⏎", "send the reaction", Footer), NO])],
         Mode::Quick => &[QUICK],
-        Mode::Reply => &[REPLY],
         Mode::Subscription => &[SUBSCRIPTION],
+        Mode::Switch => &[CHANMODE],
         Mode::Viewer => &[VIEWER],
         Mode::Help => &[("help", &[("esc ?", "close", Both)])],
         Mode::Hint => &[HINT],

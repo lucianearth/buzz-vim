@@ -117,6 +117,12 @@ pub enum Msg {
         label: String,
         result: anyhow::Result<()>,
     },
+    /// `M`'s records the relay stored, in order, and the first failure.
+    ModeSet {
+        stored: Vec<Event>,
+        label: String,
+        result: anyhow::Result<()>,
+    },
     /// A vote went out, or didn't.
     Voted {
         event: Box<Event>,
@@ -504,7 +510,7 @@ impl Sync {
         });
     }
 
-    /// Tab 0's data across every channel we're in: mentions of the
+    /// The needs rows' data across every channel we're in: mentions of the
     /// operator, his own posts, DMs and checklist records, the last week
     /// of them and a live tail. Asked again whenever channels load.
     pub fn load_needs(&mut self, store: &model::Store, operator: &str) {
@@ -693,23 +699,6 @@ impl Sync {
                 let draft = std::mem::take(app.draft_mut());
                 self.send(app, channel, root, parent, draft, vec![])
             }
-            Action::SendDraft {
-                channel,
-                root,
-                draft,
-                to,
-            } => {
-                let before: HashSet<String> = app.pending_sends.keys().cloned().collect();
-                self.send(app, channel, root.clone(), root, draft, to);
-                // Remember which send came from the reply box.
-                if let Some(row) = app.reply_sent.take() {
-                    for id in app.pending_sends.keys() {
-                        if !before.contains(id) {
-                            app.reply_sends.insert(id.clone(), row.clone());
-                        }
-                    }
-                }
-            }
             Action::ThumbsUp { target } => self.thumbs_up(app, target),
             Action::Reset {
                 channel,
@@ -805,6 +794,15 @@ impl Sync {
                 agent,
                 text,
             } => self.send_quick(app, channel, content, agent, text),
+            Action::SetMode { channel, pick } => self.set_mode(app, channel, pick),
+            Action::Typing { channel, root } => {
+                if let Ok(ev) = self
+                    .relay
+                    .sign(crate::model::typing(&channel, root.as_deref()))
+                {
+                    let _ = self.live.send(Cmd::Publish(Box::new(ev)));
+                }
+            }
             Action::SaveState | Action::Quit => {}
         }
     }
@@ -1056,6 +1054,71 @@ impl Sync {
             let result = r.publish_new(&ev).await;
             Msg::SubscriptionSet {
                 event: Box::new(ev),
+                label,
+                result,
+            }
+        });
+    }
+
+    /// `M`'s pick: save it, flip the header, or post the go (or the ask
+    /// for a list) from the owner, as `chanmode::plan` says.
+    fn set_mode(&mut self, app: &mut App, channel: String, pick: crate::chanmode::ChanMode) {
+        use crate::chanmode::{self, Step};
+        let is_bot = |pk: &str| crate::needs::is_bot(&app.store, &app.agents, &app.checklists, pk);
+        let steps = match chanmode::steps(
+            &app.store,
+            &app.checklists,
+            &app.modes,
+            &channel,
+            pick,
+            is_bot,
+        ) {
+            Ok(s) => s,
+            Err(e) => return app.say(e),
+        };
+        if steps.is_empty() {
+            return app.say(format!("already {}", pick.label()));
+        }
+        let mut events = vec![];
+        for step in steps {
+            let built = match step {
+                Step::Save(m) => app.modes.record(&channel, m, now()),
+                Step::Flip => match app.checklists.flip_to_ideating(&channel, now()) {
+                    Some(b) => b,
+                    None => continue,
+                },
+                Step::Send { text, to } => {
+                    let mut d = crate::draft::Draft::default();
+                    d.insert(text);
+                    self.send(app, channel.clone(), None, None, d, vec![to]);
+                    continue;
+                }
+            };
+            match self.relay.sign(built) {
+                Ok(ev) => events.push(ev),
+                Err(e) => return app.say(format!("couldn't sign the mode: {e}")),
+            }
+        }
+        let label = format!("{} {}", pick.icon().unwrap_or("·"), pick.label());
+        if events.is_empty() {
+            return app.say(label);
+        }
+        app.say(format!("{label}…"));
+        // Shown once the relay stores it, so a pick that never lands
+        // (offline, refused, or older than the relay's) leaves nothing.
+        let r = self.relay.clone();
+        self.spawn(async move {
+            let mut stored = vec![];
+            let mut result = Ok(());
+            for ev in events {
+                if let Err(e) = r.publish_new(&ev).await {
+                    result = Err(e);
+                    break;
+                }
+                stored.push(ev);
+            }
+            Msg::ModeSet {
+                stored,
                 label,
                 result,
             }
@@ -1350,6 +1413,11 @@ pub fn fold(app: &mut App, sync: &mut Sync, ev: &Event, live_channel: bool) -> V
         }
         30078 if Subscriptions::is_record(ev) => {
             app.subscriptions.apply(ev);
+            return vec![];
+        }
+        30078 if crate::chanmode::is_record(ev) => {
+            let owner = app.checklists.trust.owner.clone();
+            app.modes.apply(ev, &owner);
             return vec![];
         }
         30078 if readstate::is_read_state(ev) => {
