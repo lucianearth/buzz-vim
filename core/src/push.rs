@@ -544,13 +544,19 @@ pub fn note(store: &Store, ev: &Event) -> Note {
     let channel = crate::model::tag(ev, "h").unwrap_or_default();
     let label = store.label(channel);
     let text = crate::needs::one_line(&m.content);
+    // The watcher's pings say which kind they are (aei contract): the
+    // title carries it, the body the rest.
+    let ping = ["Your turn:", "Dropped out:"]
+        .into_iter()
+        .find_map(|p| Some((p.trim_end_matches(':'), text.strip_prefix(p)?.trim())));
+    let (title, body) = match ping {
+        Some((kind, rest)) => (format!("{kind} · {label}"), rest.to_string()),
+        None if text.is_empty() => (format!("{label} · {who}"), "sent an attachment".into()),
+        None => (format!("{label} · {who}"), text.clone()),
+    };
     Note {
-        title: format!("{label} · {who}"),
-        body: if text.is_empty() {
-            "sent an attachment".into()
-        } else {
-            text
-        },
+        title,
+        body,
         link: Some(crate::checklist::message_link(
             channel,
             &m.id,
@@ -907,6 +913,33 @@ mod tests {
         assert_eq!(
             (n.title.as_str(), n.body.as_str()),
             ("@alice · alice", "sent an attachment")
+        );
+    }
+
+    #[test]
+    fn watcher_pings_title_their_kind() {
+        let (me, watcher) = (Keys::generate(), Keys::generate());
+        let mut store = Store::new(pk(&me));
+        store.channel_mut(CH).name = "general".into();
+        let n = |text: &str| {
+            let n = note(&store, &message(&watcher, CH, text, Some(&pk(&me)), NOW));
+            (n.title, n.body)
+        };
+        assert_eq!(
+            n("Your turn: taskbot asked about the key"),
+            (
+                "Your turn · #general".into(),
+                "taskbot asked about the key".into()
+            )
+        );
+        assert_eq!(
+            n("Dropped out: stalled 20m"),
+            ("Dropped out · #general".into(), "stalled 20m".into())
+        );
+        let who = store.name_of(&pk(&watcher));
+        assert_eq!(
+            n("waiting on you"),
+            (format!("#general · {who}"), "waiting on you".into())
         );
     }
 }
