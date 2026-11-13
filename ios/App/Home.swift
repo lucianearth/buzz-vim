@@ -47,8 +47,8 @@ extension EnvironmentValues {
     }
 }
 
-/// Tabs across the top, Needs you (tab 0) first, then one channel per
-/// page, then Routing and Control last: swipe sideways between them,
+/// Tabs across the top, one channel per page, each with its mode (🧠 / 🚀)
+/// flashing to 🚩 or 📣 when it needs you, then Routing and Control last: swipe sideways between them,
 /// tap a message for its thread (it opens in the tab, which remembers it;
 /// swipes still change tabs), pull the header down for the agents,
 /// hold a tab or the status line for the switcher
@@ -69,7 +69,7 @@ struct Home: View {
     @State private var switcher = false
     /// The Q sheet, while it's up.
     @State private var quick: QuickBox?
-    /// Where links, bell landings and Needs you rows jumped from, oldest
+    /// Where links and bell landings jumped from, oldest
     /// first; the ↰ chip walks back along it.
     @State private var jumps: [Place] = []
 
@@ -93,12 +93,6 @@ struct Home: View {
                 ScrollViewReader { proxy in
                     ScrollView(.horizontal) {
                         LazyHStack(spacing: 0) {
-                            // Tab 0 first, always.
-                            NeedsView(client: client) { link in
-                                if let f = client.follow(url: link) { follow(f) }
-                            }
-                            .containerRelativeFrame([.horizontal, .vertical])
-                            .id(Needs.id)
                             ForEach(tabs, id: \.id) { t in
                                 page(t.id, t.label)
                                     .containerRelativeFrame([.horizontal, .vertical])
@@ -203,12 +197,11 @@ struct Home: View {
         }
     }
 
-    /// The tab `by` places along, wrapping (tab 0 included), on its open
-    /// thread if it has one. The keyboard stays up on a channel tab.
+    /// The tab `by` places along, wrapping, on its open thread if it has
+    /// one. The keyboard stays up on a channel tab.
     private func step(_ by: Int) {
-        // Tab 0 (Needs you) sits before the first channel in the ring,
-        // Routing and Control after the last.
-        let ring = [Needs.id] + client.tabs().map(\.id) + [Routing.id, Control.id]
+        // Routing and Control after the last channel.
+        let ring = client.tabs().map(\.id) + [Routing.id, Control.id]
         let i = ring.firstIndex { $0 == selected } ?? 0
         let id = ring[((i + by) % ring.count + ring.count) % ring.count]
         if channelPage(id) != nil {
@@ -247,7 +240,7 @@ struct Home: View {
     private func pick(_ t: ChannelTab) {
         if !client.tabs().contains(where: { $0.section == t.section }) {
             // settle() runs on the new row before onChange(selected)
-            // moves `wanted`; set it first, or Needs you or Routing wins.
+            // moves `wanted`; set it first, or Routing wins.
             wanted = t.id
             model.setChosen([t.section])
         }
@@ -311,7 +304,6 @@ struct Home: View {
 
     /// A place in the ↰ chip's chain.
     private func name(_ p: Place, _ tabs: [ChannelTab]) -> String {
-        if p.tab == Needs.id { return "⚑ needs you" }
         if p.tab == Routing.id { return "routing" }
         if p.tab == Control.id { return "control" }
         let ch = tabs.first { $0.id == p.tab }?.label ?? p.label
@@ -391,6 +383,9 @@ struct Header: View {
                     .onTapGesture { showAgents = true }
                     .onLongPressGesture { openSwitcher() }
                 Spacer()
+                if let s = channelPage(selected) {
+                    modeMenu(s)
+                }
                 // Q: a quick question to taskbot in #quick.
                 Button(action: openQuick) {
                     Text("Q")
@@ -404,8 +399,9 @@ struct Header: View {
             }
             .padding(.horizontal, 22)
             // The operator loop's line for the open channel, when it has
-            // one; ⚑ N (tab 0's count) in every channel's.
-            let flags = client.needsCount()
+            // one; ⚑ N (flagged tabs) in every channel's.
+            let flagged = tabs.filter { $0.flag != nil }
+            let flags = UInt32(flagged.count)
             if let s = channelPage(selected), let loop = client.loopStatus(channel: s) {
                 LoopLine(status: loop, flags: flags)
                     .padding(.horizontal, 22)
@@ -419,14 +415,15 @@ struct Header: View {
                     .padding(.horizontal, 22)
                     .padding(.top, -8)
                     .contentShape(Rectangle())
-                    .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { selected = Needs.id } }
+                    .onTapGesture {
+                        // The oldest flag first, as `!` in the terminal.
+                        let oldest = flagged.min { ($0.flagSince ?? 0) < ($1.flagSince ?? 0) }
+                        withAnimation(.easeOut(duration: 0.2)) { selected = oldest?.id ?? selected }
+                    }
             }
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
-                        needsChip(flags)
-                            .id(Needs.id)
-                            .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { selected = Needs.id } }
                         ForEach(tabs, id: \.id) { t in
                             chip(t)
                                 .id(t.id)
@@ -521,9 +518,6 @@ struct Header: View {
     /// Where the open tab sits in the row, like a page indicator.
     private var dots: some View {
         HStack(spacing: 8) {
-            Circle()
-                .fill(selected == Needs.id ? theme.chipOn : theme.rule)
-                .frame(width: 7, height: 7)
             ForEach(tabs, id: \.id) { t in
                 Circle()
                     .fill(t.id == selected ? theme.chipOn : theme.rule)
@@ -539,26 +533,41 @@ struct Header: View {
         .frame(maxWidth: .infinity)
     }
 
-    /// Tab 0's chip, its badge the count of rows that need an answer.
-    private func needsChip(_ n: UInt32) -> some View {
-        let on = selected == Needs.id
-        return HStack(spacing: 5) {
-            Text("⚑ needs you")
-                .font(on ? .chipOn : .chip)
-                .lineLimit(1)
-            if n > 0 {
-                Text("\(n)")
-                    .font(.tiny)
-                    .foregroundStyle(theme.onAccent)
-                    .padding(.horizontal, 5)
-                    .frame(minWidth: 17, minHeight: 17)
-                    .background(theme.badge, in: Capsule())
-            }
+    /// The open channel's mode: ideating, running or off, as `M` in the
+    /// terminal. Running with no list asks a bot to make one.
+    private func modeMenu(_ channel: String) -> some View {
+        let hasList = client.loopStatus(channel: channel)?.mode != nil
+        let now = tabs.first { $0.id == channel }
+        return Menu {
+            Button("🧠 ideating") { setMode(channel, "ideating") }
+            Button(hasList ? "🚀 running" : "🚀 running: ask for a list") { setMode(channel, "running") }
+            Button("off") { setMode(channel, "off") }
+        } label: {
+            Text(now?.icon ?? "mode")
+                .font(.chipOn)
+                .foregroundStyle(theme.muted)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 4)
+                .background(theme.chipOff, in: RoundedRectangle(cornerRadius: 8))
         }
-        .foregroundStyle(on ? theme.onAccent : theme.muted)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 11)
-        .background(on ? theme.chipOn : theme.chipOff, in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func setMode(_ channel: String, _ mode: String) {
+        do {
+            let done = try client.setMode(channel: channel, mode: mode)
+            model.say(done)
+        } catch {
+            model.say(error.localizedDescription)
+        }
+    }
+
+    /// The mode icon, flashing to the flag when the channel needs you; off
+    /// channels and DMs hold a steady 📣.
+    private func modeIcon(_ t: ChannelTab) -> some View {
+        TimelineView(.periodic(from: .now, by: 0.6)) { ctx in
+            let beat = Int(ctx.date.timeIntervalSince1970 / 0.6) % 2 == 0
+            Text((t.flashes && !beat ? t.icon : t.flag ?? t.icon) ?? "")
+        }
     }
 
     /// The Routing page's chip, before Control's.
@@ -588,18 +597,23 @@ struct Header: View {
     private func chip(_ t: ChannelTab) -> some View {
         let on = t.id == selected
         let name = t.label.hasPrefix("#") ? String(t.label.dropFirst()) : t.label
+        // A running tab shows no unread count: its flag says enough.
+        let counts = !on && t.mode != "running"
         return HStack(spacing: 5) {
+            if t.icon != nil || t.flag != nil {
+                modeIcon(t)
+            }
             Text(name)
                 .font(on ? .chipOn : .chip)
                 .lineLimit(1)
-            if t.mentions > 0 && !on {
+            if t.mentions > 0 && counts {
                 Text("\(t.mentions)")
                     .font(.tiny)
                     .foregroundStyle(theme.onAccent)
                     .padding(.horizontal, 5)
                     .frame(minWidth: 17, minHeight: 17)
                     .background(theme.badge, in: Capsule())
-            } else if t.unread > 0 && !on {
+            } else if t.unread > 0 && counts {
                 Circle().fill(theme.badge).frame(width: 6, height: 6)
             }
         }

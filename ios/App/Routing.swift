@@ -6,10 +6,10 @@ enum Routing {
     static let id = "routing"
 }
 
-/// The page's channel, or nil for tab 0, Routing and Control, which
-/// aren't channels.
+/// The page's channel, or nil for Routing and Control, which aren't
+/// channels.
 func channelPage(_ id: String?) -> String? {
-    guard let id, id != Needs.id, id != Routing.id, id != Control.id else { return nil }
+    guard let id, id != Routing.id, id != Control.id else { return nil }
     return id
 }
 
