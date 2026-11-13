@@ -1060,10 +1060,12 @@ impl Sync {
         });
     }
 
-    /// `M`'s pick: save it, flip the header, or post the go (or the ask
-    /// for a list) from the owner, as `chanmode::plan` says.
+    /// `M`'s pick: save it, flip the header, or post the go and flip the
+    /// header to running with it (or ask for a list) from the owner, as
+    /// `chanmode::plan` says. The go and the records go out in order, each
+    /// once the relay stores the one before.
     fn set_mode(&mut self, app: &mut App, channel: String, pick: crate::chanmode::ChanMode) {
-        use crate::chanmode::{self, Step};
+        use crate::chanmode;
         let is_bot = |pk: &str| crate::needs::is_bot(&app.store, &app.agents, &app.checklists, pk);
         let steps = match chanmode::steps(
             &app.store,
@@ -1079,25 +1081,19 @@ impl Sync {
         if steps.is_empty() {
             return app.say(format!("already {}", pick.label()));
         }
-        let mut events = vec![];
-        for step in steps {
-            let built = match step {
-                Step::Save(m) => app.modes.record(&channel, m, now()),
-                Step::Flip => match app.checklists.flip_to_ideating(&channel, now()) {
-                    Some(b) => b,
-                    None => continue,
-                },
-                Step::Send { text, to } => {
-                    let mut d = crate::draft::Draft::default();
-                    d.insert(text);
-                    self.send(app, channel.clone(), None, None, d, vec![to]);
-                    continue;
-                }
-            };
-            match self.relay.sign(built) {
-                Ok(ev) => events.push(ev),
-                Err(e) => return app.say(format!("couldn't sign the mode: {e}")),
-            }
+        let relay = &self.relay;
+        let signed =
+            chanmode::sign_steps(steps, &channel, &app.checklists, &app.modes, now(), |b| {
+                relay.sign(b).map_err(|e| e.to_string())
+            });
+        let chanmode::Signed { events, sends } = match signed {
+            Ok(s) => s,
+            Err(e) => return app.say(format!("couldn't sign the mode: {e}")),
+        };
+        for (text, to) in sends {
+            let mut d = crate::draft::Draft::default();
+            d.insert(text);
+            self.send(app, channel.clone(), None, None, d, vec![to]);
         }
         let label = format!("{} {}", pick.icon().unwrap_or("·"), pick.label());
         if events.is_empty() {

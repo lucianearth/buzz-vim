@@ -235,6 +235,60 @@ pub fn plan(
     })
 }
 
+/// A pick's steps, signed in publish order by `sign`: the saved picks,
+/// the header flips, and a go that a [`Step::FlipRunning`] names, before
+/// it. A Send with no FlipRunning (the ask for a list) is left in `sends`,
+/// for the caller to send as his own message.
+pub fn sign_steps(
+    steps: Vec<Step>,
+    channel: &str,
+    lists: &Checklists,
+    saved: &Overrides,
+    now: u64,
+    mut sign: impl FnMut(EventBuilder) -> Result<Event, String>,
+) -> Result<Signed, String> {
+    let inline = steps.contains(&Step::FlipRunning);
+    let mut out = Signed::default();
+    let mut go = None;
+    for step in steps {
+        let is_go = matches!(step, Step::Send { .. });
+        let built = match step {
+            Step::Save(m) => saved.record(channel, m, now),
+            Step::Flip => match lists.flip_to_ideating(channel, now) {
+                Some(b) => b,
+                None => continue,
+            },
+            Step::Send { text, to } if inline => message(channel, text, &to)?,
+            Step::Send { text, to } => {
+                out.sends.push((text, to));
+                continue;
+            }
+            Step::FlipRunning => match go
+                .as_deref()
+                .and_then(|g| lists.flip_to_running(channel, g, now))
+            {
+                Some(b) => b,
+                None => continue,
+            },
+        };
+        let ev = sign(built)?;
+        if is_go {
+            go = Some(ev.id.to_hex());
+        }
+        out.events.push(ev);
+    }
+    Ok(out)
+}
+
+/// [`sign_steps`]' result.
+#[derive(Debug, Default)]
+pub struct Signed {
+    /// To publish in order, each once the relay stores the one before.
+    pub events: Vec<Event>,
+    /// Messages to send as the owner's own: (text, to).
+    pub sends: Vec<(&'static str, String)>,
+}
+
 /// A [`Step::Send`] as the owner's top-level message p-tagging `to`, as
 /// a send from the box builds it: signed by the caller so a
 /// [`Step::FlipRunning`] after it can name its id.
