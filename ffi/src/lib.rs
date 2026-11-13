@@ -2523,48 +2523,76 @@ impl Engine {
     }
 
     fn set_mode(&mut self, channel: String, pick: ChanMode) -> Result<String, BuzzError> {
-        use chanmode::Step;
+        let Some((events, held)) = self.mode_events(&channel, pick)? else {
+            return Ok(format!("already {}", pick.label()));
+        };
+        if !held {
+            // Shown at once; the relay's copy changes nothing.
+            for ev in &events {
+                self.modes.apply(ev, &self.checklists.trust.owner);
+                self.checklists.apply(ev);
+            }
+        }
+        // In order, each once the relay stores the one before: the header
+        // names the go, so it never lands without it.
+        let r = self.relay.clone();
+        let tx = self.tx.clone();
+        RT.spawn(async move {
+            for ev in events {
+                if let Err(e) = r.publish(&ev).await {
+                    let _ = tx.send(if held {
+                        Msg::Notice(format!("mode not set: {e}; pick again"))
+                    } else {
+                        Msg::Events(Err(e.context("the mode didn't go through")))
+                    });
+                    return;
+                }
+                if held {
+                    let _ = tx.send(Msg::Events(Ok(vec![ev])));
+                }
+            }
+        });
+        Ok(if held {
+            format!("{}…", pick.label())
+        } else {
+            pick.label().into()
+        })
+    }
+
+    /// A pick's records to publish, signed in order, and whether they are
+    /// held until the relay stores them: a go and the running header naming
+    /// it show only then, so a go that never lands leaves the list as it
+    /// was. A plain pick shows at once. The ask for a list is sent here.
+    /// None: nothing to do.
+    fn mode_events(
+        &mut self,
+        channel: &str,
+        pick: ChanMode,
+    ) -> Result<Option<(Vec<Event>, bool)>, BuzzError> {
         let is_bot = |pk: &str| needs::is_bot(&self.store, &self.agents, &self.checklists, pk);
         let steps = chanmode::steps(
             &self.store,
             &self.checklists,
             &self.modes,
-            &channel,
+            channel,
             pick,
             is_bot,
         )
         .map_err(|e| BuzzError::Failed(e.into()))?;
         if steps.is_empty() {
-            return Ok(format!("already {}", pick.label()));
+            return Ok(None);
         }
-        for step in steps {
-            let built = match step {
-                Step::Save(m) => self.modes.record(&channel, m, now()),
-                Step::Flip => match self.checklists.flip_to_ideating(&channel, now()) {
-                    Some(b) => b,
-                    None => continue,
-                },
-                Step::Send { text, to } => {
-                    self.send(channel.clone(), None, text.into(), &[], &[to])?;
-                    continue;
-                }
-            };
-            let ev = self
-                .relay
-                .sign(built)
-                .map_err(|e| BuzzError::Failed(format!("couldn't sign the mode: {e}")))?;
-            // Shown at once; the relay's copy changes nothing.
-            self.modes.apply(&ev, &self.checklists.trust.owner);
-            self.checklists.apply(&ev);
-            let r = self.relay.clone();
-            let tx = self.tx.clone();
-            RT.spawn(async move {
-                if let Err(e) = r.publish(&ev).await {
-                    let _ = tx.send(Msg::Events(Err(e.context("the mode didn't go through"))));
-                }
-            });
+        let held = steps.contains(&chanmode::Step::FlipRunning);
+        let relay = &self.relay;
+        let signed =
+            chanmode::sign_steps(steps, channel, &self.checklists, &self.modes, now(), |b| {
+                relay.sign(b).map_err(|e| e.to_string())
+            })
+            .map_err(|e| BuzzError::Failed(format!("couldn't sign the mode: {e}")))?;
+        for (text, to) in signed.sends {
+            self.send(channel.to_string(), None, text.into(), &[], &[to])?;
         }
-        Ok(pick.label().into())
+        Ok(Some((signed.events, held)))
     }
 
     fn thumbs_up(&mut self, target: &str) {
@@ -2858,6 +2886,61 @@ mod tests {
             .unwrap();
         c.engine.lock().unwrap().fold(&off, true);
         assert_eq!(tab(&c).0, "off");
+    }
+
+    /// Picking running with a list signs the go, then the owner's header
+    /// to running naming it; neither shows until the relay stores it, and
+    /// folding the stored pair runs the list (lucian 2026-11-13).
+    #[test]
+    fn set_mode_running_posts_the_go_then_the_header_with_it() {
+        use nostr::{EventBuilder, Kind, Tag, Timestamp};
+        let ch = "2130646b-d6c8-4ec3-93e3-36f77bee1a37";
+        let mut e = engine();
+        e.checklists.trust.owner = e.relay.keys.public_key().to_hex();
+        e.tabs = vec![ch.into()];
+        let bot = Keys::generate();
+        let bk = bot.public_key().to_hex();
+        let d = format!("buzz-checklist/header/{ch}/{bk}");
+        let tags = [
+            ["d", d.as_str()],
+            ["h", ch],
+            ["t", "buzz-checklist"],
+            ["channel", ch],
+            ["checklist-type", "header"],
+        ]
+        .map(|t| Tag::parse(t).unwrap());
+        let header = EventBuilder::new(
+            Kind::Custom(30471),
+            r#"{"v":1,"title":"t","mode":"ideating"}"#,
+        )
+        .tags(tags)
+        .custom_created_at(Timestamp::from(now() - 60))
+        .sign_with_keys(&bot)
+        .unwrap();
+        e.fold(&header, true);
+        let (events, held) = e.mode_events(ch, ChanMode::Running).unwrap().unwrap();
+        assert!(held);
+        let [go, flip] = events.as_slice() else {
+            panic!("the go, then the header: {events:?}");
+        };
+        assert_eq!(go.content, chanmode::GO_TEXT);
+        assert_eq!(model::tag(go, "p"), Some(bk.as_str()));
+        let mode = |e: &Engine| e.checklists.header(ch).unwrap().mode;
+        assert_eq!(mode(&e), checklist::Mode::Ideating, "held until stored");
+        for ev in [go, flip] {
+            e.fold(ev, true);
+        }
+        let h = e.checklists.header(ch).unwrap();
+        let id = go.id.to_hex();
+        assert_eq!(
+            (h.mode, h.go.as_deref(), h.creator.as_str()),
+            (checklist::Mode::Running, Some(id.as_str()), bk.as_str())
+        );
+        assert!(e.store.channels[ch].messages.contains_key(&id));
+        assert_eq!(
+            e.set_mode(ch.into(), ChanMode::Running).ok().as_deref(),
+            Some("already running")
+        );
     }
 
     /// ⚑ N's tap goes round the flagged tabs, oldest first (review ecfa8439).
