@@ -23,6 +23,8 @@ pub enum Mode {
     Vote,
     /// `B`: whose Claude subscription this channel's agents spend.
     Subscription,
+    /// `M`: the channel's mode (ideating, running, off).
+    Switch,
 }
 
 impl Mode {
@@ -42,6 +44,7 @@ impl Mode {
             Mode::Archive => "ARCHIVE?",
             Mode::Vote => "VOTE?",
             Mode::Subscription => "SUBSCRIPTION",
+            Mode::Switch => "MODE",
         }
     }
 }
@@ -87,11 +90,12 @@ const MOVE: Section = (
 const TABS: Section = (
     "tabs",
     &[
-        ("0-9", "go to tab (0 needs you)", Help),
+        ("1-9", "go to tab", Help),
         ("H L ⇥", "prev / next tab", Help),
         ("< >", "move tab left / right", Help),
         ("T", "tab order", Help),
-        ("!", "next ⚑, oldest first", Help),
+        ("!", "next 🚩 📣 tab, oldest first", Help),
+        ("M", "channel mode: 🧠 🚀 off", Help),
     ],
 );
 const MESSAGES: Section = (
@@ -219,6 +223,15 @@ const SUBSCRIPTION: Section = (
         ("esc", "close", Footer),
     ],
 );
+const CHANMODE: Section = (
+    "channel mode (M)",
+    &[
+        ("j k ↑↓", "pick", Footer),
+        ("M", "next", Both),
+        ("⏎", "set it", Both),
+        ("esc", "close", Footer),
+    ],
+);
 const VIEWER: Section = (
     "image (o)",
     &[
@@ -245,6 +258,7 @@ pub const HELP: [&[Section]; 2] = [
         ROUTING,
         CONTROL,
         SUBSCRIPTION,
+        CHANMODE,
         SECTIONS,
         ORDER,
         VIEWER,
@@ -267,6 +281,7 @@ pub fn sections(mode: Mode) -> &'static [Section] {
         Mode::Quick => &[QUICK],
         Mode::Reply => &[REPLY],
         Mode::Subscription => &[SUBSCRIPTION],
+        Mode::Switch => &[CHANMODE],
         Mode::Viewer => &[VIEWER],
         Mode::Help => &[("help", &[("esc ?", "close", Both)])],
         Mode::Hint => &[HINT],

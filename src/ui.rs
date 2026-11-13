@@ -88,6 +88,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             | Mode::Reply
             | Mode::Vote
             | Mode::Subscription
+            | Mode::Switch
     ) || (app.mode == Mode::Insert && !app.mention_candidates().is_empty());
     for (rect, key) in images.into_iter().filter(|_| !overlay) {
         if let Some(p) = app.media.encoded.get(&key) {
@@ -105,8 +106,60 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Reply => draw_reply(f, app, area),
         Mode::Vote => draw_vote(f, app, area),
         Mode::Subscription => draw_subscription(f, app, area),
+        Mode::Switch => draw_chanmode(f, app, area),
         _ => {}
     }
+}
+
+/// `M`: the channel's mode. With no list, running asks a bot for one.
+fn draw_chanmode(f: &mut Frame, app: &mut App, area: Rect) {
+    use crate::chanmode::ChanMode;
+    let Some(channel) = app.current().map(str::to_string) else {
+        return;
+    };
+    let now = app.chan_tab(&app.needs, &channel).mode;
+    let has_list = app.checklists.header(&channel).is_some();
+    let bot = crate::chanmode::last_bot(&app.store, &channel, |pk| {
+        crate::needs::is_bot(&app.store, &app.agents, &app.checklists, pk)
+    });
+    let legend = crate::keys::legend(Mode::Switch);
+    let r = centered(area, 64, 8);
+    clear(f, r);
+    let block = Block::bordered()
+        .border_style(theme::text())
+        .title(Span::styled(" channel mode ", theme::bright()));
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    let mut lines = vec![Line::raw("")];
+    for (i, m) in ChanMode::ALL.into_iter().enumerate() {
+        let text = match (m, has_list, &bot) {
+            (ChanMode::Running, false, Some(b)) => {
+                format!("running: ask {} to make a list", app.store.name_of(b))
+            }
+            (ChanMode::Running, false, None) => "running: no list here".to_string(),
+            _ => m.label().to_string(),
+        };
+        let st = if i == app.mode_cursor {
+            theme::tab_active()
+        } else {
+            theme::text()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {} ", if m == now { "●" } else { " " }),
+                theme::bright(),
+            ),
+            Span::styled(format!("{} {text} ", m.icon().unwrap_or("  ")), st),
+        ]));
+    }
+    let mut keys = vec![Span::raw(" ")];
+    for (i, (k, what, _)) in legend.iter().enumerate() {
+        keys.push(Span::styled(format!(" {k} "), theme::chip(theme::nth(i))));
+        keys.push(Span::styled(format!(" {what} "), theme::muted()));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(keys));
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// `B`: whose Claude subscription this channel's agents spend. Two
@@ -379,6 +432,14 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(Span::styled(label, style)), r);
     app.hits.push((r, Hit::NeedsTab));
     x += w + 1;
+    // Flags flash on a 600 ms beat.
+    let on = (app.tick / 4).is_multiple_of(2);
+    let states: Vec<crate::chanmode::Tab> = app
+        .tabs
+        .iter()
+        .map(|c| app.chan_tab(&app.needs, c))
+        .collect();
+    app.flashing = states.iter().any(|t| t.flashes());
     let labels: Vec<(String, usize)> = app
         .tabs
         .iter()
@@ -386,9 +447,16 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|(i, id)| {
             let ch = app.store.channels.get(id);
             let name = ch.map(channel_label).unwrap_or_else(|| "…".into());
-            let unread = ch.map_or(0, |c| c.unread.len());
+            let state = states[i];
+            // A running tab shows no unread count: its flag says enough.
+            let running = state.mode == crate::chanmode::ChanMode::Running;
+            let unread = if running {
+                0
+            } else {
+                ch.map_or(0, |c| c.unread.len())
+            };
             // In a DM every message is to you.
-            let mentions = ch.map_or(0, |c| {
+            let mentions = ch.filter(|_| !running).map_or(0, |c| {
                 if c.is_dm {
                     c.unread.len()
                 } else {
@@ -410,10 +478,12 @@ fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 SPIN[app.tick as usize % SPIN.len()]
             };
+            // Two columns always, so tabs keep their width as it flashes.
+            let icon = state.icon(on).unwrap_or("  ");
             let label = if i < 9 {
-                format!(" {} {name} {dot}{spin}", i + 1)
+                format!(" {} {icon} {name} {dot}{spin}", i + 1)
             } else {
-                format!(" {name} {dot}{spin}")
+                format!(" {icon} {name} {dot}{spin}")
             };
             (label, unread)
         })
@@ -1532,7 +1602,7 @@ fn draw_status(f: &mut Frame, app: &mut App, row: Rect, channel: &str, hint: boo
     let sum = app
         .checklists
         .summary(channel, crate::checklist::local_midnight(now));
-    let flags = crate::needs::answer_count(&app.needs);
+    let flags = app.flagged_tabs(&app.needs).len();
     // The channel's Claude subscription (`B`), at the right end; the
     // summary gets the rest of the row so it never writes over it.
     let mut row = row;
@@ -5328,6 +5398,7 @@ mod tests {
             Archive,
             Vote,
             Subscription,
+            Switch,
         ];
         for m in modes {
             for s in sections(m)

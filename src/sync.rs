@@ -805,6 +805,7 @@ impl Sync {
                 agent,
                 text,
             } => self.send_quick(app, channel, content, agent, text),
+            Action::SetMode { channel, pick } => self.set_mode(app, channel, pick),
             Action::Typing { channel, root } => {
                 if let Ok(ev) = self
                     .relay
@@ -1071,6 +1072,55 @@ impl Sync {
     }
 
     /// A vote on a control request: the action's emoji as a reaction.
+    /// `M`'s pick: save it, flip the header, or post the go (or the ask
+    /// for a list) from the owner, as `chanmode::plan` says.
+    fn set_mode(&mut self, app: &mut App, channel: String, pick: crate::chanmode::ChanMode) {
+        use crate::chanmode::{self, Step};
+        let header = app.checklists.header(&channel);
+        let is_bot = |pk: &str| crate::needs::is_bot(&app.store, &app.agents, &app.checklists, pk);
+        let bot = chanmode::last_bot(&app.store, &channel, is_bot);
+        let steps = match chanmode::plan(
+            pick,
+            header.as_ref(),
+            app.modes.get(&channel),
+            bot.as_deref(),
+        ) {
+            Ok(s) => s,
+            Err(e) => return app.say(e),
+        };
+        if steps.is_empty() {
+            return app.say(format!("already {}", pick.label()));
+        }
+        for step in steps {
+            let (event, text, to) = match step {
+                Step::Save(m) => (Some(chanmode::record(&channel, m)), None, None),
+                Step::Flip => (app.checklists.flip_to_ideating(&channel, now()), None, None),
+                Step::Go { to } => (None, Some(chanmode::GO_TEXT), Some(to)),
+                Step::AskList { to } => (None, Some(chanmode::ASK_LIST_TEXT), Some(to)),
+            };
+            if let (Some(text), Some(to)) = (text, to) {
+                let mut d = crate::draft::Draft::default();
+                d.insert(text);
+                self.send(app, channel.clone(), None, None, d, vec![to]);
+                continue;
+            }
+            let Some(ev) = event.map(|b| self.relay.sign(b)) else {
+                continue;
+            };
+            match ev {
+                // Shown at once; the relay's copy changes nothing.
+                Ok(ev) => {
+                    let owner = app.checklists.trust.owner.clone();
+                    app.modes.apply(&ev, &owner);
+                    app.checklists.apply(&ev);
+                    let _ = self.live.send(Cmd::Publish(Box::new(ev)));
+                }
+                Err(e) => return app.say(format!("couldn't sign the mode: {e}")),
+            }
+        }
+        app.say(format!("{} {}", pick.icon().unwrap_or("·"), pick.label()));
+    }
+
     fn react(&mut self, app: &mut App, target: String, emoji: String, label: String) {
         let Ok(id) = EventId::from_hex(&target) else {
             app.control_sending.remove(&target);
@@ -1358,6 +1408,11 @@ pub fn fold(app: &mut App, sync: &mut Sync, ev: &Event, live_channel: bool) -> V
         }
         30078 if Subscriptions::is_record(ev) => {
             app.subscriptions.apply(ev);
+            return vec![];
+        }
+        30078 if crate::chanmode::is_record(ev) => {
+            let owner = app.checklists.trust.owner.clone();
+            app.modes.apply(ev, &owner);
             return vec![];
         }
         30078 if readstate::is_read_state(ev) => {

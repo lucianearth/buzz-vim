@@ -11,6 +11,7 @@ use ratatui::layout::Rect;
 use ratatui_image::picker::Picker;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::chanmode::{self, ChanMode, Overrides};
 use crate::checklist::Checklists;
 use crate::clip::Pending;
 use crate::config::Loop;
@@ -177,6 +178,11 @@ pub enum Action {
         edit: subscription::Edit,
         label: String,
     },
+    /// `M`: set a channel's mode (see `chanmode::plan`).
+    SetMode {
+        channel: String,
+        pick: ChanMode,
+    },
     /// A typing pulse (kind 20002) in a channel or thread.
     Typing {
         channel: String,
@@ -310,6 +316,12 @@ pub struct App {
     pub needs_cursor: usize,
     /// channel -> when we last sent a typing pulse there (secs).
     pub typed: HashMap<String, u64>,
+    /// The owner's saved channel modes (kind 30078 `buzz-mode:`).
+    pub modes: Overrides,
+    /// The mode picker's row (`ChanMode::ALL`).
+    pub mode_cursor: usize,
+    /// A tab flashes (set by drawing): ticks redraw.
+    pub flashing: bool,
     /// Tab 0's rows as last drawn; the cursor picks from these.
     pub needs: Vec<Row>,
     /// The row `!` went to last.
@@ -445,6 +457,9 @@ impl App {
             needs_view: false,
             needs_cursor: 0,
             typed: HashMap::new(),
+            modes: Overrides::default(),
+            mode_cursor: 0,
+            flashing: false,
             needs: vec![],
             needs_jump: None,
             reply_to: None,
@@ -482,6 +497,7 @@ impl App {
     /// Whether a tick should trigger a redraw (spinners, flashes, loading).
     pub fn animating(&self) -> bool {
         self.uploading
+            || self.flashing
             || self.conn != ConnState::Online
             || self.agents.by_pubkey.values().any(|a| a.is_busy())
             || self
@@ -886,6 +902,74 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    // ---------- channel mode ----------
+
+    /// A channel's tab: its mode and flag, from `rows` (tab 0's rows).
+    pub fn chan_tab(&self, rows: &[Row], channel: &str) -> chanmode::Tab {
+        let is_bot = |pk: &str| needs::is_bot(&self.store, &self.agents, &self.checklists, pk);
+        let working = |c: &str| !self.agents.working(&self.store, c, None).is_empty();
+        let typed = |c: &str| self.typed.get(c).copied().unwrap_or(0);
+        chanmode::tab(
+            &chanmode::World {
+                store: &self.store,
+                lists: &self.checklists,
+                saved: &self.modes,
+                rows,
+                is_bot: &is_bot,
+                working: &working,
+                typed: &typed,
+            },
+            channel,
+        )
+    }
+
+    /// Tabs with a flag, and since when.
+    pub fn flagged_tabs(&self, rows: &[Row]) -> Vec<(String, u64)> {
+        self.tabs
+            .iter()
+            .filter_map(|c| Some((c.clone(), self.chan_tab(rows, c).flag?.1)))
+            .collect()
+    }
+
+    fn open_chanmode(&mut self) {
+        let Some(c) = self.current().map(str::to_string) else {
+            return;
+        };
+        let now = self.chan_tab(&self.needs_rows(), &c).mode;
+        self.mode_cursor = ChanMode::ALL.iter().position(|m| *m == now).unwrap_or(0);
+        self.mode = Mode::Switch;
+    }
+
+    fn key_chanmode(&mut self, k: KeyEvent) {
+        let n = ChanMode::ALL.len();
+        match k.code {
+            KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('M') => {
+                self.mode_cursor = (self.mode_cursor + 1) % n
+            }
+            KeyCode::Char('k') | KeyCode::Up => self.mode_cursor = (self.mode_cursor + n - 1) % n,
+            KeyCode::Enter => {
+                self.mode = Mode::Normal;
+                if let Some(channel) = self.current().map(str::to_string) {
+                    let pick = ChanMode::ALL[self.mode_cursor % n];
+                    self.actions.push(Action::SetMode { channel, pick });
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
+            _ => {}
+        }
+    }
+
+    /// `!`: the next flagged tab, oldest flag first, round again.
+    fn next_flagged(&mut self) {
+        let flagged = self.flagged_tabs(&self.needs_rows());
+        let Some(c) = chanmode::next_flagged(&flagged, self.current()).map(str::to_string) else {
+            return self.say("nothing flagged");
+        };
+        if let Some(i) = self.tabs.iter().position(|t| *t == c) {
+            self.switch_tab(i);
+        }
     }
 
     // ---------- control ----------
@@ -2132,6 +2216,7 @@ impl App {
                 _ => {}
             },
             Mode::Subscription => self.key_subscription(k),
+            Mode::Switch => self.key_chanmode(k),
             Mode::Archive => match k.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.archive(),
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
@@ -2278,7 +2363,7 @@ impl App {
             // Tab 0 is Needs you; the channels are 1 to 9.
             KeyCode::Char('0') => self.open_needs(),
             KeyCode::Char(c @ '1'..='9') => self.switch_tab(c as usize - '1' as usize),
-            KeyCode::Char('!') => self.next_needs(),
+            KeyCode::Char('!') => self.next_flagged(),
             // H and L go round through tab 0.
             KeyCode::Char('L') | KeyCode::Tab => match (self.needs_view, n) {
                 (_, 0) => self.open_needs(),
@@ -2344,6 +2429,7 @@ impl App {
             KeyCode::Char('w') => self.open_routing(),
             KeyCode::Char('C') => self.open_control(),
             KeyCode::Char('B') => self.open_subscription(),
+            KeyCode::Char('M') => self.open_chanmode(),
             KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
             KeyCode::Char('d') | KeyCode::PageDown => self.page_lines(self.pane_h, true),
@@ -3157,6 +3243,29 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M opens the picker on the channel's mode; M and the arrows move
+    /// and wrap, Enter sets it with no confirm.
+    #[test]
+    fn m_picks_the_channel_mode() {
+        let mut app = App::new("me".into(), None);
+        app.tabs = vec!["a".into()];
+        app.on_key(KeyEvent::from(KeyCode::Char('M')));
+        assert_eq!(
+            (app.mode, app.mode_cursor),
+            (Mode::Switch, 2),
+            "no list, no bot: off"
+        );
+        app.on_key(KeyEvent::from(KeyCode::Char('M')));
+        assert_eq!(app.mode_cursor, 0, "wraps");
+        app.on_key(KeyEvent::from(KeyCode::Up));
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.actions.iter().any(|a| matches!(a,
+            Action::SetMode { channel, pick: ChanMode::Running } if channel == "a")));
+    }
 
     /// Typing sends one pulse per channel every few seconds, not one per key.
     #[test]
