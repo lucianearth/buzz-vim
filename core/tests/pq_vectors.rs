@@ -136,3 +136,58 @@ fn write_rust_fixtures() {
     )
     .unwrap();
 }
+
+/// Both directions live against the real CLI, through a shared `$PQ_HOME`:
+/// `PQ_CMD="<python> <pq>/pq.py" cargo test -p buzz-vim-core --test pq_vectors -- --ignored live_cross_with_pq_cli`
+#[test]
+#[ignore]
+fn live_cross_with_pq_cli() {
+    use std::process::Command;
+    let cmd = std::env::var("PQ_CMD").unwrap();
+    let mut words = cmd.split_whitespace();
+    let (prog, pre): (&str, Vec<&str>) = (words.next().unwrap(), words.collect());
+    let home = std::env::temp_dir().join(format!("pq-live-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let store = Store { home: home.clone() };
+    let pq_cli = |args: &[&str], stdin: &[u8]| {
+        use std::io::Write;
+        let mut child = Command::new(prog)
+            .args(&pre)
+            .args(args)
+            .env("PQ_HOME", &home)
+            .env("PQ_NO_CLIPBOARD", "1")
+            .env("PQ_NO_DIALOG", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    };
+
+    // core asks, the CLI answers, core opens with the record it stored.
+    let rec = pq::request("live");
+    store.save(&rec).unwrap();
+    let req_file = home.join("req.txt");
+    std::fs::write(&req_file, rec.request().block()).unwrap();
+    let reply = pq_cli(&["send", req_file.to_str().unwrap(), "-"], b"cli to core");
+    let msg = Message::from_block(std::str::from_utf8(&reply).unwrap()).unwrap();
+    let rec = store.load(&msg.header.id).unwrap().unwrap();
+    assert_eq!(pq::open(&msg, &rec).unwrap(), b"cli to core");
+
+    // The CLI asks, core answers, the CLI opens (and burns) with its own key.
+    let block = pq_cli(&["receive", "from cli"], b"");
+    let req = Request::from_block(std::str::from_utf8(&block).unwrap()).unwrap();
+    let sealed = pq::seal(&req, b"core to cli", "c.txt").unwrap();
+    let opened = pq_cli(&["open", "--stdout", "--burn", "-"], sealed.as_bytes());
+    assert_eq!(opened, b"core to cli");
+    assert_eq!(store.load(&req.id).unwrap(), None);
+    std::fs::remove_dir_all(&home).unwrap();
+}
