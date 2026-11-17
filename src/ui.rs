@@ -19,6 +19,7 @@ use crate::live::ConnState;
 use crate::media::Slot;
 use crate::model::{Channel, Message};
 use crate::theme;
+use buzz_vim_core::pq::{self, Piece};
 
 mod control;
 
@@ -708,7 +709,16 @@ fn message_block(
                 .filter(|c| !c.name.is_empty())
                 .map(|c| c.name.clone())
         };
-        let r = render_markdown_links(body.trim_end(), inner, &mention_names, &name);
+        let signer = app.store.name_of(&m.author);
+        let unasked = |rid: &str| unasked(app, ch, m, rid);
+        let r = render_body(
+            body.trim_end(),
+            inner,
+            &mention_names,
+            &name,
+            &signer,
+            &unasked,
+        );
         let top = lines.len();
         for (row, col, w, k) in r.at {
             links.push((
@@ -3426,6 +3436,122 @@ pub fn render_markdown(src: &str, width: usize, mentions: &[String]) -> Vec<Line
 /// Just enough markdown for chat: code fences, `inline code`, **bold**,
 /// _italic_, @mentions and links. Wraps to `width` columns. `channel_name`
 /// names the channels bare `buzz://` links point at.
+/// `n` bytes as "33 B", "1.2 KB", "4.0 MB".
+fn byte_size(n: u64) -> String {
+    match n {
+        n if n < 1000 => format!("{n} B"),
+        n if n < 1_000_000 => format!("{:.1} KB", n as f64 / 1e3),
+        n => format!("{:.1} MB", n as f64 / 1e6),
+    }
+}
+
+/// When the person who sealed `m` is not someone the REQUEST `rid` was
+/// addressed to (its event's p-tags), who it was addressed to. A request
+/// that tagged nobody, or one we don't hold, warns about no one.
+fn unasked(app: &App, ch: &Channel, m: &Message, rid: &str) -> Option<String> {
+    let req = ch.messages.values().find(|x| {
+        x.content.contains("BEGIN PQBOX REQUEST")
+            && pq::parse_blocks(&x.content)
+                .iter()
+                .any(|p| matches!(p, Piece::Request(r) if r.id == rid))
+    })?;
+    if req.mentions.is_empty() || req.mentions.contains(&m.author) {
+        return None;
+    }
+    let names: Vec<String> = req
+        .mentions
+        .iter()
+        .map(|pk| app.store.name_of(pk))
+        .collect();
+    Some(names.join(", "))
+}
+
+/// The rows of a pq card. `signer` is the message's author; the label and
+/// the file name come from the other party and go through pq's
+/// `display_text`.
+fn pq_card(
+    piece: &Piece,
+    width: usize,
+    signer: &str,
+    unasked: &dyn Fn(&str) -> Option<String>,
+) -> Vec<Line<'static>> {
+    let row = |text: String, style: Style| Line::from(Span::styled(clip(&text, width), style));
+    match piece {
+        Piece::Request(r) => {
+            let label = pq::display_text(&r.label);
+            let label = if label.is_empty() {
+                "a secret".to_string()
+            } else {
+                label
+            };
+            vec![row(
+                format!("🔒 {signer} asks for: {label}"),
+                theme::bright(),
+            )]
+        }
+        Piece::Message(msg) => {
+            let h = &msg.header;
+            let name = h.name.as_deref().unwrap_or("message.out");
+            let name = pq::display_text(name.rsplit(['/', '\\']).next().unwrap_or(""));
+            let size = byte_size(h.size.unwrap_or(0));
+            let mut rows = vec![row(
+                format!("🔐 sealed by {signer}, {name}, {size}"),
+                theme::bright(),
+            )];
+            if let Some(asked) = unasked(&h.id) {
+                rows.push(row(
+                    format!("⚠ {signer} was not asked: the request named {asked}"),
+                    theme::badge(),
+                ));
+            }
+            rows
+        }
+        Piece::Text(_) => vec![],
+    }
+}
+
+/// A message body: markdown, with each pq block drawn as a card.
+fn render_body(
+    src: &str,
+    width: usize,
+    mentions: &[String],
+    channel_name: &dyn Fn(&str) -> Option<String>,
+    signer: &str,
+    unasked: &dyn Fn(&str) -> Option<String>,
+) -> Rendered {
+    let pieces = pq::parse_blocks(src);
+    if pieces.iter().all(|p| matches!(p, Piece::Text(_))) {
+        return render_markdown_links(src, width, mentions, channel_name);
+    }
+    let mut r = Rendered::default();
+    for p in &pieces {
+        let part = match p {
+            Piece::Text(t) if t.trim().is_empty() => continue,
+            Piece::Text(t) => {
+                render_markdown_links(t.trim_matches('\n'), width, mentions, channel_name)
+            }
+            card => {
+                let lines = pq_card(card, width, signer, unasked);
+                Rendered {
+                    copy: vec![(false, 0, 0); lines.len()],
+                    lines,
+                    ..Rendered::default()
+                }
+            }
+        };
+        let (rows, urls) = (r.lines.len(), r.urls.len());
+        r.at.extend(
+            part.at
+                .into_iter()
+                .map(|(row, col, w, k)| (row + rows, col, w, k + urls)),
+        );
+        r.lines.extend(part.lines);
+        r.urls.extend(part.urls);
+        r.copy.extend(part.copy);
+    }
+    r
+}
+
 pub fn render_markdown_links(
     src: &str,
     width: usize,
@@ -6520,5 +6646,64 @@ mod tests {
             short.contains("kevin's Max") && short.contains("+2 more"),
             "{short}"
         );
+    }
+
+    #[test]
+    fn pq_blocks_render_as_cards() {
+        let rec = pq::request("db \u{202e}password");
+        let text_of = |r: &Rendered| -> Vec<String> {
+            r.lines
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect()
+        };
+        let none = |_: &str| None;
+        let src = format!("see [doc](https://x.io)\n{}\nthanks", rec.request().block());
+        let r = render_body(&src, 80, &[], &|_| None, "lucian", &none);
+        let rows = text_of(&r);
+        assert_eq!(rows[1], "🔒 lucian asks for: db password");
+        assert_eq!(rows.len(), 3);
+        assert_eq!((r.copy.len(), r.urls.len()), (3, 1));
+
+        let sealed = pq::seal(&rec.request(), b"hunter2", "../x/pw.txt").unwrap();
+        let named = |id: &str| (id == rec.id).then(|| "taskbot".to_string());
+        let rows = text_of(&render_body(&sealed, 80, &[], &|_| None, "mallory", &named));
+        assert_eq!(
+            rows,
+            [
+                "🔐 sealed by mallory, pw.txt, 7 B",
+                "⚠ mallory was not asked: the request named taskbot"
+            ]
+        );
+        assert_eq!(byte_size(1_234_567), "1.2 MB");
+    }
+
+    #[test]
+    fn a_reply_from_someone_the_request_did_not_tag_warns() {
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let (me, asked, other) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let mut app = App::new(me.public_key().to_hex(), None);
+        let post = |k: &Keys, text: &str, p: Option<&Keys>| {
+            let mut tags = vec![Tag::parse(["h", "c1"]).unwrap()];
+            if let Some(p) = p {
+                tags.push(Tag::parse(["p", &p.public_key().to_hex()]).unwrap());
+            }
+            EventBuilder::new(Kind::Custom(9), text)
+                .tags(tags)
+                .sign_with_keys(k)
+                .unwrap()
+        };
+        let tagged = pq::request("x");
+        let untagged = pq::request("y");
+        app.store
+            .apply(&post(&me, &tagged.request().block(), Some(&asked)));
+        app.store
+            .apply(&post(&me, &untagged.request().block(), None));
+        let ch = app.store.channels.get("c1").unwrap();
+        let from = |k: &Keys| Message::from_event(&post(k, "", None));
+        assert_eq!(unasked(&app, ch, &from(&asked), &tagged.id), None);
+        assert!(unasked(&app, ch, &from(&other), &tagged.id).is_some());
+        assert_eq!(unasked(&app, ch, &from(&other), &untagged.id), None);
+        assert_eq!(unasked(&app, ch, &from(&other), "0000000000000000"), None);
     }
 }
