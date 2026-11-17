@@ -293,7 +293,13 @@ pub fn parse_blocks(text: &str) -> Vec<Piece> {
         });
         match block {
             Some((len, Some(piece))) => {
-                plain.push_str(&rest[..i]);
+                // Email quoting before BEGIN belongs to the block.
+                let before = &rest[..i];
+                let line = before.rfind('\n').map_or(0, |n| n + 1);
+                let quote = before[line..]
+                    .chars()
+                    .all(|c| c == '>' || c.is_whitespace());
+                plain.push_str(if quote { &before[..line] } else { before });
                 if !plain.is_empty() {
                     out.push(Piece::Text(std::mem::take(&mut plain)));
                 }

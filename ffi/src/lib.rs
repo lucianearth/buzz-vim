@@ -35,6 +35,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 
 mod control;
 mod pairing;
+mod pq;
 mod push;
 mod routing;
 pub use control::{
@@ -154,6 +155,22 @@ pub enum Segment {
     Text { text: String },
     /// A fenced code block.
     Code { lang: String, body: String },
+    /// A pq REQUEST block: someone asks for a secret. `label` is safe to
+    /// show; `block` goes to `pq_seal`.
+    PqRequest {
+        id: String,
+        label: String,
+        block: String,
+    },
+    /// A pq MESSAGE block: a sealed secret for request `id`. `name` (the
+    /// sender's, made safe to show) and `size` are readable without the
+    /// key; `block` goes to `pq_open`.
+    PqMessage {
+        id: String,
+        name: String,
+        size: u64,
+        block: String,
+    },
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -2741,7 +2758,20 @@ fn system_text(raw: &str) -> String {
 }
 
 /// Split markdown into text and fenced code blocks.
+/// pq blocks first, then code fences in the text around them. A block
+/// pasted inside a fence leaves the fence lines with nothing in them; those
+/// empty pieces are dropped.
 fn segments(src: &str) -> Vec<Segment> {
+    let mut out = pq::split(src, |t, out| out.extend(fences(t)));
+    out.retain(|s| match s {
+        Segment::Text { text } => !text.trim().is_empty(),
+        Segment::Code { body, .. } => !body.trim().is_empty(),
+        _ => true,
+    });
+    out
+}
+
+fn fences(src: &str) -> Vec<Segment> {
     let mut out = vec![];
     let mut text: Vec<&str> = vec![];
     let mut code: Option<(String, Vec<&str>)> = None;
@@ -2799,6 +2829,39 @@ mod tests {
         assert!(matches!(&s[2], Segment::Text { text } if text == "ok"));
         let open = segments("```\nunclosed");
         assert!(matches!(&open[0], Segment::Code { body, .. } if body == "unclosed"));
+    }
+
+    #[test]
+    fn pq_blocks_become_segments_and_round_trip() {
+        let new = pq::pq_request("db \u{202e}password".into());
+        let text = format!("can you send it?\n```\n{}\n```\nthanks", new.block);
+        let s = segments(&text);
+        assert_eq!(s.len(), 3);
+        let Segment::PqRequest { id, label, block } = &s[1] else {
+            panic!("not a request")
+        };
+        assert_eq!((id, label.as_str()), (&new.id, "db password"));
+        let sealed =
+            pq::pq_seal(block.clone(), b"hunter2".to_vec(), "../../pw.txt".into()).unwrap();
+        let s = segments(&format!("> {}", sealed.replace('\n', "\n> ")));
+        let [
+            Segment::PqMessage {
+                id,
+                name,
+                size,
+                block,
+            },
+        ] = &s[..]
+        else {
+            panic!("not one message")
+        };
+        assert_eq!((id, name.as_str(), *size), (&new.id, "pw.txt", 7));
+        assert_eq!(
+            pq::pq_open(block.clone(), new.record.clone()).unwrap(),
+            b"hunter2"
+        );
+        let other = pq::pq_request(String::new());
+        assert!(pq::pq_open(block.clone(), other.record).is_err());
     }
 
     #[test]

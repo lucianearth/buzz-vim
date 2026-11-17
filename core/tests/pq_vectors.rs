@@ -61,7 +61,7 @@ fn blocks_are_found_in_quoted_chat_text() {
     let text = format!("here you go:\n{quoted}\nthanks\n\n{}", REQUEST.trim_end());
     let pieces = pq::parse_blocks(&text);
     assert_eq!(pieces.len(), 4);
-    assert!(matches!(&pieces[0], Piece::Text(t) if t == "here you go:\n> "));
+    assert!(matches!(&pieces[0], Piece::Text(t) if t == "here you go:\n"));
     let Piece::Message(msg) = &pieces[1] else {
         panic!("not a message")
     };

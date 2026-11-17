@@ -303,6 +303,11 @@ struct MessageRow: View, Equatable {
                             .fixedSize(horizontal: false, vertical: true)
                     case let .code(lang, body):
                         CodeBlock(lang: lang, code: body)
+                    // Placeholders until the pq cards land (iOS big item).
+                    case let .pqRequest(_, label, _):
+                        Text("🔒 asks for: \(label)").font(.text)
+                    case let .pqMessage(_, name, size, _):
+                        Text("🔐 sealed: \(name), \(size) bytes").font(.text)
                     }
                 }
                 let images = m.media.filter { $0.mime.hasPrefix("image/") || $0.mime.isEmpty }
