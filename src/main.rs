@@ -10,6 +10,7 @@ mod config;
 mod garden;
 mod keys;
 mod media;
+mod pqbox;
 mod state;
 mod sync;
 mod theme;

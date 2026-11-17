@@ -794,6 +794,16 @@ impl Sync {
                 agent,
                 text,
             } => self.send_quick(app, channel, content, agent, text),
+            Action::SendPq {
+                channel,
+                root,
+                content,
+                to,
+            } => {
+                let mut draft = crate::draft::Draft::default();
+                draft.insert(&content);
+                self.send(app, channel, root.clone(), root, draft, to)
+            }
             Action::SetMode { channel, pick } => self.set_mode(app, channel, pick),
             Action::Typing { channel, root } => {
                 if let Ok(ev) = self

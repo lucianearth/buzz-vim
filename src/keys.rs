@@ -23,6 +23,8 @@ pub enum Mode {
     Subscription,
     /// `M`: the channel's mode (ideating, running, off).
     Switch,
+    /// `P` / `p`: asking for, sending or opening a pq secret.
+    Pq,
 }
 
 impl Mode {
@@ -42,6 +44,7 @@ impl Mode {
             Mode::Vote => "VOTE?",
             Mode::Subscription => "SUBSCRIPTION",
             Mode::Switch => "MODE",
+            Mode::Pq => "PQ",
         }
     }
 }
@@ -107,6 +110,7 @@ const MESSAGES: Section = (
         ("f", "links", Both),
         ("⌫ ^o", "back from link", Help),
         ("^v", "paste image or file", Help),
+        ("P p", "pq: ask / answer, open", Help),
     ],
 );
 const APP: Section = (
@@ -203,6 +207,16 @@ const QUICK: Section = (
         ("esc", "close (keeps the text)", Footer),
     ],
 );
+/// The box lists its own keys; the overlay has the one row under messages.
+const PQ: Section = (
+    "pq",
+    &[
+        ("⏎", "next / seal and send", Footer),
+        ("⇥", "secret: text / file", Footer),
+        ("y s", "opened: copy / save", Footer),
+        ("esc", "close", Footer),
+    ],
+);
 const SUBSCRIPTION: Section = (
     "Claude subscription (B)",
     &[
@@ -269,6 +283,7 @@ pub fn sections(mode: Mode) -> &'static [Section] {
         Mode::Quick => &[QUICK],
         Mode::Subscription => &[SUBSCRIPTION],
         Mode::Switch => &[CHANMODE],
+        Mode::Pq => &[PQ],
         Mode::Viewer => &[VIEWER],
         Mode::Help => &[("help", &[("esc ?", "close", Both)])],
         Mode::Hint => &[HINT],

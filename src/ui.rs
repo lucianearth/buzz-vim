@@ -87,6 +87,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             | Mode::Vote
             | Mode::Subscription
             | Mode::Switch
+            | Mode::Pq
     ) || (app.mode == Mode::Insert && !app.mention_candidates().is_empty());
     for (rect, key) in images.into_iter().filter(|_| !overlay) {
         if let Some(p) = app.media.encoded.get(&key) {
@@ -104,6 +105,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Vote => draw_vote(f, app, area),
         Mode::Subscription => draw_subscription(f, app, area),
         Mode::Switch => draw_chanmode(f, app, area),
+        Mode::Pq => draw_pq(f, app, area),
         _ => {}
     }
 }
@@ -2031,6 +2033,142 @@ fn draw_quick(f: &mut Frame, app: &mut App, area: Rect) {
         "type your question",
         &short,
     );
+}
+
+/// The pq box: the label prompt, the secret (masked), the last look before
+/// sealing, and what an opened message held.
+fn draw_pq(f: &mut Frame, app: &mut App, area: Rect) {
+    use crate::pqbox::PqBox;
+    let Some(b) = &app.pq else { return };
+    let (title, lines) = match b {
+        PqBox::Ask(d) => {
+            let head = Line::styled(
+                " posts a pq REQUEST here; the key stays in pq's inbox",
+                theme::faint(),
+            );
+            let short = [("⏎", "ask"), ("esc", "close")];
+            return draw_box(
+                f,
+                area,
+                " ask for a secret ".into(),
+                head,
+                d,
+                "what is it for?",
+                &short,
+            );
+        }
+        PqBox::Answer { to, input, file } => {
+            let label = pq::display_text(&to.req.label);
+            let who = app.store.name_of(&to.asker);
+            let head = Line::styled(format!(" {who} asks for: {label}"), theme::bright());
+            let short = [
+                ("⏎", "next"),
+                (
+                    "⇥",
+                    if *file {
+                        "type it instead"
+                    } else {
+                        "send a file"
+                    },
+                ),
+                ("esc", "close"),
+            ];
+            if *file {
+                return draw_box(
+                    f,
+                    area,
+                    " send a file ".into(),
+                    head,
+                    input,
+                    "path to the file",
+                    &short,
+                );
+            }
+            // Never on screen: one * per character, lines kept.
+            let masked = crate::draft::Draft {
+                text: input
+                    .text
+                    .chars()
+                    .map(|c| if c == '\n' { c } else { '*' })
+                    .collect(),
+                cursor: input.text[..input.cursor].chars().count(),
+                ..Default::default()
+            };
+            return draw_box(
+                f,
+                area,
+                " send a secret ".into(),
+                head,
+                &masked,
+                "type or paste it",
+                &short,
+            );
+        }
+        PqBox::Confirm { to, data, name } => {
+            let who = app.store.name_of(&to.asker);
+            (
+                " seal and send this? ".to_string(),
+                vec![
+                    Line::styled(
+                        format!(" for    {who}: {}", pq::display_text(&to.req.label)),
+                        theme::text(),
+                    ),
+                    Line::styled(
+                        format!(
+                            " file   {} · {}",
+                            pq::display_text(name),
+                            byte_size(data.len() as u64)
+                        ),
+                        theme::bright(),
+                    ),
+                    Line::styled(
+                        " goes to the request's thread, sealed to its key",
+                        theme::faint(),
+                    ),
+                    Line::raw(""),
+                    Line::styled(" y ⏎  seal and send     n esc  cancel", theme::tab_active()),
+                ],
+            )
+        }
+        PqBox::Opened { name, data } => {
+            let mut lines = vec![Line::styled(
+                format!(" {name} · {} · key burned", byte_size(data.len() as u64)),
+                theme::bright(),
+            )];
+            lines.push(Line::raw(""));
+            match std::str::from_utf8(data) {
+                Ok(t) => {
+                    let rows: Vec<String> = t
+                        .lines()
+                        .flat_map(|l| wrap_cols(&l.replace('\t', "    "), 70))
+                        .collect();
+                    for l in rows.iter().take(12) {
+                        lines.push(Line::styled(format!(" {l}"), theme::text()));
+                    }
+                    if rows.len() > 12 {
+                        let more = format!(" … {} more lines (y copies all)", rows.len() - 12);
+                        lines.push(Line::styled(more, theme::faint()));
+                    }
+                }
+                Err(_) => lines.push(Line::styled(" not text; s saves it", theme::faint())),
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                " y copy   s save to Downloads   esc close",
+                theme::tab_active(),
+            ));
+            (" opened ".to_string(), lines)
+        }
+    };
+    let r = centered(area, 76, lines.len() as u16 + 2);
+    clear(f, r);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(theme::bright())
+        .title(Span::styled(title, theme::bright()));
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// A box over everything for a short text: a line saying where it goes,
@@ -5227,6 +5365,7 @@ mod tests {
             Vote,
             Subscription,
             Switch,
+            Pq,
         ];
         for m in modes {
             for s in sections(m)

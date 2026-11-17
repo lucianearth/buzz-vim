@@ -170,6 +170,13 @@ pub enum Action {
         agent: String,
         text: String,
     },
+    /// A pq block, as its own message in a channel or thread, tagging `to`.
+    SendPq {
+        channel: String,
+        root: Option<String>,
+        content: String,
+        to: Vec<String>,
+    },
     /// Look up these people's names (the Q agent's, in #quick).
     WantProfiles(Vec<String>),
     /// Read the control channel's notes, replies and reactions.
@@ -318,6 +325,9 @@ pub struct App {
     /// The Q box (`Q` / `^q`): its text, and whether it carries this channel.
     pub quick_draft: Draft,
     pub quick_include: bool,
+    /// The pq box (`P` / `p`), and pq's key inbox (`$PQ_HOME`, `~/.pqbox`).
+    pub pq: Option<crate::pqbox::PqBox>,
+    pub pq_store: Option<buzz_vim_core::pq::Store>,
     pub loop_: Loop,
     /// channel -> when we last sent a typing pulse there (secs).
     pub typed: HashMap<String, u64>,
@@ -447,6 +457,8 @@ impl App {
             checklist_view: false,
             checklist_cursor: 0,
             quick_draft: Draft::default(),
+            pq: None,
+            pq_store: buzz_vim_core::pq::Store::from_env(),
             quick_include: false,
             loop_: Loop::default(),
             typed: HashMap::new(),
@@ -1893,6 +1905,9 @@ impl App {
 
     fn on_paste(&mut self, s: String) {
         let text = s.replace("\r\n", "\n").replace('\r', "\n");
+        if self.mode == Mode::Pq {
+            return self.pq_paste(&text);
+        }
         // The Q box takes text only, a dropped path included.
         if self.mode == Mode::Quick {
             self.quick_draft.insert(&text);
@@ -1962,6 +1977,11 @@ impl App {
                 }
                 return;
             }
+            if self.mode == Mode::Pq {
+                self.pq = None;
+                self.mode = Mode::Normal;
+                return;
+            }
             if self.mode == Mode::Insert && !self.draft_ref().is_empty() {
                 self.draft_mut().clear();
                 self.mode = Mode::Normal;
@@ -1987,6 +2007,7 @@ impl App {
         }
         match self.mode {
             Mode::Quick => self.key_quick(k),
+            Mode::Pq => self.key_pq(k),
             Mode::Insert => self.key_insert(k),
             Mode::Normal => self.key_normal(k),
             Mode::Sections => self.key_sections(k),
@@ -2256,6 +2277,8 @@ impl App {
                 self.checklist_view = false;
             }
             KeyCode::Char('+') => self.thumbs_up(),
+            KeyCode::Char('P') => self.pq_ask(),
+            KeyCode::Char('p') => self.pq_act(),
             KeyCode::Char('s') => {
                 self.picker_marks = self.chosen.iter().cloned().collect();
                 self.picker_touched = false;
