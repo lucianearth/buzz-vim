@@ -23,3 +23,8 @@ buzz-core = { git = "https://github.com/block/buzz", rev = "5397ea49e27fd56d4e03
 buzz-sdk = { git = "https://github.com/block/buzz", rev = "5397ea49e27fd56d4e0346e2120906d09ac91579" }
 buzz-ws-client = { git = "https://github.com/block/buzz", rev = "5397ea49e27fd56d4e0346e2120906d09ac91579" }
 uuid = "1.28.0"
+chacha20poly1305 = "0.10.1"
+hkdf = "0.13.0"
+x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+libcrux-ml-kem = "0.0.11"
+getrandom = "0.3"

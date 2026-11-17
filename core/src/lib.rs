@@ -18,6 +18,7 @@ pub mod mention;
 pub mod model;
 pub mod needs;
 pub mod palette;
+pub mod pq;
 pub mod push;
 pub mod quick;
 pub mod readstate;
