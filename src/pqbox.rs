@@ -114,7 +114,7 @@ impl App {
         }
     }
 
-    fn pq_close(&mut self) {
+    pub(crate) fn pq_close(&mut self) {
         self.pq = None;
         self.mode = Mode::Normal;
     }
@@ -242,25 +242,13 @@ fn expand_home(p: &str) -> std::path::PathBuf {
     }
 }
 
-/// Into ~/Downloads (made 0700 if missing), never over an existing file.
-/// The sender chose `name`: no leading dots, so it can't be a dotfile.
-fn save(name: &str, data: &[u8]) -> std::io::Result<std::path::PathBuf> {
-    use std::io::Write;
-    let home = std::env::var_os("HOME").ok_or(std::io::ErrorKind::NotFound)?;
-    let dir = std::path::Path::new(&home).join("Downloads");
-    let mut b = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
-    b.recursive(true).create(&dir)?;
-    let name = Some(name.trim_start_matches('.'))
-        .filter(|n| !n.is_empty())
-        .unwrap_or("message.out");
-    let path = dir.join(name);
-    let mut o = std::fs::OpenOptions::new();
-    o.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-    o.open(&path)?.write_all(data)?;
+/// As any download: into Downloads under a free name, owner-only. Never
+/// into $HOME when there is no Downloads folder. `name` is already
+/// `Header::shown_name`: no path, no dotfile.
+fn save(name: &str, data: &[u8]) -> anyhow::Result<std::path::PathBuf> {
+    let dir = dirs::download_dir().ok_or_else(|| anyhow::anyhow!("no Downloads folder"))?;
+    let path = crate::links::free_path(&dir, name)?;
+    std::fs::write(&path, data)?;
     Ok(path)
 }
 

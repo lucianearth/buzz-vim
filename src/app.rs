@@ -1978,9 +1978,7 @@ impl App {
                 return;
             }
             if self.mode == Mode::Pq {
-                self.pq = None;
-                self.mode = Mode::Normal;
-                return;
+                return self.pq_close();
             }
             if self.mode == Mode::Insert && !self.draft_ref().is_empty() {
                 self.draft_mut().clear();

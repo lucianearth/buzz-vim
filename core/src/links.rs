@@ -231,7 +231,8 @@ pub fn file_name(url: &str, given: Option<&str>) -> String {
 
 /// `name` in `dir`, or `name (1)`, `name (2)`… if that's taken, the way a
 /// browser saves downloads. Created empty, so a second download started
-/// before this one finishes can't pick the same name.
+/// before this one finishes can't pick the same name, and owner-only
+/// (0600): a download can be a secret someone sent.
 pub fn free_path(dir: &std::path::Path, name: &str) -> std::io::Result<std::path::PathBuf> {
     let (stem, ext) = match name.rsplit_once('.') {
         Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
@@ -242,11 +243,11 @@ pub fn free_path(dir: &std::path::Path, name: &str) -> std::io::Result<std::path
             0 => dir.join(name),
             i => dir.join(format!("{stem} ({i}){ext}")),
         };
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&p)
-        {
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+        match o.open(&p) {
             Ok(_) => return Ok(p),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -366,6 +367,15 @@ mod tests {
         assert_eq!(free("a.log"), dir.join("a (2).log"));
         assert_eq!(free("Makefile"), dir.join("Makefile"));
         assert_eq!(free("Makefile"), dir.join("Makefile (1)"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("a.log"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
