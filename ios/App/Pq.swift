@@ -104,7 +104,7 @@ struct PqCard: View {
             }
         }
         .fullScreenCover(item: $opened) { o in
-            PqOpenedView(opened: o) { opened = nil }
+            PqOpenedView(opened: o) { closed(o) }
                 .modifier(Themed())
         }
     }
@@ -128,13 +128,7 @@ struct PqCard: View {
             }
             do {
                 let data = try pqOpen(messageBlock: block, record: record)
-                // Burned as it opens, as the terminal and pq do: one look.
-                if burn {
-                    let ok = PqKeys.burn(id)
-                    pqLog.info("open \(id, privacy: .public): burned \(ok, privacy: .public)")
-                    if ok { burned = true } else { model.say("opened, but couldn't burn the key") }
-                }
-                opened = PqOpened(name: name, data: data)
+                opened = PqOpened(name: name, data: data, burn: burn ? id : nil)
             } catch let BuzzError.Failed(message) {
                 model.say("couldn't open it: \(message)")
             } catch {
@@ -142,12 +136,25 @@ struct PqCard: View {
             }
         }
     }
+
+    /// The opened view closed (Done, or the app went to the background):
+    /// now the key burns, as the terminal and pq do once delivered. Not at
+    /// open, so the secret can still be copied or saved.
+    private func closed(_ o: PqOpened) {
+        opened = nil
+        guard let id = o.burn else { return }
+        let ok = PqKeys.burn(id)
+        pqLog.info("close \(id, privacy: .public): burned \(ok, privacy: .public)")
+        if ok { burned = true } else { model.say("couldn't burn the key") }
+    }
 }
 
 struct PqOpened: Identifiable {
     let id = UUID()
     let name: String
     let data: Data
+    /// The request id whose key burns when this closes; nil to keep it.
+    let burn: String?
 }
 
 /// What a sealed message held, over everything: copy (gone from the
@@ -187,7 +194,7 @@ struct PqOpenedView: View {
                 wide("Save", filled: text == nil) { save() }
             }
             wide("Done", filled: false, action: close)
-            Text("The key is gone from this phone unless you kept it.")
+            Text("The key burns when this closes, unless you kept it.")
                 .font(.small)
                 .foregroundStyle(theme.muted)
                 .frame(maxWidth: .infinity)
