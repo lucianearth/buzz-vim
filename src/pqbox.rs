@@ -209,7 +209,7 @@ impl App {
                 let read = if file {
                     let path = expand_home(input.text.trim());
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
-                    std::fs::read(&path).map(|d| (d, name.unwrap_or_else(|| "file".into())))
+                    read_small_file(&path).map(|d| (d, name.unwrap_or_else(|| "file".into())))
                 } else {
                     Ok((input.text.clone().into_bytes(), "message.txt".to_string()))
                 };
@@ -249,6 +249,32 @@ fn expand_home(p: &str) -> std::path::PathBuf {
         (Some(rest), Some(h)) => std::path::Path::new(&h).join(rest),
         _ => p.into(),
     }
+}
+
+/// The most a sealed message carries, as on iOS.
+const MAX_SEND: u64 = 1 << 20;
+
+/// A regular file of at most [`MAX_SEND`] bytes. Checked before it is
+/// opened: a FIFO would block the UI and `/dev/zero` never ends.
+fn read_small_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, Read};
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() {
+        return Err(Error::other("not a regular file"));
+    }
+    let too_big = || Error::other("too big to send in a message (over 1 MB)");
+    if meta.len() > MAX_SEND {
+        return Err(too_big());
+    }
+    // It may have grown since: read one byte past the cap to tell.
+    let mut data = vec![];
+    std::fs::File::open(path)?
+        .take(MAX_SEND + 1)
+        .read_to_end(&mut data)?;
+    if data.len() as u64 > MAX_SEND {
+        return Err(too_big());
+    }
+    Ok(data)
 }
 
 /// Where any download goes ([`crate::sync::download_path`]). `name` is
@@ -384,6 +410,37 @@ mod tests {
         assert_eq!((b.mode, status(&b)), (Mode::Normal, "not sent"));
         keys(&mut b, &[KeyCode::Char('p'), KeyCode::Enter]);
         assert_eq!(status(&b), "nothing to send");
+
+        // Not a regular file, or over 1 MB: refused before reading, and
+        // the box stays open to try another.
+        let big = tmp.join("big");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_SEND + 1)
+            .unwrap();
+        let fifo = tmp.join("fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        keys(&mut b, &[KeyCode::Tab]);
+        for (path, why) in [
+            (&tmp, "not a regular file"),
+            (&fifo, "not a regular file"),
+            (&big, "too big to send in a message (over 1 MB)"),
+        ] {
+            b.on_term(crossterm::event::Event::Key(KeyEvent::new(
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL,
+            )));
+            typed(&mut b, path.to_str().unwrap());
+            keys(&mut b, &[KeyCode::Enter]);
+            assert_eq!(status(&b), format!("couldn't read it: {why}"));
+            assert!(matches!(b.pq, Some(PqBox::Answer { file: true, .. })));
+        }
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 }
