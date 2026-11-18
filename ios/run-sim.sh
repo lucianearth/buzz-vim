@@ -17,9 +17,12 @@ def ver(rt):
 print(max(found, key=lambda f: ver(f[0]))[1] if found else "")
 ' "$device")
 [ -n "$udid" ] || { echo "no simulator named $device"; exit 1; }
+# Signed to run locally, so the entitlements are embedded: an unsigned
+# build gets -34018 from every Keychain write on the iOS 27 simulator.
 xcodebuild -project BuzzVim.xcodeproj -scheme BuzzVim -configuration Debug \
   -destination "id=$udid" -derivedDataPath build \
-  CODE_SIGNING_ALLOWED=NO build > build.log 2>&1 \
+  CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual PROVISIONING_PROFILE_SPECIFIER= \
+  build > build.log 2>&1 \
   || { grep -E " error: " build.log | sort -u; echo "full log: ios/build.log"; exit 1; }
 app=build/Build/Products/Debug-iphonesimulator/BuzzVim.app
 xcrun simctl boot "$udid" 2>/dev/null || true
