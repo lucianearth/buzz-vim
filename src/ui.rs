@@ -2058,7 +2058,7 @@ fn draw_pq(f: &mut Frame, app: &mut App, area: Rect) {
             );
         }
         PqBox::Answer { to, input, file } => {
-            let label = pq::display_text(&to.req.label);
+            let label = to.req.shown_label();
             let who = app.store.name_of(&to.asker);
             let head = Line::styled(format!(" {who} asks for: {label}"), theme::bright());
             let short = [
@@ -2110,7 +2110,7 @@ fn draw_pq(f: &mut Frame, app: &mut App, area: Rect) {
                 " seal and send this? ".to_string(),
                 vec![
                     Line::styled(
-                        format!(" for    {who}: {}", pq::display_text(&to.req.label)),
+                        format!(" for    {who}: {}", to.req.shown_label()),
                         theme::text(),
                     ),
                     Line::styled(
@@ -3595,14 +3595,8 @@ fn pq_card(
     let row = |text: String, style: Style| Line::from(Span::styled(clip(&text, width), style));
     match piece {
         Piece::Request(r) => {
-            let label = pq::display_text(&r.label);
-            let label = if label.is_empty() {
-                "a secret".to_string()
-            } else {
-                label
-            };
             vec![row(
-                format!("🔒 {signer} asks for: {label}"),
+                format!("🔒 {signer} asks for: {}", r.shown_label()),
                 theme::bright(),
             )]
         }

@@ -64,7 +64,7 @@ struct PqCard: View {
         VStack(alignment: .leading, spacing: 10) {
             switch segment {
             case let .pqRequest(_, label, _):
-                Text("🔒 \(message.authorName) asks for: \(label.isEmpty ? "a secret" : label)")
+                Text("🔒 \(message.authorName) asks for: \(label)")
                     .font(.text)
                     .foregroundStyle(theme.bright)
                 cardButton("Send secret", icon: "paperplane") { answering = true }
@@ -254,7 +254,7 @@ struct PqSendSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Send \(askerName) \(label.isEmpty ? "a secret" : label)")
+            Text("Send \(askerName) \(label)")
                 .font(.button)
                 .foregroundStyle(theme.text)
             PasteButton(payloadType: String.self) { strings in

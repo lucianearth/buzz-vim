@@ -226,6 +226,17 @@ impl Header {
 }
 
 impl Request {
+    /// The label to show: the asker chose it, so through [`display_text`];
+    /// "a secret" when nothing is left.
+    pub fn shown_label(&self) -> String {
+        let label = display_text(&self.label);
+        if label.is_empty() {
+            "a secret".into()
+        } else {
+            label
+        }
+    }
+
     /// A REQUEST payload, held to the version and suite this code speaks.
     pub fn from_json(bytes: &[u8]) -> Result<Request> {
         let req: Request = serde_json::from_slice(bytes).context("the request is not pq JSON")?;
@@ -605,6 +616,12 @@ mod tests {
         assert_eq!(display_text("a\u{202e}b\n\tc  d"), "a b c d");
         assert_eq!(display_text(&"x".repeat(250)).len(), 200);
         assert!(display_text(&"x".repeat(250)).ends_with("..."));
+    }
+
+    #[test]
+    fn shown_label_is_safe_and_never_empty() {
+        assert_eq!(request("db\u{202e}\n key").request().shown_label(), "db key");
+        assert_eq!(request(" \t").request().shown_label(), "a secret");
     }
 
     #[test]

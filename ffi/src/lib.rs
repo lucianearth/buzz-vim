@@ -156,8 +156,8 @@ pub enum Segment {
     Text { text: String },
     /// A fenced code block.
     Code { lang: String, body: String },
-    /// A pq REQUEST block: someone asks for a secret. `label` is safe to
-    /// show; `block` goes to `pq_seal`.
+    /// A pq REQUEST block: someone asks for a secret. `label` is ready to
+    /// show (`Request::shown_label`, never empty); `block` goes to `pq_seal`.
     PqRequest {
         id: String,
         label: String,
@@ -2792,7 +2792,7 @@ fn segments(src: &str) -> Vec<Segment> {
             })),
             Piece::Request(r) => out.push(Segment::PqRequest {
                 id: r.id.clone(),
-                label: core_pq::display_text(&r.label),
+                label: r.shown_label(),
                 block: r.block(),
             }),
             Piece::Message(m) => out.push(Segment::PqMessage {
