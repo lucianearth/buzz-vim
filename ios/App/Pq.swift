@@ -1,8 +1,12 @@
 import LocalAuthentication
+import OSLog
 import Security
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
+
+/// Ids and statuses only, never a record or a secret.
+private let pqLog = Logger(subsystem: "com.lucianhymer.buzzvim", category: "pq")
 
 /// pq keys: each request's record JSON (ffi `pq_request`) under account
 /// `pq:<id>`, in the Keychain on this device only. Not in the group the
@@ -26,22 +30,24 @@ enum PqKeys {
          kSecAttrSynchronizable as String: false]
     }
 
-    /// Keep a new request's record; false when the Keychain said no.
-    static func save(id: String, record: String) -> Bool {
+    /// Keep a new request's record; the Keychain's status (errSecSuccess
+    /// when kept).
+    static func save(id: String, record: String) -> OSStatus {
         var q = query(id)
         if let group { q[kSecAttrAccessGroup as String] = group }
         q[kSecValueData as String] = Data(record.utf8)
         q[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         var status = SecItemAdd(q as CFDictionary, nil)
         #if targetEnvironment(simulator)
-        if status == errSecMissingEntitlement {
-            // Unsigned simulator builds have no access groups. Never on a
-            // phone: without a group the item lands in the shared one.
+        if status != errSecSuccess {
+            // Unsigned simulator builds have no access groups (-34018 or
+            // -25243). Never on a phone: without a group the item lands in
+            // the shared one.
             q.removeValue(forKey: kSecAttrAccessGroup as String)
             status = SecItemAdd(q as CFDictionary, nil)
         }
         #endif
-        return status == errSecSuccess
+        return status
     }
 
     /// This device holds the key for request `id` (no secret is read).
@@ -373,12 +379,16 @@ struct PqSendSheet: View {
 /// first (no key, no post).
 func pqAsk(client: Client, model: Model, channel: String, root: String?, label: String) {
     let new = pqRequest(label: label.trimmingCharacters(in: .whitespacesAndNewlines))
-    guard PqKeys.save(id: new.id, record: new.record) else {
-        return model.say("couldn't keep the key; nothing posted")
+    let kept = PqKeys.save(id: new.id, record: new.record)
+    pqLog.info("ask \(new.id, privacy: .public): keychain \(kept, privacy: .public)")
+    guard kept == errSecSuccess else {
+        return model.say("couldn't keep the key (Keychain \(kept)); nothing posted")
     }
     do {
-        _ = try client.send(channel: channel, root: root, text: new.block, attachments: [], to: [])
+        let sent = try client.send(channel: channel, root: root, text: new.block, attachments: [], to: [])
+        pqLog.info("ask \(new.id, privacy: .public): sent \(sent, privacy: .public)")
     } catch let BuzzError.Failed(message) {
+        pqLog.error("ask \(new.id, privacy: .public): not sent: \(message, privacy: .public)")
         PqKeys.burn(new.id)
         model.say("not sent: \(message)")
     } catch {
