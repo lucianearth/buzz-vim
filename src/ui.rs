@@ -3587,20 +3587,8 @@ fn byte_size(n: u64) -> String {
 /// addressed to (its event's p-tags), who it was addressed to. A request
 /// that tagged nobody, or one we don't hold, warns about no one.
 fn unasked(app: &App, ch: &Channel, m: &Message, rid: &str) -> Option<String> {
-    let req = ch.messages.values().find(|x| {
-        x.content.contains("BEGIN PQBOX REQUEST")
-            && pq::parse_blocks(&x.content)
-                .iter()
-                .any(|p| matches!(p, Piece::Request(r) if r.id == rid))
-    })?;
-    if req.mentions.is_empty() || req.mentions.contains(&m.author) {
-        return None;
-    }
-    let names: Vec<String> = req
-        .mentions
-        .iter()
-        .map(|pk| app.store.name_of(pk))
-        .collect();
+    let asked = ch.pq_unasked(&m.author, rid)?;
+    let names: Vec<String> = asked.iter().map(|pk| app.store.name_of(pk)).collect();
     Some(names.join(", "))
 }
 

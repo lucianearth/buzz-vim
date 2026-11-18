@@ -63,6 +63,7 @@ pub(crate) fn split(src: &str, mut text: impl FnMut(&str, &mut Vec<Segment>)) ->
                     name,
                     size: m.header.size.unwrap_or(0),
                     block: pq::armor("MESSAGE", &m.blob, ""),
+                    unasked: String::new(),
                 })
             }
         }

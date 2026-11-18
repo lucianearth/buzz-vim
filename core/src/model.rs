@@ -215,6 +215,22 @@ pub struct Channel {
 }
 
 impl Channel {
+    /// Whom the REQUEST `rid` here asked (its mentions), when `author`
+    /// sealed a MESSAGE to it without being one of them. None when the
+    /// request isn't here, asked nobody in particular, or asked `author`.
+    pub fn pq_unasked(&self, author: &str, rid: &str) -> Option<&[String]> {
+        let req = self.messages.values().find(|x| {
+            x.content.contains("BEGIN PQBOX REQUEST")
+                && crate::pq::parse_blocks(&x.content)
+                    .iter()
+                    .any(|p| matches!(p, crate::pq::Piece::Request(r) if r.id == rid))
+        })?;
+        if req.mentions.is_empty() || req.mentions.iter().any(|m| m == author) {
+            return None;
+        }
+        Some(&req.mentions)
+    }
+
     /// The model `author`'s newest tagged message here ran on, if any.
     pub fn model_of(&self, author: &str) -> Option<&str> {
         self.messages

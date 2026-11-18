@@ -170,6 +170,9 @@ pub enum Segment {
         name: String,
         size: u64,
         block: String,
+        /// Who the request asked, by name, when the sealer wasn't one of
+        /// them ("" when fine): a warning, as the terminal draws it.
+        unasked: String,
     },
 }
 
@@ -2710,7 +2713,19 @@ impl Engine {
             author_name: self.store.name_of(&m.author),
             is_agent: self.is_agent(&m.author),
             at: m.created_at,
-            segments: segments(body.trim_end()),
+            segments: {
+                let mut s = segments(body.trim_end());
+                for seg in &mut s {
+                    if let Segment::PqMessage { id, unasked, .. } = seg
+                        && let Some(asked) = ch.pq_unasked(&m.author, id)
+                    {
+                        let names: Vec<String> =
+                            asked.iter().map(|pk| self.store.name_of(pk)).collect();
+                        *unasked = names.join(", ");
+                    }
+                }
+                s
+            },
             mention_names: m
                 .mentions
                 .iter()
@@ -2850,6 +2865,7 @@ mod tests {
                 name,
                 size,
                 block,
+                ..
             },
         ] = &s[..]
         else {
@@ -2862,6 +2878,52 @@ mod tests {
         );
         let other = pq::pq_request(String::new());
         assert!(pq::pq_open(block.clone(), other.record).is_err());
+    }
+
+    /// A MESSAGE sealed by someone the REQUEST didn't ask carries the
+    /// warning, with the asked names; the asked one's doesn't.
+    #[test]
+    fn pq_message_from_someone_unasked_is_flagged() {
+        use nostr::{EventBuilder, Kind, Tag};
+        let ch = "c1";
+        let (asked, other) = (Keys::generate(), Keys::generate());
+        let mut e = engine();
+        e.store.channel_mut(ch).name = "pq".into();
+        let me = e.relay.keys.clone();
+        let post = |e: &mut Engine, by: &Keys, content: &str, p: Option<&Keys>| {
+            let mut tags = vec![Tag::parse(["h", ch]).unwrap()];
+            if let Some(p) = p {
+                tags.push(Tag::parse(["p", &p.public_key().to_hex()]).unwrap());
+            }
+            let ev = EventBuilder::new(Kind::Custom(9), content)
+                .tags(tags)
+                .sign_with_keys(by)
+                .unwrap();
+            e.store.apply(&ev);
+        };
+        let new = pq::pq_request("token".into());
+        post(&mut e, &me, &new.block, Some(&asked));
+        let sealed = pq::pq_seal(new.block.clone(), b"s".to_vec(), "t".into()).unwrap();
+        post(&mut e, &other, &sealed, None);
+        post(&mut e, &asked, &sealed, None);
+        let c = Client {
+            engine: Arc::new(Mutex::new(e)),
+            stop: Arc::new(tokio::sync::Notify::new()),
+        };
+        let mut warnings: Vec<String> = c
+            .timeline(ch.into())
+            .messages
+            .iter()
+            .flat_map(|m| m.segments.clone())
+            .filter_map(|s| match s {
+                Segment::PqMessage { unasked, .. } => Some(unasked),
+                _ => None,
+            })
+            .collect();
+        warnings.sort();
+        let name = &warnings[1];
+        assert_eq!(warnings[0], "");
+        assert!(!name.is_empty(), "the unasked sealer is flagged");
     }
 
     #[test]
