@@ -1536,6 +1536,16 @@ fn counts_unread(kind: u16, author: &str, me: &str, active: bool) -> bool {
     model::UNREAD_KINDS.contains(&kind) && author != me && !active
 }
 
+/// A new, empty, owner-only file for a download called `name`: in
+/// Downloads, or the home folder when there is none (Linux without
+/// user-dirs), under a free name.
+pub(crate) fn download_path(name: &str) -> anyhow::Result<std::path::PathBuf> {
+    let dir = dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| anyhow::anyhow!("no Downloads folder"))?;
+    Ok(crate::links::free_path(&dir, name)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::counts_unread;
@@ -1547,14 +1557,4 @@ mod tests {
         assert!(!counts_unread(9, "them", "me", true));
         assert!(!counts_unread(40099, "them", "me", false));
     }
-}
-
-/// A new, empty, owner-only file for a download called `name`: in
-/// Downloads, or the home folder when there is none (Linux without
-/// user-dirs), under a free name.
-pub(crate) fn download_path(name: &str) -> anyhow::Result<std::path::PathBuf> {
-    let dir = dirs::download_dir()
-        .or_else(dirs::home_dir)
-        .ok_or_else(|| anyhow::anyhow!("no Downloads folder"))?;
-    Ok(crate::links::free_path(&dir, name)?)
 }
