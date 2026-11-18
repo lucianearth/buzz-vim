@@ -72,6 +72,8 @@ pub struct Header {
 pub struct Message {
     pub header: Header,
     pub blob: Vec<u8>,
+    /// Magic, header length and header: the AEAD's associated data.
+    prefix_len: usize,
 }
 
 /// A run of message text: plain text, or a block that decoded.
@@ -267,18 +269,15 @@ impl Message {
         let header: Header = serde_json::from_slice(&blob[hstart..hstart + hlen])
             .context("message header is corrupt -- ask the sender to resend it")?;
         ensure!(valid_id(&header.id), "message names a malformed request id");
-        Ok(Message { header, blob })
+        Ok(Message {
+            header,
+            blob,
+            prefix_len: hstart + hlen,
+        })
     }
 
     pub fn from_block(text: &str) -> Result<Message> {
         Message::parse(dearmor(text, "MESSAGE")?)
-    }
-
-    fn prefix_len(&self) -> usize {
-        MAGIC.len()
-            + 4
-            + u32::from_be_bytes(self.blob[MAGIC.len()..MAGIC.len() + 4].try_into().unwrap())
-                as usize
     }
 }
 
@@ -473,7 +472,7 @@ pub fn open(msg: &Message, rec: &Record) -> Result<Vec<u8>> {
         ss_ecdh.as_bytes(),
         &transcript(&rec.id, &b64d(&rec.ek)?, &b64d(&rec.xpk)?, &ct, &epk),
     );
-    let (prefix, ciphertext) = msg.blob.split_at(msg.prefix_len());
+    let (prefix, ciphertext) = msg.blob.split_at(msg.prefix_len);
     ChaCha20Poly1305::new(&key.into())
         .decrypt(
             &nonce.into(),
