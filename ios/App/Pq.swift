@@ -105,6 +105,9 @@ struct PqCard: View {
     @Environment(\.theme) private var theme
     @State private var answering = false
     @State private var opened: PqOpened?
+    /// Set once this card burned its key: the Keychain isn't observable,
+    /// so the card says so itself.
+    @State private var burned = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -124,7 +127,7 @@ struct PqCard: View {
                         .font(.small)
                         .foregroundStyle(theme.badge)
                 }
-                if PqKeys.has(id) {
+                if !burned && PqKeys.has(id) {
                     cardButton("Open", icon: "lock.open") { open(id: id, name: name, block: block, burn: true) }
                         .contextMenu {
                             Button("Open, keep the key") { open(id: id, name: name, block: block, burn: false) }
@@ -175,7 +178,11 @@ struct PqCard: View {
             do {
                 let data = try pqOpen(messageBlock: block, record: record)
                 // Burned as it opens, as the terminal and pq do: one look.
-                if burn, !PqKeys.burn(id) { model.say("opened, but couldn't burn the key") }
+                if burn {
+                    let ok = PqKeys.burn(id)
+                    pqLog.info("open \(id, privacy: .public): burned \(ok, privacy: .public)")
+                    if ok { burned = true } else { model.say("opened, but couldn't burn the key") }
+                }
                 opened = PqOpened(name: name.isEmpty ? "message.out" : name, data: data)
             } catch let BuzzError.Failed(message) {
                 model.say("couldn't open it: \(message)")
