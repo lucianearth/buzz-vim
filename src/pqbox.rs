@@ -33,8 +33,13 @@ pub enum PqBox {
         data: Vec<u8>,
         name: String,
     },
-    /// `p` on a MESSAGE: what it held. The key is already burned.
-    Opened { name: String, data: Vec<u8> },
+    /// `p` on a MESSAGE: what it held. Its key `id` burns when this
+    /// closes, so it can be copied or saved first.
+    Opened {
+        name: String,
+        data: Vec<u8>,
+        id: String,
+    },
 }
 
 impl App {
@@ -96,13 +101,10 @@ impl App {
             Ok(d) => d,
             Err(e) => return self.say(format!("couldn't open it: {e}")),
         };
-        // Burned as it opens, as pq does at a terminal: one look.
-        if let Err(e) = store.burn(&rec.id) {
-            self.say(format!("opened, but couldn't burn the key: {e}"));
-        }
         self.pq = Some(PqBox::Opened {
             name: msg.header.shown_name(),
             data,
+            id: rec.id,
         });
         self.mode = Mode::Pq;
     }
@@ -114,8 +116,15 @@ impl App {
         }
     }
 
+    /// Close the box. An opened secret's key burns now, as pq burns once
+    /// it has delivered: one look, but a whole one.
     pub(crate) fn pq_close(&mut self) {
-        self.pq = None;
+        if let Some(PqBox::Opened { id, .. }) = self.pq.take()
+            && let Some(store) = &self.pq_store
+            && let Err(e) = store.burn(&id)
+        {
+            self.say(format!("couldn't burn the key: {e}"));
+        }
         self.mode = Mode::Normal;
     }
 
@@ -150,7 +159,7 @@ impl App {
                 }
                 _ => {}
             },
-            PqBox::Opened { name, data } => match k.code {
+            PqBox::Opened { name, data, .. } => match k.code {
                 KeyCode::Char('y') => match std::str::from_utf8(data) {
                     Ok(t) => {
                         let t = t.to_string();
@@ -242,12 +251,10 @@ fn expand_home(p: &str) -> std::path::PathBuf {
     }
 }
 
-/// As any download: into Downloads under a free name, owner-only. Never
-/// into $HOME when there is no Downloads folder. `name` is already
-/// `Header::shown_name`: no path, no dotfile.
+/// Where any download goes ([`crate::sync::download_path`]). `name` is
+/// already `Header::shown_name`: no path, no dotfile.
 fn save(name: &str, data: &[u8]) -> anyhow::Result<std::path::PathBuf> {
-    let dir = dirs::download_dir().ok_or_else(|| anyhow::anyhow!("no Downloads folder"))?;
-    let path = crate::links::free_path(&dir, name)?;
+    let path = crate::sync::download_path(name)?;
     std::fs::write(&path, data)?;
     Ok(path)
 }
@@ -335,13 +342,17 @@ mod tests {
         let id = post(&mut [&mut a, &mut b], &them, &sealed);
         a.selected.insert("c1".into(), id);
 
-        // Opening burns the key; a second look has nothing to open with.
+        // The key outlives the open and a copy; closing burns it, and a
+        // second look has nothing to open with.
         keys(&mut a, &[KeyCode::Char('p')]);
         assert!(matches!(&a.pq, Some(PqBox::Opened { data, .. }) if data == b"hunter2"));
-        assert_eq!(a.pq_store.as_ref().unwrap().load(&req.id).unwrap(), None);
         keys(&mut a, &[KeyCode::Char('y')]);
         assert!(matches!(a.actions.last(), Some(Action::Copy(t)) if t == "hunter2"));
-        keys(&mut a, &[KeyCode::Esc, KeyCode::Char('p')]);
+        let key = |a: &App| a.pq_store.as_ref().unwrap().load(&req.id).unwrap();
+        assert!(key(&a).is_some());
+        keys(&mut a, &[KeyCode::Esc]);
+        assert_eq!(key(&a), None);
+        keys(&mut a, &[KeyCode::Char('p')]);
         assert_eq!(
             status(&a),
             "no key here (another device, or already opened)"

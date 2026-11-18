@@ -1168,10 +1168,7 @@ impl Sync {
         let r = self.relay.clone();
         self.spawn(async move {
             let res = async {
-                let dir = dirs::download_dir()
-                    .or_else(dirs::home_dir)
-                    .ok_or_else(|| anyhow::anyhow!("no Downloads folder"))?;
-                let path = crate::links::free_path(&dir, &name)?;
+                let path = download_path(&name)?;
                 let n = r.download_to(&url, &path).await?;
                 crate::links::reveal(&path)?;
                 anyhow::Ok(format!(
@@ -1550,4 +1547,14 @@ mod tests {
         assert!(!counts_unread(9, "them", "me", true));
         assert!(!counts_unread(40099, "them", "me", false));
     }
+}
+
+/// A new, empty, owner-only file for a download called `name`: in
+/// Downloads, or the home folder when there is none (Linux without
+/// user-dirs), under a free name.
+pub(crate) fn download_path(name: &str) -> anyhow::Result<std::path::PathBuf> {
+    let dir = dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| anyhow::anyhow!("no Downloads folder"))?;
+    Ok(crate::links::free_path(&dir, name)?)
 }

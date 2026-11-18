@@ -2130,10 +2130,10 @@ fn draw_pq(f: &mut Frame, app: &mut App, area: Rect) {
                 ],
             )
         }
-        PqBox::Opened { name, data } => {
+        PqBox::Opened { name, data, .. } => {
             let mut lines = vec![Line::styled(
                 format!(
-                    " {name} · {} · key burned",
+                    " {name} · {} · the key burns on close",
                     crate::clip::human_size(data.len())
                 ),
                 theme::bright(),
@@ -2157,7 +2157,7 @@ fn draw_pq(f: &mut Frame, app: &mut App, area: Rect) {
             }
             lines.push(Line::raw(""));
             lines.push(Line::styled(
-                " y copy   s save to Downloads   esc close",
+                " y copy   s save   esc close (burns the key)",
                 theme::tab_active(),
             ));
             (" opened ".to_string(), lines)
