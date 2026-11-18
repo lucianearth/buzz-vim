@@ -2117,7 +2117,7 @@ fn draw_pq(f: &mut Frame, app: &mut App, area: Rect) {
                         format!(
                             " file   {} · {}",
                             pq::display_text(name),
-                            byte_size(data.len() as u64)
+                            crate::clip::human_size(data.len())
                         ),
                         theme::bright(),
                     ),
@@ -2132,7 +2132,10 @@ fn draw_pq(f: &mut Frame, app: &mut App, area: Rect) {
         }
         PqBox::Opened { name, data } => {
             let mut lines = vec![Line::styled(
-                format!(" {name} · {} · key burned", byte_size(data.len() as u64)),
+                format!(
+                    " {name} · {} · key burned",
+                    crate::clip::human_size(data.len())
+                ),
                 theme::bright(),
             )];
             lines.push(Line::raw(""));
@@ -3571,18 +3574,6 @@ pub fn render_markdown(src: &str, width: usize, mentions: &[String]) -> Vec<Line
     render_markdown_links(src, width, mentions, &|_| None).lines
 }
 
-/// Just enough markdown for chat: code fences, `inline code`, **bold**,
-/// _italic_, @mentions and links. Wraps to `width` columns. `channel_name`
-/// names the channels bare `buzz://` links point at.
-/// `n` bytes as "33 B", "1.2 KB", "4.0 MB".
-fn byte_size(n: u64) -> String {
-    match n {
-        n if n < 1000 => format!("{n} B"),
-        n if n < 1_000_000 => format!("{:.1} KB", n as f64 / 1e3),
-        n => format!("{:.1} MB", n as f64 / 1e6),
-    }
-}
-
 /// When the person who sealed `m` is not someone the REQUEST `rid` was
 /// addressed to (its event's p-tags), who it was addressed to. A request
 /// that tagged nobody, or one we don't hold, warns about no one.
@@ -3618,7 +3609,7 @@ fn pq_card(
         Piece::Message(msg) => {
             let h = &msg.header;
             let name = h.shown_name();
-            let size = byte_size(h.size.unwrap_or(0));
+            let size = crate::clip::human_size(h.size.unwrap_or(0) as usize);
             let mut rows = vec![row(
                 format!("🔐 sealed by {signer}, {name}, {size}"),
                 theme::bright(),
@@ -3677,6 +3668,9 @@ fn render_body(
     r
 }
 
+/// Just enough markdown for chat: code fences, `inline code`, **bold**,
+/// _italic_, @mentions and links. Wraps to `width` columns. `channel_name`
+/// names the channels bare `buzz://` links point at.
 pub fn render_markdown_links(
     src: &str,
     width: usize,
@@ -6801,7 +6795,6 @@ mod tests {
                 "⚠ mallory was not asked: the request named taskbot"
             ]
         );
-        assert_eq!(byte_size(1_234_567), "1.2 MB");
     }
 
     #[test]
