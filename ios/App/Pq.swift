@@ -33,11 +33,14 @@ enum PqKeys {
         q[kSecValueData as String] = Data(record.utf8)
         q[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         var status = SecItemAdd(q as CFDictionary, nil)
+        #if targetEnvironment(simulator)
         if status == errSecMissingEntitlement {
-            // Unsigned simulator builds have no access groups.
+            // Unsigned simulator builds have no access groups. Never on a
+            // phone: without a group the item lands in the shared one.
             q.removeValue(forKey: kSecAttrAccessGroup as String)
             status = SecItemAdd(q as CFDictionary, nil)
         }
+        #endif
         return status == errSecSuccess
     }
 
@@ -58,8 +61,11 @@ enum PqKeys {
         return String(data: data, encoding: .utf8)
     }
 
-    static func burn(_ id: String) {
-        SecItemDelete(query(id) as CFDictionary)
+    /// False when a key was there and couldn't be deleted.
+    @discardableResult
+    static func burn(_ id: String) -> Bool {
+        let s = SecItemDelete(query(id) as CFDictionary)
+        return s == errSecSuccess || s == errSecItemNotFound
     }
 }
 
@@ -163,7 +169,7 @@ struct PqCard: View {
             do {
                 let data = try pqOpen(messageBlock: block, record: record)
                 // Burned as it opens, as the terminal and pq do: one look.
-                if burn { PqKeys.burn(id) }
+                if burn, !PqKeys.burn(id) { model.say("opened, but couldn't burn the key") }
                 opened = PqOpened(name: name.isEmpty ? "message.out" : name, data: data)
             } catch let BuzzError.Failed(message) {
                 model.say("couldn't open it: \(message)")
@@ -187,6 +193,11 @@ struct PqOpenedView: View {
     let done: () -> Void
     @Environment(\.theme) private var theme
     @Environment(Model.self) private var model
+    @Environment(\.scenePhase) private var phase
+
+    /// Saved files wait here for the share sheet; emptied on each save and
+    /// when the overlay closes, so a killed app leaves at most one behind.
+    static let saves = FileManager.default.temporaryDirectory.appendingPathComponent("pq", isDirectory: true)
 
     var body: some View {
         let text = String(data: opened.data, encoding: .utf8)
@@ -196,7 +207,6 @@ struct PqOpenedView: View {
                 Text(text ?? "binary, \(opened.data.count) bytes: Save to keep it")
                     .font(.mono)
                     .foregroundStyle(text == nil ? theme.muted : theme.code)
-                    .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .padding(12)
@@ -212,7 +222,7 @@ struct PqOpenedView: View {
                 }
                 wide("Save", filled: text == nil) { save() }
             }
-            wide("Done", filled: false, action: done)
+            wide("Done", filled: false, action: close)
             Text("The key is gone from this phone unless you kept it.")
                 .font(.small)
                 .foregroundStyle(theme.muted)
@@ -220,6 +230,13 @@ struct PqOpenedView: View {
         }
         .padding(22)
         .background(theme.sheet)
+        // Not into the app switcher's snapshot.
+        .onChange(of: phase) { _, now in if now == .background { close() } }
+    }
+
+    private func close() {
+        try? FileManager.default.removeItem(at: Self.saves)
+        done()
     }
 
     private func wide(_ title: String, filled: Bool, action: @escaping () -> Void) -> some View {
@@ -236,7 +253,8 @@ struct PqOpenedView: View {
     /// To a file only the share sheet sees, deleted when it closes. The
     /// sender chose the name: its last path part, no leading dots.
     private func save() {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try? FileManager.default.removeItem(at: Self.saves)
+        let dir = Self.saves.appendingPathComponent(UUID().uuidString, isDirectory: true)
         var name = String(opened.name.drop { $0 == "." })
         if name.isEmpty { name = "message.out" }
         let file = dir.appendingPathComponent(name)
@@ -267,6 +285,8 @@ struct PqSendSheet: View {
     @State private var typed = ""
     @State private var picking = false
     @State private var pending: PendingUpload?
+    /// Said yes on the confirm sheet: sealed and sent once it has gone.
+    @State private var approved: PendingUpload?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -311,13 +331,18 @@ struct PqSendSheet: View {
                 model.say("couldn't read it: \(e.localizedDescription)")
             }
         }
-        .sheet(item: $pending) { p in
+        .sheet(item: $pending, onDismiss: {
+            if let p = approved {
+                approved = nil
+                send(p)
+            }
+        }) { p in
             UploadSheet(upload: p, host: model.relayHost,
                         action: "Seal and send",
                         detail: "sealed for \(askerName), as a reply in the thread",
                         footer: "Nothing is sent until you say yes.") { yes in
+                if yes { approved = p }
                 pending = nil
-                if yes { send(p) }
             }
             .presentationDetents([.height(320)])
             .modifier(Themed())
@@ -326,6 +351,7 @@ struct PqSendSheet: View {
 
     private func confirm(_ data: Data, name: String) {
         if data.isEmpty { return model.say("nothing to send") }
+        if data.count > 1 << 20 { return model.say("too big to send in a message (over 1 MB)") }
         pending = PendingUpload(data: data, mime: "", name: name, preview: nil)
     }
 

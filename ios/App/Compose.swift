@@ -83,6 +83,7 @@ struct ComposeBar: View {
                             .foregroundStyle(theme.muted)
                             .padding(.bottom, 3)
                     }
+                    .accessibilityLabel("Attach")
                 }
                 ComposeField(text: text, focused: $focused, lines: 6) { data, type in
                     Task { prepare(await PendingUpload.make(data, type)) }
