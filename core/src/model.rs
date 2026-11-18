@@ -297,23 +297,23 @@ impl Store {
     /// Whom the REQUEST `rid` in `ch` asked (its mentions, as names joined
     /// with ", "), when `author` sealed a MESSAGE to it without being one of
     /// them: what that MESSAGE's card warns with. None when the request
-    /// isn't here, asked nobody in particular, or asked `author`. The
-    /// earliest copy of the REQUEST is the asker's: a later repost (quoted,
-    /// tagging nobody) can't clear the warning.
+    /// isn't here, asked nobody in particular, or asked `author`. Copies of
+    /// the REQUEST that tag nobody (a quoted repost) are ignored, and any
+    /// tagged copy that leaves `author` out warns: no timestamp decides it,
+    /// since the signer sets created_at and a repost can be backdated.
     pub fn pq_unasked_names(&self, ch: &Channel, author: &str, rid: &str) -> Option<String> {
         let req = ch
             .messages
             .values()
             .filter(|x| {
-                x.content.contains("BEGIN PQBOX REQUEST")
+                !x.mentions.is_empty()
+                    && !x.mentions.iter().any(|m| m == author)
+                    && x.content.contains("BEGIN PQBOX REQUEST")
                     && crate::pq::parse_blocks(&x.content)
                         .iter()
                         .any(|p| matches!(p, crate::pq::Piece::Request(r) if r.id == rid))
             })
-            .min_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)))?;
-        if req.mentions.is_empty() || req.mentions.iter().any(|m| m == author) {
-            return None;
-        }
+            .min_by_key(|x| &x.id)?; // lowest id: the same names on every run
         Some(
             req.mentions
                 .iter()
@@ -780,6 +780,41 @@ mod tests {
             let warn = |who: &Keys| s.pq_unasked_names(ch, &who.public_key().to_hex(), &rid.id);
             assert!(warn(&mallory).is_some(), "the repost cleared the warning");
             assert_eq!(warn(&asked), None);
+        }
+    }
+
+    #[test]
+    fn a_backdated_repost_of_a_request_does_not_clear_the_unasked_warning() {
+        let (me, asked, mallory) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let rid = pq::request("x");
+        let block = rid.request().block();
+        let asked_hex = asked.public_key().to_hex();
+        let mallory_hex = mallory.public_key().to_hex();
+        for _ in 0..20 {
+            let mut s = Store::new(me.public_key().to_hex());
+            s.apply(&ev(
+                &me,
+                9,
+                &block,
+                vec![vec!["h", "c"], vec!["p", &asked_hex]],
+                100,
+            ));
+            // Mallory's repost tags only herself and claims to predate the original.
+            s.apply(&ev(
+                &mallory,
+                9,
+                &block,
+                vec![vec!["h", "c"], vec!["p", &mallory_hex]],
+                50,
+            ));
+            let ch = &s.channels["c"];
+            let warn = |who: &Keys| s.pq_unasked_names(ch, &who.public_key().to_hex(), &rid.id);
+            assert_eq!(
+                warn(&mallory),
+                Some(s.name_of(&asked_hex)),
+                "backdating cleared it"
+            );
+            assert_eq!(warn(&asked), None, "a self-tag is no tag");
         }
     }
 
