@@ -356,7 +356,14 @@ pub fn parse_blocks(text: &str) -> Vec<Piece> {
                 out.push(piece);
                 rest = &rest[i + len..];
                 if fenced.is_some() {
-                    rest = skip_closing_fence(rest);
+                    match skip_closing_fence(rest) {
+                        Some(after) => rest = after,
+                        None if rest.trim().is_empty() => {}
+                        // Still inside the fence: open it again for what
+                        // follows (another block, or the writer's code).
+                        None if rest.starts_with(['\n', '\r']) => plain.push_str("```"),
+                        None => plain.push_str("```\n"),
+                    }
                 }
             }
             // A block that doesn't decode is text, up to its END, as in
@@ -398,12 +405,12 @@ fn open_fence(text: &str) -> Option<usize> {
     last.filter(|_| fences % 2 == 1)
 }
 
-/// `text` without its first non-blank line when that line is a bare
+/// `text` after its first non-blank line, when that line is a bare
 /// closing fence.
-fn skip_closing_fence(text: &str) -> &str {
+fn skip_closing_fence(text: &str) -> Option<&str> {
     let t = text.trim_start();
     let (line, after) = t.split_once('\n').unwrap_or((t, ""));
-    if line.trim() == "```" { after } else { text }
+    (line.trim() == "```").then_some(after)
 }
 
 // ---------------------------------------------------------------- crypto
@@ -731,6 +738,23 @@ mod tests {
                 Piece::Request(req.clone()),
                 Piece::Text("thanks".into()),
             ]
+        );
+        // Two blocks in one fence; a block then code in one fence.
+        let t = format!("ask\n```\n{block}\n{block}\n```\nthanks");
+        let p = parse_blocks(&t);
+        assert_eq!(p.len(), 4, "{p:?}");
+        assert_eq!(p[3], Piece::Text("thanks".into()));
+        let t = format!("ask\n```\n{block}\nmore\n```\nthanks");
+        assert_eq!(
+            parse_blocks(&t)[2],
+            Piece::Text("```\nmore\n```\nthanks".into())
+        );
+        // A fence never closed after the block leaves nothing behind.
+        let t = format!("ask\n```\n{block}\n");
+        assert!(
+            !parse_blocks(&t)
+                .iter()
+                .any(|p| matches!(p, Piece::Text(x) if x.contains("```")))
         );
         // A closed fence before the block is the writer's own code: kept.
         let t = format!("```\ncode\n```\n{block}\n```\nafter");
