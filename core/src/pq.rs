@@ -237,9 +237,11 @@ impl Request {
         }
     }
 
-    /// A REQUEST payload, held to the version and suite this code speaks.
-    pub fn from_json(bytes: &[u8]) -> Result<Request> {
-        let req: Request = serde_json::from_slice(bytes).context("the request is not pq JSON")?;
+    /// The first REQUEST block in `text`, held to the version and suite
+    /// this code speaks.
+    pub fn from_block(text: &str) -> Result<Request> {
+        let req: Request = serde_json::from_slice(&dearmor(text, "REQUEST")?)
+            .context("the request is not pq JSON")?;
         ensure!(
             req.v == VERSION,
             "request uses format v{}, this speaks v{VERSION}",
@@ -252,10 +254,6 @@ impl Request {
         );
         ensure!(valid_id(&req.id), "request has a malformed id");
         Ok(req)
-    }
-
-    pub fn from_block(text: &str) -> Result<Request> {
-        Request::from_json(&dearmor(text, "REQUEST")?)
     }
 
     /// The armored block, with pq.py's note so a CLI user knows what to do.

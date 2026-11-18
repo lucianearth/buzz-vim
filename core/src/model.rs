@@ -215,28 +215,6 @@ pub struct Channel {
 }
 
 impl Channel {
-    /// Whom the REQUEST `rid` here asked (its mentions), when `author`
-    /// sealed a MESSAGE to it without being one of them. None when the
-    /// request isn't here, asked nobody in particular, or asked `author`.
-    /// The earliest copy of the REQUEST is the asker's: a later repost
-    /// (quoted, tagging nobody) can't clear the warning.
-    fn pq_unasked(&self, author: &str, rid: &str) -> Option<&[String]> {
-        let req = self
-            .messages
-            .values()
-            .filter(|x| {
-                x.content.contains("BEGIN PQBOX REQUEST")
-                    && crate::pq::parse_blocks(&x.content)
-                        .iter()
-                        .any(|p| matches!(p, crate::pq::Piece::Request(r) if r.id == rid))
-            })
-            .min_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)))?;
-        if req.mentions.is_empty() || req.mentions.iter().any(|m| m == author) {
-            return None;
-        }
-        Some(&req.mentions)
-    }
-
     /// The model `author`'s newest tagged message here ran on, if any.
     pub fn model_of(&self, author: &str) -> Option<&str> {
         self.messages
@@ -316,12 +294,28 @@ impl Store {
             .collect()
     }
 
-    /// [`Channel::pq_unasked`] as names, joined with ", ": what a sealed
-    /// MESSAGE's card warns with when `author` was not among those asked.
+    /// Whom the REQUEST `rid` in `ch` asked (its mentions, as names joined
+    /// with ", "), when `author` sealed a MESSAGE to it without being one of
+    /// them: what that MESSAGE's card warns with. None when the request
+    /// isn't here, asked nobody in particular, or asked `author`. The
+    /// earliest copy of the REQUEST is the asker's: a later repost (quoted,
+    /// tagging nobody) can't clear the warning.
     pub fn pq_unasked_names(&self, ch: &Channel, author: &str, rid: &str) -> Option<String> {
-        let asked = ch.pq_unasked(author, rid)?;
+        let req = ch
+            .messages
+            .values()
+            .filter(|x| {
+                x.content.contains("BEGIN PQBOX REQUEST")
+                    && crate::pq::parse_blocks(&x.content)
+                        .iter()
+                        .any(|p| matches!(p, crate::pq::Piece::Request(r) if r.id == rid))
+            })
+            .min_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)))?;
+        if req.mentions.is_empty() || req.mentions.iter().any(|m| m == author) {
+            return None;
+        }
         Some(
-            asked
+            req.mentions
                 .iter()
                 .map(|pk| self.name_of(pk))
                 .collect::<Vec<_>>()
