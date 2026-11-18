@@ -215,13 +215,11 @@ struct PqOpenedView: View {
     }
 
     /// To a file only the share sheet sees, deleted when it closes. The
-    /// sender chose the name: its last path part, no leading dots.
+    /// sender chose the name; core already made it safe (`shown_name`).
     private func save() {
         try? FileManager.default.removeItem(at: Self.saves)
         let dir = Self.saves.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        var name = String(opened.name.drop { $0 == "." })
-        if name.isEmpty { name = "message.out" }
-        let file = dir.appendingPathComponent(name)
+        let file = dir.appendingPathComponent(opened.name)
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             try opened.data.write(to: file, options: [.withoutOverwriting, .completeFileProtection])
