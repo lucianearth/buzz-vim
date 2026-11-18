@@ -141,6 +141,8 @@ struct PqCard: View {
     /// now the key burns, as the terminal and pq do once delivered. Not at
     /// open, so the secret can still be copied or saved.
     private func closed(_ o: PqOpened) {
+        // Done then backgrounding mid-dismiss closes twice: burn once.
+        guard opened?.id == o.id else { return }
         opened = nil
         guard let id = o.burn else { return }
         let ok = PqKeys.burn(id)
