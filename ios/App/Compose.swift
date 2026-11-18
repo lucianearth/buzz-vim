@@ -22,6 +22,10 @@ struct ComposeBar: View {
     @State private var picked: PhotosPickerItem?
     @State private var pending: PendingUpload?
     @State private var uploading = false
+    @State private var choosingPhoto = false
+    /// Request secret: what it is for, asked in an alert.
+    @State private var asking = false
+    @State private var askLabel = ""
 
     private var key: String { root.map { "\(channel)/\($0)" } ?? channel }
 
@@ -68,12 +72,18 @@ struct ComposeBar: View {
             }
             HStack(alignment: .bottom, spacing: 10) {
                 if focused || canSend {
-                    PhotosPicker(selection: $picked, matching: .images) {
+                    Menu {
+                        Button { choosingPhoto = true } label: { Label("Photo", systemImage: "photo") }
+                        Button { askLabel = ""; asking = true } label: {
+                            Label("Request secret", systemImage: "lock")
+                        }
+                    } label: {
                         Image(systemName: "paperclip")
                             .font(.text)
                             .foregroundStyle(theme.muted)
                             .padding(.bottom, 3)
                     }
+                    .accessibilityLabel("Attach")
                 }
                 ComposeField(text: text, focused: $focused, lines: 6) { data, type in
                     Task { prepare(await PendingUpload.make(data, type)) }
@@ -114,6 +124,16 @@ struct ComposeBar: View {
             guard let item else { return }
             picked = nil
             Task { prepare(await PendingUpload.load(item)) }
+        }
+        .photosPicker(isPresented: $choosingPhoto, selection: $picked, matching: .images)
+        .alert("Request secret", isPresented: $asking) {
+            TextField("what it's for", text: $askLabel)
+            Button("Ask") {
+                pqAsk(client: client, model: model, channel: channel, root: root, label: askLabel)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Posts a request here. Whoever answers seals the secret to a key only this phone holds.")
         }
         .sheet(item: $pending) { p in
             UploadSheet(upload: p, host: model.relayHost) { yes in
@@ -333,6 +353,10 @@ struct PendingUpload: Identifiable {
 struct UploadSheet: View {
     let upload: PendingUpload
     let host: String
+    /// pq's Send secret asks with the same sheet, in its own words.
+    var action = "Upload"
+    var detail: String?
+    var footer = "Nothing uploads until you say yes."
     let done: (Bool) -> Void
     @Environment(\.theme) private var theme
 
@@ -350,13 +374,13 @@ struct UploadSheet: View {
                     Text("\(upload.name) · \(ByteCountFormatter.string(fromByteCount: Int64(upload.data.count), countStyle: .file))")
                         .font(.button)
                         .foregroundStyle(theme.text)
-                    Text("uploads to \(host.replacingOccurrences(of: "https://", with: ""))/upload")
+                    Text(detail ?? "uploads to \(host.replacingOccurrences(of: "https://", with: ""))/upload")
                         .font(.small)
                         .foregroundStyle(theme.muted)
                 }
             }
             Button { done(true) } label: {
-                Text("Upload")
+                Text(action)
                     .font(.button)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 14)
@@ -371,7 +395,7 @@ struct UploadSheet: View {
                     .foregroundStyle(theme.text)
                     .background(theme.idle, in: RoundedRectangle(cornerRadius: 14))
             }
-            Text("Nothing uploads until you say yes.")
+            Text(footer)
                 .font(.small)
                 .foregroundStyle(theme.muted)
                 .frame(maxWidth: .infinity)

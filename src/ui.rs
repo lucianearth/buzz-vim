@@ -19,6 +19,7 @@ use crate::live::ConnState;
 use crate::media::Slot;
 use crate::model::{Channel, Message};
 use crate::theme;
+use buzz_vim_core::pq::{self, Piece};
 
 mod control;
 
@@ -86,6 +87,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             | Mode::Vote
             | Mode::Subscription
             | Mode::Switch
+            | Mode::Pq
     ) || (app.mode == Mode::Insert && !app.mention_candidates().is_empty());
     for (rect, key) in images.into_iter().filter(|_| !overlay) {
         if let Some(p) = app.media.encoded.get(&key) {
@@ -103,6 +105,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Vote => draw_vote(f, app, area),
         Mode::Subscription => draw_subscription(f, app, area),
         Mode::Switch => draw_chanmode(f, app, area),
+        Mode::Pq => draw_pq(f, app, area),
         _ => {}
     }
 }
@@ -708,7 +711,16 @@ fn message_block(
                 .filter(|c| !c.name.is_empty())
                 .map(|c| c.name.clone())
         };
-        let r = render_markdown_links(body.trim_end(), inner, &mention_names, &name);
+        let signer = app.store.name_of(&m.author);
+        let unasked = |rid: &str| app.store.pq_unasked_names(ch, &m.author, rid);
+        let r = render_body(
+            body.trim_end(),
+            inner,
+            &mention_names,
+            &name,
+            &signer,
+            &unasked,
+        );
         let top = lines.len();
         for (row, col, w, k) in r.at {
             links.push((
@@ -2021,6 +2033,145 @@ fn draw_quick(f: &mut Frame, app: &mut App, area: Rect) {
         "type your question",
         &short,
     );
+}
+
+/// The pq box: the label prompt, the secret (masked), the last look before
+/// sealing, and what an opened message held.
+fn draw_pq(f: &mut Frame, app: &mut App, area: Rect) {
+    use crate::pqbox::PqBox;
+    let Some(b) = &app.pq else { return };
+    let (title, lines) = match b {
+        PqBox::Ask(d) => {
+            let head = Line::styled(
+                " posts a pq REQUEST here; the key stays in pq's inbox",
+                theme::faint(),
+            );
+            let short = [("⏎", "ask"), ("esc", "close")];
+            return draw_box(
+                f,
+                area,
+                " ask for a secret ".into(),
+                head,
+                d,
+                "what is it for?",
+                &short,
+            );
+        }
+        PqBox::Answer { to, input, file } => {
+            let label = to.req.shown_label();
+            let who = app.store.name_of(&to.asker);
+            let head = Line::styled(format!(" {who} asks for: {label}"), theme::bright());
+            let short = [
+                ("⏎", "next"),
+                (
+                    "⇥",
+                    if *file {
+                        "type it instead"
+                    } else {
+                        "send a file"
+                    },
+                ),
+                ("esc", "close"),
+            ];
+            if *file {
+                return draw_box(
+                    f,
+                    area,
+                    " send a file ".into(),
+                    head,
+                    input,
+                    "path to the file",
+                    &short,
+                );
+            }
+            // Never on screen: one * per character, lines kept.
+            let masked = crate::draft::Draft {
+                text: input
+                    .text
+                    .chars()
+                    .map(|c| if c == '\n' { c } else { '*' })
+                    .collect(),
+                cursor: input.text[..input.cursor].chars().count(),
+                ..Default::default()
+            };
+            return draw_box(
+                f,
+                area,
+                " send a secret ".into(),
+                head,
+                &masked,
+                "type or paste it",
+                &short,
+            );
+        }
+        PqBox::Confirm { to, data, name } => {
+            let who = app.store.name_of(&to.asker);
+            (
+                " seal and send this? ".to_string(),
+                vec![
+                    Line::styled(
+                        format!(" for    {who}: {}", to.req.shown_label()),
+                        theme::text(),
+                    ),
+                    Line::styled(
+                        format!(
+                            " file   {} · {}",
+                            pq::display_text(name),
+                            crate::clip::human_size(data.len())
+                        ),
+                        theme::bright(),
+                    ),
+                    Line::styled(
+                        " goes to the request's thread, sealed to its key",
+                        theme::faint(),
+                    ),
+                    Line::raw(""),
+                    Line::styled(" y ⏎  seal and send     n esc  cancel", theme::tab_active()),
+                ],
+            )
+        }
+        PqBox::Opened { name, data, .. } => {
+            let mut lines = vec![Line::styled(
+                format!(
+                    " {name} · {} · the key burns on close",
+                    crate::clip::human_size(data.len())
+                ),
+                theme::bright(),
+            )];
+            lines.push(Line::raw(""));
+            match std::str::from_utf8(data) {
+                Ok(t) => {
+                    let rows: Vec<String> = t
+                        .lines()
+                        .flat_map(|l| wrap_cols(&l.replace('\t', "    "), 70))
+                        .collect();
+                    for l in rows.iter().take(12) {
+                        lines.push(Line::styled(format!(" {l}"), theme::text()));
+                    }
+                    if rows.len() > 12 {
+                        let more = format!(" … {} more lines (y copies all)", rows.len() - 12);
+                        lines.push(Line::styled(more, theme::faint()));
+                    }
+                }
+                Err(_) => lines.push(Line::styled(" not text; s saves it", theme::faint())),
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                " y copy   s save   esc close (burns the key)",
+                theme::tab_active(),
+            ));
+            (" opened ".to_string(), lines)
+        }
+    };
+    let r = centered(area, 76, lines.len() as u16 + 2);
+    clear(f, r);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(theme::bright())
+        .title(Span::styled(title, theme::bright()));
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// A box over everything for a short text: a line saying where it goes,
@@ -3421,6 +3572,85 @@ pub struct Rendered {
 #[cfg(test)]
 pub fn render_markdown(src: &str, width: usize, mentions: &[String]) -> Vec<Line<'static>> {
     render_markdown_links(src, width, mentions, &|_| None).lines
+}
+
+/// The rows of a pq card. `signer` is the message's author; the label and
+/// the file name come from the other party and go through pq's
+/// `display_text`.
+fn pq_card(
+    piece: &Piece,
+    width: usize,
+    signer: &str,
+    unasked: &dyn Fn(&str) -> Option<String>,
+) -> Vec<Line<'static>> {
+    let row = |text: String, style: Style| Line::from(Span::styled(clip(&text, width), style));
+    match piece {
+        Piece::Request(r) => {
+            vec![row(
+                format!("🔒 {signer} asks for: {}", r.shown_label()),
+                theme::bright(),
+            )]
+        }
+        Piece::Message(msg) => {
+            let h = &msg.header;
+            let name = h.shown_name();
+            let size = crate::clip::human_size(h.size.unwrap_or(0) as usize);
+            let mut rows = vec![row(
+                format!("🔐 sealed by {signer}, {name}, {size}"),
+                theme::bright(),
+            )];
+            if let Some(asked) = unasked(&h.id) {
+                rows.push(row(
+                    format!("⚠ {signer} was not asked: the request named {asked}"),
+                    theme::badge(),
+                ));
+            }
+            rows
+        }
+        Piece::Text(_) => vec![],
+    }
+}
+
+/// A message body: markdown, with each pq block drawn as a card.
+fn render_body(
+    src: &str,
+    width: usize,
+    mentions: &[String],
+    channel_name: &dyn Fn(&str) -> Option<String>,
+    signer: &str,
+    unasked: &dyn Fn(&str) -> Option<String>,
+) -> Rendered {
+    let pieces = pq::parse_blocks(src);
+    if pieces.iter().all(|p| matches!(p, Piece::Text(_))) {
+        return render_markdown_links(src, width, mentions, channel_name);
+    }
+    let mut r = Rendered::default();
+    for p in &pieces {
+        let part = match p {
+            Piece::Text(t) if t.trim().is_empty() => continue,
+            Piece::Text(t) => {
+                render_markdown_links(t.trim_matches('\n'), width, mentions, channel_name)
+            }
+            card => {
+                let lines = pq_card(card, width, signer, unasked);
+                Rendered {
+                    copy: vec![(false, 0, 0); lines.len()],
+                    lines,
+                    ..Rendered::default()
+                }
+            }
+        };
+        let (rows, urls) = (r.lines.len(), r.urls.len());
+        r.at.extend(
+            part.at
+                .into_iter()
+                .map(|(row, col, w, k)| (row + rows, col, w, k + urls)),
+        );
+        r.lines.extend(part.lines);
+        r.urls.extend(part.urls);
+        r.copy.extend(part.copy);
+    }
+    r
 }
 
 /// Just enough markdown for chat: code fences, `inline code`, **bold**,
@@ -5101,6 +5331,7 @@ mod tests {
             Vote,
             Subscription,
             Switch,
+            Pq,
         ];
         for m in modes {
             for s in sections(m)
@@ -6519,6 +6750,84 @@ mod tests {
         assert!(
             short.contains("kevin's Max") && short.contains("+2 more"),
             "{short}"
+        );
+    }
+
+    #[test]
+    fn pq_blocks_render_as_cards() {
+        let rec = pq::request("db \u{202e}password");
+        let text_of = |r: &Rendered| -> Vec<String> {
+            r.lines
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect()
+        };
+        let none = |_: &str| None;
+        let src = format!("see [doc](https://x.io)\n{}\nthanks", rec.request().block());
+        let r = render_body(&src, 80, &[], &|_| None, "lucian", &none);
+        let rows = text_of(&r);
+        assert_eq!(rows[1], "🔒 lucian asks for: db password");
+        assert_eq!(rows.len(), 3);
+        assert_eq!((r.copy.len(), r.urls.len()), (3, 1));
+        // Fenced, the text after the block is still text, not code.
+        let fenced = format!("ask\n```\n{}\n```\nthanks", rec.request().block());
+        let r = render_body(&fenced, 80, &[], &|_| None, "lucian", &none);
+        assert_eq!(
+            text_of(&r),
+            ["ask", "🔒 lucian asks for: db password", "thanks"]
+        );
+
+        let sealed = pq::seal(&rec.request(), b"hunter2", "../x/pw.txt").unwrap();
+        let named = |id: &str| (id == rec.id).then(|| "taskbot".to_string());
+        let rows = text_of(&render_body(&sealed, 80, &[], &|_| None, "mallory", &named));
+        assert_eq!(
+            rows,
+            [
+                "🔐 sealed by mallory, pw.txt, 7 B",
+                "⚠ mallory was not asked: the request named taskbot"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reply_from_someone_the_request_did_not_tag_warns() {
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+        let (me, asked, other) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let mut app = App::new(me.public_key().to_hex(), None);
+        let post = |k: &Keys, text: &str, p: Option<&Keys>| {
+            let mut tags = vec![Tag::parse(["h", "c1"]).unwrap()];
+            if let Some(p) = p {
+                tags.push(Tag::parse(["p", &p.public_key().to_hex()]).unwrap());
+            }
+            EventBuilder::new(Kind::Custom(9), text)
+                .tags(tags)
+                .sign_with_keys(k)
+                .unwrap()
+        };
+        let tagged = pq::request("x");
+        let untagged = pq::request("y");
+        app.store
+            .apply(&post(&me, &tagged.request().block(), Some(&asked)));
+        app.store
+            .apply(&post(&me, &untagged.request().block(), None));
+        let ch = app.store.channels.get("c1").unwrap();
+        let from = |k: &Keys| k.public_key().to_hex();
+        assert_eq!(
+            app.store.pq_unasked_names(ch, &from(&asked), &tagged.id),
+            None
+        );
+        assert_eq!(
+            app.store.pq_unasked_names(ch, &from(&other), &tagged.id),
+            Some(app.store.name_of(&from(&asked)))
+        );
+        assert_eq!(
+            app.store.pq_unasked_names(ch, &from(&other), &untagged.id),
+            None
+        );
+        assert_eq!(
+            app.store
+                .pq_unasked_names(ch, &from(&other), "0000000000000000"),
+            None
         );
     }
 }

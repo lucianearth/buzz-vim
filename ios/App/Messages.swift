@@ -33,7 +33,8 @@ struct ChannelView: View {
                             .foregroundStyle(theme.muted)
                     }
                     ForEach(tl.messages, id: \.id) { m in
-                        MessageRow(client: client, message: m, showReplies: true, latest: m.id == tl.latest)
+                        MessageRow(client: client, channel: channel, message: m, showReplies: true,
+                                   latest: m.id == tl.latest)
                             .equatable()
                             .contentShape(Rectangle())
                             .onTapGesture(count: 2) { client.thumbsUp(target: m.id) }
@@ -250,6 +251,10 @@ struct MessageRow: View, Equatable {
     }
 
     let client: Client
+    /// The channel, and the thread this row sits in (nil: the channel
+    /// itself, so a reply starts a thread under the row).
+    let channel: String
+    var root: String?
     let message: Message
     let showReplies: Bool
     /// The newest activity here: marked so it's easy to find.
@@ -303,6 +308,9 @@ struct MessageRow: View, Equatable {
                             .fixedSize(horizontal: false, vertical: true)
                     case let .code(lang, body):
                         CodeBlock(lang: lang, code: body)
+                    case .pqRequest, .pqMessage:
+                        PqCard(client: client, segment: s, message: m, channel: channel,
+                               root: root ?? m.id)
                     }
                 }
                 let images = m.media.filter { $0.mime.hasPrefix("image/") || $0.mime.isEmpty }

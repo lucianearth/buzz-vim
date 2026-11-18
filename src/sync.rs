@@ -794,6 +794,16 @@ impl Sync {
                 agent,
                 text,
             } => self.send_quick(app, channel, content, agent, text),
+            Action::SendPq {
+                channel,
+                root,
+                content,
+                to,
+            } => {
+                let mut draft = crate::draft::Draft::default();
+                draft.insert(&content);
+                self.send(app, channel, root.clone(), root, draft, to)
+            }
             Action::SetMode { channel, pick } => self.set_mode(app, channel, pick),
             Action::Typing { channel, root } => {
                 if let Ok(ev) = self
@@ -1158,10 +1168,7 @@ impl Sync {
         let r = self.relay.clone();
         self.spawn(async move {
             let res = async {
-                let dir = dirs::download_dir()
-                    .or_else(dirs::home_dir)
-                    .ok_or_else(|| anyhow::anyhow!("no Downloads folder"))?;
-                let path = crate::links::free_path(&dir, &name)?;
+                let path = download_path(&name)?;
                 let n = r.download_to(&url, &path).await?;
                 crate::links::reveal(&path)?;
                 anyhow::Ok(format!(
@@ -1527,6 +1534,16 @@ pub fn fold_unread(app: &mut App, channel: &str, evs: &[Event]) {
 /// Desktop: most agent answers land in threads.
 fn counts_unread(kind: u16, author: &str, me: &str, active: bool) -> bool {
     model::UNREAD_KINDS.contains(&kind) && author != me && !active
+}
+
+/// A new, empty, owner-only file for a download called `name`: in
+/// Downloads, or the home folder when there is none (Linux without
+/// user-dirs), under a free name.
+pub(crate) fn download_path(name: &str) -> anyhow::Result<std::path::PathBuf> {
+    let dir = dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| anyhow::anyhow!("no Downloads folder"))?;
+    Ok(crate::links::free_path(&dir, name)?)
 }
 
 #[cfg(test)]

@@ -1,46 +1,85 @@
 import Foundation
 import Security
 
-/// The Keychain, this device only, in the access group the app shares with
-/// its notification extension (`KeychainGroup` in both Info.plists, the
-/// same group in both entitlements): the nsec ("nsec"), the relay ("relay")
-/// and the push state ("push").
+/// The Keychain, this device only. Two access groups:
+/// - `.shared`, the group the app shares with its notification extension
+///   (`KeychainGroup` in both Info.plists, the same group in both
+///   entitlements): the nsec ("nsec"), the relay ("relay") and the push
+///   state ("push").
+/// - `.app`, the app's own application-identifier group, so only the app
+///   reads it: pq keys ("pq:<id>", Pq.swift).
 enum Keychain {
-    private static let group = Bundle.main.object(forInfoDictionaryKey: "KeychainGroup") as? String
+    enum Group { case shared, app }
 
-    private static func query(_ account: String, shared: Bool = true) -> [String: Any] {
+    private static let sharedGroup = Bundle.main.object(forInfoDictionaryKey: "KeychainGroup") as? String
+    /// `<team prefix>.<bundle id>`, the prefix taken from the shared group.
+    private static let appGroup: String? = {
+        guard let shared = Keychain.sharedGroup, let dot = shared.firstIndex(of: "."),
+              let bundle = Bundle.main.bundleIdentifier else { return nil }
+        return String(shared[..<dot]) + "." + bundle
+    }()
+
+    /// In `group`, or (nil) in any group this app reads.
+    private static func query(_ account: String, group: Group?) -> [String: Any] {
         var q: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "buzz-vim",
             kSecAttrAccount as String: account,
         ]
-        if shared, let group { q[kSecAttrAccessGroup as String] = group }
+        let name: String? = switch group {
+        case .shared: sharedGroup
+        case .app: appGroup
+        case nil: nil
+        }
+        if let name { q[kSecAttrAccessGroup as String] = name }
         return q
     }
 
-    static func save(_ value: String, account: String = "nsec") {
+    /// Replace `account` with `value`; the Keychain's status. Readable
+    /// after first unlock by default, so the extension can read the nsec
+    /// while the phone is locked.
+    @discardableResult
+    static func save(_ value: String, account: String = "nsec", group: Group = .shared,
+                     accessible: CFString = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly) -> OSStatus {
         delete(account: account)
-        var q = query(account)
+        var q = query(account, group: group)
         q[kSecValueData as String] = Data(value.utf8)
-        q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        if SecItemAdd(q as CFDictionary, nil) == errSecMissingEntitlement {
-            // Unsigned simulator builds have no access groups.
+        q[kSecAttrAccessible as String] = accessible
+        var status = SecItemAdd(q as CFDictionary, nil)
+        #if targetEnvironment(simulator)
+        if status != errSecSuccess {
+            // Unsigned simulator builds have no access groups (-34018 or
+            // -25243). Never on a phone: there an item without a group
+            // lands in the shared one.
             q.removeValue(forKey: kSecAttrAccessGroup as String)
-            SecItemAdd(q as CFDictionary, nil)
+            status = SecItemAdd(q as CFDictionary, nil)
         }
+        #endif
+        return status
     }
 
-    static func read(account: String = "nsec") -> String? {
-        if let v = copy(query(account)) { return v }
-        // Builds before push kept the nsec outside the shared group: move it in.
-        guard let v = copy(query(account, shared: false)) else { return nil }
-        save(v, account: account)
+    static func read(account: String = "nsec", group: Group = .shared) -> String? {
+        if let v = copy(query(account, group: group)) { return v }
+        // Outside its group: a simulator fallback, or (shared) a build
+        // before push kept the nsec outside the shared group: move it in.
+        guard let v = copy(query(account, group: nil)) else { return nil }
+        if group == .shared { save(v, account: account) }
         return v
     }
 
-    /// Every copy, shared or not.
-    static func delete(account: String = "nsec") {
-        SecItemDelete(query(account, shared: false) as CFDictionary)
+    /// `account` is here, in any group (its value is not read).
+    static func has(account: String) -> Bool {
+        var q = query(account, group: nil)
+        q[kSecReturnAttributes as String] = true
+        return SecItemCopyMatching(q as CFDictionary, nil) == errSecSuccess
+    }
+
+    /// Every copy, in any group. False when one was there and couldn't
+    /// be deleted.
+    @discardableResult
+    static func delete(account: String = "nsec") -> Bool {
+        let s = SecItemDelete(query(account, group: nil) as CFDictionary)
+        return s == errSecSuccess || s == errSecItemNotFound
     }
 
     private static func copy(_ query: [String: Any]) -> String? {

@@ -38,6 +38,7 @@ targets:
         # The Keychain group the notification extension shares (Keychain.swift).
         KeychainGroup: $(AppIdentifierPrefix)com.lucianhymer.buzzvim.shared
         NSCameraUsageDescription: Scan the pairing code Buzz Desktop shows, to log in.
+        NSFaceIDUsageDescription: Face ID unlocks a sealed secret before it shows.
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false

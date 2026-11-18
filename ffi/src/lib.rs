@@ -22,6 +22,7 @@ use buzz_vim_core::mention;
 use buzz_vim_core::model::{self, Applied, Store};
 use buzz_vim_core::needs;
 use buzz_vim_core::palette::{self, Role};
+use buzz_vim_core::pq::{self as core_pq, Piece};
 use buzz_vim_core::quick;
 use buzz_vim_core::readstate::{self, ReadState};
 use buzz_vim_core::relay::{BlobDescriptor, Relay};
@@ -35,6 +36,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 
 mod control;
 mod pairing;
+mod pq;
 mod push;
 mod routing;
 pub use control::{
@@ -154,6 +156,25 @@ pub enum Segment {
     Text { text: String },
     /// A fenced code block.
     Code { lang: String, body: String },
+    /// A pq REQUEST block: someone asks for a secret. `label` is ready to
+    /// show (`Request::shown_label`, never empty); `block` goes to `pq_seal`.
+    PqRequest {
+        id: String,
+        label: String,
+        block: String,
+    },
+    /// A pq MESSAGE block: a sealed secret for request `id`. `name` (the
+    /// sender's, made safe to show) and `size` are readable without the
+    /// key; `block` goes to `pq_open`.
+    PqMessage {
+        id: String,
+        name: String,
+        size: u64,
+        block: String,
+        /// Who the request asked, by name, when the sealer wasn't one of
+        /// them ("" when fine): a warning, as the terminal draws it.
+        unasked: String,
+    },
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -2693,7 +2714,17 @@ impl Engine {
             author_name: self.store.name_of(&m.author),
             is_agent: self.is_agent(&m.author),
             at: m.created_at,
-            segments: segments(body.trim_end()),
+            segments: {
+                let mut s = segments(body.trim_end());
+                for seg in &mut s {
+                    if let Segment::PqMessage { id, unasked, .. } = seg
+                        && let Some(names) = self.store.pq_unasked_names(ch, &m.author, id)
+                    {
+                        *unasked = names;
+                    }
+                }
+                s
+            },
             mention_names: m
                 .mentions
                 .iter()
@@ -2740,8 +2771,38 @@ fn system_text(raw: &str) -> String {
     }
 }
 
-/// Split markdown into text and fenced code blocks.
+/// Split markdown into text and fenced code blocks, with pq blocks first
+/// and fences in the text around them.
 fn segments(src: &str) -> Vec<Segment> {
+    let pieces = core_pq::parse_blocks(src);
+    if pieces.iter().all(|p| matches!(p, Piece::Text(_))) {
+        return fences(src);
+    }
+    let mut out = vec![];
+    for piece in pieces {
+        match piece {
+            // Blank text between blocks is dropped (core already took out
+            // the fence lines around a block).
+            Piece::Text(t) if t.trim().is_empty() => {}
+            Piece::Text(t) => out.extend(fences(&t)),
+            Piece::Request(r) => out.push(Segment::PqRequest {
+                id: r.id.clone(),
+                label: r.shown_label(),
+                block: r.block(),
+            }),
+            Piece::Message(m) => out.push(Segment::PqMessage {
+                id: m.header.id.clone(),
+                name: m.header.shown_name(),
+                size: m.header.size.unwrap_or(0),
+                block: core_pq::armor("MESSAGE", &m.blob, ""),
+                unasked: String::new(),
+            }),
+        }
+    }
+    out
+}
+
+fn fences(src: &str) -> Vec<Segment> {
     let mut out = vec![];
     let mut text: Vec<&str> = vec![];
     let mut code: Option<(String, Vec<&str>)> = None;
@@ -2799,6 +2860,97 @@ mod tests {
         assert!(matches!(&s[2], Segment::Text { text } if text == "ok"));
         let open = segments("```\nunclosed");
         assert!(matches!(&open[0], Segment::Code { body, .. } if body == "unclosed"));
+        // Without pq blocks nothing is dropped, an empty fence included.
+        let empty = segments("```\n```");
+        assert!(matches!(&empty[..], [Segment::Code { body, .. }] if body.is_empty()));
+    }
+
+    #[test]
+    fn pq_blocks_become_segments_and_round_trip() {
+        let new = pq::pq_request("db \u{202e}password".into());
+        let text = format!("can you send it?\n```\n{}\n```\nthanks", new.block);
+        let s = segments(&text);
+        let [
+            Segment::Text { text: ask },
+            Segment::PqRequest { id, label, block },
+            Segment::Text { text: thanks },
+        ] = &s[..]
+        else {
+            panic!("not text, request, text")
+        };
+        assert_eq!(
+            (ask.as_str(), thanks.as_str()),
+            ("can you send it?", "thanks")
+        );
+        assert_eq!((id, label.as_str()), (&new.id, "db password"));
+        let sealed =
+            pq::pq_seal(block.clone(), b"hunter2".to_vec(), "../../pw.txt".into()).unwrap();
+        let s = segments(&format!("> {}", sealed.replace('\n', "\n> ")));
+        let [
+            Segment::PqMessage {
+                id,
+                name,
+                size,
+                block,
+                ..
+            },
+        ] = &s[..]
+        else {
+            panic!("not one message")
+        };
+        assert_eq!((id, name.as_str(), *size), (&new.id, "pw.txt", 7));
+        assert_eq!(
+            pq::pq_open(block.clone(), new.record.clone()).unwrap(),
+            b"hunter2"
+        );
+        let other = pq::pq_request(String::new());
+        assert!(pq::pq_open(block.clone(), other.record).is_err());
+    }
+
+    /// A MESSAGE sealed by someone the REQUEST didn't ask carries the
+    /// warning, with the asked names; the asked one's doesn't.
+    #[test]
+    fn pq_message_from_someone_unasked_is_flagged() {
+        use nostr::{EventBuilder, Kind, Tag};
+        let ch = "c1";
+        let (asked, other) = (Keys::generate(), Keys::generate());
+        let mut e = engine();
+        e.store.channel_mut(ch).name = "pq".into();
+        let me = e.relay.keys.clone();
+        let post = |e: &mut Engine, by: &Keys, content: &str, p: Option<&Keys>| {
+            let mut tags = vec![Tag::parse(["h", ch]).unwrap()];
+            if let Some(p) = p {
+                tags.push(Tag::parse(["p", &p.public_key().to_hex()]).unwrap());
+            }
+            let ev = EventBuilder::new(Kind::Custom(9), content)
+                .tags(tags)
+                .sign_with_keys(by)
+                .unwrap();
+            e.store.apply(&ev);
+        };
+        let new = pq::pq_request("token".into());
+        post(&mut e, &me, &new.block, Some(&asked));
+        let sealed = pq::pq_seal(new.block.clone(), b"s".to_vec(), "t".into()).unwrap();
+        post(&mut e, &other, &sealed, None);
+        post(&mut e, &asked, &sealed, None);
+        let c = Client {
+            engine: Arc::new(Mutex::new(e)),
+            stop: Arc::new(tokio::sync::Notify::new()),
+        };
+        let mut warnings: Vec<String> = c
+            .timeline(ch.into())
+            .messages
+            .iter()
+            .flat_map(|m| m.segments.clone())
+            .filter_map(|s| match s {
+                Segment::PqMessage { unasked, .. } => Some(unasked),
+                _ => None,
+            })
+            .collect();
+        warnings.sort();
+        let name = &warnings[1];
+        assert_eq!(warnings[0], "");
+        assert!(!name.is_empty(), "the unasked sealer is flagged");
     }
 
     #[test]
