@@ -2781,13 +2781,10 @@ fn segments(src: &str) -> Vec<Segment> {
     let mut out = vec![];
     for piece in pieces {
         match piece {
-            // A block pasted inside a fence leaves the fence lines with
-            // nothing in them; those empty pieces are dropped.
-            Piece::Text(t) => out.extend(fences(&t).into_iter().filter(|s| match s {
-                Segment::Text { text } => !text.trim().is_empty(),
-                Segment::Code { body, .. } => !body.trim().is_empty(),
-                _ => true,
-            })),
+            // Blank text between blocks is dropped (core already took out
+            // the fence lines around a block).
+            Piece::Text(t) if t.trim().is_empty() => {}
+            Piece::Text(t) => out.extend(fences(&t)),
             Piece::Request(r) => out.push(Segment::PqRequest {
                 id: r.id.clone(),
                 label: r.shown_label(),
@@ -2873,10 +2870,18 @@ mod tests {
         let new = pq::pq_request("db \u{202e}password".into());
         let text = format!("can you send it?\n```\n{}\n```\nthanks", new.block);
         let s = segments(&text);
-        assert_eq!(s.len(), 3);
-        let Segment::PqRequest { id, label, block } = &s[1] else {
-            panic!("not a request")
+        let [
+            Segment::Text { text: ask },
+            Segment::PqRequest { id, label, block },
+            Segment::Text { text: thanks },
+        ] = &s[..]
+        else {
+            panic!("not text, request, text")
         };
+        assert_eq!(
+            (ask.as_str(), thanks.as_str()),
+            ("can you send it?", "thanks")
+        );
         assert_eq!((id, label.as_str()), (&new.id, "db password"));
         let sealed =
             pq::pq_seal(block.clone(), b"hunter2".to_vec(), "../../pw.txt".into()).unwrap();

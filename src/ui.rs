@@ -6769,6 +6769,13 @@ mod tests {
         assert_eq!(rows[1], "🔒 lucian asks for: db password");
         assert_eq!(rows.len(), 3);
         assert_eq!((r.copy.len(), r.urls.len()), (3, 1));
+        // Fenced, the text after the block is still text, not code.
+        let fenced = format!("ask\n```\n{}\n```\nthanks", rec.request().block());
+        let r = render_body(&fenced, 80, &[], &|_| None, "lucian", &none);
+        assert_eq!(
+            text_of(&r),
+            ["ask", "🔒 lucian asks for: db password", "thanks"]
+        );
 
         let sealed = pq::seal(&rec.request(), b"hunter2", "../x/pw.txt").unwrap();
         let named = |id: &str| (id == rec.id).then(|| "taskbot".to_string());

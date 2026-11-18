@@ -347,11 +347,17 @@ pub fn parse_blocks(text: &str) -> Vec<Piece> {
                     .chars()
                     .all(|c| c == '>' || c.is_whitespace());
                 plain.push_str(if quote { &before[..line] } else { before });
+                // A block pasted inside a code fence: both fence lines go,
+                // or the text after the block would read as code.
+                let fenced = open_fence(&plain).map(|at| plain.truncate(at));
                 if !plain.is_empty() {
                     out.push(Piece::Text(std::mem::take(&mut plain)));
                 }
                 out.push(piece);
                 rest = &rest[i + len..];
+                if fenced.is_some() {
+                    rest = skip_closing_fence(rest);
+                }
             }
             // A block that doesn't decode is text, up to its END, as in
             // pq.py, whose pattern also runs from a BEGIN to the next END.
@@ -372,6 +378,32 @@ pub fn parse_blocks(text: &str) -> Vec<Piece> {
         out.push(Piece::Text(plain));
     }
     out
+}
+
+/// Where the last line of `text` starts when that line opens a code fence
+/// that is still open (the text holds an odd number of fence lines).
+fn open_fence(text: &str) -> Option<usize> {
+    let mut fences = 0;
+    let mut last = None;
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        if line.trim_start().starts_with("```") {
+            fences += 1;
+            last = Some(at);
+        } else if !line.trim().is_empty() {
+            last = None;
+        }
+        at += line.len();
+    }
+    last.filter(|_| fences % 2 == 1)
+}
+
+/// `text` without its first non-blank line when that line is a bare
+/// closing fence.
+fn skip_closing_fence(text: &str) -> &str {
+    let t = text.trim_start();
+    let (line, after) = t.split_once('\n').unwrap_or((t, ""));
+    if line.trim() == "```" { after } else { text }
 }
 
 // ---------------------------------------------------------------- crypto
@@ -685,6 +717,31 @@ mod tests {
                 .all(|l| !l.starts_with("ok") && !l.starts_with("and"))
         );
         assert_eq!(Request::from_block(&block).unwrap(), rec.request());
+    }
+
+    #[test]
+    fn fence_lines_around_a_block_go_and_the_text_after_stays_text() {
+        let block = request("x").request().block();
+        let req = Request::from_block(&block).unwrap();
+        let t = format!("ask\n```\n{block}\n```\nthanks");
+        assert_eq!(
+            parse_blocks(&t),
+            vec![
+                Piece::Text("ask\n".into()),
+                Piece::Request(req.clone()),
+                Piece::Text("thanks".into()),
+            ]
+        );
+        // A closed fence before the block is the writer's own code: kept.
+        let t = format!("```\ncode\n```\n{block}\n```\nafter");
+        assert_eq!(
+            parse_blocks(&t),
+            vec![
+                Piece::Text("```\ncode\n```\n".into()),
+                Piece::Request(req),
+                Piece::Text("\n```\nafter".into()),
+            ]
+        );
     }
 
     #[test]
