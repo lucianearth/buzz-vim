@@ -712,7 +712,7 @@ fn message_block(
                 .map(|c| c.name.clone())
         };
         let signer = app.store.name_of(&m.author);
-        let unasked = |rid: &str| unasked(app, ch, m, rid);
+        let unasked = |rid: &str| app.store.pq_unasked_names(ch, &m.author, rid);
         let r = render_body(
             body.trim_end(),
             inner,
@@ -3572,15 +3572,6 @@ pub struct Rendered {
 #[cfg(test)]
 pub fn render_markdown(src: &str, width: usize, mentions: &[String]) -> Vec<Line<'static>> {
     render_markdown_links(src, width, mentions, &|_| None).lines
-}
-
-/// When the person who sealed `m` is not someone the REQUEST `rid` was
-/// addressed to (its event's p-tags), who it was addressed to. A request
-/// that tagged nobody, or one we don't hold, warns about no one.
-fn unasked(app: &App, ch: &Channel, m: &Message, rid: &str) -> Option<String> {
-    let asked = ch.pq_unasked(&m.author, rid)?;
-    let names: Vec<String> = asked.iter().map(|pk| app.store.name_of(pk)).collect();
-    Some(names.join(", "))
 }
 
 /// The rows of a pq card. `signer` is the message's author; the label and
@@ -6813,10 +6804,23 @@ mod tests {
         app.store
             .apply(&post(&me, &untagged.request().block(), None));
         let ch = app.store.channels.get("c1").unwrap();
-        let from = |k: &Keys| Message::from_event(&post(k, "", None));
-        assert_eq!(unasked(&app, ch, &from(&asked), &tagged.id), None);
-        assert!(unasked(&app, ch, &from(&other), &tagged.id).is_some());
-        assert_eq!(unasked(&app, ch, &from(&other), &untagged.id), None);
-        assert_eq!(unasked(&app, ch, &from(&other), "0000000000000000"), None);
+        let from = |k: &Keys| k.public_key().to_hex();
+        assert_eq!(
+            app.store.pq_unasked_names(ch, &from(&asked), &tagged.id),
+            None
+        );
+        assert_eq!(
+            app.store.pq_unasked_names(ch, &from(&other), &tagged.id),
+            Some(app.store.name_of(&from(&asked)))
+        );
+        assert_eq!(
+            app.store.pq_unasked_names(ch, &from(&other), &untagged.id),
+            None
+        );
+        assert_eq!(
+            app.store
+                .pq_unasked_names(ch, &from(&other), "0000000000000000"),
+            None
+        );
     }
 }

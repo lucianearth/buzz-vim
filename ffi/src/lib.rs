@@ -2718,11 +2718,9 @@ impl Engine {
                 let mut s = segments(body.trim_end());
                 for seg in &mut s {
                     if let Segment::PqMessage { id, unasked, .. } = seg
-                        && let Some(asked) = ch.pq_unasked(&m.author, id)
+                        && let Some(names) = self.store.pq_unasked_names(ch, &m.author, id)
                     {
-                        let names: Vec<String> =
-                            asked.iter().map(|pk| self.store.name_of(pk)).collect();
-                        *unasked = names.join(", ");
+                        *unasked = names;
                     }
                 }
                 s

@@ -218,7 +218,7 @@ impl Channel {
     /// Whom the REQUEST `rid` here asked (its mentions), when `author`
     /// sealed a MESSAGE to it without being one of them. None when the
     /// request isn't here, asked nobody in particular, or asked `author`.
-    pub fn pq_unasked(&self, author: &str, rid: &str) -> Option<&[String]> {
+    fn pq_unasked(&self, author: &str, rid: &str) -> Option<&[String]> {
         let req = self.messages.values().find(|x| {
             x.content.contains("BEGIN PQBOX REQUEST")
                 && crate::pq::parse_blocks(&x.content)
@@ -308,6 +308,19 @@ impl Store {
             .filter(|pk| !ch.members.contains(pk) && ours(pk))
             .cloned()
             .collect()
+    }
+
+    /// [`Channel::pq_unasked`] as names, joined with ", ": what a sealed
+    /// MESSAGE's card warns with when `author` was not among those asked.
+    pub fn pq_unasked_names(&self, ch: &Channel, author: &str, rid: &str) -> Option<String> {
+        let asked = ch.pq_unasked(author, rid)?;
+        Some(
+            asked
+                .iter()
+                .map(|pk| self.name_of(pk))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
     }
 
     pub fn name_of(&self, pubkey: &str) -> String {

@@ -620,7 +620,10 @@ mod tests {
 
     #[test]
     fn shown_label_is_safe_and_never_empty() {
-        assert_eq!(request("db\u{202e}\n key").request().shown_label(), "db key");
+        assert_eq!(
+            request("db\u{202e}\n key").request().shown_label(),
+            "db key"
+        );
         assert_eq!(request(" \t").request().shown_label(), "a secret");
     }
 
