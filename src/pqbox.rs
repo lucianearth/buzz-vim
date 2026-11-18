@@ -388,6 +388,19 @@ mod tests {
     }
 
     #[test]
+    fn a_pasted_secret_keeps_its_exact_bytes() {
+        let tmp = std::env::temp_dir().join(format!("pqbox-paste-{}", std::process::id()));
+        let (me, them) = (Keys::generate(), Keys::generate());
+        let mut b = app(&them, &tmp);
+        post(&mut [&mut b], &me, &pq::request("x").request().block());
+        keys(&mut b, &[KeyCode::Char('p')]);
+        b.on_term(crossterm::event::Event::Paste("a\r\nb\rc\n".into()));
+        keys(&mut b, &[KeyCode::Enter]);
+        assert!(matches!(&b.pq, Some(PqBox::Confirm { data, .. }) if data == b"a\r\nb\rc\n"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn a_file_answer_sends_the_file_under_its_name() {
         let tmp = std::env::temp_dir().join(format!("pqbox-file-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();

@@ -1904,10 +1904,11 @@ impl App {
     }
 
     fn on_paste(&mut self, s: String) {
-        let text = s.replace("\r\n", "\n").replace('\r', "\n");
+        // A secret is sealed byte for byte: no line-ending clean-up.
         if self.mode == Mode::Pq {
-            return self.pq_paste(&text);
+            return self.pq_paste(&s);
         }
+        let text = s.replace("\r\n", "\n").replace('\r', "\n");
         // The Q box takes text only, a dropped path included.
         if self.mode == Mode::Quick {
             self.quick_draft.insert(&text);
