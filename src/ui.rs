@@ -3617,8 +3617,7 @@ fn pq_card(
         }
         Piece::Message(msg) => {
             let h = &msg.header;
-            let name = h.name.as_deref().unwrap_or("message.out");
-            let name = pq::display_text(name.rsplit(['/', '\\']).next().unwrap_or(""));
+            let name = h.shown_name();
             let size = byte_size(h.size.unwrap_or(0));
             let mut rows = vec![row(
                 format!("🔐 sealed by {signer}, {name}, {size}"),

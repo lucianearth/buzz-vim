@@ -100,14 +100,8 @@ impl App {
         if let Err(e) = store.burn(&rec.id) {
             self.say(format!("opened, but couldn't burn the key: {e}"));
         }
-        let name = msg.header.name.as_deref().unwrap_or("message.out");
-        let name = name
-            .rsplit(['/', '\\'])
-            .next()
-            .filter(|n| !n.is_empty())
-            .unwrap_or("message.out");
         self.pq = Some(PqBox::Opened {
-            name: pq::display_text(name),
+            name: msg.header.shown_name(),
             data,
         });
         self.mode = Mode::Pq;

@@ -54,18 +54,13 @@ pub(crate) fn split(src: &str, mut text: impl FnMut(&str, &mut Vec<Segment>)) ->
                 label: pq::display_text(&r.label),
                 block: r.block(),
             }),
-            Piece::Message(m) => {
-                let name = m.header.name.as_deref().unwrap_or("message.out");
-                // The sender's name, untrusted: its last path part, made safe to show.
-                let name = pq::display_text(name.rsplit(['/', '\\']).next().unwrap_or(""));
-                out.push(Segment::PqMessage {
-                    id: m.header.id.clone(),
-                    name,
-                    size: m.header.size.unwrap_or(0),
-                    block: pq::armor("MESSAGE", &m.blob, ""),
-                    unasked: String::new(),
-                })
-            }
+            Piece::Message(m) => out.push(Segment::PqMessage {
+                id: m.header.id.clone(),
+                name: m.header.shown_name(),
+                size: m.header.size.unwrap_or(0),
+                block: pq::armor("MESSAGE", &m.blob, ""),
+                unasked: String::new(),
+            }),
         }
     }
     out

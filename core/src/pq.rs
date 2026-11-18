@@ -215,6 +215,16 @@ pub fn dearmor(text: &str, kind: &str) -> Result<Vec<u8>> {
         .with_context(|| format!("the PQBOX {kind} block is corrupt (bad base64)"))
 }
 
+impl Header {
+    /// The name to show and save under. The sender chose it: only its last
+    /// path part, through [`display_text`] and [`links::file_name`] (no
+    /// dotfile); `message.out` when nothing is left, as pq does.
+    pub fn shown_name(&self) -> String {
+        let name = self.name.as_deref().map(display_text);
+        crate::links::file_name("message.out", name.as_deref())
+    }
+}
+
 impl Request {
     /// A REQUEST payload, held to the version and suite this code speaks.
     pub fn from_json(bytes: &[u8]) -> Result<Request> {
@@ -595,6 +605,24 @@ mod tests {
         assert_eq!(display_text("a\u{202e}b\n\tc  d"), "a b c d");
         assert_eq!(display_text(&"x".repeat(250)).len(), 200);
         assert!(display_text(&"x".repeat(250)).ends_with("..."));
+    }
+
+    #[test]
+    fn shown_name_is_a_safe_last_path_part() {
+        let msg = Message::from_block(&seal(&request("").request(), b"x", "f").unwrap()).unwrap();
+        let shown = |name: Option<&str>| {
+            Header {
+                name: name.map(str::to_string),
+                ..msg.header.clone()
+            }
+            .shown_name()
+        };
+        assert_eq!(shown(Some("../../etc/passwd")), "passwd");
+        assert_eq!(shown(Some("C:\\x\\a.pdf")), "a.pdf");
+        assert_eq!(shown(Some("\u{200b}.bashrc")), "bashrc");
+        assert_eq!(shown(Some("evil\u{202e}fdp.exe")), "evil fdp.exe");
+        assert_eq!(shown(Some("dir/")), "message.out");
+        assert_eq!(shown(None), "message.out");
     }
 
     #[test]
