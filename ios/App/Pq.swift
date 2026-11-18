@@ -70,7 +70,7 @@ struct PqCard: View {
                 cardButton("Send secret", icon: "paperplane") { answering = true }
             case let .pqMessage(id, name, size, block, unasked):
                 Text("🔐 sealed by \(message.authorName), \(name), "
-                     + ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file))
+                     + ByteCountFormatter.string(fromByteCount: Int64(clamping: size), countStyle: .file))
                     .font(.text)
                     .foregroundStyle(theme.bright)
                 if !unasked.isEmpty {
