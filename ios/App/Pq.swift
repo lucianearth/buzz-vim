@@ -9,70 +9,21 @@ import UniformTypeIdentifiers
 private let pqLog = Logger(subsystem: "com.lucianhymer.buzzvim", category: "pq")
 
 /// pq keys: each request's record JSON (ffi `pq_request`) under account
-/// `pq:<id>`, in the Keychain on this device only. Not in the group the
-/// notification extension shares (Keychain.swift): the app's own
-/// application-identifier group, so only the app reads them. Never synced.
+/// `pq:<id>`, in the Keychain's `.app` group (not the one the notification
+/// extension shares), this device only, readable only while unlocked.
 enum PqKeys {
-    private static let service = "buzz-vim-pq"
-
-    /// `<team prefix>.<bundle id>`, the prefix taken from the shared group.
-    private static let group: String? = {
-        guard let shared = Bundle.main.object(forInfoDictionaryKey: "KeychainGroup") as? String,
-              let dot = shared.firstIndex(of: "."),
-              let bundle = Bundle.main.bundleIdentifier else { return nil }
-        return String(shared[..<dot]) + "." + bundle
-    }()
-
-    private static func query(_ id: String) -> [String: Any] {
-        [kSecClass as String: kSecClassGenericPassword,
-         kSecAttrService as String: service,
-         kSecAttrAccount as String: "pq:\(id)",
-         kSecAttrSynchronizable as String: false]
-    }
-
-    /// Keep a new request's record; the Keychain's status (errSecSuccess
-    /// when kept).
     static func save(id: String, record: String) -> OSStatus {
-        var q = query(id)
-        if let group { q[kSecAttrAccessGroup as String] = group }
-        q[kSecValueData as String] = Data(record.utf8)
-        q[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-        var status = SecItemAdd(q as CFDictionary, nil)
-        #if targetEnvironment(simulator)
-        if status != errSecSuccess {
-            // Unsigned simulator builds have no access groups (-34018 or
-            // -25243). Never on a phone: without a group the item lands in
-            // the shared one.
-            q.removeValue(forKey: kSecAttrAccessGroup as String)
-            status = SecItemAdd(q as CFDictionary, nil)
-        }
-        #endif
-        return status
+        Keychain.save(record, account: "pq:\(id)", group: .app,
+                      accessible: kSecAttrAccessibleWhenUnlockedThisDeviceOnly)
     }
 
-    /// This device holds the key for request `id` (no secret is read).
-    static func has(_ id: String) -> Bool {
-        var q = query(id)
-        q[kSecReturnAttributes as String] = true
-        return SecItemCopyMatching(q as CFDictionary, nil) == errSecSuccess
-    }
+    static func has(_ id: String) -> Bool { Keychain.has(account: "pq:\(id)") }
 
-    static func read(_ id: String) -> String? {
-        var q = query(id)
-        q[kSecReturnData as String] = true
-        q[kSecMatchLimit as String] = kSecMatchLimitOne
-        var out: AnyObject?
-        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
-              let data = out as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
-    }
+    static func read(_ id: String) -> String? { Keychain.read(account: "pq:\(id)", group: .app) }
 
     /// False when a key was there and couldn't be deleted.
     @discardableResult
-    static func burn(_ id: String) -> Bool {
-        let s = SecItemDelete(query(id) as CFDictionary)
-        return s == errSecSuccess || s == errSecItemNotFound
-    }
+    static func burn(_ id: String) -> Bool { Keychain.delete(account: "pq:\(id)") }
 }
 
 /// Face ID (or the passcode) before a secret shows. A phone with neither
@@ -183,7 +134,7 @@ struct PqCard: View {
                     pqLog.info("open \(id, privacy: .public): burned \(ok, privacy: .public)")
                     if ok { burned = true } else { model.say("opened, but couldn't burn the key") }
                 }
-                opened = PqOpened(name: name.isEmpty ? "message.out" : name, data: data)
+                opened = PqOpened(name: name, data: data)
             } catch let BuzzError.Failed(message) {
                 model.say("couldn't open it: \(message)")
             } catch {
