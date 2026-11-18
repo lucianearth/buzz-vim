@@ -147,16 +147,26 @@ pub fn armor(kind: &str, blob: &[u8], note: &str) -> String {
     let mut out = vec![begin(kind)];
     if !note.is_empty() {
         // Every line break Python's splitlines() knows, or pq.py would read
-        // the rest of a comment line as base64.
-        let note: String = note
-            .chars()
-            .map(|c| match c {
+        // the rest of a comment line as base64. A space after every fourth
+        // dash in a run: no BEGIN or END marker can hide in the comment and
+        // cut the block short (the JSON payload keeps the text as is).
+        let mut dashes = 0;
+        let mut note_out = String::with_capacity(note.len());
+        for c in note.chars() {
+            let c = match c {
                 '\r' | '\x0b' | '\x0c' | '\x1c'..='\x1e' | '\u{85}' | '\u{2028}' | '\u{2029}' => {
                     '\n'
                 }
                 c => c,
-            })
-            .collect();
+            };
+            dashes = if c == '-' { dashes + 1 } else { 0 };
+            if dashes == 5 {
+                note_out.push(' ');
+                dashes = 1;
+            }
+            note_out.push(c);
+        }
+        let note = note_out;
         out.extend(note.lines().map(|l| {
             if l.is_empty() {
                 "#".to_string()
@@ -582,6 +592,19 @@ mod tests {
         assert_eq!(msg.header.size, Some(8));
         assert_eq!(open(&msg, &rec).unwrap(), b"hi\0there");
         assert!(open(&msg, &request("other")).is_err());
+    }
+
+    #[test]
+    fn a_label_with_armor_markers_cannot_break_the_request() {
+        let label = "x\n-----END PQBOX REQUEST-----\n------BEGIN PQBOX MESSAGE------ y";
+        let req = request(label).request();
+        let block = req.block();
+        assert_eq!(block.matches("-----END PQBOX").count(), 1);
+        assert_eq!(block.matches("-----BEGIN PQBOX").count(), 1);
+        assert!(block.ends_with("-----END PQBOX REQUEST-----"));
+        assert_eq!(parse_blocks(&format!("hi\n{block}\nbye")).len(), 3);
+        assert_eq!(parse_blocks(&block), vec![Piece::Request(req.clone())]);
+        assert_eq!(Request::from_block(&block).unwrap().label, label);
     }
 
     #[test]

@@ -173,7 +173,7 @@ fn live_cross_with_pq_cli() {
     };
 
     // core asks, the CLI answers, core opens with the record it stored.
-    let rec = pq::request("live");
+    let rec = pq::request("live\n-----END PQBOX REQUEST-----\nlabel tail");
     store.save(&rec).unwrap();
     let req_file = home.join("req.txt");
     std::fs::write(&req_file, rec.request().block()).unwrap();
