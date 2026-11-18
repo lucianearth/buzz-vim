@@ -1,10 +1,10 @@
-//! pq for the iPhone app: blocks become [`Segment`]s, and asking, sealing
-//! and opening go through core's pq. Swift keeps each request's record JSON
+//! pq for the iPhone app: asking, sealing and opening go through core's pq
+//! (blocks become segments in `segments`). Swift keeps each request's record JSON
 //! in its Keychain (account `pq:<id>`), so records cross as strings.
 
-use buzz_vim_core::pq::{self, Message, Piece, Request};
+use buzz_vim_core::pq::{self, Message, Request};
 
-use crate::{BuzzError, Segment};
+use crate::BuzzError;
 
 /// A request just made: post `block`, keep `record` (secret) under `id`.
 #[derive(uniffi::Record, Clone)]
@@ -41,27 +41,4 @@ pub fn pq_open(message_block: String, record: String) -> Result<Vec<u8>, BuzzErr
     let rec = serde_json::from_str(&record)
         .map_err(|e| BuzzError::Failed(format!("the key record is corrupt: {e}")))?;
     Ok(pq::open(&Message::from_block(&message_block)?, &rec)?)
-}
-
-/// pq blocks out of `src`; the text between them goes to `text`.
-pub(crate) fn split(src: &str, mut text: impl FnMut(&str, &mut Vec<Segment>)) -> Vec<Segment> {
-    let mut out = vec![];
-    for piece in pq::parse_blocks(src) {
-        match piece {
-            Piece::Text(t) => text(&t, &mut out),
-            Piece::Request(r) => out.push(Segment::PqRequest {
-                id: r.id.clone(),
-                label: pq::display_text(&r.label),
-                block: r.block(),
-            }),
-            Piece::Message(m) => out.push(Segment::PqMessage {
-                id: m.header.id.clone(),
-                name: m.header.shown_name(),
-                size: m.header.size.unwrap_or(0),
-                block: pq::armor("MESSAGE", &m.blob, ""),
-                unasked: String::new(),
-            }),
-        }
-    }
-    out
 }

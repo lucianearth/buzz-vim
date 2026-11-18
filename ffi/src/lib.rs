@@ -22,6 +22,7 @@ use buzz_vim_core::mention;
 use buzz_vim_core::model::{self, Applied, Store};
 use buzz_vim_core::needs;
 use buzz_vim_core::palette::{self, Role};
+use buzz_vim_core::pq::{self as core_pq, Piece};
 use buzz_vim_core::quick;
 use buzz_vim_core::readstate::{self, ReadState};
 use buzz_vim_core::relay::{BlobDescriptor, Relay};
@@ -2772,17 +2773,37 @@ fn system_text(raw: &str) -> String {
     }
 }
 
-/// Split markdown into text and fenced code blocks.
-/// pq blocks first, then code fences in the text around them. A block
-/// pasted inside a fence leaves the fence lines with nothing in them; those
-/// empty pieces are dropped.
+/// Split markdown into text and fenced code blocks, with pq blocks first
+/// and fences in the text around them.
 fn segments(src: &str) -> Vec<Segment> {
-    let mut out = pq::split(src, |t, out| out.extend(fences(t)));
-    out.retain(|s| match s {
-        Segment::Text { text } => !text.trim().is_empty(),
-        Segment::Code { body, .. } => !body.trim().is_empty(),
-        _ => true,
-    });
+    let pieces = core_pq::parse_blocks(src);
+    if pieces.iter().all(|p| matches!(p, Piece::Text(_))) {
+        return fences(src);
+    }
+    let mut out = vec![];
+    for piece in pieces {
+        match piece {
+            // A block pasted inside a fence leaves the fence lines with
+            // nothing in them; those empty pieces are dropped.
+            Piece::Text(t) => out.extend(fences(&t).into_iter().filter(|s| match s {
+                Segment::Text { text } => !text.trim().is_empty(),
+                Segment::Code { body, .. } => !body.trim().is_empty(),
+                _ => true,
+            })),
+            Piece::Request(r) => out.push(Segment::PqRequest {
+                id: r.id.clone(),
+                label: core_pq::display_text(&r.label),
+                block: r.block(),
+            }),
+            Piece::Message(m) => out.push(Segment::PqMessage {
+                id: m.header.id.clone(),
+                name: m.header.shown_name(),
+                size: m.header.size.unwrap_or(0),
+                block: core_pq::armor("MESSAGE", &m.blob, ""),
+                unasked: String::new(),
+            }),
+        }
+    }
     out
 }
 
@@ -2844,6 +2865,9 @@ mod tests {
         assert!(matches!(&s[2], Segment::Text { text } if text == "ok"));
         let open = segments("```\nunclosed");
         assert!(matches!(&open[0], Segment::Code { body, .. } if body == "unclosed"));
+        // Without pq blocks nothing is dropped, an empty fence included.
+        let empty = segments("```\n```");
+        assert!(matches!(&empty[..], [Segment::Code { body, .. }] if body.is_empty()));
     }
 
     #[test]
