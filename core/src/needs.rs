@@ -6,8 +6,10 @@
 //! on lucian, waiting on release), a contested
 //! channel whose lists run, and people's @mentions and DMs he hasn't
 //! answered. Bots' @mentions don't count. A message row clears once he posts in its
-//! thread (in a DM: anywhere in it) after the message; a watch or item row
-//! once the record moves on.
+//! thread (in a DM: anywhere in it) after the message; a watch row once he
+//! posts anywhere in the channel after its ask (the watcher's rule; a
+//! release row only in its thread) or the record moves on; an item row once
+//! the record moves on.
 
 use std::collections::HashMap;
 
@@ -254,7 +256,18 @@ pub fn rows(
             if let Some(p) = &w.ping {
                 pings.push(p.clone());
             }
-            if !answered(channel, thread.as_deref(), anchor) {
+            // An ask (stalled, waiting on him) clears on any post of his in
+            // the channel after it, in whatever thread: the watcher's own rule
+            // (aei stall-judge.py, `owner_spoke`), which re-judges only once
+            // the agent's turn goes quiet. A thread-only check kept a row up
+            // that the watcher would clear (lucian 2026-11-18,
+            // #data-round-nov). A release row waits on a card's thumb, not on
+            // talk, so only a post in its thread clears it (judgebot).
+            let scope = match w.state {
+                WatchState::WaitingOnRelease => thread.as_deref(),
+                _ => None,
+            };
+            if !answered(channel, scope, anchor) {
                 let detail = if !w.reason.trim().is_empty() {
                     one_line(&w.reason)
                 } else {
@@ -780,6 +793,33 @@ mod tests {
         assert_eq!(r[0].at, NOW - 600);
         w.post(&op, CH, "released", None, Some(&root), NOW - 60);
         assert!(w.rows().is_empty());
+    }
+
+    #[test]
+    fn a_post_anywhere_in_the_channel_after_the_ask_clears_the_watch_row() {
+        let mut w = World::new();
+        let op = w.op.clone();
+        let root = w.post(&op, CH, "go", None, None, NOW - 4000);
+        let other = w.post(&op, CH, "another thread", None, None, NOW - 3000);
+        let wk = w.watcher.clone();
+        let ping = w.post(
+            &wk,
+            CH,
+            "@lucian one more card",
+            Some(&op),
+            Some(&root),
+            NOW - 600,
+        );
+        w.watch("waiting_on_lucian", NOW - 600, Some(&ping), Some(&root));
+        // His post in another thread before the ask doesn't answer it.
+        assert_eq!(keys(&w.rows()), ["waiting on lucian"]);
+        // After the ask, in another thread: answered, as the watcher counts it.
+        w.post(&op, CH, "catch me up", None, Some(&other), NOW - 60);
+        assert!(w.rows().is_empty());
+        // A release row waits on a thumb: talk elsewhere doesn't clear it.
+        w.watch("waiting_on_release", NOW - 30, Some(&ping), Some(&root));
+        w.post(&op, CH, "status?", None, Some(&other), NOW - 10);
+        assert_eq!(keys(&w.rows()), ["waiting on release"]);
     }
 
     /// No parking (lucian 2026-10-20): the driver's legacy parked item is
