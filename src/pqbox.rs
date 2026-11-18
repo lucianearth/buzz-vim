@@ -248,13 +248,19 @@ fn expand_home(p: &str) -> std::path::PathBuf {
     }
 }
 
-/// Into ~/Downloads (else home), never over an existing file.
+/// Into ~/Downloads (made 0700 if missing), never over an existing file.
+/// The sender chose `name`: no leading dots, so it can't be a dotfile.
 fn save(name: &str, data: &[u8]) -> std::io::Result<std::path::PathBuf> {
     use std::io::Write;
-    let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-    let dir = Some(home.join("Downloads"))
-        .filter(|d| d.is_dir())
-        .unwrap_or(home);
+    let home = std::env::var_os("HOME").ok_or(std::io::ErrorKind::NotFound)?;
+    let dir = std::path::Path::new(&home).join("Downloads");
+    let mut b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.recursive(true).create(&dir)?;
+    let name = Some(name.trim_start_matches('.'))
+        .filter(|n| !n.is_empty())
+        .unwrap_or("message.out");
     let path = dir.join(name);
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create_new(true);

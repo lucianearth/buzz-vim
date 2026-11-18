@@ -144,6 +144,17 @@ pub fn armor(kind: &str, blob: &[u8], note: &str) -> String {
     let b64 = B64.encode(blob);
     let mut out = vec![begin(kind)];
     if !note.is_empty() {
+        // Every line break Python's splitlines() knows, or pq.py would read
+        // the rest of a comment line as base64.
+        let note: String = note
+            .chars()
+            .map(|c| match c {
+                '\r' | '\x0b' | '\x0c' | '\x1c'..='\x1e' | '\u{85}' | '\u{2028}' | '\u{2029}' => {
+                    '\n'
+                }
+                c => c,
+            })
+            .collect();
         out.extend(note.lines().map(|l| {
             if l.is_empty() {
                 "#".to_string()
@@ -277,16 +288,24 @@ pub fn parse_blocks(text: &str) -> Vec<Piece> {
     let mut out = vec![];
     let mut plain = String::new();
     let mut rest = text;
+    // Kinds with no END left in the text: no later BEGIN of theirs can
+    // close, so they aren't searched again (hostile text stays linear).
+    let mut unclosed = [false; 2];
     while let Some(i) = rest.find("-----BEGIN PQBOX ") {
         let after = &rest[i..];
         let kind = ["REQUEST", "MESSAGE"]
             .into_iter()
-            .find(|k| after.starts_with(&begin(k)));
+            .position(|k| after.starts_with(&begin(k)))
+            .filter(|&k| !unclosed[k]);
         let block = kind.and_then(|k| {
-            let e = end(k);
-            let len = after.find(&e)? + e.len();
+            let e = end(["REQUEST", "MESSAGE"][k]);
+            let Some(at) = after.find(&e) else {
+                unclosed[k] = true;
+                return None;
+            };
+            let len = at + e.len();
             let piece = match k {
-                "REQUEST" => Request::from_block(&after[..len]).ok().map(Piece::Request),
+                0 => Request::from_block(&after[..len]).ok().map(Piece::Request),
                 _ => Message::from_block(&after[..len]).ok().map(Piece::Message),
             };
             Some((len, piece))
@@ -306,8 +325,14 @@ pub fn parse_blocks(text: &str) -> Vec<Piece> {
                 out.push(piece);
                 rest = &rest[i + len..];
             }
-            // Not a block we can read: keep its first line as text, go on.
-            _ => {
+            // A block that doesn't decode is text, up to its END, as in
+            // pq.py, whose pattern also runs from a BEGIN to the next END.
+            Some((len, None)) => {
+                plain.push_str(&rest[..i + len]);
+                rest = &rest[i + len..];
+            }
+            // No block here: keep the marker as text, go on.
+            None => {
                 let skip = i + "-----BEGIN PQBOX ".len();
                 plain.push_str(&rest[..skip]);
                 rest = &rest[skip..];
@@ -571,6 +596,27 @@ mod tests {
         assert_eq!(display_text("a\u{202e}b\n\tc  d"), "a b c d");
         assert_eq!(display_text(&"x".repeat(250)).len(), 200);
         assert!(display_text(&"x".repeat(250)).ends_with("..."));
+    }
+
+    #[test]
+    fn hostile_text_parses_in_linear_time() {
+        let t = "-----BEGIN PQBOX REQUEST-----\n".repeat(20_000) + "-----END PQBOX REQUEST-----";
+        let t = t + &"-----BEGIN PQBOX MESSAGE-----\n".repeat(20_000);
+        let start = std::time::Instant::now();
+        assert_eq!(parse_blocks(&t), vec![Piece::Text(t.clone())]);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_label_with_python_line_breaks_still_armors() {
+        let rec = request("db\u{2028}ok\x0cand\rmore");
+        let block = rec.request().block();
+        assert!(
+            block
+                .lines()
+                .all(|l| !l.starts_with("ok") && !l.starts_with("and"))
+        );
+        assert_eq!(Request::from_block(&block).unwrap(), rec.request());
     }
 
     #[test]
