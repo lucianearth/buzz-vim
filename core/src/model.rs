@@ -218,13 +218,19 @@ impl Channel {
     /// Whom the REQUEST `rid` here asked (its mentions), when `author`
     /// sealed a MESSAGE to it without being one of them. None when the
     /// request isn't here, asked nobody in particular, or asked `author`.
+    /// The earliest copy of the REQUEST is the asker's: a later repost
+    /// (quoted, tagging nobody) can't clear the warning.
     fn pq_unasked(&self, author: &str, rid: &str) -> Option<&[String]> {
-        let req = self.messages.values().find(|x| {
-            x.content.contains("BEGIN PQBOX REQUEST")
-                && crate::pq::parse_blocks(&x.content)
-                    .iter()
-                    .any(|p| matches!(p, crate::pq::Piece::Request(r) if r.id == rid))
-        })?;
+        let req = self
+            .messages
+            .values()
+            .filter(|x| {
+                x.content.contains("BEGIN PQBOX REQUEST")
+                    && crate::pq::parse_blocks(&x.content)
+                        .iter()
+                        .any(|p| matches!(p, crate::pq::Piece::Request(r) if r.id == rid))
+            })
+            .min_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)))?;
         if req.mentions.is_empty() || req.mentions.iter().any(|m| m == author) {
             return None;
         }
@@ -678,6 +684,7 @@ fn insert_sorted(list: &mut Vec<String>, msgs: &HashMap<String, Message>, id: St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pq;
     use nostr::{EventBuilder, Keys, Kind, Tag};
 
     fn ev(keys: &Keys, kind: u16, content: &str, tags: Vec<Vec<&str>>, at: u64) -> Event {
@@ -754,6 +761,32 @@ mod tests {
         s.channel_mut("d").is_dm = true;
         assert!(s.outsiders("d", &said, agent).is_empty());
         assert!(s.outsiders("nope", &said, agent).is_empty());
+    }
+
+    #[test]
+    fn a_repost_of_a_request_does_not_clear_the_unasked_warning() {
+        let (me, asked, mallory) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let rid = pq::request("x");
+        let block = rid.request().block();
+        let quoted: String = block.lines().map(|l| format!("> {l}\n")).collect();
+        let asked_hex = asked.public_key().to_hex();
+        // Each Store hashes with its own seed, so 20 runs cover the orders
+        // a HashMap lookup could take.
+        for _ in 0..20 {
+            let mut s = Store::new(me.public_key().to_hex());
+            s.apply(&ev(
+                &me,
+                9,
+                &block,
+                vec![vec!["h", "c"], vec!["p", &asked_hex]],
+                100,
+            ));
+            s.apply(&ev(&mallory, 9, &quoted, vec![vec!["h", "c"]], 200));
+            let ch = &s.channels["c"];
+            let warn = |who: &Keys| s.pq_unasked_names(ch, &who.public_key().to_hex(), &rid.id);
+            assert!(warn(&mallory).is_some(), "the repost cleared the warning");
+            assert_eq!(warn(&asked), None);
+        }
     }
 
     #[test]
