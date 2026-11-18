@@ -11,25 +11,25 @@ import Security
 enum Keychain {
     enum Group { case shared, app }
 
-    private static let shared = Bundle.main.object(forInfoDictionaryKey: "KeychainGroup") as? String
+    private static let sharedGroup = Bundle.main.object(forInfoDictionaryKey: "KeychainGroup") as? String
     /// `<team prefix>.<bundle id>`, the prefix taken from the shared group.
-    private static let app: String? = {
-        guard let shared, let dot = shared.firstIndex(of: "."),
+    private static let appGroup: String? = {
+        guard let shared = Keychain.sharedGroup, let dot = shared.firstIndex(of: "."),
               let bundle = Bundle.main.bundleIdentifier else { return nil }
         return String(shared[..<dot]) + "." + bundle
     }()
 
     /// In `group`, or (nil) in any group this app reads.
-    private static func query(_ account: String, group: Group? = .shared) -> [String: Any] {
+    private static func query(_ account: String, group: Group?) -> [String: Any] {
         var q: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "buzz-vim",
             kSecAttrAccount as String: account,
         ]
-        let name = switch group {
-        case .shared: shared
-        case .app: app
-        case nil: String?.none
+        let name: String? = switch group {
+        case .shared: sharedGroup
+        case .app: appGroup
+        case nil: nil
         }
         if let name { q[kSecAttrAccessGroup as String] = name }
         return q
