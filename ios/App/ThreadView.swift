@@ -32,7 +32,8 @@ struct ThreadView: View {
                     // Not lazy, for the same reason as the channel view.
                     VStack(alignment: .leading, spacing: 22) {
                         ForEach(tl.messages, id: \.id) { m in
-                            MessageRow(client: client, message: m, showReplies: false,
+                            MessageRow(client: client, channel: route.channel, root: route.root, message: m,
+                                       showReplies: false,
                                        latest: m.id == tl.latest)
                                 .equatable()
                                 .contentShape(Rectangle())

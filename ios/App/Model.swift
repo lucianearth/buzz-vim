@@ -262,11 +262,13 @@ final class Model {
         return .handled
     }
 
-    private func share(_ file: URL) {
+    /// The share sheet for `file`; `closed` runs when it goes away.
+    func share(_ file: URL, closed: (() -> Void)? = nil) {
         let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
-        guard var top = scene?.keyWindow?.rootViewController else { return }
+        guard var top = scene?.keyWindow?.rootViewController else { closed?(); return }
         while let p = top.presentedViewController { top = p }
         let sheet = UIActivityViewController(activityItems: [file], applicationActivities: nil)
+        sheet.completionWithItemsHandler = { _, _, _, _ in closed?() }
         sheet.popoverPresentationController?.sourceView = top.view
         top.present(sheet, animated: true)
     }
